@@ -1,0 +1,385 @@
+package utils
+
+import (
+	"fmt"
+	"math"
+	"strings"
+	"unicode/utf8"
+)
+
+const approxBytesPerToken = 4
+
+type PolicyMode string
+
+const (
+	PolicyBytes  PolicyMode = "bytes"
+	PolicyTokens PolicyMode = "tokens"
+)
+
+type TruncationPolicy struct {
+	Mode  PolicyMode
+	Limit int
+}
+
+type ContentItemKind string
+
+const (
+	ContentInputText        ContentItemKind = "input_text"
+	ContentInputImage       ContentItemKind = "input_image"
+	ContentEncryptedContent ContentItemKind = "encrypted_content"
+)
+
+type FunctionCallOutputContentItem struct {
+	Kind     ContentItemKind
+	Text     string
+	ImageURL string
+	// FileID is the uploaded-file form of an image content item (Rust #45794):
+	// truncation keeps these items intact instead of resolving them.
+	FileID           string
+	Detail           *string
+	EncryptedContent string
+}
+
+func BytesPolicy(limit int) TruncationPolicy {
+	return TruncationPolicy{Mode: PolicyBytes, Limit: limit}
+}
+
+func TokensPolicy(limit int) TruncationPolicy {
+	return TruncationPolicy{Mode: PolicyTokens, Limit: limit}
+}
+
+func (p *TruncationPolicy) ByteBudget() int {
+	if p == nil {
+		return 0
+	}
+	if p.Mode == PolicyTokens {
+		return ApproxBytesForTokens(p.Limit)
+	}
+	if p.Limit < 0 {
+		return 0
+	}
+	return p.Limit
+}
+
+func (p *TruncationPolicy) TokenBudget() int {
+	if p == nil {
+		return 0
+	}
+	if p.Mode == PolicyTokens {
+		if p.Limit < 0 {
+			return 0
+		}
+		return p.Limit
+	}
+	return int(ApproxTokensFromByteCount(p.ByteBudget()))
+}
+
+// WithSerializationAllowance mirrors Rust's
+// `codex_utils_output_truncation::with_serialization_allowance`: the existing
+// 20% allowance for serialization and headers. Saved history budgets already
+// include this allowance, so callers must apply it only to the model's raw
+// truncation policy. Rust multiplies the policy value in floating point and
+// rounds up, preserving the policy's mode.
+func (p TruncationPolicy) WithSerializationAllowance() TruncationPolicy {
+	if p.Limit <= 0 {
+		return p
+	}
+	return TruncationPolicy{Mode: p.Mode, Limit: int(math.Ceil(float64(p.Limit) * 1.2))}
+}
+
+func FormattedTruncateText(content string, policy TruncationPolicy) string {
+	if len(content) <= (&policy).ByteBudget() {
+		return content
+	}
+	originalTokenCount := ApproxTokenCount(content)
+	totalLines := countLines(content)
+	result := TruncateText(content, policy)
+	return fmt.Sprintf("Warning: truncated output (original token count: %d)\nTotal output lines: %d\n\n%s", originalTokenCount, totalLines, result)
+}
+
+func TruncateText(content string, policy TruncationPolicy) string {
+	if policy.Mode == PolicyTokens {
+		out, _ := TruncateMiddleWithTokenBudget(content, policy.Limit)
+		return out
+	}
+	return TruncateMiddleChars(content, policy.Limit)
+}
+
+func FormattedTruncateTextContentItemsWithPolicy(items []FunctionCallOutputContentItem, policy TruncationPolicy) ([]FunctionCallOutputContentItem, *int) {
+	textSegments := make([]string, 0)
+	for i := range items {
+		item := &items[i]
+		if item.Kind == ContentInputText {
+			textSegments = append(textSegments, item.Text)
+		}
+	}
+	if len(textSegments) == 0 {
+		return cloneItems(items), nil
+	}
+	combined := strings.Join(textSegments, "\n")
+	if len(combined) <= (&policy).ByteBudget() {
+		return cloneItems(items), nil
+	}
+	originalTokenCount := ApproxTokenCount(combined)
+	out := []FunctionCallOutputContentItem{{
+		Kind: ContentInputText,
+		Text: FormattedTruncateText(combined, policy),
+	}}
+	for i := range items {
+		item := &items[i]
+		switch item.Kind {
+		case ContentInputImage, ContentEncryptedContent:
+			out = append(out, *item)
+		}
+	}
+	return out, &originalTokenCount
+}
+
+func TruncateFunctionOutputItemsWithPolicy(items []FunctionCallOutputContentItem, policy TruncationPolicy) []FunctionCallOutputContentItem {
+	out := make([]FunctionCallOutputContentItem, 0, len(items))
+	remainingBudget := (&policy).ByteBudget()
+	if policy.Mode == PolicyTokens {
+		remainingBudget = (&policy).TokenBudget()
+	}
+	omittedTextItems := 0
+
+	for i := range items {
+		item := &items[i]
+		switch item.Kind {
+		case ContentInputText:
+			if remainingBudget == 0 {
+				omittedTextItems++
+				continue
+			}
+			cost := len(item.Text)
+			if policy.Mode == PolicyTokens {
+				cost = ApproxTokenCount(item.Text)
+			}
+			if cost <= remainingBudget {
+				out = append(out, *item)
+				remainingBudget -= cost
+				continue
+			}
+			snippetPolicy := TruncationPolicy{Mode: policy.Mode, Limit: remainingBudget}
+			snippet := TruncateText(item.Text, snippetPolicy)
+			if snippet == "" {
+				omittedTextItems++
+			} else {
+				truncated := *item
+				truncated.Text = snippet
+				out = append(out, truncated)
+			}
+			remainingBudget = 0
+		case ContentInputImage, ContentEncryptedContent:
+			out = append(out, *item)
+		}
+	}
+
+	if omittedTextItems > 0 {
+		out = append(out, FunctionCallOutputContentItem{
+			Kind: ContentInputText,
+			Text: fmt.Sprintf("[omitted %d text items ...]", omittedTextItems),
+		})
+	}
+	return out
+}
+
+// TextTruncation is the head/tail edit a token truncation performs: the byte
+// range it removes and the marker that replaces it (Rust
+// `codex_utils_string::truncate::TextTruncation`).
+type TextTruncation struct {
+	RemovedStart int
+	RemovedEnd   int
+	Marker       string
+}
+
+// PlanTokenTruncation plans the head/tail token truncation without applying it,
+// so callers that keep content in parts can apply the same edit to each part and
+// preserve the sources of the retained slices (Rust
+// `codex_utils_string::truncate::plan_token_truncation`). The marker is outside
+// the retained-text budget, exactly as in TruncateMiddleWithTokenBudget.
+func PlanTokenTruncation(s string, maxTokens int) *TextTruncation {
+	maxBytes := ApproxBytesForTokens(maxTokens)
+	if len(s) <= maxBytes {
+		return nil
+	}
+	leftBudget, rightBudget := splitBudget(maxBytes)
+	return &TextTruncation{
+		RemovedStart: floorCharBoundary(s, leftBudget),
+		RemovedEnd:   ceilCharBoundary(s, len(s)-rightBudget),
+		Marker:       formatTruncationMarker(true, ApproxTokensFromByteCount(len(s)-maxBytes)),
+	}
+}
+
+// TruncateMiddleChars retains at most maxBytes from a string's ends and adds a
+// character-count marker outside that budget (Rust `truncate_middle_chars`).
+func TruncateMiddleChars(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	leftBudget, rightBudget := splitBudget(maxBytes)
+	removedChars, left, right := SplitString(s, leftBudget, rightBudget)
+	return left + formatTruncationMarker(false, uint64(removedChars)) + right
+}
+
+// TruncateMiddleWithMarker retains a UTF-8-safe prefix and suffix around marker
+// so the complete result (including the marker) fits maxBytes. Mirrors Rust
+// `truncate_middle_with_marker` (codex-rs/utils/string/src/truncate.rs): when
+// the marker does not fit, the longest original prefix that does is returned.
+func TruncateMiddleWithMarker(s string, maxBytes int, marker string) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	if maxBytes < len(marker) {
+		return s[:floorCharBoundary(s, maxBytes)]
+	}
+	leftBudget, rightBudget := splitBudget(maxBytes - len(marker))
+	prefixEnd := floorCharBoundary(s, leftBudget)
+	suffixStart := ceilCharBoundary(s, len(s)-rightBudget)
+	return s[:prefixEnd] + marker + s[suffixStart:]
+}
+
+func TruncateMiddleWithTokenBudget(s string, maxTokens int) (string, *uint64) {
+	truncation := PlanTokenTruncation(s, maxTokens)
+	if truncation == nil {
+		return s, nil
+	}
+	truncated := s[:truncation.RemovedStart] + truncation.Marker + s[truncation.RemovedEnd:]
+	if truncated == s {
+		// Rust `truncate_middle_with_token_budget`
+		// (codex-rs/utils/string/src/truncate.rs:80-84) reports no truncation when the
+		// assembled text equals its input: the planned edit replaced exactly the bytes
+		// the notice re-inserts.
+		return truncated, nil
+	}
+	totalTokens := uint64(ApproxTokenCount(s))
+	return truncated, &totalTokens
+}
+
+func ApproxTokenCount(text string) int {
+	return (len(text) + approxBytesPerToken - 1) / approxBytesPerToken
+}
+
+func ApproxBytesForTokens(tokens int) int {
+	if tokens <= 0 {
+		return 0
+	}
+	return tokens * approxBytesPerToken
+}
+
+func ApproxTokensFromByteCount(bytes int) uint64 {
+	if bytes <= 0 {
+		return 0
+	}
+	return uint64((bytes + approxBytesPerToken - 1) / approxBytesPerToken)
+}
+
+func ApproxTokensFromByteCountInt64(bytes int64) int64 {
+	if bytes <= 0 {
+		return 0
+	}
+	tokens := (bytes + approxBytesPerToken - 1) / approxBytesPerToken
+	if tokens < 0 {
+		return 0
+	}
+	return tokens
+}
+
+// floorCharBoundary returns the largest index at or below index that starts a
+// UTF-8 sequence, clamped to the string bounds (Rust str::floor_char_boundary).
+func floorCharBoundary(s string, index int) int {
+	if index <= 0 {
+		return 0
+	}
+	if index >= len(s) {
+		return len(s)
+	}
+	for index > 0 && !utf8.RuneStart(s[index]) {
+		index--
+	}
+	return index
+}
+
+// ceilCharBoundary returns the smallest index at or above index that starts a
+// UTF-8 sequence, clamped to the string bounds (Rust str::ceil_char_boundary).
+func ceilCharBoundary(s string, index int) int {
+	if index <= 0 {
+		return 0
+	}
+	if index >= len(s) {
+		return len(s)
+	}
+	for index < len(s) && !utf8.RuneStart(s[index]) {
+		index++
+	}
+	return index
+}
+
+func SplitString(s string, beginningBytes int, endBytes int) (int, string, string) {
+	if s == "" {
+		return 0, "", ""
+	}
+	if beginningBytes < 0 {
+		beginningBytes = 0
+	}
+	if endBytes < 0 {
+		endBytes = 0
+	}
+	length := len(s)
+	tailStartTarget := length - endBytes
+	if tailStartTarget < 0 {
+		tailStartTarget = 0
+	}
+	prefixEnd := 0
+	suffixStart := length
+	removedChars := 0
+	suffixStarted := false
+
+	for idx, ch := range s {
+		charEnd := idx + utf8.RuneLen(ch)
+		if charEnd <= beginningBytes {
+			prefixEnd = charEnd
+			continue
+		}
+		if idx >= tailStartTarget {
+			if !suffixStarted {
+				suffixStart = idx
+				suffixStarted = true
+			}
+			continue
+		}
+		removedChars++
+	}
+	if suffixStart < prefixEnd {
+		suffixStart = prefixEnd
+	}
+	return removedChars, s[:prefixEnd], s[suffixStart:]
+}
+
+func splitBudget(budget int) (int, int) {
+	if budget <= 0 {
+		return 0, 0
+	}
+	left := budget / 2
+	return left, budget - left
+}
+
+func formatTruncationMarker(useTokens bool, removedCount uint64) string {
+	if useTokens {
+		return fmt.Sprintf("\u2026%d tokens truncated\u2026", removedCount)
+	}
+	return fmt.Sprintf("\u2026%d chars truncated\u2026", removedCount)
+}
+
+func countLines(content string) int {
+	if content == "" {
+		return 0
+	}
+	return strings.Count(content, "\n") + 1
+}
+
+func cloneItems(items []FunctionCallOutputContentItem) []FunctionCallOutputContentItem {
+	out := make([]FunctionCallOutputContentItem, len(items))
+	copy(out, items)
+	return out
+}

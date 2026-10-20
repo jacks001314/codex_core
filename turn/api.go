@@ -1,0 +1,889 @@
+package turn
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	"codex_core/protocol"
+	"codex_core/sandbox"
+)
+
+var (
+	ErrInvalidTurnRequest   = errors.New("invalid turn request")
+	ErrNoActiveTurnToSteer  = errors.New("no active turn to steer")
+	ErrExpectedTurnMismatch = errors.New("expected active turn mismatch")
+	ErrEmptyTurnSteerInput  = errors.New("empty turn steer input")
+)
+
+const (
+	MaxUserInputTextChars = 1 << 20
+	InputTooLargeCode     = "input_too_large"
+)
+
+type InputTooLargeError struct {
+	MaxChars    int
+	ActualChars int
+}
+
+// CyberAccessProgram is the app-server v2 `turn/start.cyberAccessProgram`
+// selection (Rust app-server-protocol `CyberAccessProgram`, camelCase on the
+// wire). It is a distinct type from the core value that reaches the request
+// body and the rollout record (Rust `turn_input::CyberAccessProgram`,
+// snake_case, modelled as `model.CyberAccessProgram`); CoreValue performs the
+// mapping.
+type CyberAccessProgram string
+
+const (
+	CyberAccessProgramStandard     CyberAccessProgram = "standard"
+	CyberAccessProgramDaybreakBlue CyberAccessProgram = "daybreakBlue"
+	CyberAccessProgramDaybreakRed  CyberAccessProgram = "daybreakRed"
+)
+
+// CoreValue maps the app-server selection onto the core snake_case value used by
+// the Responses request body and the persisted turn context
+// (Rust `impl From<CyberAccessProgram> for CoreCyberAccessProgram`). An unknown
+// selection has no core value, so it is dropped: Rust's v2 enum rejects it
+// during deserialization instead.
+func (p CyberAccessProgram) CoreValue() string {
+	switch p {
+	case CyberAccessProgramStandard:
+		return "standard"
+	case CyberAccessProgramDaybreakBlue:
+		return "daybreak_blue"
+	case CyberAccessProgramDaybreakRed:
+		return "daybreak_red"
+	default:
+		return ""
+	}
+}
+
+func (e *InputTooLargeError) Error() string {
+	maxChars := MaxUserInputTextChars
+	if e != nil && e.MaxChars > 0 {
+		maxChars = e.MaxChars
+	}
+	return fmt.Sprintf("Input exceeds the maximum length of %d characters.", maxChars)
+}
+
+func (e *InputTooLargeError) Unwrap() error {
+	return ErrInvalidTurnRequest
+}
+
+func (e *InputTooLargeError) JSONRPCErrorData() map[string]any {
+	maxChars := MaxUserInputTextChars
+	actualChars := 0
+	if e != nil {
+		if e.MaxChars > 0 {
+			maxChars = e.MaxChars
+		}
+		actualChars = e.ActualChars
+	}
+	return map[string]any{
+		"input_error_code": InputTooLargeCode,
+		"max_chars":        maxChars,
+		"actual_chars":     actualChars,
+	}
+}
+
+type TurnUserInput struct {
+	Type         string        `json:"type,omitempty"`
+	Text         string        `json:"text,omitempty"`
+	TextElements []TextElement `json:"text_elements,omitempty"`
+	Path         string        `json:"path,omitempty"`
+	URL          string        `json:"url,omitempty"`
+	// FileID references an uploaded file instead of an inline URL (Rust
+	// #45794): the app-server accepts `fileId` alongside `url` for image
+	// inputs and the reference is forwarded to the Responses API as `file_id`.
+	FileID   string  `json:"fileId,omitempty"`
+	Name     string  `json:"name,omitempty"`
+	Detail   *string `json:"detail,omitempty"`
+	MimeType string  `json:"mimeType,omitempty"`
+}
+
+// TurnToolOutput carries a standalone named function-call output used to start
+// or steer a turn without a user prompt (Rust TurnToolOutput, #41002).
+type TurnToolOutput struct {
+	Name      string `json:"name"`
+	Namespace string `json:"namespace,omitempty"`
+	Output    string `json:"output"`
+	// Retain marks a client-submitted tool output that must be retained as
+	// client-authored history (Rust #52671 `retain` annotation). The marker is
+	// stored as harness metadata and never reaches a model request.
+	Retain bool `json:"retain,omitempty"`
+}
+
+type ByteRange struct {
+	Start uint `json:"start"`
+	End   uint `json:"end"`
+}
+
+type TextElement struct {
+	ByteRange   ByteRange `json:"byteRange"`
+	Placeholder *string   `json:"placeholder,omitempty"`
+}
+
+func (e TextElement) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		ByteRange   ByteRange `json:"byteRange"`
+		Placeholder *string   `json:"placeholder"`
+	}{
+		ByteRange:   e.ByteRange,
+		Placeholder: cloneStringPtr(e.Placeholder),
+	})
+}
+
+func (i *TurnUserInput) MarshalJSON() ([]byte, error) {
+	inputType := strings.TrimSpace(i.Type)
+	if inputType == "" {
+		switch {
+		case strings.TrimSpace(i.Text) != "":
+			inputType = "text"
+		case strings.TrimSpace(i.URL) != "":
+			inputType = "image"
+		case strings.TrimSpace(i.Path) != "":
+			inputType = "localImage"
+		}
+	}
+	switch inputType {
+	case "text":
+		textElements := append([]TextElement(nil), i.TextElements...)
+		if textElements == nil {
+			textElements = []TextElement{}
+		}
+		return json.Marshal(struct {
+			Type         string        `json:"type"`
+			Text         string        `json:"text"`
+			TextElements []TextElement `json:"text_elements"`
+		}{
+			Type:         "text",
+			Text:         i.Text,
+			TextElements: textElements,
+		})
+	case "image":
+		return json.Marshal(struct {
+			Type   string  `json:"type"`
+			Detail *string `json:"detail,omitempty"`
+			URL    string  `json:"url"`
+		}{
+			Type:   "image",
+			Detail: cloneStringPtr(i.Detail),
+			URL:    i.URL,
+		})
+	case "localImage":
+		return json.Marshal(struct {
+			Type   string  `json:"type"`
+			Detail *string `json:"detail,omitempty"`
+			Path   string  `json:"path"`
+		}{
+			Type:   "localImage",
+			Detail: cloneStringPtr(i.Detail),
+			Path:   i.Path,
+		})
+	case "audio":
+		return json.Marshal(struct {
+			Type string `json:"type"`
+			URL  string `json:"url"`
+		}{Type: "audio", URL: i.URL})
+	case "localAudio":
+		return json.Marshal(struct {
+			Type string `json:"type"`
+			Path string `json:"path"`
+		}{Type: "localAudio", Path: i.Path})
+	case "skill", "mention":
+		return json.Marshal(struct {
+			Type string `json:"type"`
+			Name string `json:"name"`
+			Path string `json:"path"`
+		}{
+			Type: inputType,
+			Name: i.Name,
+			Path: i.Path,
+		})
+	default:
+		return json.Marshal(struct {
+			Type         string        `json:"type,omitempty"`
+			Text         string        `json:"text,omitempty"`
+			TextElements []TextElement `json:"text_elements,omitempty"`
+			Path         string        `json:"path,omitempty"`
+			URL          string        `json:"url,omitempty"`
+			Name         string        `json:"name,omitempty"`
+			Detail       *string       `json:"detail,omitempty"`
+			MimeType     string        `json:"mimeType,omitempty"`
+		}{
+			Type:         inputType,
+			Text:         i.Text,
+			TextElements: append([]TextElement(nil), i.TextElements...),
+			Path:         i.Path,
+			URL:          i.URL,
+			Name:         i.Name,
+			Detail:       cloneStringPtr(i.Detail),
+			MimeType:     i.MimeType,
+		})
+	}
+}
+
+type TurnStartParams struct {
+	ThreadID string `json:"threadId"`
+	// DisabledPluginIDs replaces this thread's disabled plugin IDs. Omitted or
+	// null preserves the saved list; an empty list clears it (Rust #44905).
+	DisabledPluginIDs    *[]string         `json:"disabledPluginIds,omitempty"`
+	Input                []TurnUserInput   `json:"input,omitempty"`
+	ToolOutput           *TurnToolOutput   `json:"toolOutput,omitempty"`
+	Prompt               string            `json:"prompt,omitempty"`
+	ClientUserMessageID  string            `json:"clientUserMessageId,omitempty"`
+	ResponsesAPIMetadata map[string]string `json:"responsesapiClientMetadata,omitempty"`
+	// ResponsesAPIMetadataPatch adds or overwrites individual client
+	// metadata entries without replacing the map. It is applied after
+	// ResponsesAPIMetadata when both are supplied (Rust #54053).
+	ResponsesAPIMetadataPatch map[string]string `json:"responsesapiClientMetadataPatch,omitempty"`
+	CWD                       string            `json:"cwd,omitempty"`
+	Model                     string            `json:"model,omitempty"`
+	Originator                string            `json:"originator,omitempty"`
+	TurnTrigger               string            `json:"turnTrigger,omitempty"`
+	ApprovalPolicy            any               `json:"approvalPolicy,omitempty"`
+	ApprovalsReviewer         *string           `json:"approvalsReviewer,omitempty"`
+	SandboxPolicy             any               `json:"sandboxPolicy,omitempty"`
+	Permissions               *string           `json:"permissions,omitempty"`
+	// PersistedPermissionProfile is the unnamed runtime profile recovered from
+	// the thread-owned rollout snapshot. It is a fallback only: explicit
+	// permission overrides and managed requirements take priority, and it is
+	// never serialized on the turn wire (Rust #53419).
+	PersistedPermissionProfile *sandbox.PermissionProfile `json:"-"`
+	RuntimeWorkspaceRoots      []string                   `json:"runtimeWorkspaceRoots,omitempty"`
+	Environments               []map[string]any           `json:"environments,omitempty"`
+	ServiceTier                *string                    `json:"serviceTier,omitempty"`
+	ServiceTierSet             bool                       `json:"-"`
+	// ServiceTierForTurn overrides the service tier only for the turn this
+	// request starts ("default" for standard speed); it does not change the
+	// thread's tier and is ignored when the request steers a turn (Rust
+	// TurnStartParams::service_tier_for_turn).
+	ServiceTierForTurn *string        `json:"serviceTierForTurn,omitempty"`
+	Effort             *string        `json:"effort,omitempty"`
+	Summary            *string        `json:"summary,omitempty"`
+	OutputSchema       any            `json:"outputSchema,omitempty"`
+	CollaborationMode  map[string]any `json:"collaborationMode,omitempty"`
+	// Deprecated: accepted for old app-server clients, but ignored by runtime.
+	MultiAgentMode *string `json:"multiAgentMode,omitempty"`
+	// CyberAccessProgram requests a workspace-authorized cyber program for this
+	// turn (Rust `turn/start.cyberAccessProgram`, EXPERIMENTAL). Omission
+	// preserves the backend's automatic behavior; the value never grants access,
+	// and only the OpenAI provider records it (Rust TurnContext).
+	CyberAccessProgram *CyberAccessProgram `json:"cyberAccessProgram,omitempty"`
+	// CoreCyberAccessProgram is the core snake_case program an internally started
+	// turn inherits (Rust `TurnStartOptions.cyber_access_program`): a spawned or
+	// continued subagent turn copies the initiating turn's program. It is the
+	// resolved, provider-gated value, so it is not a client-settable field.
+	CoreCyberAccessProgram string                            `json:"-"`
+	Personality            *string                           `json:"personality,omitempty"`
+	PersonalitySet         bool                              `json:"-"`
+	Config                 map[string]any                    `json:"config,omitempty"`
+	BaseInstructions       *string                           `json:"baseInstructions,omitempty"`
+	DeveloperInstructions  *string                           `json:"developerInstructions,omitempty"`
+	AdditionalContext      map[string]AdditionalContextEntry `json:"additionalContext,omitempty"`
+	DynamicTools           []DynamicToolSpec                 `json:"dynamicTools,omitempty"`
+	ExperimentalRawEvents  bool                              `json:"-"`
+	// ParentTurnID is the turn that caused this new turn to start; RootTurnID
+	// is the first turn in the chain of work that led to it (Rust #51415). Both
+	// are optional client inputs on `turn/start` and are ignored when the
+	// request adds input to an already-active turn.
+	ParentTurnID string `json:"parentTurnId,omitempty"`
+	RootTurnID   string `json:"rootTurnId,omitempty"`
+	// InitiatingAgentPath is the agent path that initiated this turn (Rust
+	// #51402 `TurnStartOptions.initiating_agent_path`): a turn started by a
+	// triggered inter-agent communication records the sender's path. It is
+	// harness-owned rather than a client input, so it is not serialized on the
+	// wire (matching Rust, which never sends it in the Responses metadata).
+	InitiatingAgentPath  string `json:"-"`
+	AdditionalInputItems []any  `json:"-"`
+	// Trace carries the W3C trace context of the request that started this turn
+	// (Rust TurnInputRequest::with_trace), so the model request continues the
+	// caller's trace.
+	Trace *protocol.W3CTraceContext `json:"-"`
+}
+
+func (p *TurnStartParams) CloneDynamicTools() []DynamicToolSpec {
+	if p == nil || len(p.DynamicTools) == 0 {
+		return nil
+	}
+	out := make([]DynamicToolSpec, len(p.DynamicTools))
+	copy(out, p.DynamicTools)
+	return out
+}
+
+func (p *TurnStartParams) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		ThreadID            string              `json:"threadId"`
+		ClientUserMessageID string              `json:"clientUserMessageId,omitempty"`
+		Input               []TurnUserInput     `json:"input"`
+		ToolOutput          *TurnToolOutput     `json:"toolOutput,omitempty"`
+		TurnTrigger         string              `json:"turnTrigger,omitempty"`
+		ParentTurnID        string              `json:"parentTurnId,omitempty"`
+		RootTurnID          string              `json:"rootTurnId,omitempty"`
+		CWD                 string              `json:"cwd,omitempty"`
+		ApprovalPolicy      any                 `json:"approvalPolicy,omitempty"`
+		ApprovalsReviewer   *string             `json:"approvalsReviewer,omitempty"`
+		SandboxPolicy       any                 `json:"sandboxPolicy,omitempty"`
+		Model               string              `json:"model,omitempty"`
+		ServiceTier         *string             `json:"serviceTier,omitempty"`
+		Effort              *string             `json:"effort,omitempty"`
+		Summary             *string             `json:"summary,omitempty"`
+		Personality         *string             `json:"personality,omitempty"`
+		OutputSchema        any                 `json:"outputSchema,omitempty"`
+		CollaborationMode   map[string]any      `json:"collaborationMode,omitempty"`
+		CyberAccessProgram  *CyberAccessProgram `json:"cyberAccessProgram,omitempty"`
+	}{
+		ThreadID:            p.ThreadID,
+		ClientUserMessageID: p.ClientUserMessageID,
+		Input:               userInputsForJSONWithPrompt(p.Input, p.Prompt),
+		ToolOutput:          p.ToolOutput,
+		TurnTrigger:         p.TurnTrigger,
+		ParentTurnID:        p.ParentTurnID,
+		RootTurnID:          p.RootTurnID,
+		CWD:                 p.CWD,
+		ApprovalPolicy:      p.ApprovalPolicy,
+		ApprovalsReviewer:   p.ApprovalsReviewer,
+		SandboxPolicy:       p.SandboxPolicy,
+		Model:               p.Model,
+		ServiceTier:         p.ServiceTier,
+		Effort:              p.Effort,
+		Summary:             p.Summary,
+		Personality:         p.Personality,
+		OutputSchema:        p.OutputSchema,
+		CollaborationMode:   p.CollaborationMode,
+		CyberAccessProgram:  p.CyberAccessProgram,
+	})
+}
+
+func (p *TurnStartParams) UnmarshalJSON(data []byte) error {
+	type turnStartParamsAlias TurnStartParams
+	var decoded turnStartParamsAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if serviceTierRaw, ok := raw["serviceTier"]; ok {
+		decoded.ServiceTierSet = true
+		if strings.TrimSpace(string(serviceTierRaw)) == "null" {
+			decoded.ServiceTier = nil
+		} else {
+			var serviceTier string
+			if err := json.Unmarshal(serviceTierRaw, &serviceTier); err != nil {
+				return err
+			}
+			decoded.ServiceTier = &serviceTier
+		}
+	}
+	if _, ok := raw["personality"]; ok {
+		decoded.PersonalitySet = true
+	}
+	*p = TurnStartParams(decoded)
+	return nil
+}
+
+func (p *TurnStartParams) Validate() error {
+	if p == nil || strings.TrimSpace(p.ThreadID) == "" {
+		return fmt.Errorf("%w: threadId is required", ErrInvalidTurnRequest)
+	}
+	if err := ValidateDynamicTools(p.DynamicTools); err != nil {
+		return err
+	}
+	if err := validateRuntimeWorkspaceRoots(p.RuntimeWorkspaceRoots); err != nil {
+		return err
+	}
+	if err := validateTurnEnvironmentCWDs(p.Environments); err != nil {
+		return err
+	}
+	if p.ToolOutput != nil {
+		if strings.TrimSpace(p.ToolOutput.Name) == "" {
+			return fmt.Errorf("%w: toolOutput.name must not be empty", ErrInvalidTurnRequest)
+		}
+		if userInputTextChars(p.Prompt, p.Input) > 0 {
+			return fmt.Errorf("%w: toolOutput cannot be combined with nonempty input", ErrInvalidTurnRequest)
+		}
+		if actualChars := utf8.RuneCountInString(p.ToolOutput.Output); actualChars > MaxUserInputTextChars {
+			return &InputTooLargeError{
+				MaxChars:    MaxUserInputTextChars,
+				ActualChars: actualChars,
+			}
+		}
+	}
+	if err := validateUserInputTextLimit(p.Prompt, p.Input); err != nil {
+		return err
+	}
+	if err := rejectConfigurationUpdateInput(p.Input); err != nil {
+		return err
+	}
+	return nil
+}
+
+// maxTurnEnvironmentCWDBytes mirrors Rust ThreadManager's
+// MAX_TURN_ENVIRONMENT_CWD_BYTES (8 KiB, #39040): pathological selected working
+// directories are rejected at the environment-selection boundary.
+const maxTurnEnvironmentCWDBytes = 8 * 1024
+
+func validateTurnEnvironmentCWDs(environments []map[string]any) error {
+	for _, environment := range environments {
+		cwd, _ := environment["cwd"].(string)
+		if len(cwd) > maxTurnEnvironmentCWDBytes {
+			return fmt.Errorf("%w: turn environment working directory exceeds the maximum size", ErrInvalidTurnRequest)
+		}
+	}
+	return nil
+}
+
+func validateRuntimeWorkspaceRoots(roots []string) error {
+	for _, root := range roots {
+		if !isAbsoluteRuntimeWorkspaceRoot(root) {
+			return fmt.Errorf("%w: runtimeWorkspaceRoots must contain absolute paths: %s", ErrInvalidTurnRequest, strings.TrimSpace(root))
+		}
+	}
+	return nil
+}
+
+func isAbsoluteRuntimeWorkspaceRoot(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	if strings.HasPrefix(value, "/") || strings.HasPrefix(value, `\`) {
+		return true
+	}
+	return len(value) >= 3 && asciiLetter(value[0]) && value[1] == ':' && (value[2] == '/' || value[2] == '\\')
+}
+
+func asciiLetter(value byte) bool {
+	return (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z')
+}
+
+type TurnSteerParams struct {
+	ThreadID             string            `json:"threadId"`
+	ExpectedTurnID       string            `json:"expectedTurnId"`
+	Input                []TurnUserInput   `json:"input,omitempty"`
+	Prompt               string            `json:"prompt,omitempty"`
+	ApprovalsReviewer    *string           `json:"approvalsReviewer,omitempty"`
+	ClientUserMessageID  string            `json:"clientUserMessageId,omitempty"`
+	ResponsesAPIMetadata map[string]string `json:"responsesapiClientMetadata,omitempty"`
+	// ResponsesAPIMetadataPatch adds or overwrites individual client
+	// metadata entries without replacing the map. It is applied after
+	// ResponsesAPIMetadata when both are supplied (Rust #54053).
+	ResponsesAPIMetadataPatch map[string]string                 `json:"responsesapiClientMetadataPatch,omitempty"`
+	AdditionalContext         map[string]AdditionalContextEntry `json:"additionalContext,omitempty"`
+}
+
+func (p *TurnSteerParams) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		ThreadID            string          `json:"threadId"`
+		ClientUserMessageID string          `json:"clientUserMessageId,omitempty"`
+		Input               []TurnUserInput `json:"input"`
+		ExpectedTurnID      string          `json:"expectedTurnId"`
+		ApprovalsReviewer   *string         `json:"approvalsReviewer,omitempty"`
+	}{
+		ThreadID:            p.ThreadID,
+		ClientUserMessageID: p.ClientUserMessageID,
+		Input:               userInputsForJSONWithPrompt(p.Input, p.Prompt),
+		ExpectedTurnID:      p.ExpectedTurnID,
+		ApprovalsReviewer:   p.ApprovalsReviewer,
+	})
+}
+
+func (p *TurnSteerParams) Validate() error {
+	if p == nil || strings.TrimSpace(p.ThreadID) == "" {
+		return fmt.Errorf("%w: threadId is required", ErrInvalidTurnRequest)
+	}
+	if strings.TrimSpace(p.ExpectedTurnID) == "" {
+		return fmt.Errorf("%w: expectedTurnId must not be empty", ErrInvalidTurnRequest)
+	}
+	if err := validateUserInputTextLimit(p.Prompt, p.Input); err != nil {
+		return err
+	}
+	if err := rejectConfigurationUpdateInput(p.Input); err != nil {
+		return err
+	}
+	return nil
+}
+
+func rejectConfigurationUpdateInput(inputs []TurnUserInput) error {
+	for _, input := range inputs {
+		if strings.EqualFold(strings.TrimSpace(input.Type), "configuration_update") {
+			return fmt.Errorf("%w: configuration_update cannot be supplied as turn input", ErrInvalidTurnRequest)
+		}
+	}
+	return nil
+}
+
+type TurnInterruptParams struct {
+	ThreadID string `json:"threadId"`
+	TurnID   string `json:"turnId"`
+}
+
+func (p *TurnInterruptParams) Validate() error {
+	if p == nil || strings.TrimSpace(p.ThreadID) == "" || strings.TrimSpace(p.TurnID) == "" {
+		return fmt.Errorf("%w: threadId and turnId are required", ErrInvalidTurnRequest)
+	}
+	return nil
+}
+
+type TurnCompleteParams struct {
+	ThreadID string `json:"threadId"`
+	TurnID   string `json:"turnId"`
+	Status   string `json:"status,omitempty"`
+}
+
+func (p *TurnCompleteParams) Validate() error {
+	if p == nil || strings.TrimSpace(p.ThreadID) == "" || strings.TrimSpace(p.TurnID) == "" {
+		return fmt.Errorf("%w: threadId and turnId are required", ErrInvalidTurnRequest)
+	}
+	return nil
+}
+
+type TurnStartResponse struct {
+	Turn TurnRecord `json:"turn"`
+}
+
+type TurnSteerResponse struct {
+	TurnID string `json:"turnId"`
+}
+
+// TurnSettingsUpdateParams mirrors the Rust turn/settings/update request
+// (#42121). It applies model, effort, summary, service tier, approvals reviewer,
+// and environment selections to one live turn without changing future turns.
+type TurnSettingsUpdateParams struct {
+	ThreadID          string  `json:"threadId"`
+	TurnID            string  `json:"turnId"`
+	ApprovalsReviewer *string `json:"approvalsReviewer,omitempty"`
+	Model             *string `json:"model,omitempty"`
+	Effort            *string `json:"effort,omitempty"`
+	Summary           *string `json:"summary,omitempty"`
+	ServiceTier       *string `json:"serviceTier,omitempty"`
+	// ServiceTierSet distinguishes an omitted field from an explicit null:
+	// null clears the requested tier, omission leaves it unchanged.
+	ServiceTierSet bool `json:"-"`
+	// Environments replaces the environment selection used by subsequent steps
+	// of the active turn without changing the thread's saved default selection.
+	// A non-nil empty slice explicitly selects no environments.
+	Environments []map[string]any `json:"environments,omitempty"`
+}
+
+func (p *TurnSettingsUpdateParams) MarshalJSON() ([]byte, error) {
+	if p == nil {
+		return []byte("null"), nil
+	}
+	type alias TurnSettingsUpdateParams
+	data, err := json.Marshal((*alias)(p))
+	if err != nil {
+		return nil, err
+	}
+	var value map[string]any
+	if err := json.Unmarshal(data, &value); err != nil {
+		return nil, err
+	}
+	if p.Environments != nil {
+		value["environments"] = p.Environments
+	}
+	if p.ServiceTierSet {
+		if p.ServiceTier == nil {
+			value["serviceTier"] = nil
+		} else {
+			value["serviceTier"] = *p.ServiceTier
+		}
+	}
+	return json.Marshal(value)
+}
+
+func (p *TurnSettingsUpdateParams) UnmarshalJSON(data []byte) error {
+	type alias TurnSettingsUpdateParams
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if serviceTierRaw, ok := raw["serviceTier"]; ok {
+		decoded.ServiceTierSet = true
+		if strings.TrimSpace(string(serviceTierRaw)) == "null" {
+			decoded.ServiceTier = nil
+		} else {
+			var serviceTier string
+			if err := json.Unmarshal(serviceTierRaw, &serviceTier); err != nil {
+				return err
+			}
+			decoded.ServiceTier = &serviceTier
+		}
+	}
+	*p = TurnSettingsUpdateParams(decoded)
+	return nil
+}
+
+func (p *TurnSettingsUpdateParams) Validate() error {
+	if p == nil || strings.TrimSpace(p.ThreadID) == "" {
+		return fmt.Errorf("%w: threadId is required", ErrInvalidTurnRequest)
+	}
+	if strings.TrimSpace(p.TurnID) == "" {
+		return fmt.Errorf("%w: turnId is required", ErrInvalidTurnRequest)
+	}
+	if p.ApprovalsReviewer == nil && p.Model == nil && p.Effort == nil && p.Summary == nil && !p.ServiceTierSet && p.ServiceTier == nil && p.Environments == nil {
+		return fmt.Errorf("%w: at least one turn setting update is required", ErrInvalidTurnRequest)
+	}
+	if err := validateTurnEnvironmentCWDs(p.Environments); err != nil {
+		return err
+	}
+	return nil
+}
+
+// TurnSettingsUpdateStatus reports whether the target live turn accepted the
+// update.
+type TurnSettingsUpdateStatus string
+
+const (
+	// TurnSettingsUpdateStatusApplied means the settings were published for
+	// subsequent captures.
+	TurnSettingsUpdateStatusApplied TurnSettingsUpdateStatus = "applied"
+	// TurnSettingsUpdateStatusTargetUnavailable means no matching live turn
+	// remained available.
+	TurnSettingsUpdateStatusTargetUnavailable TurnSettingsUpdateStatus = "targetUnavailable"
+)
+
+// TurnSettingsUpdateResponse mirrors Rust's TurnSettingsUpdateResponse.
+type TurnSettingsUpdateResponse struct {
+	Status TurnSettingsUpdateStatus `json:"status"`
+}
+
+type TurnInterruptResponse struct{}
+
+type TurnRecord struct {
+	ID       string `json:"id"`
+	ThreadID string `json:"threadId"`
+	Status   string `json:"status"`
+	// RootTurnID is the first turn in the chain of work that led to this turn
+	// (Rust #51415). Empty means unknown (older history), serialized as null.
+	RootTurnID  string          `json:"rootTurnId,omitempty"`
+	Prompt      string          `json:"prompt,omitempty"`
+	StartedAt   int64           `json:"startedAt"`
+	CompletedAt *int64          `json:"completedAt"`
+	Inputs      []TurnUserInput `json:"input,omitempty"`
+}
+
+func (r *TurnRecord) MarshalJSON() ([]byte, error) {
+	status := normalizeTurnStatus(r.Status)
+	return json.Marshal(struct {
+		ID          string           `json:"id"`
+		RootTurnID  *string          `json:"rootTurnId"`
+		Items       []map[string]any `json:"items"`
+		ItemsView   string           `json:"itemsView"`
+		Status      string           `json:"status"`
+		Error       any              `json:"error"`
+		StartedAt   *int64           `json:"startedAt"`
+		CompletedAt *int64           `json:"completedAt"`
+		DurationMS  *int64           `json:"durationMs"`
+	}{
+		ID:          r.ID,
+		RootTurnID:  stringPtrIfNotEmpty(r.RootTurnID),
+		Items:       []map[string]any{},
+		ItemsView:   "notLoaded",
+		Status:      status,
+		Error:       nil,
+		StartedAt:   nil,
+		CompletedAt: r.CompletedAt,
+	})
+}
+
+const (
+	TurnStatusInProgress  = "inProgress"
+	TurnStatusCompleted   = "completed"
+	TurnStatusInterrupted = "interrupted"
+	TurnStatusFailed      = "failed"
+)
+
+type AdditionalContextKind string
+
+const (
+	AdditionalContextUntrusted   AdditionalContextKind = "untrusted"
+	AdditionalContextApplication AdditionalContextKind = "application"
+)
+
+type AdditionalContextEntry struct {
+	Value string                `json:"value"`
+	Kind  AdditionalContextKind `json:"kind"`
+}
+
+type TurnService struct {
+	mu     sync.Mutex
+	nextID int
+	active map[string]TurnRecord
+	now    func() time.Time
+}
+
+func NewTurnService() *TurnService {
+	return &TurnService{active: map[string]TurnRecord{}, now: time.Now}
+}
+
+func (s *TurnService) SetClock(clock func() time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if clock == nil {
+		s.now = time.Now
+		return
+	}
+	s.now = clock
+}
+
+func (s *TurnService) Start(params *TurnStartParams) (*TurnStartResponse, error) {
+	if err := params.Validate(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nextID++
+	turnID := fmt.Sprintf("turn-%d", s.nextID)
+	turn := TurnRecord{
+		ID:         turnID,
+		ThreadID:   params.ThreadID,
+		Status:     TurnStatusInProgress,
+		RootTurnID: firstNonEmpty(strings.TrimSpace(params.RootTurnID), turnID),
+		Prompt:     firstNonEmpty(params.Prompt, textFromInputs(params.Input)),
+		StartedAt:  s.now().UTC().Unix(),
+		Inputs:     append([]TurnUserInput(nil), params.Input...),
+	}
+	s.active[params.ThreadID] = turn
+	return &TurnStartResponse{Turn: turn}, nil
+}
+
+func (s *TurnService) Steer(params *TurnSteerParams) (*TurnSteerResponse, error) {
+	if err := params.Validate(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	turn, ok := s.active[params.ThreadID]
+	if !ok {
+		return nil, ErrNoActiveTurnToSteer
+	}
+	if turn.ID != params.ExpectedTurnID {
+		return nil, fmt.Errorf("%w: expected active turn id `%s` but found `%s`", ErrExpectedTurnMismatch, params.ExpectedTurnID, turn.ID)
+	}
+	return &TurnSteerResponse{TurnID: turn.ID}, nil
+}
+
+func (s *TurnService) Interrupt(params *TurnInterruptParams) (*TurnInterruptResponse, error) {
+	if err := params.Validate(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	turn, ok := s.active[params.ThreadID]
+	if !ok || turn.ID != params.TurnID {
+		return nil, fmt.Errorf("turn %s is not active", params.TurnID)
+	}
+	delete(s.active, params.ThreadID)
+	return &TurnInterruptResponse{}, nil
+}
+
+func (s *TurnService) Complete(params *TurnCompleteParams) error {
+	if err := params.Validate(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	turn, ok := s.active[params.ThreadID]
+	if !ok {
+		return nil
+	}
+	if turn.ID != params.TurnID {
+		return fmt.Errorf("active turn mismatch: expected %s, got %s", params.TurnID, turn.ID)
+	}
+	delete(s.active, params.ThreadID)
+	return nil
+}
+
+func normalizeTurnStatus(status string) string {
+	switch strings.TrimSpace(status) {
+	case "", "running":
+		return TurnStatusInProgress
+	case TurnStatusInProgress, TurnStatusCompleted, TurnStatusInterrupted, TurnStatusFailed:
+		return status
+	default:
+		return status
+	}
+}
+
+func userInputsForJSON(values []TurnUserInput) []TurnUserInput {
+	out := append([]TurnUserInput(nil), values...)
+	if out == nil {
+		return []TurnUserInput{}
+	}
+	return out
+}
+
+func userInputsForJSONWithPrompt(values []TurnUserInput, prompt string) []TurnUserInput {
+	out := userInputsForJSON(values)
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return out
+	}
+	input := TurnUserInput{Type: "text", Text: prompt}
+	return append([]TurnUserInput{input}, out...)
+}
+
+func validateUserInputTextLimit(prompt string, inputs []TurnUserInput) error {
+	actualChars := userInputTextChars(prompt, inputs)
+	if actualChars > MaxUserInputTextChars {
+		return &InputTooLargeError{
+			MaxChars:    MaxUserInputTextChars,
+			ActualChars: actualChars,
+		}
+	}
+	return nil
+}
+
+func userInputTextChars(prompt string, inputs []TurnUserInput) int {
+	total := utf8.RuneCountInString(strings.TrimSpace(prompt))
+	for _, input := range inputs {
+		if !turnUserInputCountsAsText(input) {
+			continue
+		}
+		total += utf8.RuneCountInString(input.Text)
+	}
+	return total
+}
+
+func turnUserInputCountsAsText(input TurnUserInput) bool {
+	inputType := strings.TrimSpace(input.Type)
+	return inputType == "" || inputType == "text"
+}
+
+func cloneStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}
+
+func textFromInputs(inputs []TurnUserInput) string {
+	parts := []string{}
+	for _, input := range inputs {
+		if strings.TrimSpace(input.Text) != "" {
+			parts = append(parts, strings.TrimSpace(input.Text))
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}

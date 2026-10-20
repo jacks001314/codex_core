@@ -1,0 +1,1231 @@
+package turn
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"codex_core/agent"
+	"codex_core/agentboard"
+	"codex_core/apps"
+	"codex_core/compact"
+	"codex_core/execserver"
+	featureflags "codex_core/features"
+	"codex_core/jsonschema"
+	"codex_core/mcp"
+	"codex_core/model"
+	"codex_core/plugin"
+	"codex_core/sandbox"
+	"codex_core/skillprovider"
+	"codex_core/tool"
+)
+
+type ToolRegistryOptions struct {
+	PlanStore                      *tool.PlanStore
+	ContextStatus                  func() compact.TokenStatus
+	UserInputResponder             tool.UserInputResponder
+	RequestUserInputAvailableModes []string
+	// VerifiedAnswerRecorder receives the accepted request_user_input answers
+	// (Rust request_user_input.rs's retained verified-answer capture).
+	VerifiedAnswerRecorder       tool.VerifiedAnswerRecorder
+	DynamicToolCaller            DynamicToolCaller
+	ClockProvider                tool.ClockProvider
+	EnvironmentWaiter            tool.EnvironmentWaiter
+	SelectedEnvironmentIDs       []string
+	WaitForEnvironmentToolConfig *tool.WaitForEnvironmentToolConfig
+	// EnvironmentFileSystems resolves the selected environment's filesystem for
+	// the environment-backed handlers (apply_patch / view_image /
+	// request_permissions, Rust #20647 `78421face0`). Nil keeps every handler on
+	// the host process filesystem.
+	EnvironmentFileSystems tool.EnvironmentFileSystemProvider
+
+	Shell        *tool.ShellExecutorOptions
+	ApplyPatch   *tool.ApplyPatchExecutorOptions
+	UnifiedExec  *tool.UnifiedExecManager
+	CodexVersion string
+
+	MCPService    *mcp.MCPService
+	MCPTools      []mcp.RuntimeToolInfo
+	MCPConnectors []mcp.RuntimeConnector
+	MCPExposure   tool.Exposure
+	// AppsConfigValues is the effective `[apps]` config section, used for the
+	// per-connector tool-exposure omissions Rust reads from the config layer
+	// stack in its tool spec plan (#46035). Nil disables connector omissions.
+	AppsConfigValues map[string]any
+	// MCPTurnMetadata supplies the turn-metadata document every MCP tool call
+	// reports in `_meta` (Rust build_mcp_tool_call_request_meta). Nil omits the
+	// entry; the callback runs per call so live turn state is current.
+	MCPTurnMetadata func() map[string]any
+	// MCPTurnRootTurnID supplies the issuing turn's root turn id for host-owned
+	// Apps calls (Rust #51421). Nil omits the field.
+	MCPTurnRootTurnID func() string
+	// MCPToolApproval enables Rust's custom-MCP-server tool approval policy
+	// (mcp_tool_call.rs maybe_request_mcp_tool_approval). Nil leaves the gate
+	// off, which mirrors a runtime without a client to ask.
+	MCPToolApproval *mcp.ToolApprovalOptions
+	// MCPAuthElicitation enables the Codex Apps connector URL elicitation flow
+	// for this turn (Rust maybe_request_codex_apps_auth_elicitation); the caller
+	// gates it on the auth_elicitation feature and the approval policy.
+	MCPAuthElicitation *mcp.AuthElicitationOptions
+	// AnalyticsEnabled is the thread's effective analytics collection state
+	// (Rust `analytics_events_client.is_enabled()`); the result-metadata capture
+	// (Rust #46010 `result_metadata_capture_allowed`) needs it and treats an
+	// absent state (nil) as a disabled client. Whether the exposed snapshot is
+	// recorded is decided by the dispatch sites' own recorder state.
+	AnalyticsEnabled *bool
+	// SessionID and WindowID are the turn identity the MCP executors report as
+	// `_meta.sessionId` and `_meta.windowId` (Rust with_mcp_tool_call_ids_meta,
+	// #45409). WindowID is the same `{thread_id}:{window_number}` string the
+	// turn's Responses client metadata reports as `x-codex-window-id`.
+	WindowID string
+	// MCPConnectorAuthFailureObserver reports a host-owned apps call whose raw
+	// result is a trusted connector authentication failure, so the caller can
+	// classify the call for analytics (Rust #45716). Nil leaves the report off.
+	MCPConnectorAuthFailureObserver func(callID string)
+	// MCPSourceObserver receives every completed MCP tools/call so the thread can
+	// accumulate its cumulative MCP attribution (Rust `record_mcp_source`). Nil
+	// leaves the report off.
+	MCPSourceObserver         func(source mcp.McpCallSource)
+	OrchestratorSkillsEnabled *bool
+	SkillProviders            *skillprovider.Registry
+	OpenAIFileRewriter        *mcp.OpenAIFileRewriter
+	Model                     string
+	// ModelConfirmationPolicies carries the issuing model's Browser Use /
+	// Computer Use confirmation-policy Markdown (#41072), forwarded to actor MCP
+	// calls. Nil results in an empty openai/confirmation_policies object for
+	// eligible node_repl/cua_repl calls.
+	ModelConfirmationPolicies *model.ConfirmationPolicies
+	// FunctionDescriptionPrefixes carries the active model's
+	// functions-namespace per-tool guidance (Rust #51930).
+	FunctionDescriptionPrefixes map[string]string
+	// IndirectDescriptionPrefixes carries the active model's guidance for
+	// Code Mode, ALL_TOOLS, and tool search renderings (Rust #47642).
+	IndirectDescriptionPrefixes *tool.IndirectDescriptionPrefixes
+	// SuppressActorConfirmationPolicies omits the confirmation-policies request
+	// metadata (Guardian review sessions).
+	SuppressActorConfirmationPolicies bool
+
+	AgentController                agent.ToolController
+	AgentExposure                  tool.Exposure
+	AgentVersion                   agent.MultiAgentVersion
+	AgentNamespace                 string
+	AgentUsageHintText             *string
+	AgentWaitDefault               time.Duration
+	AgentWaitMin                   time.Duration
+	AgentWaitMax                   time.Duration
+	AgentWaitConfigured            bool
+	AgentHideSpawnMetadata         bool
+	AgentExposeSpawnModelOverrides bool
+	// AgentToolOverrides carries the model catalog's per-tool Multi-Agent V2
+	// overrides (Rust ModelMessages::multi_agent_tool_*, #46505).
+	AgentToolOverrides map[string]agent.MultiAgentToolOverride
+	AgentRoles         map[string]agent.RoleConfig
+	AgentDefaults      agent.SpawnDefaults
+
+	PluginInstallCandidates            []plugin.DiscoverableInfo
+	PluginInstallRecommendationContext bool
+	PluginInstallRuntime               tool.PluginInstallRuntime
+	PluginInstallAppServerClientName   string
+	// NonRootAgent marks a delegated subagent's turn, so root-only tools (plugin
+	// install requests) reject the call like Rust #45806.
+	NonRootAgent    bool
+	WebSearch       *WebSearchOptions
+	ImageGeneration *ImageGenerationOptions
+	ViewImage       *tool.ViewImageOptions
+
+	EnableCore        bool
+	EnableShell       bool
+	EnableUnifiedExec bool
+	// StableEnvironmentTools mirrors the default-off `stable_environment_tools`
+	// feature (Rust #50962): environment-backed tools stay advertised while an
+	// executor starts, an explicit environment selector only needs to be a
+	// selected environment, and `shell`/`login` stay on the exec_command schema.
+	// The default (off) exposes environment-backed tools only when a usable
+	// environment exists, which is upstream's default.
+	StableEnvironmentTools       bool
+	EnableCodeMode               bool
+	CodeModeProvider             tool.CodeModeRemoteProvider
+	CodeModeRuntime              *tool.CodeModeRuntime
+	CodeModeDefaultExecYieldTime time.Duration
+	// CodeModeMessages carries the active model catalog's exec/wait/deferred
+	// guidance and MCP TypeScript overrides (Rust #47118).
+	CodeModeMessages *model.CodeModeToolMessages
+	// AllowedTools, when non-nil, restricts the finalized registry to these
+	// names. An empty list disables every tool (Rust #45711).
+	AllowedTools *[]string
+	// CodeModeShowCellOverhead mirrors features.code_mode.experimental_show_cell_overhead
+	// (#46288): code-mode cell responses report the host duration and overhead.
+	CodeModeShowCellOverhead bool
+	// CodeModeToolDescriptionFirst mirrors
+	// features.code_mode_tool_description_first (#51690/#51704): nested tool
+	// definitions put the tool description before the namespace description.
+	CodeModeToolDescriptionFirst bool
+	// DirectOnlyToolNamespaces mirrors Rust
+	// features.code_mode.direct_only_tool_namespaces: exact namespaces exposed
+	// only as direct model tools, bypassing deferral and the nested Code Mode
+	// surface.
+	DirectOnlyToolNamespaces []string
+	// ExcludedToolNamespaces mirrors Rust
+	// features.code_mode.excluded_tool_namespaces: matching namespaces stay
+	// registered for direct model access but are omitted from the nested Code
+	// Mode surface.
+	ExcludedToolNamespaces []string
+	// CodeModeOnlyStrictThirdPartyTools defers eligible MCP/app and dynamic
+	// tools in Code Mode Only (Rust #50687).
+	CodeModeOnlyStrictThirdPartyTools bool
+	// CodeModeToolInputSchemaMaxBytes enlarges the rendered Code Mode input
+	// type budget when set (Rust #47936).
+	CodeModeToolInputSchemaMaxBytes int
+	DisableCodeModeFallback         bool
+	// ToolMode is the turn's resolved tool mode (Rust `effective_tool_mode`).
+	// CodeModeOnly keeps the MCP resource helpers registered even without
+	// configured servers (Rust #50546).
+	ToolMode         string
+	EnableApplyPatch bool
+	EnableMCP        bool
+	// EnableMultiEnvCopyFile mirrors the default-off `multi_env_copy_file`
+	// feature (Rust #54741 `6d8b4c7479`): the host installs the file-copy
+	// extension, and the tool stays advertised whether or not the turn selected
+	// an environment.
+	EnableMultiEnvCopyFile     bool
+	EnableRequestPermissions   bool
+	RequestPermissionsReviewer tool.RequestPermissionsReviewer
+	EnableAgents               bool
+	EnableToolSearch           bool
+	OmitToolSearchSources      bool
+	// DisableRequestUserInput hides request_user_input when
+	// tools.experimental_request_user_input.enabled is false (Rust #51908).
+	DisableRequestUserInput bool
+	EnableCurrentTimeTool   bool
+	EnableSleepTool         bool
+	// NonfatalClockReadErrors mirrors the feature of the same name (#46006).
+	NonfatalClockReadErrors  bool
+	EnableWaitForEnvironment bool
+	DisableUpdatePlan        bool
+	// DisableGetContextRemaining keeps the token-budget status tool off the
+	// model-visible surface unless the `token_budget` feature is enabled
+	// (Rust core/src/tools/spec_plan.rs).
+	DisableGetContextRemaining bool
+	NewContextWindow           func()
+	// SendUserMessageAsync, when set, emits an asynchronous user-visible
+	// agent message for the send_user_message_async tool (#39319).
+	SendUserMessageAsync func(message string)
+	// SendUserMessageAsyncDescription, when set, overrides the built-in
+	// description of the send_user_message_async tool with the model-catalog
+	// value (#41461). A non-nil pointer to an empty string keeps it empty.
+	SendUserMessageAsyncDescription *string
+	// RequestUserInputAsyncDescription/Parameters carry the model catalog's
+	// `send_user_message_async` entry into the request_user_input_async schema
+	// (Rust #47773).
+	RequestUserInputAsyncDescription *string
+	RequestUserInputAsyncParameters  *string
+	// MCPResourceMessages carries the model catalog's `mcp_resources` entries
+	// for the built-in resource helpers (Rust #47677).
+	MCPResourceMessages  *model.McpResourceToolMessages
+	DisableWaitAgent     bool
+	DisableDirectMessage bool
+	// MessageBoard, when set, registers the shared discussion board's nine
+	// collaboration tools for this turn's caller (Rust
+	// `install_agent_message_board`). The host owns board selection, the tool
+	// namespace and its description.
+	MessageBoard             *MessageBoardOptions
+	DynamicTools             []DynamicToolSpec
+	ThreadID                 string
+	TurnID                   string
+	SessionID                string
+	PluginMetricsResolver    func(command []string, cwd string) *plugin.ResolvedPluginMetricsOperation
+	PluginMeasurementTracker func(context.Context, plugin.PluginMeasurementBatch)
+	ExtraTools               []tool.Executor
+	// ExperimentalSupportedTools mirrors Rust model_info.experimental_supported_tools:
+	// tools the selected model declares as supported are registered
+	// conditionally (e.g. test_sync_tool for testing models).
+	ExperimentalSupportedTools []string
+}
+
+// MultiAgentToolOverridesFromCatalog mirrors Rust's per-tool catalog override
+// resolution (ModelMessages::multi_agent_tool_description_override and
+// multi_agent_tool_parameters_override, #46505): only the tools whose catalog
+// entry declares a description or parameters appear in the result.
+func MultiAgentToolOverridesFromCatalog(messages *model.ModelMessages) map[string]agent.MultiAgentToolOverride {
+	if messages == nil {
+		return nil
+	}
+	out := map[string]agent.MultiAgentToolOverride{}
+	for _, name := range agent.MultiAgentV2ToolNames {
+		description := messages.MultiAgentToolDescriptionOverride(name)
+		parameters := messages.MultiAgentToolParametersOverride(name)
+		if description == nil && parameters == nil {
+			continue
+		}
+		out[name] = agent.MultiAgentToolOverride{Description: description, Parameters: parameters}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// MessageBoardOptions supplies the caller-bound board and the host-owned
+// namespace for the shared-discussion tools of one turn.
+type MessageBoardOptions struct {
+	// Board is the caller-bound board handle the host selected (in-memory or
+	// SQLite).
+	Board agentboard.Board
+	// Caller is the calling thread; CallerPath is its authoritative tree path.
+	Caller     string
+	CallerPath agent.AgentPath
+	// Namespace is the host-configured Multi-Agent V2 namespace; an empty
+	// namespace publishes plain function tools. NamespaceDescription decorates
+	// the merged namespace.
+	Namespace            string
+	NamespaceDescription string
+	// ToolOverrides carries the active model catalog's per-tool overrides keyed
+	// by tool name (Rust `MultiAgentToolMessages::by_name`, which the board
+	// tools look up by their own names).
+	ToolOverrides map[string]agentboard.MessageBoardToolOverride
+}
+
+// registerMessageBoardTools mirrors Rust's
+// message_board_tools_with_descriptions registration: the board already exists,
+// so the nine tools are contributed for this caller.
+func registerMessageBoardTools(registry *tool.Registry, options *MessageBoardOptions) error {
+	if options == nil || options.Board == nil {
+		return nil
+	}
+	for _, executor := range agentboard.NewMessageBoardToolsWithOverrides(
+		options.Board,
+		options.Caller,
+		options.CallerPath,
+		options.Namespace,
+		options.NamespaceDescription,
+		options.ToolOverrides,
+	) {
+		if err := registry.Register(executor); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func DefaultToolRegistryOptions(cwd string) *ToolRegistryOptions {
+	return &ToolRegistryOptions{
+		Shell: &tool.ShellExecutorOptions{
+			Validation: tool.ShellValidationOptions{
+				// Rust exposes with_additional_permissions only when the
+				// exec_permission_approvals feature is enabled for this turn.
+				AdditionalPermissionsAllowed: false,
+				ApprovalPolicy:               sandbox.ApprovalOnRequest,
+				// Rust defaults allow_login_shell to true (per-environment
+				// since b258c028fe); the turn runtime overrides this from the
+				// effective config when available.
+				AllowLoginShell: true,
+				// Rust #49467: `Feature::LoginShellPackagePath` stays off unless
+				// the effective config opts in; the app-server and exec lanes
+				// override this from the turn's feature settings.
+				LoginShellPackagePath: featureflags.Enabled(nil, "login_shell_package_path"),
+				CWD:                   cwd,
+			},
+		},
+		ApplyPatch:                   &tool.ApplyPatchExecutorOptions{CWD: cwd},
+		UnifiedExec:                  tool.NewUnifiedExecManager(),
+		CodeModeDefaultExecYieldTime: tool.CodeModeDefaultExecYieldTime,
+		AgentController:              agent.NewMemoryToolController(),
+		AgentExposure:                tool.ExposureDiscoverable,
+		EnableCore:                   true,
+		EnableShell:                  true,
+		EnableUnifiedExec:            featureflags.Enabled(nil, "unified_exec"),
+		StableEnvironmentTools:       featureflags.Enabled(nil, "stable_environment_tools"),
+		// Rust registers the code-mode exec/wait executors from the effective
+		// tool mode, not the code_mode feature flag (finalize_tool_router in
+		// codex-rs/core/src/tools/spec_plan.rs). Register them unconditionally
+		// here; Runtime.Run filters the model-visible surface per turn based on
+		// the effective tool mode, so direct-mode turns still see shell tools.
+		EnableCodeMode:   true,
+		EnableApplyPatch: true,
+		EnableMCP:        true,
+		EnableAgents:     true,
+		EnableToolSearch: true,
+	}
+}
+
+// TurnEnvironmentPlan mirrors the environment half of Rust's tool spec plan
+// (Rust #50741/#50962): whether environment-backed tools are advertised, which
+// selector mode the exec_command schema uses, and the readiness facts the
+// executors report when they cannot resolve an environment.
+type TurnEnvironmentPlan struct {
+	// Advertise is Rust's `advertise_environment_tools`: with the
+	// `stable_environment_tools` feature off, environment-backed tools (the
+	// shell family, apply_patch, view_image, request_permissions) exist only
+	// while the turn has a usable environment.
+	Advertise bool
+	// IncludeEnvironmentID is Rust's `include_environment_id`
+	// (`ToolEnvironmentMode::Multiple`). Nil keeps Go's pre-#50962 derivation
+	// from the resolved environment list, for hosts that do not model readiness.
+	IncludeEnvironmentID *bool
+	// Check carries the readiness facts to the executors. Nil means the host
+	// resolved no readiness, so the executors keep their pre-#50962 behavior.
+	Check *tool.UnifiedExecEnvironmentCheck
+}
+
+// resolveTurnEnvironmentPlan computes the plan from the host-supplied
+// selections, resolved executors and readiness waiter.
+func resolveTurnEnvironmentPlan(options *ToolRegistryOptions) TurnEnvironmentPlan {
+	stable := options != nil && options.StableEnvironmentTools
+	ready, known := readyEnvironmentCount(options)
+	plan := TurnEnvironmentPlan{Advertise: stable || !known || ready > 0}
+	if !known {
+		return plan
+	}
+	selected := 1
+	if options != nil && len(options.SelectedEnvironmentIDs) > 0 {
+		selected = len(options.SelectedEnvironmentIDs)
+	}
+	count := ready
+	if stable {
+		// Rust #50962: the selectors stay stable as readiness changes.
+		count = selected
+	}
+	multiple := count > 1
+	plan.IncludeEnvironmentID = &multiple
+	plan.Check = &tool.UnifiedExecEnvironmentCheck{
+		SelectedEnvironmentIDs: append([]string(nil), options.SelectedEnvironmentIDs...),
+		ReadyEnvironmentCount:  ready,
+		StableEnvironmentTools: stable,
+	}
+	return plan
+}
+
+// readyEnvironmentCount returns how many of the turn's selections have a usable
+// executor (Rust `TurnEnvironmentSnapshot::turn_environments().count()`), and
+// whether the host resolved readiness at all.
+//
+// Evidence for each input:
+//   - Shell.UnifiedExecEnvironments is the host-resolved usable set: the
+//     app-server drops selections whose configuration is pending or failed
+//     (Rust #38684) and ids with no executor record, and adds the provider's
+//     default environment.
+//   - EnvironmentWaiter is the host's readiness source; when the host has none
+//     and resolved no executors it also resolved no readiness, so the plan keeps
+//     the pre-#50962 advertisement decision.
+//   - Rust's environment manager always selects the implicit local environment,
+//     whose executor is ready; Go leaves that selection implicit, so a turn with
+//     no selections counts as one.
+func readyEnvironmentCount(options *ToolRegistryOptions) (int, bool) {
+	if options == nil {
+		return 1, false
+	}
+	resolved := 0
+	if options.Shell != nil {
+		for i := range options.Shell.UnifiedExecEnvironments {
+			if strings.TrimSpace(options.Shell.UnifiedExecEnvironments[i].ID) != "" {
+				resolved++
+			}
+		}
+	}
+	if len(options.SelectedEnvironmentIDs) == 0 {
+		if resolved > 0 {
+			return resolved, true
+		}
+		return 1, true
+	}
+	ready := resolved
+	for _, id := range options.SelectedEnvironmentIDs {
+		if isImplicitLocalEnvironmentID(id) {
+			ready++
+		}
+	}
+	if resolved > 0 || options.EnvironmentWaiter != nil {
+		return ready, true
+	}
+	return len(options.SelectedEnvironmentIDs), false
+}
+
+// isImplicitLocalEnvironmentID reports whether a selection names this process's
+// own environment — Rust's implicit local executor, which is always usable. The
+// host-reported selection ids are trimmed here; the executors compare the ids a
+// model passes exactly (Rust compares `TurnEnvironmentSelection::environment_id`
+// without normalizing).
+func isImplicitLocalEnvironmentID(environmentID string) bool {
+	return strings.TrimSpace(environmentID) == execserver.LocalEnvironmentID
+}
+
+// execCommandShellParameter mirrors Rust #50962's `include_shell_parameter`.
+func execCommandShellParameter(options *ToolRegistryOptions) bool {
+	if options == nil {
+		return true
+	}
+	if options.StableEnvironmentTools {
+		return true
+	}
+	if options.Shell == nil || options.Shell.Validation.ShellMode != tool.UnifiedExecShellModeZshFork {
+		return true
+	}
+	for i := range options.Shell.UnifiedExecEnvironments {
+		if options.Shell.UnifiedExecEnvironments[i].Remote() {
+			return true
+		}
+	}
+	return false
+}
+
+// execCommandLoginParameter mirrors Rust #50962's `include_login_parameter`:
+// with the feature off the `login` argument follows the usable environments'
+// login-shell policy, and the turn-level policy stands in for the implicit
+// local environment.
+func execCommandLoginParameter(options *ToolRegistryOptions) bool {
+	if options == nil || options.Shell == nil {
+		return true
+	}
+	if options.StableEnvironmentTools {
+		return true
+	}
+	environments := options.Shell.UnifiedExecEnvironments
+	if len(environments) == 0 {
+		return options.Shell.Validation.AllowLoginShell
+	}
+	allow := false
+	for i := range environments {
+		if environments[i].AllowLoginShell != nil {
+			allow = allow || *environments[i].AllowLoginShell
+			continue
+		}
+		allow = allow || options.Shell.Validation.AllowLoginShell
+	}
+	return allow
+}
+
+func BuildToolRegistry(options *ToolRegistryOptions) (*tool.Registry, error) {
+	if options == nil {
+		options = DefaultToolRegistryOptions("")
+	}
+	registry := tool.NewRegistry()
+	registry.SetDefaultInputSchemaMaxBytes(maxIntTurn(tool.DefaultCodeModeInputSchemaMaxBytes, options.CodeModeToolInputSchemaMaxBytes))
+	// Rust #50741/#50962: the environment-backed tools are advertised by the
+	// same readiness decision, so it is resolved once per registry.
+	environmentPlan := resolveTurnEnvironmentPlan(options)
+	var codeModeCommandTool tool.ToolName
+	if options.EnableCore {
+		if err := tool.RegisterCoreHandlersWithOptions(registry, &tool.CoreHandlerOptions{
+			PlanStore:                      options.PlanStore,
+			ContextStatus:                  options.ContextStatus,
+			UserInputResponder:             options.UserInputResponder,
+			RequestUserInputAvailableModes: options.RequestUserInputAvailableModes,
+			DisableRequestUserInput:        options.DisableRequestUserInput,
+			VerifiedAnswerRecorder:         options.VerifiedAnswerRecorder,
+			ClockProvider:                  options.ClockProvider,
+			ThreadID:                       options.ThreadID,
+			EnableCurrentTime:              options.EnableCurrentTimeTool,
+			EnableClockSleep:               options.EnableSleepTool,
+			DisableUpdatePlan:              options.DisableUpdatePlan,
+			DisableGetContextRemaining:     options.DisableGetContextRemaining,
+			NonfatalClockReadErrors:        options.NonfatalClockReadErrors,
+			NewContextWindow:               options.NewContextWindow,
+		}); err != nil {
+			return nil, err
+		}
+		for _, supported := range options.ExperimentalSupportedTools {
+			if supported == "test_sync_tool" {
+				if err := registry.Register(&tool.TestSyncHandler{}); err != nil {
+					return nil, err
+				}
+			}
+			if supported == tool.DefaultSendMessageToUserAsyncToolName {
+				if err := registry.Register(tool.NewSendMessageToUserAsyncHandler(options.SendUserMessageAsync)); err != nil {
+					return nil, err
+				}
+			}
+			if supported == tool.DefaultRequestUserInputAsyncToolName || supported == tool.DefaultSendUserMessageAsyncToolName {
+				if err := registry.Register(&tool.RequestUserInputAsyncHandler{
+					Description: options.RequestUserInputAsyncDescription,
+					Parameters:  options.RequestUserInputAsyncParameters,
+				}); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	if options.MessageBoard != nil {
+		if err := registerMessageBoardTools(registry, options.MessageBoard); err != nil {
+			return nil, err
+		}
+	}
+	if options.EnableShell && environmentPlan.Advertise {
+		supportsShellCommand := SupportsLegacyShellCommand(options.SelectedEnvironmentIDs)
+		shellOptions := options.Shell
+		if shellOptions == nil {
+			shellOptions = &tool.ShellExecutorOptions{}
+		}
+		shellOptions.ToolName = tool.PlainName(tool.DefaultShellCommandToolName)
+		shellOptions.UnifiedExecThreadID = options.ThreadID
+		shellOptions.UnifiedExecTurnID = options.TurnID
+		shellOptions.SessionID = options.SessionID
+		shellOptions.CodexVersion = options.CodexVersion
+		shellOptions.PluginMetricsResolver = options.PluginMetricsResolver
+		shellOptions.PluginMeasurementTracker = options.PluginMeasurementTracker
+		shellOptions.EnvironmentCheck = environmentPlan.Check
+		shellOptions.IncludeEnvironmentID = environmentPlan.IncludeEnvironmentID
+		shellParameter := execCommandShellParameter(options)
+		loginParameter := execCommandLoginParameter(options)
+		shellOptions.IncludeShellParameter = &shellParameter
+		shellOptions.IncludeLoginParameter = &loginParameter
+		shellOptions.UnifiedExec = nil
+		if options.EnableUnifiedExec {
+			shellOptions.ToolName = tool.PlainName(tool.DefaultExecCommandToolName)
+			shellOptions.UnifiedExec = options.UnifiedExec
+		}
+		if options.EnableUnifiedExec || supportsShellCommand {
+			shellExecutor := tool.NewShellExecutor(shellOptions)
+			if options.EnableCodeMode {
+				shellSpec := shellExecutor.Spec()
+				shellSpec.Exposure = tool.ExposureHidden
+				if err := registry.Register(tool.NewExecutorFunc(shellSpec, shellExecutor.Execute)); err != nil {
+					return nil, err
+				}
+				codeModeCommandTool = shellOptions.ToolName
+			} else if err := registry.Register(shellExecutor); err != nil {
+				return nil, err
+			}
+		}
+		// Rust #41393: when resumable unified execution is disabled, keep
+		// `exec_command` available in a completion-only (one-shot) mode instead
+		// of dropping it. The one-shot executor runs to completion via the local
+		// shell runner with a `timeout_ms` bound and no session/write_stdin.
+		if !options.EnableUnifiedExec && supportsShellCommand {
+			oneShotOptions := *shellOptions
+			oneShotOptions.ToolName = tool.PlainName(tool.DefaultExecCommandToolName)
+			oneShotOptions.UnifiedExec = nil
+			oneShotOptions.OneShot = true
+			oneShotExecutor := tool.NewShellExecutor(&oneShotOptions)
+			if err := registry.Register(oneShotExecutor); err != nil {
+				return nil, err
+			}
+		}
+		if options.EnableUnifiedExec && supportsShellCommand {
+			legacyOptions := *shellOptions
+			legacyOptions.ToolName = tool.PlainName(tool.DefaultShellCommandToolName)
+			legacyOptions.UnifiedExec = nil
+			legacyExecutor := tool.NewShellExecutor(&legacyOptions)
+			legacySpec := legacyExecutor.Spec()
+			legacySpec.Exposure = tool.ExposureHidden
+			if err := registry.Register(tool.NewExecutorFunc(legacySpec, legacyExecutor.Execute)); err != nil {
+				return nil, err
+			}
+		}
+		maxOutputTokens := (*int)(nil)
+		if shellOptions != nil {
+			maxOutputTokens = shellOptions.MaxOutputTokens
+		}
+		if options.EnableUnifiedExec {
+			if err := tool.RegisterWriteStdinHandlerWithOptions(registry, &tool.WriteStdinOptions{
+				Manager:          options.UnifiedExec,
+				MaxOutputTokens:  maxOutputTokens,
+				EnvironmentCheck: environmentPlan.Check,
+			}); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if options.EnableApplyPatch && environmentPlan.Advertise {
+		// Rust #50962: the readiness facts reach the handler so a patch-level
+		// environment id is resolved before verification.
+		applyPatchOptions := options.ApplyPatch
+		if applyPatchOptions != nil {
+			clone := *applyPatchOptions
+			clone.EnvironmentCheck = environmentPlan.Check
+			clone.EnvironmentFileSystems = options.EnvironmentFileSystems
+			applyPatchOptions = &clone
+		}
+		if err := tool.RegisterApplyPatchHandler(registry, applyPatchOptions); err != nil {
+			return nil, err
+		}
+	}
+	if err := registerSkillsTools(registry, options); err != nil {
+		return nil, err
+	}
+	if options.EnableAgents {
+		if err := agent.RegisterMultiAgentHandlersWithOptions(registry, &agent.MultiAgentHandlerOptions{
+			Controller:                options.AgentController,
+			Exposure:                  options.AgentExposure,
+			Version:                   options.AgentVersion,
+			Namespace:                 options.AgentNamespace,
+			UsageHintText:             options.AgentUsageHintText,
+			WaitDefault:               options.AgentWaitDefault,
+			WaitMin:                   options.AgentWaitMin,
+			WaitMax:                   options.AgentWaitMax,
+			WaitConfigured:            options.AgentWaitConfigured,
+			HideSpawnMetadata:         options.AgentHideSpawnMetadata,
+			ExposeSpawnModelOverrides: options.AgentExposeSpawnModelOverrides,
+			Roles:                     options.AgentRoles,
+			Defaults:                  options.AgentDefaults,
+			DisableWaitAgent:          options.DisableWaitAgent,
+			DisableDirectMessage:      options.DisableDirectMessage,
+			ToolOverrides:             options.AgentToolOverrides,
+		}); err != nil {
+			return nil, err
+		}
+	}
+	if len(options.PluginInstallCandidates) > 0 {
+		if err := tool.RegisterPluginInstallSuggestionHandlers(registry, &tool.PluginInstallSuggestionOptions{
+			Candidates:            options.PluginInstallCandidates,
+			RecommendationContext: options.PluginInstallRecommendationContext,
+			Runtime:               options.PluginInstallRuntime,
+			AppServerClientName:   options.PluginInstallAppServerClientName,
+			NonRootAgent:          options.NonRootAgent,
+		}); err != nil {
+			return nil, err
+		}
+	}
+	for _, executor := range options.ExtraTools {
+		if executor == nil {
+			continue
+		}
+		if err := registry.Register(executor); err != nil {
+			return nil, err
+		}
+	}
+	if options.ViewImage != nil && environmentPlan.Advertise {
+		// Rust #50962: same readiness facts as the shell family, so an explicit
+		// environment_id resolves instead of being silently ignored.
+		viewImageOptions := *options.ViewImage
+		viewImageOptions.EnvironmentCheck = environmentPlan.Check
+		viewImageOptions.EnvironmentFileSystems = options.EnvironmentFileSystems
+		if err := registry.Register(tool.NewViewImageHandler(viewImageOptions)); err != nil {
+			return nil, err
+		}
+	}
+	// Rust #54741: the host installs the file-copy extension when the
+	// `multi_env_copy_file` feature is on. The tool is advertised independently
+	// of the turn's environments, so a call against an unavailable endpoint
+	// reports it instead of the tool being hidden.
+	if options.EnableMultiEnvCopyFile {
+		if err := registry.Register(tool.NewMultiEnvCopyFileHandler(tool.MultiEnvCopyFileOptions{EnvironmentFileSystems: options.EnvironmentFileSystems})); err != nil {
+			return nil, err
+		}
+	}
+	if options.EnableWaitForEnvironment {
+		if err := registry.Register(tool.NewWaitForEnvironmentHandler(options.EnvironmentWaiter, options.SelectedEnvironmentIDs, options.WaitForEnvironmentToolConfig)); err != nil {
+			return nil, err
+		}
+	}
+
+	// Runtime-provided tools are external input. Keep the first registered
+	// runtime for a name so they cannot replace host-owned tools or abort a turn.
+	if options.EnableMCP {
+		if err := registerMCPTools(registry, options); err != nil {
+			return nil, err
+		}
+	}
+	// Rust add_mcp_resource_tools registers the MCP resource helpers whenever
+	// MCP servers are configured, and - since #50546 - always in CodeModeOnly so
+	// their definitions stay stable as the first server is added or the last is
+	// removed. They are independent of tool search, so models can list or read
+	// resources even when the servers' other tools are deferred.
+	if options.MCPService.HasServers() || options.ToolMode == model.ToolModeCodeModeOnly {
+		if err := registerMCPResourceHandlers(registry, options.MCPService, options.MCPResourceMessages, options.ThreadID); err != nil {
+			return nil, err
+		}
+	}
+	if options.WebSearch != nil {
+		if _, err := registry.RegisterExternal(NewWebSearchHandler(options.WebSearch)); err != nil {
+			return nil, err
+		}
+	}
+	if options.EnableRequestPermissions && options.RequestPermissionsReviewer != nil && environmentPlan.Advertise {
+		if err := tool.RegisterRequestPermissionsToolWithFileSystems(registry, options.RequestPermissionsReviewer, environmentPlan.Check, options.EnvironmentFileSystems); err != nil {
+			return nil, err
+		}
+	}
+	if options.ImageGeneration != nil {
+		if _, err := registry.RegisterExternal(NewImageGenerationHandler(options.ImageGeneration)); err != nil {
+			return nil, err
+		}
+	}
+	if err := RegisterDynamicToolHandlers(registry, &DynamicToolRegistryOptions{
+		Caller:    options.DynamicToolCaller,
+		ThreadID:  options.ThreadID,
+		TurnID:    options.TurnID,
+		Tools:     options.DynamicTools,
+		Now:       nil,
+		EnableAll: true,
+	}); err != nil {
+		return nil, err
+	}
+	var indirectPrefixes *tool.IndirectNamespacePrefixes
+	if options.IndirectDescriptionPrefixes != nil {
+		resolved, resolveErr := tool.NewIndirectNamespacePrefixes(options.IndirectDescriptionPrefixes, registry.MCPServerNamespaces())
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		indirectPrefixes = resolved
+	}
+	applyDirectOnlyToolNamespaceOverrides(registry, options.DirectOnlyToolNamespaces)
+	if options.CodeModeOnlyStrictThirdPartyTools && options.ToolMode == model.ToolModeCodeModeOnly {
+		registry.EnforceStrictThirdPartyTools()
+	}
+	if options.EnableToolSearch {
+		// Rust only adds tool_search when at least one deferred executor is
+		// searchable. Advertising an empty search tool causes models to emit a
+		// useless tool_search_call/output pair which is then persisted into
+		// resumed Responses history.
+		if registryHasSearchableDeferredTool(registry) {
+			registry.Remove(tool.PlainName(tool.ToolSearchName))
+			specs := registry.DiscoverableSpecs()
+			specs = tool.OrderCodeModeToolDescriptions(specs, options.CodeModeToolDescriptionFirst)
+			if indirectPrefixes != nil {
+				specs = indirectPrefixes.ApplyToSpecs(specs)
+			}
+			if err := tool.RegisterToolSearchHandlerWithOptions(registry, specs, options.OmitToolSearchSources); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if options.EnableCodeMode {
+		registry.Remove(tool.PlainName(tool.CodeModeExecToolName))
+		registry.Remove(tool.PlainName("wait"))
+		var execExecutor, waitExecutor tool.Executor
+		if options.CodeModeRuntime != nil {
+			options.CodeModeRuntime.SetDefaultExecYieldTime(options.CodeModeDefaultExecYieldTime)
+			options.CodeModeRuntime.SetCodeModeMessages(options.CodeModeMessages)
+			options.CodeModeRuntime.SetShowCellOverhead(options.CodeModeShowCellOverhead)
+			options.CodeModeRuntime.SetToolDescriptionFirst(options.CodeModeToolDescriptionFirst)
+			options.CodeModeRuntime.SetExcludedToolNamespaces(options.ExcludedToolNamespaces)
+			options.CodeModeRuntime.SetIndirectDescriptionPrefixes(indirectPrefixes)
+			// Rust #45409: a Code Mode cell retains the window it started in, so
+			// the nested MCP calls it issues keep reporting that window.
+			options.CodeModeRuntime.SetTurnWindowID(options.WindowID)
+			execExecutor, waitExecutor = options.CodeModeRuntime.Executors(registry, codeModeCommandTool)
+		} else {
+			runtime := tool.NewCodeModeRuntime(options.CodeModeProvider, options.DisableCodeModeFallback)
+			runtime.SetDefaultExecYieldTime(options.CodeModeDefaultExecYieldTime)
+			runtime.SetCodeModeMessages(options.CodeModeMessages)
+			runtime.SetShowCellOverhead(options.CodeModeShowCellOverhead)
+			runtime.SetToolDescriptionFirst(options.CodeModeToolDescriptionFirst)
+			runtime.SetExcludedToolNamespaces(options.ExcludedToolNamespaces)
+			runtime.SetIndirectDescriptionPrefixes(indirectPrefixes)
+			execExecutor, waitExecutor = runtime.Executors(registry, codeModeCommandTool)
+		}
+		if err := registry.Prepend(waitExecutor); err != nil {
+			return nil, err
+		}
+		if err := registry.Prepend(execExecutor); err != nil {
+			return nil, err
+		}
+	}
+	if err := registry.ApplyFunctionsNamespaceFunctionDescriptionPrefixes(options.FunctionDescriptionPrefixes); err != nil {
+		return nil, err
+	}
+	if options.AllowedTools != nil {
+		registry.RestrictToTools(*options.AllowedTools)
+	}
+	return registry, nil
+}
+
+// applyDirectOnlyToolNamespaceOverrides mirrors Rust
+// apply_direct_model_only_namespace_overrides (spec_plan.rs): every code-mode
+// available tool in an exact configured namespace becomes a direct model tool,
+// so it bypasses deferral and is omitted from the nested Code Mode surface.
+// Hidden tools stay hidden, and the later strict third-party pass may defer
+// eligible third-party tools again, exactly as upstream orders the two passes.
+func applyDirectOnlyToolNamespaceOverrides(registry *tool.Registry, namespaces []string) {
+	if registry == nil || len(namespaces) == 0 {
+		return
+	}
+	directOnly := make(map[string]bool, len(namespaces))
+	for _, namespace := range namespaces {
+		if namespace = strings.TrimSpace(namespace); namespace != "" {
+			directOnly[namespace] = true
+		}
+	}
+	if len(directOnly) == 0 {
+		return
+	}
+	for _, name := range registry.Names() {
+		spec, ok := registry.Spec(name)
+		if !ok || !tool.IsCodeModeAvailable(spec.Exposure) {
+			continue
+		}
+		// Rust's with_default_namespace gives plain built-in tools the
+		// "functions" namespace.
+		namespace := strings.TrimSpace(name.Namespace)
+		if namespace == "" {
+			namespace = "functions"
+		}
+		if directOnly[namespace] {
+			registry.SetExposure(name, tool.ExposureDirectModelOnly)
+		}
+	}
+}
+
+// SupportsLegacyShellCommand matches Rust's single-local-environment gate.
+// An omitted selection denotes the implicit local environment.
+func SupportsLegacyShellCommand(environmentIDs []string) bool {
+	if len(environmentIDs) == 0 {
+		return true
+	}
+	return len(environmentIDs) == 1 && strings.EqualFold(strings.TrimSpace(environmentIDs[0]), "local")
+}
+
+func registryHasSearchableDeferredTool(registry *tool.Registry) bool {
+	if registry == nil {
+		return false
+	}
+	for _, spec := range registry.DiscoverableSpecs() {
+		if spec.Name.Key() != tool.ToolSearchName && spec.Search != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func BuildToolRouter(options *ToolRegistryOptions) (*tool.Router, error) {
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		return nil, err
+	}
+	router := tool.NewRouter(registry)
+	router.SetToolPlan(
+		options.ToolMode,
+		router.CodeModeToolNames(),
+		tool.CollectToolNamespacesInfo(registry, router.CodeModeToolNames(), router.ModelVisibleSpecs()),
+	)
+	return router, nil
+}
+
+func registerMCPTools(registry *tool.Registry, options *ToolRegistryOptions) error {
+	if len(options.MCPTools) == 0 {
+		return nil
+	}
+	if options.MCPExposure != "" {
+		return registerMCPToolSet(registry, options, options.MCPTools, options.MCPExposure)
+	}
+	exposure := mcp.BuildRuntimeExposure(options.MCPTools, options.MCPConnectors, options.EnableToolSearch)
+	// BuildRuntimeExposure returns either the direct or the deferred tool set
+	// depending on tool search, never both. Union them and apply Rust's
+	// per-server omit_tools_from policy (51c9ed6d4f) to each tool individually
+	// so a server can opt out of any model-facing surface without disabling its
+	// tools everywhere.
+	allTools := append([]mcp.RuntimeToolInfo(nil), exposure.DirectTools...)
+	allTools = append(allTools, exposure.DeferredTools...)
+	for i := range allTools {
+		info := allTools[i]
+		// Rust #46035: a Codex Apps connector's own omissions are combined with
+		// the server's so app settings never drop a server restriction.
+		omit := mcpOmitToolsFromForTool(options.MCPService, options.AppsConfigValues, info)
+		strictThirdParty := options.CodeModeOnlyStrictThirdPartyTools && options.ToolMode == model.ToolModeCodeModeOnly
+		exposure := mcpToolExposureForSurfaces(omit, options.EnableToolSearch, strictThirdParty)
+		if err := registerMCPToolSet(registry, options, []mcp.RuntimeToolInfo{info}, exposure); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// mcpToolExposureForSurfaces maps a server's omit_tools_from surfaces to the
+// final tool exposure using Rust's apply_mcp_tool_exposure_policy table:
+// (direct, deferred, code_mode) -> ToolExposure. Go has no
+// direct_only_tool_namespaces configuration, so that restriction is skipped.
+func mcpToolExposureForSurfaces(omit []string, searchToolEnabled bool, strictThirdParty bool) tool.Exposure {
+	if strictThirdParty {
+		// Rust #50687 ignores MCP/app omit_tools_from for eligible third-party
+		// tools. Hidden tools filtered before this point remain absent.
+		omit = nil
+	}
+	allowed := map[string]bool{"direct": true, "deferred": true, "code_mode": true}
+	for _, surface := range omit {
+		switch strings.ToLower(strings.TrimSpace(surface)) {
+		case "direct", "deferred", "code_mode":
+			allowed[strings.ToLower(strings.TrimSpace(surface))] = false
+		}
+	}
+	if searchToolEnabled && allowed["deferred"] {
+		allowed["direct"] = false
+	} else {
+		allowed["deferred"] = false
+	}
+	direct, deferred, codeMode := allowed["direct"], allowed["deferred"], allowed["code_mode"]
+	switch {
+	case !direct && !deferred && !codeMode:
+		return tool.ExposureHidden
+	case !direct && !deferred && codeMode:
+		return tool.ExposureCodeModeOnly
+	case direct && !deferred && !codeMode:
+		return tool.ExposureDirectModelOnly
+	case direct && !deferred && codeMode:
+		return tool.ExposureModelVisible
+	case !direct && deferred && !codeMode:
+		return tool.ExposureDeferredModelOnly
+	default:
+		return tool.ExposureDiscoverable
+	}
+}
+
+// mcpOmitToolsFromForTool mirrors Rust's apply_mcp_tool_exposure_policy (#46035):
+// a tool's omitted surfaces are its server's omissions plus, for Codex Apps
+// tools, the omissions configured for the invoking connector.
+func mcpOmitToolsFromForTool(service *mcp.MCPService, appsConfigValues map[string]any, info mcp.RuntimeToolInfo) []string {
+	serverName := strings.TrimSpace(info.ServerName)
+	omitted := []string{}
+	if service != nil && serverName != "" {
+		if config, ok := service.ServerConfigForServer(serverName); ok {
+			omitted = append(omitted, config.OmitToolsFrom...)
+		}
+	}
+	omitted = append(omitted, mcpConnectorOmitToolsFrom(appsConfigValues, info)...)
+	return omitted
+}
+
+func mcpServerToolInputSchemaMaxBytes(service *mcp.MCPService, serverName string) int {
+	if service == nil {
+		return jsonschema.DefaultCompactToolSchemaBytes
+	}
+	config, ok := service.ServerConfigForServer(serverName)
+	if !ok {
+		return jsonschema.DefaultCompactToolSchemaBytes
+	}
+	return config.ToolInputSchemaCompactionBytes()
+}
+
+func maxIntTurn(left int, right int) int {
+	if right > left {
+		return right
+	}
+	return left
+}
+
+// mcpConnectorOmitToolsFrom returns the connector-level omissions configured for
+// a Codex Apps tool (`apps.<connector_id>.omit_tools_from`). Non-apps tools and
+// tools without a connector id have no connector-level omissions.
+func mcpConnectorOmitToolsFrom(appsConfigValues map[string]any, info mcp.RuntimeToolInfo) []string {
+	if len(appsConfigValues) == 0 || !mcp.IsCodexAppsMCPServerName(strings.TrimSpace(info.ServerName)) {
+		return nil
+	}
+	connectorID := strings.TrimSpace(info.ConnectorID)
+	if connectorID == "" {
+		return nil
+	}
+	config := apps.AppsConfigFromValues(appsConfigValues)
+	if config == nil {
+		return nil
+	}
+	app, ok := config.Apps[connectorID]
+	if !ok || app.OmitToolsFrom == nil {
+		return nil
+	}
+	return append([]string(nil), (*app.OmitToolsFrom)...)
+}
+
+func mcpOmitToolsFromByServer(service *mcp.MCPService, tools []mcp.RuntimeToolInfo) map[string][]string {
+	omitByServer := map[string][]string{}
+	if service == nil {
+		return omitByServer
+	}
+	for i := range tools {
+		serverName := strings.TrimSpace(tools[i].ServerName)
+		if serverName == "" {
+			continue
+		}
+		if _, seen := omitByServer[serverName]; seen {
+			continue
+		}
+		config, ok := service.ServerConfigForServer(serverName)
+		if !ok {
+			omitByServer[serverName] = nil
+			continue
+		}
+		omitByServer[serverName] = append([]string(nil), config.OmitToolsFrom...)
+	}
+	return omitByServer
+}
+
+// mcpServerParallelToolCalls resolves each server's parallel-tool-call opt-in
+// from the effective runtime configuration (Rust
+// McpServerMetadata::supports_parallel_tool_calls).
+func mcpServerParallelToolCalls(service *mcp.MCPService, tools []mcp.RuntimeToolInfo) map[string]bool {
+	parallelByServer := map[string]bool{}
+	if service == nil {
+		return parallelByServer
+	}
+	for i := range tools {
+		serverName := strings.TrimSpace(tools[i].ServerName)
+		if serverName == "" {
+			continue
+		}
+		if _, seen := parallelByServer[serverName]; seen {
+			continue
+		}
+		config, ok := service.ServerConfigForServer(serverName)
+		parallelByServer[serverName] = ok && config.SupportsParallelToolCalls
+	}
+	return parallelByServer
+}
+
+// mcpResultMetadataCaptureAllowed mirrors Rust #46010's
+// `result_metadata_capture_allowed`: the raw MCP result `_meta` is exposed for
+// the internal executed-tool-call record only when the session's analytics
+// client is enabled and the call belongs to the host-owned apps server. An
+// absent analytics state (nil) is Rust's disabled client and does not enable
+// the capture. Whether the exposed snapshot is actually recorded is a separate
+// check at the dispatch sites, exactly like Rust's recorder-state check.
+func mcpResultMetadataCaptureAllowed(options *ToolRegistryOptions, serverName string) bool {
+	return options != nil &&
+		options.AnalyticsEnabled != nil && *options.AnalyticsEnabled &&
+		mcp.IsCodexAppsMCPServerName(serverName)
+}
+
+func registerMCPToolSet(registry *tool.Registry, options *ToolRegistryOptions, tools []mcp.RuntimeToolInfo, exposure tool.Exposure) error {
+	tools = mcp.NormalizeRuntimeToolsForModel(tools)
+	// Rust's per-server opt-in marks every tool from the server as safe for
+	// parallel tool calls (McpServerMetadata::supports_parallel_tool_calls ->
+	// ToolInfo::supports_parallel_tool_calls).
+	parallelByServer := mcpServerParallelToolCalls(options.MCPService, tools)
+	for i := range tools {
+		info := tools[i]
+		// Rust #46010: the raw result metadata is captured only when analytics is
+		// enabled and the call belongs to the host-owned apps server.
+		captureResultMetadata := mcpResultMetadataCaptureAllowed(options, info.ServerName)
+		executor := mcp.NewToolExecutor(&mcp.ToolExecutorOptions{
+			Service:    options.MCPService,
+			ServerName: info.ServerName,
+			ToolInfo: &mcp.MCPToolInfo{
+				Name:        info.Tool.Name,
+				Title:       info.Tool.Title,
+				Description: info.Tool.Description,
+				InputSchema: info.Tool.InputSchema,
+				Annotations: info.Tool.Annotations,
+				Meta:        info.Meta,
+			},
+			Parallel:                          parallelByServer[strings.TrimSpace(info.ServerName)],
+			ToolName:                          tool.NamespacedName(info.CallableNamespace, info.CallableName),
+			ToolInputSchemaMaxBytes:           mcpServerToolInputSchemaMaxBytes(options.MCPService, info.ServerName),
+			CodeModeInputSchemaMaxBytes:       maxIntTurn(maxIntTurn(tool.DefaultCodeModeInputSchemaMaxBytes, options.CodeModeToolInputSchemaMaxBytes), mcpServerToolInputSchemaMaxBytes(options.MCPService, info.ServerName)),
+			ThreadID:                          options.ThreadID,
+			TurnID:                            options.TurnID,
+			RequestMeta:                       mcpRuntimeToolRequestMeta(&info),
+			OpenAIFileRewriter:                options.OpenAIFileRewriter,
+			OpenAIFileInputOptionalFields:     info.OpenAIFileInputOptionalFields,
+			AgentPlugin:                       info.AgentPlugin,
+			ConnectorID:                       info.ConnectorID,
+			ConnectorName:                     info.ConnectorName,
+			PluginID:                          info.PluginID,
+			Model:                             options.Model,
+			TurnMetadata:                      options.MCPTurnMetadata,
+			TurnRootTurnID:                    options.MCPTurnRootTurnID,
+			HostOwnedApps:                     info.HostOwnedApps,
+			AuthElicitation:                   options.MCPAuthElicitation,
+			ToolApproval:                      options.MCPToolApproval,
+			ConfirmationPolicies:              mcpActorConfirmationPolicies(options.ModelConfirmationPolicies),
+			SuppressActorConfirmationPolicies: options.SuppressActorConfirmationPolicies,
+			CaptureResultMetadata:             captureResultMetadata,
+			SessionID:                         options.SessionID,
+			WindowID:                          options.WindowID,
+			ConnectorAuthFailureObserver:      options.MCPConnectorAuthFailureObserver,
+			MCPSourceObserver:                 options.MCPSourceObserver,
+		})
+		spec := executor.Spec()
+		spec.ThirdParty = true
+		spec.NamespaceDescription = mcp.BoundedMCPNamespaceDescription(info.NamespaceDescription)
+		if spec.Search != nil && spec.Search.Source != nil {
+			spec.Search.Source.Description = spec.NamespaceDescription
+		}
+		if exposure != "" && exposure != tool.ExposureModelVisible {
+			spec.Exposure = exposure
+		}
+		if _, err := registry.RegisterExternal(&specOverrideExecutor{Executor: executor, spec: spec}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func mcpRuntimeToolRequestMeta(info *mcp.RuntimeToolInfo) map[string]any {
+	if info == nil || !mcp.IsCodexAppsMCPServerName(info.ServerName) {
+		return nil
+	}
+	apps := map[string]any{}
+	if connectorID := strings.TrimSpace(info.ConnectorID); connectorID != "" {
+		apps["connector_id"] = connectorID
+	}
+	return map[string]any{"_codex_apps": apps}
+}
+
+// mcpActorConfirmationPolicies converts the model catalog's confirmation-policy
+// documents into the MCP executor's actor metadata form (#41072). A nil input
+// remains nil so the executor attaches an empty object for eligible calls.
+func mcpActorConfirmationPolicies(cp *model.ConfirmationPolicies) *mcp.ActorConfirmationPolicies {
+	if cp == nil {
+		return nil
+	}
+	out := &mcp.ActorConfirmationPolicies{}
+	if cp.BrowserUse != nil {
+		out.BrowserUse = *cp.BrowserUse
+	}
+	if cp.ComputerUse != nil {
+		out.ComputerUse = *cp.ComputerUse
+	}
+	return out
+}
+
+type specOverrideExecutor struct {
+	tool.Executor
+	spec tool.Spec
+}
+
+func (e *specOverrideExecutor) Spec() tool.Spec {
+	if e == nil {
+		return tool.Spec{}
+	}
+	return e.spec
+}
+
+func (e *specOverrideExecutor) WaitUntilReady(ctx context.Context, invocation *tool.Invocation) error {
+	if e == nil {
+		return nil
+	}
+	waiter, ok := e.Executor.(tool.ReadinessWaiter)
+	if !ok {
+		return nil
+	}
+	return waiter.WaitUntilReady(ctx, invocation)
+}
+
+func (e *specOverrideExecutor) PreToolUsePayload(invocation *tool.Invocation) (*tool.PreToolUsePayload, bool) {
+	if e == nil {
+		return nil, false
+	}
+	provider, ok := e.Executor.(tool.PreToolUsePayloadProvider)
+	if !ok {
+		return nil, false
+	}
+	return provider.PreToolUsePayload(invocation)
+}
+
+func (e *specOverrideExecutor) PostToolUsePayload(invocation *tool.Invocation, output *tool.Output) (*tool.PostToolUsePayload, bool) {
+	if e == nil {
+		return nil, false
+	}
+	provider, ok := e.Executor.(tool.PostToolUsePayloadProvider)
+	if !ok {
+		return nil, false
+	}
+	return provider.PostToolUsePayload(invocation, output)
+}
+
+func (e *specOverrideExecutor) WithUpdatedHookInput(invocation *tool.Invocation, updatedInput any) (*tool.Invocation, error) {
+	if e == nil {
+		return nil, tool.RespondToModel("hook input rewrite received unsupported payload")
+	}
+	updater, ok := e.Executor.(tool.HookInputUpdater)
+	if !ok {
+		return nil, tool.RespondToModel("hook input rewrite received unsupported payload")
+	}
+	return updater.WithUpdatedHookInput(invocation, updatedInput)
+}
+
+func EnsureRegistry(options *ToolRegistryOptions) (*tool.Registry, error) {
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		return nil, fmt.Errorf("build tool registry: %w", err)
+	}
+	return registry, nil
+}

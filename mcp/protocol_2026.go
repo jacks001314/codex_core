@@ -1,0 +1,310 @@
+package mcp
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+)
+
+const (
+	defaultMCPProtocol               = "2025-06-18"
+	modernMCPProtocol                = "2026-07-28"
+	mcpProtocolVersionEnvVar         = "CODEX_MCP_PROTOCOL_VERSION"
+	maxModernMCPMessageBytes         = 8 * 1024 * 1024
+	mcpProtocolVersionMetadataKey    = "io.modelcontextprotocol/protocolVersion"
+	mcpClientInfoMetadataKey         = "io.modelcontextprotocol/clientInfo"
+	mcpClientCapabilitiesMetadataKey = "io.modelcontextprotocol/clientCapabilities"
+	mcpJSONRPCMethodNotFoundCode     = int64(-32601)
+	mcpLegacyPrevalidationErrorCode  = int64(-32000)
+	maxMCPInputRequiredRounds        = 1000
+)
+
+var knownLegacyMCPProtocols = map[string]struct{}{
+	"2025-11-25": {},
+	"2025-06-18": {},
+	"2025-03-26": {},
+	"2024-11-05": {},
+}
+
+type MCPProtocolMode uint8
+
+const (
+	MCPProtocolLegacy MCPProtocolMode = iota
+	MCPProtocol20260728
+)
+
+var errMCPModernProtocolUnsupported = errors.New("MCP server does not support protocol version 2026-07-28")
+
+func mcpProtocolModeFromValues(values map[string]any) MCPProtocolMode {
+	if mcpFeatureEnabled(values, "mcp_2026_07_28") {
+		return MCPProtocol20260728
+	}
+	return MCPProtocolLegacy
+}
+
+// hostOwnedAppsProtocolModeFromValues mirrors Rust
+// host_owned_apps_protocol_mode (feature codex_apps_mcp_2026_07_28): the
+// trusted, HTTP Codex Apps registration has an independent protocol mode.
+func hostOwnedAppsProtocolModeFromValues(values map[string]any) MCPProtocolMode {
+	if mcpFeatureEnabled(values, "codex_apps_mcp_2026_07_28") {
+		return MCPProtocol20260728
+	}
+	return MCPProtocolLegacy
+}
+
+func mcpFeatureEnabled(values map[string]any, key string) bool {
+	features, _ := values["features"].(map[string]any)
+	switch feature := features[key].(type) {
+	case bool:
+		return feature
+	case map[string]any:
+		if enabled, _ := feature["enabled"].(bool); enabled {
+			return true
+		}
+	}
+	return false
+}
+
+// effectiveMCPProtocolMode mirrors Rust McpConnectionSet resolution (#44571): a
+// registration that selects its own mode wins, otherwise the host-owned Codex
+// Apps registration uses its independent mode and every other server uses the
+// default. The override applies only to Streamable HTTP connections, which is
+// where the HTTP client consults config.ProtocolMode.
+func effectiveMCPProtocolMode(runtime *RuntimeConfig, name string, registration ServerRegistration) MCPProtocolMode {
+	if registration.Config.ProtocolModeOverride != nil {
+		return *registration.Config.ProtocolModeOverride
+	}
+	if runtime == nil {
+		return MCPProtocolLegacy
+	}
+	if isHostOwnedCodexAppsRegistration(name, registration) {
+		return runtime.HostOwnedAppsProtocolMode
+	}
+	return runtime.ProtocolMode
+}
+
+func isHostOwnedCodexAppsRegistration(name string, registration ServerRegistration) bool {
+	// Mirrors Rust McpServerSource::is_host_owned_apps: the exact Apps server
+	// name, a local-environment config, and a compatibility (controller-owned)
+	// source. Extension contributions do not gain host-owned Apps authority.
+	if strings.TrimSpace(name) != CodexAppsServerName || !registration.Config.IsLocalEnvironment() {
+		return false
+	}
+	return registration.Source == string(CatalogSourceCompatibility) ||
+		registration.ContributorID == legacyCodexAppsRegistrationID
+}
+
+func (m MCPProtocolMode) protocolVersion() string {
+	if m == MCPProtocol20260728 {
+		return modernMCPProtocol
+	}
+	return defaultMCPProtocol
+}
+
+func mcpClientCapabilities(openAIForm bool) map[string]any {
+	return mcpClientCapabilitiesWithAuthChange(openAIForm, false)
+}
+
+// mcpClientCapabilitiesWithAuthChange mirrors mcpClientCapabilities and also
+// offers the experimental auth-change capability when a source is attached
+// (Rust #43428).
+func mcpClientCapabilitiesWithAuthChange(openAIForm bool, advertiseAuthChange bool) map[string]any {
+	return mcpClientCapabilitiesWithFeatures(openAIForm, advertiseAuthChange, false)
+}
+
+// mcpClientCapabilitiesWithFeatures mirrors Rust #43524: user verification is
+// advertised only to the host-owned apps MCP server.
+func mcpClientCapabilitiesWithFeatures(openAIForm bool, advertiseAuthChange bool, userVerification bool) map[string]any {
+	capabilities := map[string]any{
+		"roots": map[string]any{"listChanged": false},
+	}
+	if openAIForm {
+		elicitation := map[string]any{"form": map[string]any{}}
+		if userVerification {
+			elicitation["userVerification"] = map[string]any{}
+		}
+		capabilities["extensions"] = map[string]any{
+			// Rust #41447 advertises the umbrella elicitation form capability
+			// alongside the legacy openai/form extension.
+			"openai/form":        map[string]any{},
+			"openai/elicitation": elicitation,
+		}
+	}
+	if advertiseAuthChange {
+		mcpAdvertiseAuthChangeCapability(capabilities)
+	}
+	return capabilities
+}
+
+func mcpParamsWithProtocolMetadata(params any, mode MCPProtocolMode, openAIForm bool) any {
+	return mcpParamsWithProtocolMetadataAndAuthChange(params, mode, openAIForm, false)
+}
+
+func mcpParamsWithProtocolMetadataAndAuthChange(params any, mode MCPProtocolMode, openAIForm bool, advertiseAuthChange bool) any {
+	return mcpParamsWithProtocolMetadataAndFeatures(params, mode, openAIForm, advertiseAuthChange, false)
+}
+
+func mcpParamsWithProtocolMetadataAndFeatures(params any, mode MCPProtocolMode, openAIForm bool, advertiseAuthChange bool, userVerification bool) any {
+	if mode != MCPProtocol20260728 {
+		return params
+	}
+	out := map[string]any{}
+	if params != nil {
+		data, err := json.Marshal(params)
+		if err == nil {
+			_ = json.Unmarshal(data, &out)
+		}
+	}
+	meta, _ := out["_meta"].(map[string]any)
+	meta = cloneAnyMap(meta)
+	if meta == nil {
+		meta = map[string]any{}
+	}
+	meta[mcpProtocolVersionMetadataKey] = modernMCPProtocol
+	meta[mcpClientInfoMetadataKey] = map[string]string{"name": "codex-go", "version": "go-port"}
+	meta[mcpClientCapabilitiesMetadataKey] = mcpClientCapabilitiesWithFeatures(openAIForm, advertiseAuthChange, userVerification)
+	out["_meta"] = meta
+	return out
+}
+
+type mcpDiscoveryResult struct {
+	ResultType        string          `json:"resultType"`
+	SupportedVersions []string        `json:"supportedVersions"`
+	Capabilities      json.RawMessage `json:"capabilities"`
+}
+
+func validateMCPModernDiscovery(result *json.RawMessage) error {
+	if result == nil {
+		return errors.New("MCP server/discover response is missing a result")
+	}
+	var discovery mcpDiscoveryResult
+	if err := json.Unmarshal(*result, &discovery); err != nil {
+		return fmt.Errorf("decode MCP server/discover response: %w", err)
+	}
+	for _, version := range discovery.SupportedVersions {
+		if strings.TrimSpace(version) == modernMCPProtocol {
+			return nil
+		}
+	}
+	return errMCPModernProtocolUnsupported
+}
+
+func isMCPDiscoveryFallbackError(err error) bool {
+	if errors.Is(err, errMCPModernProtocolUnsupported) {
+		return true
+	}
+	// Rust #39798 (rmcp 3.1.3): any server/discover JSON-RPC error falls back
+	// to legacy initialization while preserving its diagnostics; unproven
+	// rejections are reclassified as header mismatches so authentication and
+	// retry classifications survive the fallback.
+	var remoteErr *MCPRemoteError
+	return errors.As(err, &remoteErr) && remoteErr.Code != 0
+}
+
+func hasMCPLegacyFallbackEvidence(message string) bool {
+	if message == "Bad Request: No valid session ID provided" {
+		return true
+	}
+	const prefixes = "Bad Request: Unsupported protocol version: 2026-07-28 (supported versions: "
+	const legacyPrefix = "Bad Request: Unsupported protocol version (supported versions: "
+	supported, ok := strings.CutPrefix(message, prefixes)
+	if !ok {
+		supported, ok = strings.CutPrefix(message, legacyPrefix)
+	}
+	if !ok || !strings.HasSuffix(supported, ")") {
+		return false
+	}
+	versions := strings.Split(strings.TrimSuffix(supported, ")"), ",")
+	hasKnown := false
+	for _, raw := range versions {
+		version := strings.TrimSpace(raw)
+		if !isLegacyMCPProtocolDate(version) {
+			return false
+		}
+		if _, ok := knownLegacyMCPProtocols[version]; ok {
+			hasKnown = true
+		}
+	}
+	return len(versions) > 0 && hasKnown
+}
+
+func isLegacyMCPProtocolDate(version string) bool {
+	if len(version) != 10 || version >= modernMCPProtocol || version[4] != '-' || version[7] != '-' {
+		return false
+	}
+	for index := range version {
+		if index == 4 || index == 7 {
+			continue
+		}
+		if version[index] < '0' || version[index] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+type mcpInputRequiredResult struct {
+	ResultType    string                             `json:"resultType"`
+	InputRequests map[string]mcpInputRequiredRequest `json:"inputRequests"`
+	RequestState  json.RawMessage                    `json:"requestState"`
+}
+
+type mcpInputRequiredRequest struct {
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
+}
+
+func nextMCP2026RequestParams(ctx context.Context, serverName string, elicitation MCPElicitationHandler, baseParams any, result *json.RawMessage) (any, bool, error) {
+	if result == nil {
+		return nil, false, nil
+	}
+	var required mcpInputRequiredResult
+	if err := json.Unmarshal(*result, &required); err != nil || required.ResultType != "input_required" {
+		return nil, false, nil
+	}
+
+	params := map[string]any{}
+	if baseParams != nil {
+		data, err := json.Marshal(baseParams)
+		if err != nil {
+			return nil, false, err
+		}
+		if err := json.Unmarshal(data, &params); err != nil {
+			return nil, false, err
+		}
+	}
+	if state := bytes.TrimSpace(required.RequestState); len(state) > 0 && !bytes.Equal(state, []byte("null")) {
+		params["requestState"] = append(json.RawMessage(nil), state...)
+	}
+
+	if len(required.InputRequests) > 0 {
+		keys := make([]string, 0, len(required.InputRequests))
+		for key := range required.InputRequests {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		responses := make(map[string]any, len(keys))
+		for _, key := range keys {
+			request := required.InputRequests[key]
+			id, _ := json.Marshal(key)
+			response, rpcErr := mcpClientRequestResult(ctx, serverName, elicitation, request.Method, id, request.Params)
+			if rpcErr != nil {
+				return nil, false, newMCPRemoteError(request.Method, rpcErr)
+			}
+			responses[key] = response
+		}
+		params["inputResponses"] = responses
+	}
+	return params, true, nil
+}
+
+func modernMCPMessageLimit(mode MCPProtocolMode) int64 {
+	if mode == MCPProtocol20260728 {
+		return maxModernMCPMessageBytes
+	}
+	return 0
+}

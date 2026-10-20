@@ -1,0 +1,567 @@
+package turn
+
+import (
+	"encoding/json"
+	"strconv"
+	"strings"
+	"testing"
+
+	"codex_core/model"
+	"codex_core/tool"
+)
+
+func TestExecutedToolCallRecorderAttachesDirectAttemptToOutput(t *testing.T) {
+	recorder := NewExecutedToolCallRecorder()
+	invocation := &tool.Invocation{
+		CallID:   "call-1",
+		ToolName: tool.NamespacedName("mcp", "echo"),
+		Payload:  tool.Payload{Kind: tool.PayloadFunction, Arguments: `{"value":1}`},
+	}
+	recorder.RecordToolCall(invocation, "")
+	call, permit := recorder.PrepareDirectCall(invocation, "")
+	if call == nil || permit == nil {
+		t.Fatal("PrepareDirectCall() returned no record")
+	}
+	output := &ToolResponseItem{Type: "function_call_output", CallID: "call-1", Output: NewFunctionCallOutputPayload("ok", nil)}
+	recorder.AttachDirectCallToOutput(output, call, permit)
+	permit.Release()
+
+	if calls := output.ExecutedToolCalls(); len(calls) != 1 {
+		t.Fatalf("output metadata = %#v", calls)
+	}
+	object := marshalExecutedToolCallItem(t, model.BoundExecutedToolCallsForPrompt([]any{output})[0])
+	metadata := object["internal_chat_message_metadata_passthrough"].(map[string]any)
+	if metadata["tool_calls_complete"] != true {
+		t.Fatalf("direct output completeness = %#v", metadata)
+	}
+	calls := executedToolCallsFromObject(t, object)
+	if calls[0]["name"] != "mcp__echo" || calls[0]["arguments"].(map[string]any)["value"] != float64(1) {
+		t.Fatalf("serialized metadata = %#v", calls)
+	}
+	// The prompt path skips items that already carry a direct record, so the
+	// metadata is neither lost nor duplicated (Rust #45185).
+	attached, token := recorder.AttachPendingToPrompt([]any{output})
+	if token != nil {
+		t.Fatalf("prompt attachment token = %#v, want nil", token)
+	}
+	if calls := attached[0].(*ToolResponseItem).ExecutedToolCalls(); len(calls) != 1 || calls[0].Name != "mcp__echo" {
+		t.Fatalf("direct metadata changed by the prompt path: %#v", calls)
+	}
+}
+
+func TestExecutedToolCallRecorderRecordsResultSourcesForCodeModeOnly(t *testing.T) {
+	recorder := NewExecutedToolCallRecorder()
+	direct := &tool.Invocation{CallID: "direct", ToolName: tool.PlainName("echo"), Payload: tool.Payload{Kind: tool.PayloadFunction, Arguments: `{}`}}
+	recorder.RecordToolCall(direct, "")
+	// Direct records carry their result metadata from the invocation, so the
+	// recorder only accepts nested Code Mode captures (Rust #45185).
+	if recorder.RecordToolResultSources(direct, model.NewToolResultSources([]model.ToolResultSource{{Type: "document", ID: "R1"}})) {
+		t.Fatal("direct result source must not be recorded through the Code Mode path")
+	}
+	if call, permit := recorder.PrepareDirectCall(direct, ""); call != nil {
+		output := &ToolResponseItem{Type: "function_call_output", CallID: "direct", Output: NewFunctionCallOutputPayload("", boolPtr(true))}
+		recorder.AttachDirectCallToOutput(output, call, permit)
+		permit.Release()
+		data, err := json.Marshal(output)
+		if err != nil {
+			t.Fatalf("Marshal() error = %v", err)
+		}
+		if strings.Contains(string(data), "tool_result_sources") {
+			t.Fatalf("direct output carried Code Mode sources: %s", data)
+		}
+	}
+
+	codeMode := &tool.Invocation{
+		CallID:   "nested",
+		Source:   "code_mode",
+		ToolName: tool.PlainName("nested-tool"),
+		Payload:  tool.Payload{Kind: tool.PayloadFunction, Arguments: `{}`},
+		Context:  map[string]any{tool.CodeModeCellIDContextKey: "cell-1"},
+	}
+	recorder.RecordToolCall(codeMode, model.ToolModeCodeMode)
+	if !recorder.RecordToolResultSources(codeMode, model.NewToolResultSources([]model.ToolResultSource{{Type: "room", ID: "R2"}})) {
+		t.Fatal("code mode result source was not recorded")
+	}
+	recorder.RegisterCell("cell-1", "outer")
+	items, attachment := recorder.AttachPendingToPrompt([]any{&ToolResponseItem{Type: "function_call_output", CallID: "outer", Output: NewFunctionCallOutputPayload("", boolPtr(true))}})
+	if attachment == nil || len(items) != 1 {
+		t.Fatalf("code mode AttachPendingToPrompt() = %#v, %#v", items, attachment)
+	}
+	data, err := json.Marshal(items[0])
+	if err != nil {
+		t.Fatalf("code mode Marshal() error = %v", err)
+	}
+	if !strings.Contains(string(data), `"tool_result_sources":[{"type":"room","id":"R2"}]`) {
+		t.Fatalf("code mode attached JSON = %s", data)
+	}
+}
+
+func TestExecutedToolCallRecorderRecordsResultMetadataForCodeModeOnly(t *testing.T) {
+	recorder := NewExecutedToolCallRecorder()
+	direct := &tool.Invocation{CallID: "direct-meta", ToolName: tool.PlainName("echo"), Payload: tool.Payload{Kind: tool.PayloadFunction, Arguments: `{}`}}
+	recorder.RecordToolCall(direct, "")
+	// Direct records get their result metadata from the invocation, so only
+	// nested Code Mode captures are accepted here (Rust #45185).
+	if recorder.RecordToolResultMetadata(direct, map[string]any{"provider/custom": map[string]any{"items": []any{1}}}) {
+		t.Fatal("direct result metadata must not be recorded through the Code Mode path")
+	}
+	if recorder.RecordToolResultMetadata(&tool.Invocation{CallID: "missing"}, map[string]any{"k": "v"}) {
+		t.Fatal("metadata for an unknown call must be ignored")
+	}
+
+	codeMode := &tool.Invocation{
+		CallID:   "nested-meta",
+		Source:   "code_mode",
+		ToolName: tool.PlainName("nested-tool"),
+		Payload:  tool.Payload{Kind: tool.PayloadFunction, Arguments: `{}`},
+		Context:  map[string]any{tool.CodeModeCellIDContextKey: "cell-meta"},
+	}
+	recorder.RecordToolCall(codeMode, model.ToolModeCodeMode)
+	if !recorder.RecordToolResultMetadata(codeMode, map[string]any{"room": "R2"}) {
+		t.Fatal("code mode result metadata was not recorded")
+	}
+	recorder.RegisterCell("cell-meta", "outer-meta")
+	items, attachment := recorder.AttachPendingToPrompt([]any{&ToolResponseItem{Type: "function_call_output", CallID: "outer-meta", Output: NewFunctionCallOutputPayload("", boolPtr(true))}})
+	if attachment == nil || len(items) != 1 {
+		t.Fatalf("code mode AttachPendingToPrompt() = %#v, %#v", items, attachment)
+	}
+	data, err := json.Marshal(items[0])
+	if err != nil {
+		t.Fatalf("code mode Marshal() error = %v", err)
+	}
+	if !strings.Contains(string(data), `"tool_result_metadata":{"room":"R2"}`) {
+		t.Fatalf("code mode attached JSON = %s", data)
+	}
+}
+
+func TestExecutedToolCallRecorderCodeModeAttachmentSurvivesRetryUntilCommit(t *testing.T) {
+	recorder := NewExecutedToolCallRecorder()
+	recorder.RecordToolCall(codeModeNestedInvocation("nested-retry", "cell-retry", "first"), model.ToolModeCodeMode)
+	recorder.RegisterCell("cell-retry", "call-retry")
+	output := map[string]any{
+		"type":    "custom_tool_call_output",
+		"call_id": "call-retry",
+		"output":  "ok",
+		"internal_chat_message_metadata_passthrough": map[string]any{
+			"turn_id":             "turn-1",
+			"executed_tool_calls": []any{map[string]any{"name": "forged"}},
+		},
+	}
+
+	first, firstToken := recorder.AttachPendingToPrompt([]any{output})
+	if firstToken == nil {
+		t.Fatal("first attachment token is nil")
+	}
+	second, secondToken := recorder.AttachPendingToPrompt([]any{output})
+	if secondToken == nil {
+		t.Fatal("retry attachment token is nil")
+	}
+	for _, attached := range [][]any{first, second} {
+		object := marshalExecutedToolCallItem(t, model.BoundExecutedToolCallsForPrompt(attached)[0])
+		metadata := object["internal_chat_message_metadata_passthrough"].(map[string]any)
+		if metadata["turn_id"] != "turn-1" {
+			t.Fatalf("turn metadata = %#v", metadata)
+		}
+		calls := executedToolCallsFromObject(t, object)
+		if len(calls) != 1 || calls[0]["name"] != "mcp__echo" {
+			t.Fatalf("retry metadata = %#v", calls)
+		}
+	}
+	recorder.CommitAttachment(secondToken)
+}
+
+func TestExecutedToolCallRecorderCoalescesCodeModeCellAcrossExecAndWait(t *testing.T) {
+	recorder := NewExecutedToolCallRecorder()
+	recorder.RecordToolCall(&tool.Invocation{
+		CallID: "exec-call", ToolName: tool.PlainName(tool.CodeModeExecToolName),
+		Payload: tool.Payload{Kind: tool.PayloadCustom, Input: `text("running")`},
+	}, model.ToolModeCodeMode)
+	recorder.RecordToolCall(codeModeNestedInvocation("nested-1", "cell-1", "first"), model.ToolModeCodeMode)
+	recorder.RegisterCell("cell-1", "exec-call")
+
+	execOutput := &ToolResponseItem{Type: "custom_tool_call_output", CallID: "exec-call", Output: NewFunctionCallOutputPayload("running", nil)}
+	first, firstToken := recorder.AttachPendingToPrompt([]any{execOutput})
+	firstCalls := executedToolCallsFromObject(t, marshalExecutedToolCallItem(t, model.BoundExecutedToolCallsForPrompt(first)[0]))
+	if len(firstCalls) != 1 || firstCalls[0]["name"] != "mcp__echo" {
+		t.Fatalf("exec output calls = %#v", firstCalls)
+	}
+	recorder.CommitAttachment(firstToken)
+
+	recorder.RecordToolCall(codeModeNestedInvocation("nested-2", "cell-1", "second"), model.ToolModeCodeMode)
+	recorder.RegisterCell("cell-1", "wait-call")
+	waitOutput := &ToolResponseItem{Type: "function_call_output", CallID: "wait-call", Output: NewFunctionCallOutputPayload("done", nil)}
+	second, secondToken := recorder.AttachPendingToPrompt([]any{execOutput, waitOutput})
+	secondCalls := executedToolCallsFromObject(t, marshalExecutedToolCallItem(t, model.BoundExecutedToolCallsForPrompt(second)[1]))
+	if len(secondCalls) != 1 || secondCalls[0]["arguments"].(map[string]any)["message"] != "second" {
+		t.Fatalf("wait output calls = %#v", secondCalls)
+	}
+	recorder.CommitAttachment(secondToken)
+}
+
+func TestExecutedToolCallRecorderBoundsPendingCallsAndPreservesNestedArguments(t *testing.T) {
+	recorder := NewExecutedToolCallRecorder()
+	prepared := 0
+	var permits []*ExecutedToolCallPermit
+	for index := 0; index < 300; index++ {
+		callID := "direct-" + strings.Repeat("x", index%3) + string(rune(index+1))
+		invocation := &tool.Invocation{CallID: callID, ToolName: tool.PlainName("echo"), Payload: tool.Payload{Kind: tool.PayloadFunction, Arguments: `{}`}}
+		recorder.RecordToolCall(invocation, "")
+		call, permit := recorder.PrepareDirectCall(invocation, "")
+		if call == nil {
+			continue
+		}
+		prepared++
+		permits = append(permits, permit)
+	}
+	// The pending reservation bounds prepared direct calls (Rust #45185).
+	if prepared != maxPendingExecutedToolCalls {
+		t.Fatalf("prepared direct calls = %d, want %d", prepared, maxPendingExecutedToolCalls)
+	}
+	for _, permit := range permits {
+		permit.Release()
+	}
+	if got := recorder.pendingDirectCalls; got != 0 {
+		t.Fatalf("pending direct calls after release = %d", got)
+	}
+
+	for index := 0; index < 6; index++ {
+		recorder.RecordToolCall(&tool.Invocation{
+			CallID:   "nested-large-" + strconv.Itoa(index),
+			ToolName: tool.PlainName("large"),
+			Payload:  tool.Payload{Kind: tool.PayloadFunction, Arguments: `{"value":"` + strings.Repeat("x", 7900) + `"}`},
+			Source:   "code_mode",
+			Context:  map[string]any{tool.CodeModeCellIDContextKey: "large-cell"},
+		}, model.ToolModeCodeMode)
+	}
+	recorder.RegisterCell("large-cell", "large-output")
+	attached, _ := recorder.AttachPendingToPrompt([]any{&ToolResponseItem{Type: "function_call_output", CallID: "large-output", Output: NewFunctionCallOutputPayload("ok", nil)}})
+	calls := attached[0].(*ToolResponseItem).ExecutedToolCalls()
+	if len(calls) != 6 {
+		t.Fatalf("nested calls = %d", len(calls))
+	}
+	for index, call := range calls {
+		if call.Truncated() || !call.HasCompleteInventory() {
+			t.Fatalf("call %d lost its argument inventory: %#v", index, call)
+		}
+		encoded, err := json.Marshal(call)
+		if err != nil {
+			t.Fatalf("Marshal(call %d) error = %v", index, err)
+		}
+		if strings.Contains(string(encoded), "_codex_executed_tool_call_truncated") {
+			t.Fatalf("call %d was truncated: %s", index, encoded)
+		}
+	}
+}
+
+func codeModeNestedInvocation(callID string, cellID string, message string) *tool.Invocation {
+	return &tool.Invocation{
+		CallID:   callID,
+		ToolName: tool.NamespacedName("mcp", "echo"),
+		Payload:  tool.Payload{Kind: tool.PayloadFunction, Arguments: `{"message":"` + message + `"}`},
+		Source:   "code_mode",
+		Context:  map[string]any{tool.CodeModeCellIDContextKey: cellID},
+	}
+}
+
+func marshalExecutedToolCallItem(t *testing.T, item any) map[string]any {
+	t.Helper()
+	encoded, err := json.Marshal(item)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	var object map[string]any
+	if err := json.Unmarshal(encoded, &object); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	return object
+}
+
+func executedToolCallsFromObject(t *testing.T, object map[string]any) []map[string]any {
+	t.Helper()
+	metadata, ok := object["internal_chat_message_metadata_passthrough"].(map[string]any)
+	if !ok {
+		t.Fatalf("metadata = %#v", object["internal_chat_message_metadata_passthrough"])
+	}
+	rawCalls, ok := metadata["executed_tool_calls"].([]any)
+	if !ok {
+		t.Fatalf("executed calls = %#v", metadata["executed_tool_calls"])
+	}
+	calls := make([]map[string]any, 0, len(rawCalls))
+	for _, raw := range rawCalls {
+		calls = append(calls, raw.(map[string]any))
+	}
+	return calls
+}
+
+func TestExecutedToolCallRecorderAttachesCellCompletenessLikeRust(t *testing.T) {
+	recorder := NewExecutedToolCallRecorder()
+	recorder.RecordToolCall(codeModeNestedInvocation("nested-1", "cell-1", "first"), model.ToolModeCodeMode)
+	recorder.RegisterCell("cell-1", "exec-call")
+	// #46081: completeness requires the closed dispatch gate.
+	recorder.FinishCell("cell-1")
+	execInput := codeModeExecInputItem("exec-call")
+	execOutput := &ToolResponseItem{Type: "custom_tool_call_output", CallID: "exec-call", Output: NewFunctionCallOutputPayload("running", nil)}
+	first, token := recorder.AttachPendingToPrompt([]any{execInput, execOutput})
+	object := marshalExecutedToolCallItem(t, model.BoundExecutedToolCallsForPrompt(first)[1])
+	metadata := object["internal_chat_message_metadata_passthrough"].(map[string]any)
+	// The metadata cell id names the originating exec call, not the runtime
+	// handle (Rust seen_ids.rs and code_mode_terminated_empty_cell_has_complete_tool_inventory).
+	if metadata["cell_id"] != "exec-call" {
+		t.Fatalf("cell_id = %#v, want exec-call", metadata["cell_id"])
+	}
+	if metadata["tool_calls_complete"] != true {
+		t.Fatalf("tool_calls_complete = %#v, want true", metadata["tool_calls_complete"])
+	}
+	recorder.CommitAttachment(token)
+}
+
+func codeModeExecInputItem(callID string) *model.AgentItem {
+	return &model.AgentItem{Type: "custom_tool_call", CallID: callID, Name: tool.CodeModeExecToolName, Arguments: `text("running")`}
+}
+
+func codeModeWaitInputItem(callID string, cellID string) *model.AgentItem {
+	return &model.AgentItem{Type: "function_call", CallID: callID, Name: "wait", Arguments: `{"cell_id":"` + cellID + `"}`}
+}
+
+// executedToolCallCompleteness attaches items (the output must be last) and
+// returns the last item's completeness marker.
+func executedToolCallCompleteness(t *testing.T, recorder *ExecutedToolCallRecorder, items ...any) any {
+	t.Helper()
+	attached, token := recorder.AttachPendingToPrompt(items)
+	// A retained binding re-emits an output's inventory without consuming the
+	// pending state, so it produces no commit token (Rust #48222).
+	object := marshalExecutedToolCallItem(t, model.BoundExecutedToolCallsForPrompt(attached)[len(items)-1])
+	recorder.CommitAttachment(token)
+	metadata, ok := object["internal_chat_message_metadata_passthrough"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	return metadata["tool_calls_complete"]
+}
+
+// Mirrors Rust #46081: a Code Mode cell that finishes without invoking any
+// tools attaches an explicit empty inventory marked complete, so a verified
+// empty inventory is distinguishable from an unverified one.
+func TestExecutedToolCallRecorderAttachesEmptyCompleteInventoryLikeRust(t *testing.T) {
+	recorder := NewExecutedToolCallRecorder()
+	recorder.RegisterCell("cell-empty", "exec-call")
+	recorder.FinishCell("cell-empty")
+	execInput := codeModeExecInputItem("exec-call")
+	execOutput := &ToolResponseItem{Type: "custom_tool_call_output", CallID: "exec-call", Output: NewFunctionCallOutputPayload(`text("ok")`, nil)}
+	attached, token := recorder.AttachPendingToPrompt([]any{execInput, execOutput})
+	if token == nil {
+		t.Fatal("empty finished cell must produce an attachment")
+	}
+	object := marshalExecutedToolCallItem(t, model.BoundExecutedToolCallsForPrompt(attached)[1])
+	metadata := object["internal_chat_message_metadata_passthrough"].(map[string]any)
+	if metadata["cell_id"] != "exec-call" {
+		t.Fatalf("cell_id = %#v, want exec-call", metadata["cell_id"])
+	}
+	if metadata["tool_calls_complete"] != true {
+		t.Fatalf("tool_calls_complete = %#v, want true", metadata["tool_calls_complete"])
+	}
+	if calls := executedToolCallsFromObject(t, object); len(calls) != 0 {
+		t.Fatalf("executed calls = %#v, want an explicit empty list", calls)
+	}
+	recorder.CommitAttachment(token)
+}
+
+// Mirrors Rust #46081's "unfinished" scenario: a still-running cell attaches its
+// partial inventory without the completeness marker, and an empty running cell
+// attaches nothing at all.
+func TestExecutedToolCallRecorderOmitsCompletenessWhileCellRunsLikeRust(t *testing.T) {
+	recorder := NewExecutedToolCallRecorder()
+	recorder.RecordToolCall(codeModeNestedInvocation("nested-1", "cell-running", "first"), model.ToolModeCodeMode)
+	recorder.RegisterCell("cell-running", "exec-call")
+	execInput := codeModeExecInputItem("exec-call")
+	execOutput := &ToolResponseItem{Type: "custom_tool_call_output", CallID: "exec-call", Output: NewFunctionCallOutputPayload("running", nil)}
+	attached, token := recorder.AttachPendingToPrompt([]any{execInput, execOutput})
+	if token == nil {
+		t.Fatal("a running cell with recorded calls must still attach its inventory")
+	}
+	object := marshalExecutedToolCallItem(t, model.BoundExecutedToolCallsForPrompt(attached)[1])
+	metadata := object["internal_chat_message_metadata_passthrough"].(map[string]any)
+	if metadata["tool_calls_complete"] != false {
+		t.Fatalf("running cell completeness = %#v, want false", metadata["tool_calls_complete"])
+	}
+	if calls := executedToolCallsFromObject(t, object); len(calls) != 1 {
+		t.Fatalf("running cell calls = %#v, want the recorded attempt", calls)
+	}
+	recorder.CommitAttachment(token)
+
+	// A running cell with no recorded calls has nothing to report yet.
+	empty := NewExecutedToolCallRecorder()
+	empty.RegisterCell("cell-yielded", "yield-call")
+	yieldInput := codeModeExecInputItem("yield-call")
+	yieldOutput := &ToolResponseItem{Type: "custom_tool_call_output", CallID: "yield-call", Output: NewFunctionCallOutputPayload("running", nil)}
+	if attached, token := empty.AttachPendingToPrompt([]any{yieldInput, yieldOutput}); token != nil {
+		t.Fatalf("running empty cell attached metadata: %#v", attached)
+	}
+}
+
+func TestExecutedToolCallRecorderWithholdsCompletenessForReusedOrigin(t *testing.T) {
+	recorder := NewExecutedToolCallRecorder()
+	recorder.RecordToolCall(&tool.Invocation{
+		CallID: "exec-call", ToolName: tool.PlainName(tool.CodeModeExecToolName),
+		Payload: tool.Payload{Kind: tool.PayloadCustom, Input: `text("running")`},
+	}, model.ToolModeCodeMode)
+	recorder.RecordToolCall(codeModeNestedInvocation("nested-1", "cell-1", "first"), model.ToolModeCodeMode)
+	recorder.RegisterCell("cell-1", "exec-call")
+	recorder.FinishCell("cell-1")
+	reused := &ToolResponseItem{Type: "custom_tool_call_output", CallID: "exec-call", Output: NewFunctionCallOutputPayload("running", nil)}
+	execInput := codeModeExecInputItem("exec-call")
+	if got := executedToolCallCompleteness(t, recorder, execInput, reused); got != true {
+		t.Fatalf("first completeness = %#v, want true", got)
+	}
+
+	// The same origin call ID cannot introduce a second cell; its completeness
+	// is revoked rather than presented as fresh evidence (Rust #44472).
+	recorder.RecordToolCall(codeModeNestedInvocation("nested-2", "cell-1", "second"), model.ToolModeCodeMode)
+	recorder.RegisterCell("cell-1", "exec-call")
+	if got := executedToolCallCompleteness(t, recorder, execInput, reused); got != false {
+		t.Fatalf("reused-origin completeness = %#v, want false", got)
+	}
+}
+
+func TestExecutedToolCallRecorderWithholdsCompletenessForDuplicateOutput(t *testing.T) {
+	recorder := NewExecutedToolCallRecorder()
+	recorder.RecordToolCall(codeModeNestedInvocation("nested-1", "cell-1", "first"), model.ToolModeCodeMode)
+	recorder.RegisterCell("cell-1", "out-1")
+	output := &ToolResponseItem{Type: "custom_tool_call_output", CallID: "out-1", Output: NewFunctionCallOutputPayload("done", nil)}
+	attached, token := recorder.AttachPendingToPrompt([]any{codeModeExecInputItem("out-1"), output, output})
+	if token == nil {
+		t.Fatal("attachment token is nil")
+	}
+	attachedAny := false
+	for index, item := range model.BoundExecutedToolCallsForPrompt(attached) {
+		object := marshalExecutedToolCallItem(t, item)
+		metadata, ok := object["internal_chat_message_metadata_passthrough"].(map[string]any)
+		if !ok {
+			continue
+		}
+		attachedAny = true
+		if metadata["tool_calls_complete"] != false {
+			t.Fatalf("duplicate-output item %d completeness = %#v, want false", index, metadata["tool_calls_complete"])
+		}
+	}
+	if !attachedAny {
+		t.Fatal("no output carried executed tool call metadata")
+	}
+	recorder.CommitAttachment(token)
+}
+
+func TestExecutedToolCallRecorderWithholdsWaitCompletionAfterHistory(t *testing.T) {
+	recorder := NewExecutedToolCallRecorder()
+	// The first prompt supplies prior history, so inherited runtime cell handles
+	// cannot be distinguished from new ones (Rust #44472).
+	if _, token := recorder.AttachPendingToPrompt([]any{
+		map[string]any{"type": "function_call", "call_id": "history-call"},
+	}); token != nil {
+		t.Fatal("history-only attach must not produce an attachment")
+	}
+	recorder.RecordToolCall(codeModeNestedInvocation("nested-1", "cell-1", "first"), model.ToolModeCodeMode)
+	recorder.RegisterCell("cell-1", "wait-out")
+	recorder.FinishCell("cell-1")
+	waitOutput := &ToolResponseItem{Type: "function_call_output", CallID: "wait-out", Output: NewFunctionCallOutputPayload("done", nil)}
+	if got := executedToolCallCompleteness(t, recorder, codeModeWaitInputItem("wait-out", "cell-1"), waitOutput); got != false {
+		t.Fatalf("wait completeness after history = %#v, want false", got)
+	}
+}
+
+func TestExecutedToolCallRecorderAllowsFreshWaitCompletionOnNewThread(t *testing.T) {
+	recorder := NewExecutedToolCallRecorder()
+	// A new thread's first prompt carries no history, so a same-session wait can
+	// prove completion.
+	if _, token := recorder.AttachPendingToPrompt([]any{
+		map[string]any{"type": "message", "role": "user", "content": "hi"},
+	}); token != nil {
+		t.Fatal("history-free attach must not produce an attachment")
+	}
+	recorder.RecordToolCall(codeModeNestedInvocation("nested-1", "cell-1", "first"), model.ToolModeCodeMode)
+	recorder.RegisterCell("cell-1", "wait-out")
+	recorder.FinishCell("cell-1")
+	waitOutput := &ToolResponseItem{Type: "function_call_output", CallID: "wait-out", Output: NewFunctionCallOutputPayload("done", nil)}
+	if got := executedToolCallCompleteness(t, recorder, codeModeWaitInputItem("wait-out", "cell-1"), waitOutput); got != true {
+		t.Fatalf("fresh wait completeness = %#v, want true", got)
+	}
+}
+
+func TestExecutedToolCallRecorderWithholdsCompletenessForHistoricalOutputID(t *testing.T) {
+	recorder := NewExecutedToolCallRecorder()
+	if _, token := recorder.AttachPendingToPrompt([]any{
+		map[string]any{"type": "function_call_output", "call_id": "out-1"},
+	}); token != nil {
+		t.Fatal("history-only attach must not produce an attachment")
+	}
+	recorder.RecordToolCall(codeModeNestedInvocation("nested-1", "cell-1", "first"), model.ToolModeCodeMode)
+	recorder.RegisterCell("cell-1", "out-1")
+	output := &ToolResponseItem{Type: "custom_tool_call_output", CallID: "out-1", Output: NewFunctionCallOutputPayload("done", nil)}
+	if got := executedToolCallCompleteness(t, recorder, codeModeExecInputItem("out-1"), output); got != false {
+		t.Fatalf("historical-ID completeness = %#v, want false", got)
+	}
+}
+
+func TestExecutedToolCallRecorderWithholdsCompletenessWithoutMatchingInput(t *testing.T) {
+	recorder := NewExecutedToolCallRecorder()
+	recorder.RecordToolCall(codeModeNestedInvocation("nested-1", "cell-1", "first"), model.ToolModeCodeMode)
+	recorder.RegisterCell("cell-1", "out-1")
+	output := &ToolResponseItem{Type: "custom_tool_call_output", CallID: "out-1", Output: NewFunctionCallOutputPayload("done", nil)}
+	// No matching exec input is present, so the association is unproven.
+	if got := executedToolCallCompleteness(t, recorder, output); got != false {
+		t.Fatalf("missing-input completeness = %#v, want false", got)
+	}
+}
+
+func TestExecutedToolCallRecorderWithholdsCompletenessForMismatchedWaitCell(t *testing.T) {
+	recorder := NewExecutedToolCallRecorder()
+	recorder.RecordToolCall(codeModeNestedInvocation("nested-1", "cell-1", "first"), model.ToolModeCodeMode)
+	recorder.RegisterCell("cell-1", "wait-out")
+	waitOutput := &ToolResponseItem{Type: "function_call_output", CallID: "wait-out", Output: NewFunctionCallOutputPayload("done", nil)}
+	// The wait input references a different cell, so the association is ambiguous.
+	if got := executedToolCallCompleteness(t, recorder, codeModeWaitInputItem("wait-out", "other-cell"), waitOutput); got != false {
+		t.Fatalf("mismatched-wait completeness = %#v, want false", got)
+	}
+}
+
+func TestExecutedToolCallRecorderWithholdsCompletenessForNonExecCustomInput(t *testing.T) {
+	recorder := NewExecutedToolCallRecorder()
+	recorder.RecordToolCall(codeModeNestedInvocation("nested-1", "cell-1", "first"), model.ToolModeCodeMode)
+	recorder.RegisterCell("cell-1", "out-1")
+	output := &ToolResponseItem{Type: "custom_tool_call_output", CallID: "out-1", Output: NewFunctionCallOutputPayload("done", nil)}
+	// A custom input that is not the Code Mode exec tool cannot own the cell.
+	input := &model.AgentItem{Type: "custom_tool_call", CallID: "out-1", Name: "other", Arguments: `{}`}
+	if got := executedToolCallCompleteness(t, recorder, input, output); got != false {
+		t.Fatalf("non-exec custom input completeness = %#v, want false", got)
+	}
+}
+
+func TestCodeModeInputMatchesOutput(t *testing.T) {
+	execOutput := &ToolResponseItem{Type: "custom_tool_call_output", CallID: "exec-1", Output: NewFunctionCallOutputPayload("running", nil)}
+	waitOutput := &ToolResponseItem{Type: "function_call_output", CallID: "wait-1", Output: NewFunctionCallOutputPayload("done", nil)}
+	execInput := map[string]any{"type": "custom_tool_call", "call_id": "exec-1", "name": tool.CodeModeExecToolName}
+	waitInput := map[string]any{"type": "function_call", "call_id": "wait-1", "name": "wait", "arguments": `{"cell_id":"cell-1"}`}
+	cases := []struct {
+		name        string
+		input       any
+		output      any
+		callID      string
+		runtimeCell string
+		want        bool
+	}{
+		{"exec match", execInput, execOutput, "exec-1", "cell-1", true},
+		{"exec output call id mismatch", execInput, execOutput, "exec-2", "cell-1", false},
+		{"exec input wrong tool", map[string]any{"type": "custom_tool_call", "call_id": "exec-1", "name": "other"}, execOutput, "exec-1", "cell-1", false},
+		{"wait match", waitInput, waitOutput, "wait-1", "cell-1", true},
+		{"wait cell mismatch", waitInput, waitOutput, "wait-1", "cell-2", false},
+		{"wait input wrong name", map[string]any{"type": "function_call", "call_id": "wait-1", "name": "exec", "arguments": `{"cell_id":"cell-1"}`}, waitOutput, "wait-1", "cell-1", false},
+		{"output shape mismatch", waitInput, execOutput, "wait-1", "cell-1", false},
+		{"unsupported input", map[string]any{"type": "message", "role": "user"}, execOutput, "exec-1", "cell-1", false},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := codeModeInputMatchesOutput(testCase.input, testCase.output, testCase.callID, testCase.runtimeCell); got != testCase.want {
+				t.Fatalf("codeModeInputMatchesOutput() = %v, want %v", got, testCase.want)
+			}
+		})
+	}
+}

@@ -1,0 +1,427 @@
+package tool
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	"codex_core/execpolicy"
+	"codex_core/execserver"
+	"codex_core/sandbox"
+	"codex_core/sandbox/windowssandbox"
+)
+
+func TestLocalShellRunnerRequiresRequest(t *testing.T) {
+	_, err := NewLocalShellRunner().Run(context.Background(), nil)
+	if err == nil {
+		t.Fatal("Run returned nil error, want failure")
+	}
+}
+
+// TestShellRequestEnvAppliesPolicyLikeRust verifies that a shell request's
+// environment is built from the parent environment through the selected
+// environment's shell environment policy (inherit=core drops non-core vars,
+// set adds explicit overrides, explicit req.Env overrides stay authoritative),
+// mirroring Rust create_env (#38902).
+func TestShellRequestEnvAppliesPolicyLikeRust(t *testing.T) {
+	t.Setenv("CODEX_NONCORE_MARKER", "drop-me")
+	policy := execpolicy.EnvPolicyFromShellEnvironmentPolicy(map[string]any{
+		"inherit": "core",
+		"set":     map[string]any{"CODEX_KEPT": "yes"},
+	}, "")
+	env := shellRequestEnv(&ShellRequest{
+		EnvPolicy: policy,
+		ThreadID:  "thread-1",
+		Env:       map[string]string{"CODEX_SESSION_ID": "session-1"},
+	})
+	if env["CODEX_NONCORE_MARKER"] != "" {
+		t.Fatalf("non-core parent var leaked under inherit=core: %#v", env)
+	}
+	if env["CODEX_KEPT"] != "yes" {
+		t.Fatalf("set var missing: %#v", env)
+	}
+	if env["CODEX_SESSION_ID"] != "session-1" {
+		t.Fatalf("explicit env override missing: %#v", env)
+	}
+	if env[execpolicy.ThreadIDEnvVar] != "thread-1" {
+		t.Fatalf("thread id env = %q", env[execpolicy.ThreadIDEnvVar])
+	}
+}
+
+// TestShellRequestEnvDefaultExcludesAndIncludeOnlyLikeRust pins the
+// ignore_default_excludes and include_only application order: default excludes
+// (KEY/SECRET/TOKEN) drop secrets before include_only keeps only the listed
+// variables.
+func TestShellRequestEnvDefaultExcludesAndIncludeOnlyLikeRust(t *testing.T) {
+	t.Setenv("SECRET_API_TOKEN", "leak")
+	t.Setenv("PATH", "/bin")
+	policy := execpolicy.EnvPolicyFromShellEnvironmentPolicy(map[string]any{
+		"ignore_default_excludes": false,
+		"include_only":            []any{"PATH"},
+	}, "")
+	env := shellRequestEnv(&ShellRequest{EnvPolicy: policy})
+	if env["SECRET_API_TOKEN"] != "" {
+		t.Fatalf("default-excluded secret leaked: %#v", env)
+	}
+	if env["PATH"] != "/bin" {
+		t.Fatalf("include_only PATH missing: %#v", env)
+	}
+}
+
+// TestShellRequestEnvWithoutPolicyKeepsParentEnv pins the no-policy fallback:
+// without an EnvPolicy the parent environment is inherited unchanged plus the
+// explicit overrides (pre-#38902 behavior).
+func TestShellRequestEnvWithoutPolicyKeepsParentEnv(t *testing.T) {
+	t.Setenv("CODEX_PARENT_VAR", "kept")
+	env := shellRequestEnv(&ShellRequest{Env: map[string]string{"CODEX_SESSION_ID": "s"}})
+	if env["CODEX_PARENT_VAR"] != "kept" || env["CODEX_SESSION_ID"] != "s" {
+		t.Fatalf("env = %#v", env)
+	}
+}
+
+// TestShellRequestEnvAppliesExecutionMetadataLikeRust pins #52119 precedence:
+// executor metadata wins over shell environment policies and command overlays;
+// metadata presence clears an omitted thread ID; an empty call ID is preserved;
+// a NUL-containing call ID is omitted; and no metadata keeps thread context
+// while removing a stale call ID.
+func TestShellRequestEnvAppliesExecutionMetadataLikeRust(t *testing.T) {
+	t.Setenv("CODEX_THREAD_ID", "inherited-thread")
+	t.Setenv("CODEX_TOOL_CALL_ID", "inherited-call")
+	policy := &execpolicy.EnvPolicy{
+		Inherit: "all",
+		Set: map[string]string{
+			"CODEX_THREAD_ID":    "policy-thread",
+			"CODEX_TOOL_CALL_ID": "policy-call",
+		},
+	}
+	empty := ""
+	for _, testCase := range []struct {
+		name          string
+		threadID      string
+		toolCallID    *string
+		wantThread    string
+		wantThreadSet bool
+		wantCallID    string
+		wantCallSet   bool
+	}{
+		{
+			name:          "metadata wins",
+			threadID:      "current-thread",
+			toolCallID:    stringPointerForToolTest("current-call"),
+			wantThread:    "current-thread",
+			wantThreadSet: true,
+			wantCallID:    "current-call",
+			wantCallSet:   true,
+		},
+		{
+			name:        "missing thread clears stale context",
+			toolCallID:  stringPointerForToolTest("call-only"),
+			wantCallID:  "call-only",
+			wantCallSet: true,
+		},
+		{
+			name:          "empty call ID is preserved",
+			threadID:      "current-thread",
+			toolCallID:    &empty,
+			wantThread:    "current-thread",
+			wantThreadSet: true,
+			wantCallSet:   true,
+		},
+		{
+			name:          "NUL call ID is omitted",
+			threadID:      "current-thread",
+			toolCallID:    stringPointerForToolTest("bad\x00call"),
+			wantThread:    "current-thread",
+			wantThreadSet: true,
+		},
+		{
+			name:          "no metadata preserves thread and removes call",
+			wantThread:    "overlay-thread",
+			wantThreadSet: true,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			env := shellRequestEnv(&ShellRequest{
+				EnvPolicy:  policy,
+				ThreadID:   testCase.threadID,
+				ToolCallID: testCase.toolCallID,
+				Env: map[string]string{
+					"CODEX_THREAD_ID":    "overlay-thread",
+					"CODEX_TOOL_CALL_ID": "overlay-call",
+				},
+			})
+			thread, threadSet := env["CODEX_THREAD_ID"]
+			if thread != testCase.wantThread || threadSet != testCase.wantThreadSet {
+				t.Fatalf("thread = %q, present=%t; want %q, present=%t; env=%#v",
+					thread, threadSet, testCase.wantThread, testCase.wantThreadSet, env)
+			}
+			callID, callSet := env["CODEX_TOOL_CALL_ID"]
+			if callID != testCase.wantCallID || callSet != testCase.wantCallSet {
+				t.Fatalf("call id = %q, present=%t; want %q, present=%t; env=%#v",
+					callID, callSet, testCase.wantCallID, testCase.wantCallSet, env)
+			}
+		})
+	}
+}
+
+func stringPointerForToolTest(value string) *string {
+	return &value
+}
+
+func TestLocalShellRunnerRunsCommand(t *testing.T) {
+	shell := &Shell{Type: ShellBash, Path: "/bin/sh"}
+	if runtime.GOOS == "windows" {
+		shell = &Shell{Type: ShellCmd, Path: "cmd"}
+	}
+	resolved, err := ResolveCommand(&ExecCommandArgs{Cmd: "echo codex"}, shell, false)
+	if err != nil {
+		t.Fatalf("ResolveCommand returned error: %v", err)
+	}
+	result, err := NewLocalShellRunner().Run(context.Background(), &ShellRequest{
+		Command: resolved.Command,
+		CWD:     t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, stderr = %q", result.ExitCode, result.Stderr)
+	}
+	if !strings.Contains(result.Stdout, "codex") {
+		t.Fatalf("Stdout = %q", result.Stdout)
+	}
+}
+
+func TestLocalShellRunnerAppliesCWDAndEnv(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cwd, "marker.txt"), []byte("ok"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	shell := &Shell{Type: ShellBash, Path: "/bin/sh"}
+	cmd := `[ "$CODEX_RUNNER_ENV" = "runner" ] && [ -f marker.txt ] && printf ok`
+	if runtime.GOOS == "windows" {
+		shell = &Shell{Type: ShellCmd, Path: "cmd"}
+		cmd = `if "%CODEX_RUNNER_ENV%"=="runner" if exist marker.txt echo ok`
+	}
+	resolved, err := ResolveCommand(&ExecCommandArgs{Cmd: cmd}, shell, false)
+	if err != nil {
+		t.Fatalf("ResolveCommand returned error: %v", err)
+	}
+
+	result, err := NewLocalShellRunner().Run(context.Background(), &ShellRequest{
+		Command: resolved.Command,
+		CWD:     cwd,
+		Env:     map[string]string{"CODEX_RUNNER_ENV": "runner"},
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, stderr = %q", result.ExitCode, result.Stderr)
+	}
+	if !strings.Contains(result.Stdout, "ok") {
+		t.Fatalf("Stdout = %q", result.Stdout)
+	}
+}
+
+func TestLocalShellRunnerMarksTimeout(t *testing.T) {
+	shell := &Shell{Type: ShellBash, Path: "/bin/sh"}
+	cmd := "sleep 2"
+	if runtime.GOOS == "windows" {
+		shell = &Shell{Type: ShellCmd, Path: "cmd"}
+		cmd = "ping -n 3 127.0.0.1 >NUL"
+	}
+	resolved, err := ResolveCommand(&ExecCommandArgs{Cmd: cmd}, shell, false)
+	if err != nil {
+		t.Fatalf("ResolveCommand returned error: %v", err)
+	}
+
+	result, err := NewLocalShellRunner().Run(context.Background(), &ShellRequest{
+		Command:   resolved.Command,
+		CWD:       t.TempDir(),
+		TimeoutMS: 50,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if !result.TimedOut {
+		t.Fatalf("TimedOut = false, result = %#v", result)
+	}
+}
+
+func TestLocalShellRunnerReturnsExitCodeForFailure(t *testing.T) {
+	shell := &Shell{Type: ShellBash, Path: "/bin/sh"}
+	cmd := "exit 7"
+	if runtime.GOOS == "windows" {
+		shell = &Shell{Type: ShellCmd, Path: "cmd"}
+		cmd = "exit /B 7"
+	}
+	resolved, err := ResolveCommand(&ExecCommandArgs{Cmd: cmd}, shell, false)
+	if err != nil {
+		t.Fatalf("ResolveCommand returned error: %v", err)
+	}
+	result, err := NewLocalShellRunner().Run(context.Background(), &ShellRequest{
+		Command: resolved.Command,
+		CWD:     t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if result.ExitCode != 7 {
+		t.Fatalf("ExitCode = %d", result.ExitCode)
+	}
+}
+
+func TestLocalShellRunnerUsesWindowsSandboxForSandboxedProfile(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows sandbox capture is Windows-only")
+	}
+	cwd := t.TempDir()
+	codexHome := t.TempDir()
+	oldCapture := runWindowsShellSandboxCapture
+	oldCodexHome := defaultShellRunnerCodexHome
+	called := false
+	runWindowsShellSandboxCapture = func(capture *windowssandbox.CaptureRequest, elevated bool) (*windowssandbox.CaptureResult, error) {
+		called = true
+		if capture == nil {
+			t.Fatalf("capture request is nil")
+		}
+		if elevated {
+			t.Fatal("unelevated Windows sandbox request selected elevated backend")
+		}
+		if capture.PermissionProfile == nil || capture.PermissionProfile.Disabled {
+			t.Fatalf("PermissionProfile = %#v, want sandboxed profile", capture.PermissionProfile)
+		}
+		if capture.PermissionProfileID != ":workspace" {
+			t.Fatalf("PermissionProfileID = %q", capture.PermissionProfileID)
+		}
+		if len(capture.Command) != 3 || capture.Command[0] != "cmd" || capture.Command[2] != "echo sandboxed" {
+			t.Fatalf("Command = %#v", capture.Command)
+		}
+		if capture.CWD != filepath.Clean(cwd) {
+			t.Fatalf("CWD = %q, want %q", capture.CWD, filepath.Clean(cwd))
+		}
+		if len(capture.WorkspaceRoots) != 1 || capture.WorkspaceRoots[0] != filepath.Clean(cwd) {
+			t.Fatalf("WorkspaceRoots = %#v", capture.WorkspaceRoots)
+		}
+		if capture.CodexHome != filepath.Clean(codexHome) {
+			t.Fatalf("CodexHome = %q, want %q", capture.CodexHome, filepath.Clean(codexHome))
+		}
+		if capture.Env["CODEX_PERMISSION_PROFILE"] != ":workspace" || capture.Env["CODEX_RUNNER_ENV"] != "runner" {
+			t.Fatalf("Env = %#v", capture.Env)
+		}
+		if !capture.UsePrivateDesktop || !capture.DisallowSetupElevation {
+			t.Fatalf("capture privateDesktop/disallowElevation = %t/%t", capture.UsePrivateDesktop, capture.DisallowSetupElevation)
+		}
+		return &windowssandbox.CaptureResult{ExitCode: 0, Stdout: []byte("sandboxed")}, nil
+	}
+	defaultShellRunnerCodexHome = func() string { return codexHome }
+	defer func() {
+		runWindowsShellSandboxCapture = oldCapture
+		defaultShellRunnerCodexHome = oldCodexHome
+	}()
+
+	profile := sandbox.WorkspaceWritePermissionProfile()
+	result, err := NewLocalShellRunner().Run(context.Background(), &ShellRequest{
+		Command:                      []string{"cmd", "/c", "echo sandboxed"},
+		CWD:                          cwd,
+		Env:                          map[string]string{"CODEX_RUNNER_ENV": "runner"},
+		PermissionProfileID:          ":workspace",
+		PermissionProfile:            &profile,
+		WindowsSandboxLevel:          sandbox.WindowsSandboxUnelevated,
+		WindowsSandboxPrivateDesktop: true,
+		ApprovalPolicy:               sandbox.ApprovalNever,
+	})
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if !called {
+		t.Fatalf("Windows sandbox capture was not called")
+	}
+	if result.ExitCode != 0 || result.Stdout != "sandboxed" {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestWindowsShellSandboxUsesElevatedLikeRust(t *testing.T) {
+	profile := sandbox.WorkspaceWritePermissionProfile()
+	if windowsShellSandboxUsesElevated(&profile, sandbox.WindowsSandboxUnelevated) {
+		t.Fatal("ordinary unelevated profile selected elevated backend")
+	}
+	if !windowsShellSandboxUsesElevated(&profile, sandbox.WindowsSandboxElevated) {
+		t.Fatal("explicit elevated profile did not select elevated backend")
+	}
+	profile.DeniedReadEntries = []sandbox.FileSystemSandboxEntry{{}}
+	// Rust a603d7ca5c: the backend is selected solely from the configured
+	// WindowsSandboxLevel; a deny-read profile no longer forces elevated.
+	if windowsShellSandboxUsesElevated(&profile, sandbox.WindowsSandboxUnelevated) {
+		t.Fatal("deny-read profile with unelevated level selected elevated backend")
+	}
+	if !windowsShellSandboxUsesElevated(&profile, sandbox.WindowsSandboxElevated) {
+		t.Fatal("deny-read profile with elevated level did not select elevated backend")
+	}
+}
+
+func TestManagedNetworkingRejectedWithRestrictedTokenSandbox(t *testing.T) {
+	cwd := t.TempDir()
+	codexHome := t.TempDir()
+	oldCapture := runWindowsShellSandboxCapture
+	oldCodexHome := defaultShellRunnerCodexHome
+	runWindowsShellSandboxCapture = func(capture *windowssandbox.CaptureRequest, elevated bool) (*windowssandbox.CaptureResult, error) {
+		t.Fatal("managed networking with a restricted-token sandbox must be rejected before spawning")
+		return nil, nil
+	}
+	defaultShellRunnerCodexHome = func() string { return codexHome }
+	defer func() {
+		runWindowsShellSandboxCapture = oldCapture
+		defaultShellRunnerCodexHome = oldCodexHome
+	}()
+
+	profile := sandbox.WorkspaceWritePermissionProfile()
+	_, err := NewLocalShellRunner().Run(context.Background(), &ShellRequest{
+		Command:               []string{"cmd", "/c", "echo managed"},
+		CWD:                   cwd,
+		PermissionProfileID:   ":workspace",
+		PermissionProfile:     &profile,
+		WindowsSandboxLevel:   sandbox.WindowsSandboxUnelevated,
+		EnforceManagedNetwork: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "managed networking requires the elevated Windows sandbox backend") {
+		t.Fatalf("Run error = %v, want managed networking rejection", err)
+	}
+}
+
+func TestWindowsSandboxProxySettingsMode(t *testing.T) {
+	if got := windowsSandboxProxySettingsMode(execserver.WindowsSandboxProxySettingsPreserve); got != windowssandbox.ProxySettingsPreserve {
+		t.Fatalf("preserve proxy settings mode = %q", got)
+	}
+	if got := windowsSandboxProxySettingsMode(execserver.WindowsSandboxProxySettingsReconcile); got != windowssandbox.ProxySettingsReconcile {
+		t.Fatalf("reconcile proxy settings mode = %q", got)
+	}
+}
+
+// TestRunWindowsSandboxRejectsMxcLikeRust mirrors Rust #46271: selecting the
+// native MXC backend must not silently fall back to the legacy restricted-token
+// sandbox. Rust's sandbox transform fails with the native-unavailable error, so
+// Go fails the same way before any legacy sandbox work.
+func TestRunWindowsSandboxRejectsMxcLikeRust(t *testing.T) {
+	runner := NewLocalShellRunner()
+	_, err := runner.runWindowsSandbox(
+		context.Background(),
+		&ShellRequest{
+			Command:             []string{"cmd", "/c", "echo"},
+			CWD:                 t.TempDir(),
+			WindowsSandboxLevel: sandbox.WindowsSandboxMxc,
+		},
+		&sandbox.CommandRunPlan{CWD: t.TempDir(), Command: []string{"cmd", "/c", "echo"}},
+		map[string]string{},
+		time.Now(),
+	)
+	if err == nil || !strings.Contains(err.Error(), "native MXC is unavailable on this executor") {
+		t.Fatalf("runWindowsSandbox(mxc) error = %v, want the native MXC unavailability error", err)
+	}
+}

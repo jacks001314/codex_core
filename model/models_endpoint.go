@@ -1,0 +1,777 @@
+package model
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"codex_core/metrics"
+)
+
+const modelsEndpointETagHeader = "X-Models-ETag"
+const modelsEndpointClientVersion = "0.0.0"
+const modelsEndpointRefreshTimeout = 5 * time.Second
+const defaultModelsCacheTTL = 5 * time.Minute
+const modelsCacheFilename = "models_cache.json"
+
+// remoteModelsFetchUpdateDurationMetric is the remote-model fetch timer (Rust
+// #46570), tagged by the authentication mode used for the fetch.
+const remoteModelsFetchUpdateDurationMetric = "codex.remote_models.fetch_update.duration_ms"
+
+// modelsCatalogMaxBytes bounds an explicitly configured provider catalog before
+// decoding or caching it (Rust MAX_MODEL_CATALOG_BYTES).
+const modelsCatalogMaxBytes = 1024 * 1024
+
+type ModelsEndpoint interface {
+	ListModels(ctx context.Context, etag string) (*ModelsEndpointResponse, error)
+}
+
+type ModelsEndpointResponse struct {
+	Models      []ModelInfo
+	ETag        string
+	NotModified bool
+}
+
+type HTTPModelsEndpoint struct {
+	Provider   *APIProvider
+	Auth       *AuthHeaders
+	HTTPClient HTTPDoer
+	// CatalogURL, when set, is the provider's explicit Codex-native model
+	// catalog (Rust `model_catalog_url`). It replaces the derived
+	// `<base_url>/models` URL and switches on the bounded, no-redirect fetch.
+	CatalogURL string
+}
+
+func NewHTTPModelsEndpoint(provider *APIProvider, authHeaders *AuthHeaders, httpClient HTTPDoer) *HTTPModelsEndpoint {
+	return &HTTPModelsEndpoint{
+		Provider:   cloneAPIProvider(provider),
+		Auth:       cloneAuthHeaders(authHeaders),
+		HTTPClient: httpClient,
+	}
+}
+
+// SetAPIKeyModelDiscoveryEnabled records the startup API-key discovery policy
+// (Rust #44392). Static catalogs ignore this setting, and live changes require
+// a new session.
+func (m *RemoteModelsManager) SetAPIKeyModelDiscoveryEnabled(enabled bool) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.apiKeyModelDiscoveryEnabled = enabled
+	m.mu.Unlock()
+}
+
+func (m *RemoteModelsManager) apiKeyModelDiscoveryEnabledValue() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.apiKeyModelDiscoveryEnabled
+}
+
+// SupportsAPIKeyDiscovery reports whether the current provider/auth combination
+// has an authoritative catalog available with OpenAI API keys (Rust #44392).
+func (m *RemoteModelsManager) SupportsAPIKeyDiscovery() bool {
+	if m == nil {
+		return false
+	}
+	return !m.apiKeyDiscoveryDisabled && m.supportsAPIKeyModels && !m.commandAuth && m.apiKeyAuth
+}
+
+// metricsAuthMode mirrors Rust's `metric_auth_mode` for the remote-model fetch
+// timer (#46570): a provider API key or API-key login is "api_key", any other
+// credential is "chatgpt", and an unauthenticated fetch is "none".
+func (m *RemoteModelsManager) metricsAuthMode() string {
+	if m == nil {
+		return "none"
+	}
+	if m.metricsAuthModeOverride != "" {
+		return m.metricsAuthModeOverride
+	}
+	if m.apiKeyAuth {
+		return "api_key"
+	}
+	if m.hasAuth {
+		return "chatgpt"
+	}
+	return "none"
+}
+
+// remoteCatalogAuthoritative reports whether a visible remote catalog should
+// replace the bundled models. OpenAI API-key discovery catalogs are
+// authoritative just like ChatGPT account catalogs (Rust #44392).
+func (m *RemoteModelsManager) remoteCatalogAuthoritative() bool {
+	if m == nil {
+		return false
+	}
+	return m.explicitProviderCatalog || m.useRemoteCatalogAsSourceOfTruth || m.SupportsAPIKeyDiscovery()
+}
+
+func (e *HTTPModelsEndpoint) ListModels(ctx context.Context, etag string) (*ModelsEndpointResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	request, err := e.newModelsHTTPRequest(ctx, etag)
+	if err != nil {
+		return nil, err
+	}
+	catalogURL := strings.TrimSpace(e.CatalogURL)
+	client := e.HTTPClient
+	if client == nil {
+		if catalogURL != "" {
+			// Provider diagnostics may echo URL credentials, so an explicit
+			// catalog never follows redirects (Rust ClientRedirectPolicy::Reject).
+			client = &http.Client{
+				CheckRedirect: func(*http.Request, []*http.Request) error {
+					return http.ErrUseLastResponse
+				},
+			}
+		} else {
+			client = http.DefaultClient
+		}
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusNotModified {
+		return &ModelsEndpointResponse{
+			ETag:        modelsETagFromHeaders(response.Header),
+			NotModified: true,
+		}, nil
+	}
+	reader := io.Reader(response.Body)
+	if catalogURL != "" {
+		reader = io.LimitReader(response.Body, int64(modelsCatalogMaxBytes)+1)
+	}
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+	if catalogURL != "" && len(body) > modelsCatalogMaxBytes {
+		return nil, fmt.Errorf("model catalog response exceeds %d bytes", modelsCatalogMaxBytes)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		if catalogURL != "" {
+			// Suppress response diagnostics that could expose credentials
+			// (Rust #46561).
+			return nil, fmt.Errorf("models API request failed with status %d", response.StatusCode)
+		}
+		return nil, fmt.Errorf("models API request failed with status %d: %s", response.StatusCode, strings.TrimSpace(string(body)))
+	}
+	models, err := decodeModelsEndpointResponse(body)
+	if err != nil {
+		return nil, err
+	}
+	if catalogURL != "" {
+		seen := make(map[string]struct{}, len(models))
+		for _, modelInfo := range models {
+			slug := modelInfo.Slug
+			if strings.TrimSpace(slug) == "" {
+				return nil, fmt.Errorf("model catalog must contain unique, non-empty model slugs")
+			}
+			if _, duplicate := seen[slug]; duplicate {
+				return nil, fmt.Errorf("model catalog must contain unique, non-empty model slugs")
+			}
+			seen[slug] = struct{}{}
+		}
+	}
+	return &ModelsEndpointResponse{
+		Models: models,
+		ETag:   modelsETagFromHeaders(response.Header),
+	}, nil
+}
+
+func (e *HTTPModelsEndpoint) newModelsHTTPRequest(ctx context.Context, etag string) (*http.Request, error) {
+	provider := e.Provider
+	if provider == nil {
+		provider = &APIProvider{BaseURL: defaultResponsesEndpoint}
+	}
+	requestURL := ""
+	if catalogURL := strings.TrimSpace(e.CatalogURL); catalogURL != "" {
+		catalogRequestURL, err := modelsCatalogURL(provider, catalogURL)
+		if err != nil {
+			return nil, err
+		}
+		requestURL = catalogRequestURL
+	} else {
+		requestURL = modelsURL(provider)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Accept", "application/json")
+	if strings.TrimSpace(etag) != "" {
+		request.Header.Set("If-None-Match", strings.TrimSpace(etag))
+	}
+	addHeaders(request.Header, provider.Headers)
+	if e.Auth != nil {
+		if err := e.Auth.Apply(ctx, request, nil); err != nil {
+			return nil, err
+		}
+	}
+	return request, nil
+}
+
+type RemoteModelsManager struct {
+	mu                              sync.RWMutex
+	remoteModels                    []ModelInfo
+	etag                            string
+	fetched                         bool
+	endpoint                        ModelsEndpoint
+	useRemoteCatalogAsSourceOfTruth bool
+	cachePath                       string
+	cacheTTL                        time.Duration
+	cacheClientVersion              string
+	// identity scopes the disk cache to the current provider and credentials
+	// (Rust #43906); an empty identity disables cached catalog reuse.
+	identity string
+	// fetchedIdentity records the identity the in-memory catalog belongs to
+	// (Rust ModelsCacheEntry::identity), so a credential change can be detected
+	// before a turn samples with the previous identity's metadata (#46508).
+	fetchedIdentity string
+	// supportsAPIKeyModels, apiKeyAuth, and commandAuth describe whether the
+	// current provider/auth combination can discover models with an OpenAI API
+	// key (Rust #44392). apiKeyAuth reports that API-key auth is in use, either
+	// from an explicit provider key or an OpenAI API-key login (Rust
+	// `uses_api_key_auth`). Discovery stays disabled until the feature opts in.
+	supportsAPIKeyModels    bool
+	apiKeyAuth              bool
+	hasAuth                 bool
+	metricsAuthModeOverride string
+	commandAuth             bool
+	// apiKeyDiscoveryDisabled mirrors Rust #46561: a custom inference base URL
+	// without an explicit model_catalog_url must not opt into remote discovery.
+	apiKeyDiscoveryDisabled     bool
+	apiKeyModelDiscoveryEnabled bool
+	explicitProviderCatalog     bool
+	now                         func() time.Time
+}
+
+type modelsCache struct {
+	FetchedAt     time.Time `json:"fetched_at"`
+	ETag          string    `json:"etag,omitempty"`
+	ClientVersion string    `json:"client_version,omitempty"`
+	// Identity is the opaque provider/auth identity captured with the catalog
+	// (Rust #43897). Unscoped legacy entries are cache misses.
+	Identity string      `json:"identity,omitempty"`
+	Models   []ModelInfo `json:"models"`
+}
+
+type RemoteModelsManagerOptions struct {
+	ModelCatalog                    *ModelsResponse
+	Endpoint                        ModelsEndpoint
+	UseRemoteCatalogAsSourceOfTruth bool
+	// Identity is the opaque provider/auth identity used to scope cached
+	// catalogs. Empty disables cache reuse.
+	Identity string
+	// SupportsAPIKeyModels reports whether the provider serves an authoritative
+	// catalog for OpenAI API keys (Rust #44392).
+	SupportsAPIKeyModels bool
+	// APIKeyAuth reports whether the active auth is an OpenAI API key.
+	APIKeyAuth bool
+	// HasAuth reports whether any credential is available, which distinguishes
+	// the "chatgpt" and "none" remote-model fetch metric modes (Rust #46570).
+	HasAuth bool
+	// MetricsAuthMode overrides the remote-model fetch metric's `auth_mode` tag
+	// when the caller resolves the credential out of band (the TUI picker).
+	// Empty derives it from APIKeyAuth and HasAuth.
+	MetricsAuthMode string
+	// CommandAuth reports whether the provider resolves credentials through a
+	// command, which keeps the bundled API-key catalog.
+	CommandAuth bool
+	// DisableAPIKeyDiscovery blocks remote API-key catalog discovery while
+	// leaving API-key inference and bundled models available (#46561).
+	DisableAPIKeyDiscovery bool
+	// ExplicitProviderCatalog marks a provider configured with model_catalog_url.
+	// The provider catalog is authoritative: bundled models are not used as a
+	// seed or fallback, and model metadata lookup requires an exact slug match.
+	ExplicitProviderCatalog bool
+}
+
+func NewRemoteModelsManager(modelCatalog *ModelsResponse, endpoint ModelsEndpoint) *RemoteModelsManager {
+	return NewRemoteModelsManagerWithOptions(&RemoteModelsManagerOptions{
+		ModelCatalog: modelCatalog,
+		Endpoint:     endpoint,
+	})
+}
+
+func NewRemoteModelsManagerWithOptions(options *RemoteModelsManagerOptions) *RemoteModelsManager {
+	if options == nil {
+		options = &RemoteModelsManagerOptions{}
+	}
+	catalog := BundledModelsResponse()
+	if options.ModelCatalog != nil {
+		catalog = *options.ModelCatalog
+	}
+	models := cloneModelInfos(catalog.Models)
+	if options.ExplicitProviderCatalog {
+		models = nil
+	}
+	return &RemoteModelsManager{
+		remoteModels:                    models,
+		endpoint:                        options.Endpoint,
+		useRemoteCatalogAsSourceOfTruth: options.UseRemoteCatalogAsSourceOfTruth,
+		identity:                        strings.TrimSpace(options.Identity),
+		supportsAPIKeyModels:            options.SupportsAPIKeyModels,
+		apiKeyAuth:                      options.APIKeyAuth,
+		hasAuth:                         options.HasAuth,
+		metricsAuthModeOverride:         strings.TrimSpace(options.MetricsAuthMode),
+		commandAuth:                     options.CommandAuth,
+		apiKeyDiscoveryDisabled:         options.DisableAPIKeyDiscovery,
+		explicitProviderCatalog:         options.ExplicitProviderCatalog,
+		now:                             time.Now,
+	}
+}
+
+// APIKeyModelDiscoverySetter is implemented by model managers that can toggle
+// API-key model discovery (Rust #44392). Static catalogs do not implement it, so
+// callers apply the policy through SetAPIKeyModelDiscoveryEnabled.
+type APIKeyModelDiscoverySetter interface {
+	SetAPIKeyModelDiscoveryEnabled(enabled bool)
+}
+
+// SetAPIKeyModelDiscoveryEnabled applies the startup API-key discovery policy to
+// a manager when it supports it.
+func SetAPIKeyModelDiscoveryEnabled(manager ModelsManager, enabled bool) {
+	if setter, ok := manager.(APIKeyModelDiscoverySetter); ok {
+		setter.SetAPIKeyModelDiscoveryEnabled(enabled)
+	}
+}
+
+func (m *RemoteModelsManager) ConfigureCache(codexHome string) {
+	if m == nil {
+		return
+	}
+	codexHome = strings.TrimSpace(codexHome)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if codexHome == "" {
+		m.cachePath = ""
+		m.cacheTTL = 0
+		m.cacheClientVersion = ""
+		return
+	}
+	m.cachePath = filepath.Join(codexHome, modelsCacheFilename)
+	m.cacheTTL = defaultModelsCacheTTL
+	m.cacheClientVersion = modelsEndpointClientVersion
+}
+
+func (m *RemoteModelsManager) ListModels(strategy RefreshStrategy) []ModelPreset {
+	return BuildAvailableModels(m.RawModelCatalog(strategy).Models)
+}
+
+func (m *RemoteModelsManager) RawModelCatalog(strategy RefreshStrategy) ModelsResponse {
+	m.refreshAvailableModels(strategy)
+	return ModelsResponse{Models: m.GetRemoteModels()}
+}
+
+func (m *RemoteModelsManager) GetRemoteModels() []ModelInfo {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return cloneModelInfos(m.remoteModels)
+}
+
+func (m *RemoteModelsManager) GetDefaultModel(model string, allowProviderModelFallback bool, strategy RefreshStrategy) string {
+	availableModels := m.ListModels(strategy)
+	if allowProviderModelFallback {
+		if requestedModelIsAvailable(model, availableModels) {
+			return model
+		}
+		return defaultModelFromAvailable(availableModels)
+	}
+	if model != "" {
+		return model
+	}
+	return defaultModelFromAvailable(availableModels)
+}
+
+func (m *RemoteModelsManager) GetModelInfo(model string, config *ModelsManagerConfig) ModelInfo {
+	if m != nil && m.explicitProviderCatalog {
+		return ConstructModelInfoFromExactCandidate(model, m.GetRemoteModels(), config)
+	}
+	return ConstructModelInfoFromCandidates(model, m.GetRemoteModels(), config)
+}
+
+func (m *RemoteModelsManager) RefreshIfNewETag(etag string) {
+	if m == nil {
+		return
+	}
+	etag = strings.TrimSpace(etag)
+	if etag == "" {
+		return
+	}
+	m.mu.RLock()
+	current := m.etag
+	m.mu.RUnlock()
+	if current != "" && current == etag {
+		m.renewCacheTTLIfNeeded()
+		return
+	}
+	m.refreshAvailableModels(RefreshOnline)
+}
+
+// CatalogIdentity returns the provider/auth identity the in-memory catalog
+// belongs to (Rust #46508): the identity recorded when the catalog was fetched,
+// or the configured identity before any fetch.
+func (m *RemoteModelsManager) CatalogIdentity() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.fetched && m.fetchedIdentity != "" {
+		return m.fetchedIdentity
+	}
+	return m.identity
+}
+
+// RefreshAfterAuthChange mirrors Rust ModelsManager::refresh_after_auth_change
+// (#46508): a best-effort catalog refresh when the in-memory catalog belongs to
+// different credentials, so a turn after a credential change does not sample
+// with the previous identity's model metadata. The refresh runs under the same
+// five-second deadline that bounds a catalog fetch, and any failure leaves the
+// existing cache or the bundled fallback in place.
+func (m *RemoteModelsManager) RefreshAfterAuthChange() {
+	if m == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if !m.shouldRefreshModels() {
+			return
+		}
+		m.mu.RLock()
+		identity := m.identity
+		fetchedIdentity := m.fetchedIdentity
+		fetched := m.fetched
+		m.mu.RUnlock()
+		// An unscoped catalog cannot be compared to credentials, and a catalog
+		// that already belongs to the current identity needs no refresh.
+		if identity != "" && fetched && fetchedIdentity == identity {
+			return
+		}
+		m.refreshAvailableModels(RefreshOnlineIfUncached)
+	}()
+	select {
+	case <-done:
+	case <-time.After(modelsEndpointRefreshTimeout):
+	}
+}
+
+// shouldRefreshModels mirrors Rust's gate: a Codex-backend catalog, command
+// auth, or API-key discovery all keep a catalog whose owning credentials can
+// change. Go reports the Codex-backend case through the authoritative ChatGPT
+// catalog flag it already tracks.
+func (m *RemoteModelsManager) shouldRefreshModels() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.RLock()
+	codexBackend := m.useRemoteCatalogAsSourceOfTruth
+	commandAuth := m.commandAuth
+	m.mu.RUnlock()
+	return codexBackend || commandAuth || m.SupportsAPIKeyDiscovery()
+}
+
+func (m *RemoteModelsManager) refreshAvailableModels(strategy RefreshStrategy) {
+	if m == nil || m.endpoint == nil {
+		return
+	}
+	// Gate cache loading as well as requests (Rust #44392/#46561): API-key auth
+	// must have an enabled, supported catalog before a remote catalog is reused,
+	// so a custom base URL without `model_catalog_url` keeps the bundled models
+	// even when an earlier run cached one. Command-auth providers retain their
+	// existing discovery behavior.
+	if m.apiKeyAuth && !m.commandAuth && (m.apiKeyDiscoveryDisabled || !m.supportsAPIKeyModels || !m.apiKeyModelDiscoveryEnabledValue()) {
+		return
+	}
+	switch strategy {
+	case RefreshOnline:
+		m.fetchAndUpdateModels()
+	case RefreshOffline:
+		m.tryLoadFreshCache()
+	case RefreshOnlineIfUncached:
+		m.mu.RLock()
+		shouldFetch := !m.fetched
+		m.mu.RUnlock()
+		if shouldFetch && !m.tryLoadFreshCache() {
+			m.fetchAndUpdateModels()
+		}
+	}
+}
+
+func (m *RemoteModelsManager) fetchAndUpdateModels() {
+	// Rust #46570: the remote-model fetch duration carries the authentication
+	// mode used for this fetch.
+	timer := metrics.StartTimer(remoteModelsFetchUpdateDurationMetric, map[string]string{
+		"auth_mode": m.metricsAuthMode(),
+	})
+	defer timer.Stop()
+	m.mu.RLock()
+	etag := m.etag
+	m.mu.RUnlock()
+	ctx, cancel := context.WithTimeout(context.Background(), modelsEndpointRefreshTimeout)
+	defer cancel()
+	response, err := m.endpoint.ListModels(ctx, etag)
+	if err != nil || response == nil || response.NotModified {
+		if response != nil && response.NotModified {
+			m.mu.Lock()
+			m.fetched = true
+			m.fetchedIdentity = m.identity
+			if strings.TrimSpace(response.ETag) != "" {
+				m.etag = strings.TrimSpace(response.ETag)
+			}
+			m.mu.Unlock()
+			m.renewCacheTTLIfNeeded()
+		}
+		if err != nil && m.explicitProviderCatalog {
+			m.mu.Lock()
+			m.remoteModels = nil
+			m.etag = ""
+			cachePath := m.cachePath
+			clientVersion := m.cacheClientVersion
+			identity := m.identity
+			m.mu.Unlock()
+			if cachePath != "" {
+				_ = writeModelsCache(cachePath, &modelsCache{
+					ClientVersion: clientVersion,
+					Identity:      identity,
+				})
+			}
+		}
+		return
+	}
+	m.mu.Lock()
+	m.fetched = true
+	m.fetchedIdentity = m.identity
+	if len(response.Models) > 0 || m.explicitProviderCatalog {
+		if m.explicitProviderCatalog || (m.remoteCatalogAuthoritative() && hasRemoteSourceOfTruthModel(response.Models)) {
+			m.remoteModels = cloneModelInfos(response.Models)
+		} else {
+			m.remoteModels = mergeModelInfos(m.remoteModels, response.Models)
+		}
+	}
+	if strings.TrimSpace(response.ETag) != "" {
+		m.etag = strings.TrimSpace(response.ETag)
+	}
+	cache := modelsCache{
+		FetchedAt:     m.nowLocked(),
+		ETag:          m.etag,
+		ClientVersion: m.cacheClientVersion,
+		Identity:      m.identity,
+		Models:        cloneModelInfos(response.Models),
+	}
+	cachePath := m.cachePath
+	m.mu.Unlock()
+	if cachePath != "" {
+		_ = writeModelsCache(cachePath, &cache)
+	}
+}
+
+func (m *RemoteModelsManager) tryLoadFreshCache() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.RLock()
+	cachePath := m.cachePath
+	cacheTTL := m.cacheTTL
+	clientVersion := m.cacheClientVersion
+	identity := m.identity
+	now := m.nowLocked()
+	m.mu.RUnlock()
+	if cachePath == "" || cacheTTL <= 0 {
+		return false
+	}
+	cache, err := readModelsCache(cachePath)
+	if err != nil || cache.ClientVersion != clientVersion || !cache.isFresh(now, cacheTTL) {
+		return false
+	}
+	// Cached catalogs are scoped to the current provider/auth identity; unscoped
+	// legacy entries and mismatched identities are cache misses (Rust #43906).
+	if identity == "" || cache.Identity != identity {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.fetched {
+		return true
+	}
+	m.fetched = true
+	m.etag = strings.TrimSpace(cache.ETag)
+	m.fetchedIdentity = m.identity
+	if len(cache.Models) > 0 || m.explicitProviderCatalog {
+		if m.explicitProviderCatalog || (m.remoteCatalogAuthoritative() && hasRemoteSourceOfTruthModel(cache.Models)) {
+			m.remoteModels = cloneModelInfos(cache.Models)
+		} else {
+			m.remoteModels = mergeModelInfos(m.remoteModels, cache.Models)
+		}
+	}
+	return true
+}
+
+func (m *RemoteModelsManager) renewCacheTTLIfNeeded() {
+	if m == nil {
+		return
+	}
+	m.mu.RLock()
+	cachePath := m.cachePath
+	cacheTTL := m.cacheTTL
+	clientVersion := m.cacheClientVersion
+	identity := m.identity
+	etag := m.etag
+	now := m.nowLocked()
+	m.mu.RUnlock()
+	if cachePath == "" || cacheTTL <= 0 {
+		return
+	}
+	cache, err := readModelsCache(cachePath)
+	if err != nil || cache.isFresh(now, cacheTTL/2) {
+		return
+	}
+	// Only extend freshness when the stored version, identity, and ETag still
+	// match (Rust #43906 refresh_ttl).
+	if identity == "" || cache.Identity != identity || cache.ClientVersion != clientVersion || strings.TrimSpace(cache.ETag) != strings.TrimSpace(etag) {
+		return
+	}
+	cache.FetchedAt = now
+	_ = writeModelsCache(cachePath, cache)
+}
+
+func (m *RemoteModelsManager) nowLocked() time.Time {
+	if m != nil && m.now != nil {
+		return m.now().UTC()
+	}
+	return time.Now().UTC()
+}
+
+func (c *modelsCache) isFresh(now time.Time, ttl time.Duration) bool {
+	if c == nil || c.FetchedAt.IsZero() || ttl <= 0 {
+		return false
+	}
+	age := now.Sub(c.FetchedAt)
+	return age <= ttl
+}
+
+func readModelsCache(path string) (*modelsCache, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cache modelsCache
+	if err := json.Unmarshal(data, &cache); err != nil {
+		return nil, err
+	}
+	return &cache, nil
+}
+
+func writeModelsCache(path string, cache *modelsCache) error {
+	if cache == nil {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(cache, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+func hasRemoteSourceOfTruthModel(models []ModelInfo) bool {
+	for _, model := range models {
+		if strings.EqualFold(strings.TrimSpace(model.Visibility), VisibilityList) {
+			return true
+		}
+	}
+	return false
+}
+
+func modelsURL(provider *APIProvider) string {
+	baseURL := strings.TrimRight(provider.BaseURL, "/")
+	if baseURL == "" {
+		baseURL = defaultResponsesEndpoint
+	}
+	raw := baseURL + "/models"
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	query := parsed.Query()
+	if query.Get("client_version") == "" {
+		query.Set("client_version", modelsEndpointClientVersion)
+	}
+	for key, value := range provider.QueryParams {
+		query.Set(key, value)
+	}
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
+}
+
+// modelsCatalogURL builds an explicit provider catalog URL, preserving the
+// provider's routing query parameters and appending the client version
+// (Rust ModelsClient::catalog_request_url, #46561). Relative URLs are rejected.
+func modelsCatalogURL(provider *APIProvider, catalogURL string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(catalogURL))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("model_catalog_url must be an absolute URL")
+	}
+	query := parsed.Query()
+	if provider != nil {
+		for key, value := range provider.QueryParams {
+			query.Add(key, value)
+		}
+	}
+	query.Add("client_version", modelsEndpointClientVersion)
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), nil
+}
+
+func modelsETagFromHeaders(headers http.Header) string {
+	if value := strings.TrimSpace(headers.Get(modelsEndpointETagHeader)); value != "" {
+		return value
+	}
+	return strings.TrimSpace(headers.Get("ETag"))
+}
+
+func decodeModelsEndpointResponse(data []byte) ([]ModelInfo, error) {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err == nil {
+		if rawModels, ok := object["models"]; ok {
+			var models []ModelInfo
+			if err := json.Unmarshal(rawModels, &models); err != nil {
+				return nil, err
+			}
+			return models, nil
+		}
+		if rawData, ok := object["data"]; ok {
+			var models []ModelInfo
+			if err := json.Unmarshal(rawData, &models); err != nil {
+				return nil, err
+			}
+			return models, nil
+		}
+	}
+	var models []ModelInfo
+	if err := json.Unmarshal(data, &models); err == nil {
+		return models, nil
+	}
+	return nil, fmt.Errorf("models API response did not contain models")
+}

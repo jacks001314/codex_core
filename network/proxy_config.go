@@ -1,0 +1,486 @@
+package network
+
+import (
+	"fmt"
+	"net"
+	"net/url"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+
+	"codex_core/utils"
+)
+
+const (
+	DefaultProxyURL      = "http://127.0.0.1:3128"
+	DefaultProxySocksURL = "http://127.0.0.1:8081"
+)
+
+type ProxyMode string
+
+const (
+	ProxyModeLimited ProxyMode = "limited"
+	ProxyModeFull    ProxyMode = "full"
+)
+
+func (m *ProxyMode) AllowsMethod(method string) bool {
+	if m == nil || *m == ProxyModeFull {
+		return true
+	}
+	return method == "GET" || method == "HEAD" || method == "OPTIONS"
+}
+
+type ProxyDomainPermission string
+
+const (
+	ProxyDomainNone  ProxyDomainPermission = "none"
+	ProxyDomainAllow ProxyDomainPermission = "allow"
+	ProxyDomainDeny  ProxyDomainPermission = "deny"
+)
+
+type ProxyDomainPermissionEntry struct {
+	Pattern    string
+	Permission ProxyDomainPermission
+}
+
+type ProxyDomainPermissions struct {
+	Entries []ProxyDomainPermissionEntry
+}
+
+func (p *ProxyDomainPermissions) EffectiveEntries() []ProxyDomainPermissionEntry {
+	if p == nil {
+		return nil
+	}
+	order := make([]string, 0, len(p.Entries))
+	effective := map[string]ProxyDomainPermission{}
+	for _, entry := range p.Entries {
+		if _, ok := effective[entry.Pattern]; !ok {
+			order = append(order, entry.Pattern)
+		}
+		if rankPermission(entry.Permission) > rankPermission(effective[entry.Pattern]) {
+			effective[entry.Pattern] = entry.Permission
+		}
+	}
+	out := make([]ProxyDomainPermissionEntry, 0, len(order))
+	for _, pattern := range order {
+		out = append(out, ProxyDomainPermissionEntry{Pattern: pattern, Permission: effective[pattern]})
+	}
+	return out
+}
+
+type ProxyUnixSocketPermission string
+
+const (
+	ProxyUnixSocketAllow ProxyUnixSocketPermission = "allow"
+	ProxyUnixSocketDeny  ProxyUnixSocketPermission = "deny"
+)
+
+type ProxyUnixSocketPermissions struct {
+	Entries map[string]ProxyUnixSocketPermission
+}
+
+type ProxyConfig struct {
+	Network               ProxySettings
+	PolicyDecider         ProxyPolicyDecider
+	BlockedObserver       ProxyBlockedRequestObserver
+	AuditSink             ProxyPolicyAuditSink
+	AuditMetadata         ProxyAuditMetadata
+	AuditMetadataProvider ProxyAuditMetadataProvider
+	EnvironmentID         string
+	HeaderInjections      []ProxyHeaderInjection
+	// PrivateIPsViaUpstream is trusted, executor-local startup routing: it
+	// allows permitted private unicast destinations to use the configured
+	// upstream proxy (Rust #48568 NetworkProxyState::proxy_private_ips_via_upstream).
+	// Unlike the settings table it is never serialized to remote executors and
+	// is never reloaded from the wire.
+	PrivateIPsViaUpstream bool
+	// CredentialBroker reuses an executor-session broker across proxy launches.
+	// It is internal-only and never serialized to or from remote configs.
+	CredentialBroker *ProxyCredentialBroker
+}
+
+type ProxySettings struct {
+	Enabled                          bool
+	ProxyURL                         string
+	EnableSocks5                     bool
+	SocksURL                         string
+	EnableSocks5UDP                  bool
+	AllowUpstreamProxy               bool
+	DangerouslyAllowNonLoopbackProxy bool
+	// DangerouslyAllowAllUnixSockets mirrors Rust's Option<bool> (#46004):
+	// nil means omitted, which defers socket permissions to an attachment
+	// policy, while a non-nil false is an explicit denial.
+	DangerouslyAllowAllUnixSockets *bool
+	Mode                           ProxyMode
+	Domains                        *ProxyDomainPermissions
+	UnixSockets                    *ProxyUnixSocketPermissions
+	AllowLocalBinding              bool
+	// AllowLocalBindingSet distinguishes an explicit false from an omitted
+	// setting so executor-specific defaults can be applied later (Rust #46523).
+	AllowLocalBindingSet bool
+	MITM                 bool
+	MITMHooks            []ProxyMITMHookConfig
+	// MITMCA optionally supplies an external signing CA (Rust #47132).
+	MITMCA                                       *ProxyMITMCAConfig
+	CredentialBroker                             bool
+	DangerouslyAllowPlaintextCredentialInjection bool
+	// CredentialBrokerOpenAIHost is the trusted OpenAI endpoint host derived
+	// from the top-level openai_base_url (Rust's credential_broker_openai_host).
+	// It is local-only: it is never serialized to remote executors.
+	CredentialBrokerOpenAIHost string
+	// CredentialProviders holds the validated
+	// features.network_proxy.credentials definitions (#44056).
+	CredentialProviders map[string]CredentialProviderConfig
+}
+
+type ProxyMITMCAConfig struct {
+	CertificateFile string
+	PrivateKeyFile  string
+}
+
+func DefaultProxySettings() ProxySettings {
+	return ProxySettings{
+		ProxyURL:           DefaultProxyURL,
+		EnableSocks5:       true,
+		SocksURL:           DefaultProxySocksURL,
+		EnableSocks5UDP:    true,
+		AllowUpstreamProxy: true,
+		Mode:               ProxyModeFull,
+		Domains:            nil,
+		UnixSockets:        nil,
+		AllowLocalBinding:  false,
+		MITM:               false,
+		CredentialBroker:   false,
+		Enabled:            false,
+	}
+}
+
+// SetCredentialBrokerEnabled turns credential brokerage on or off. Enabling
+// brokerage also turns on MITM, matching Rust NetworkProxyConfig.
+func (s *ProxySettings) SetCredentialBrokerEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.CredentialBroker = enabled
+	if enabled {
+		s.MITM = true
+	}
+}
+
+func (s *ProxySettings) AllowedDomains() []string {
+	return s.domainEntries(ProxyDomainAllow)
+}
+
+func (s *ProxySettings) DeniedDomains() []string {
+	return s.domainEntries(ProxyDomainDeny)
+}
+
+func (s *ProxySettings) AllowUnixSockets() []string {
+	if s == nil || s.UnixSockets == nil {
+		return nil
+	}
+	out := make([]string, 0, len(s.UnixSockets.Entries))
+	for path, permission := range s.UnixSockets.Entries {
+		if permission == ProxyUnixSocketAllow {
+			out = append(out, path)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (s *ProxySettings) SetAllowedDomains(domains []string) {
+	s.setDomainEntries(domains, ProxyDomainAllow)
+}
+
+func (s *ProxySettings) SetDeniedDomains(domains []string) {
+	s.setDomainEntries(domains, ProxyDomainDeny)
+}
+
+func (s *ProxySettings) UpsertDomainPermission(host string, permission ProxyDomainPermission, normalize func(string) string) {
+	if normalize == nil {
+		normalize = NormalizeProxyHost
+	}
+	if s.Domains == nil {
+		s.Domains = &ProxyDomainPermissions{}
+	}
+	normalized := normalize(host)
+	filtered := s.Domains.Entries[:0]
+	for _, entry := range s.Domains.Entries {
+		if normalize(entry.Pattern) != normalized {
+			filtered = append(filtered, entry)
+		}
+	}
+	s.Domains.Entries = append(filtered, ProxyDomainPermissionEntry{Pattern: host, Permission: permission})
+}
+
+func (s *ProxySettings) SetAllowUnixSockets(paths []string) {
+	entries := map[string]ProxyUnixSocketPermission{}
+	if s.UnixSockets != nil {
+		for path, permission := range s.UnixSockets.Entries {
+			if permission != ProxyUnixSocketAllow {
+				entries[path] = permission
+			}
+		}
+	}
+	for _, path := range paths {
+		entries[path] = ProxyUnixSocketAllow
+	}
+	// Rust #46004: an explicitly empty list is retained as an empty permission
+	// map, which is a restrictive ceiling rather than an omitted policy.
+	s.UnixSockets = &ProxyUnixSocketPermissions{Entries: entries}
+}
+
+func (s *ProxySettings) domainEntries(permission ProxyDomainPermission) []string {
+	if s == nil || s.Domains == nil {
+		return nil
+	}
+	out := []string{}
+	for _, entry := range s.Domains.EffectiveEntries() {
+		if entry.Permission == permission {
+			out = append(out, entry.Pattern)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func (s *ProxySettings) setDomainEntries(entries []string, permission ProxyDomainPermission) {
+	if s.Domains == nil {
+		s.Domains = &ProxyDomainPermissions{}
+	}
+	filtered := s.Domains.Entries[:0]
+	for _, entry := range s.Domains.Entries {
+		if entry.Permission != permission {
+			filtered = append(filtered, entry)
+		}
+	}
+	seen := map[string]bool{}
+	for _, entry := range filtered {
+		if entry.Permission == permission {
+			seen[entry.Pattern] = true
+		}
+	}
+	for _, entry := range entries {
+		if !seen[entry] {
+			filtered = append(filtered, ProxyDomainPermissionEntry{Pattern: entry, Permission: permission})
+			seen[entry] = true
+		}
+	}
+	s.Domains.Entries = filtered
+	if len(s.Domains.Entries) == 0 {
+		s.Domains = nil
+	}
+}
+
+type ProxyRuntimeConfig struct {
+	HTTPAddr  net.TCPAddr
+	SocksAddr net.TCPAddr
+}
+
+func ResolveProxyRuntime(config ProxyConfig) (ProxyRuntimeConfig, error) {
+	return ResolveProxyRuntimeForPlatform(config, utils.NativePlatform())
+}
+
+// ResolveProxyRuntimeForPlatform mirrors Rust network-proxy
+// `resolve_runtime(cfg, executor_os)` (#46302/#46334): socket allowlist entries
+// are validated against the executor's platform rather than the controller's.
+func ResolveProxyRuntimeForPlatform(config ProxyConfig, platform utils.Platform) (ProxyRuntimeConfig, error) {
+	if _, err := CompileProxyDomainMatcher(config.Network.AllowedDomains(), false); err != nil {
+		return ProxyRuntimeConfig{}, fmt.Errorf("compile network.allowed_domains: %w", err)
+	}
+	if _, err := CompileProxyDomainMatcher(config.Network.DeniedDomains(), true); err != nil {
+		return ProxyRuntimeConfig{}, err
+	}
+	if config.Network.CredentialBroker && !config.Network.MITM {
+		return ProxyRuntimeConfig{}, fmt.Errorf("network.credential_broker requires network.mitm = true")
+	}
+	if err := ValidateProxyMITMHookConfig(config); err != nil {
+		return ProxyRuntimeConfig{}, err
+	}
+	if err := ValidateProxyUnixSocketAllowlistPathsForPlatform(config, platform); err != nil {
+		return ProxyRuntimeConfig{}, err
+	}
+	httpAddr, err := ResolveProxyAddr(config.Network.ProxyURL, 3128)
+	if err != nil {
+		return ProxyRuntimeConfig{}, fmt.Errorf("invalid network.proxy_url: %w", err)
+	}
+	socksAddr, err := ResolveProxyAddr(config.Network.SocksURL, 8081)
+	if err != nil {
+		return ProxyRuntimeConfig{}, fmt.Errorf("invalid network.socks_url: %w", err)
+	}
+	httpAddr, socksAddr = ClampProxyBindAddrs(httpAddr, socksAddr, config.Network)
+	return ProxyRuntimeConfig{HTTPAddr: httpAddr, SocksAddr: socksAddr}, nil
+}
+
+func ResolveProxyAddr(value string, defaultPort uint16) (net.TCPAddr, error) {
+	parts, err := ParseProxyHostPort(value, defaultPort)
+	if err != nil {
+		return net.TCPAddr{}, err
+	}
+	host := parts.Host
+	if strings.EqualFold(host, "localhost") {
+		host = "127.0.0.1"
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		ip = net.ParseIP("127.0.0.1")
+	}
+	return net.TCPAddr{IP: ip, Port: int(parts.Port)}, nil
+}
+
+func ClampProxyBindAddrs(httpAddr net.TCPAddr, socksAddr net.TCPAddr, settings ProxySettings) (net.TCPAddr, net.TCPAddr) {
+	httpAddr = clampNonLoopback(httpAddr, settings.DangerouslyAllowNonLoopbackProxy)
+	socksAddr = clampNonLoopback(socksAddr, settings.DangerouslyAllowNonLoopbackProxy)
+	// Rust 9742cc8ed5: Unix socket proxy permissions are macOS-only; on Windows
+	// they must not clamp proxy listeners to loopback.
+	if runtime.GOOS == "windows" {
+		return httpAddr, socksAddr
+	}
+	// Rust #46004: an omitted flag resolves to false for ordinary execution.
+	if len(settings.AllowUnixSockets()) == 0 && !boolPointerValue(settings.DangerouslyAllowAllUnixSockets) {
+		return httpAddr, socksAddr
+	}
+	httpAddr.IP = net.ParseIP("127.0.0.1")
+	socksAddr.IP = net.ParseIP("127.0.0.1")
+	return httpAddr, socksAddr
+}
+
+// boolPointerValue resolves an optional flag the way Rust's
+// `Option<bool>::unwrap_or(false)` does for ordinary execution (#46004).
+func boolPointerValue(value *bool) bool {
+	return value != nil && *value
+}
+
+type ProxySocketAddressParts struct {
+	Host string
+	Port uint16
+}
+
+func ParseProxyHostPort(value string, defaultPort uint16) (ProxySocketAddressParts, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ProxySocketAddressParts{}, fmt.Errorf("missing host in network proxy address")
+	}
+	if ip := net.ParseIP(trimmed); ip != nil && strings.Contains(trimmed, ":") && !strings.HasPrefix(trimmed, "[") {
+		return ProxySocketAddressParts{Host: trimmed, Port: defaultPort}, nil
+	}
+	candidate := trimmed
+	if !strings.Contains(candidate, "://") {
+		candidate = "http://" + candidate
+	}
+	if parsed, err := url.Parse(candidate); err == nil && parsed.Hostname() != "" {
+		port := defaultPort
+		if parsed.Port() != "" {
+			if parsedPort, err := strconv.ParseUint(parsed.Port(), 10, 16); err == nil {
+				port = uint16(parsedPort)
+			}
+		}
+		return ProxySocketAddressParts{Host: parsed.Hostname(), Port: port}, nil
+	}
+	return parseHostPortFallback(trimmed, defaultPort)
+}
+
+func ProxyHostAndPortFromNetworkAddr(value string, defaultPort uint16) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "<missing>"
+	}
+	parts, err := ParseProxyHostPort(trimmed, defaultPort)
+	if err != nil {
+		return formatHostAndPort(trimmed, defaultPort)
+	}
+	return formatHostAndPort(parts.Host, parts.Port)
+}
+
+func ValidateProxyUnixSocketAllowlistPaths(config ProxyConfig) error {
+	return ValidateProxyUnixSocketAllowlistPathsForPlatform(config, utils.NativePlatform())
+}
+
+// ValidateProxyUnixSocketAllowlistPathsForPlatform mirrors Rust
+// `validate_unix_socket_allowlist_paths` (#46302/#46334): every allowed socket
+// path must be a NUL-free absolute path for the executor OS, while deny entries
+// are preserved unchanged (they are not part of AllowUnixSockets).
+//
+// Rust 9742cc8ed5 (unix socket permissions are macOS-only runtime settings)
+// still applies where the proxy builds its runtime settings; that exclusion must
+// not skip validation, because a controller and its executor can run different
+// operating systems.
+func ValidateProxyUnixSocketAllowlistPathsForPlatform(config ProxyConfig, platform utils.Platform) error {
+	for index, socketPath := range config.Network.AllowUnixSockets() {
+		if !SocketPathIsAbsolute(platform, socketPath) || strings.IndexByte(socketPath, 0) >= 0 {
+			return fmt.Errorf("invalid network.allow_unix_sockets[%d]: expected a NUL-free absolute path for %s, got %q", index, platform, socketPath)
+		}
+	}
+	return nil
+}
+
+func rankPermission(permission ProxyDomainPermission) int {
+	switch permission {
+	case ProxyDomainDeny:
+		return 2
+	case ProxyDomainAllow:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func clampNonLoopback(addr net.TCPAddr, allow bool) net.TCPAddr {
+	if addr.IP == nil || addr.IP.IsLoopback() || allow {
+		return addr
+	}
+	addr.IP = net.ParseIP("127.0.0.1")
+	return addr
+}
+
+func formatHostAndPort(host string, port uint16) string {
+	if strings.Contains(host, ":") {
+		return fmt.Sprintf("[%s]:%d", host, port)
+	}
+	return fmt.Sprintf("%s:%d", host, port)
+}
+
+func parseHostPortFallback(input string, defaultPort uint16) (ProxySocketAddressParts, error) {
+	withoutScheme := input
+	if _, rest, ok := strings.Cut(input, "://"); ok {
+		withoutScheme = rest
+	}
+	hostPort := strings.Split(withoutScheme, "/")[0]
+	if _, rest, ok := strings.Cut(hostPort, "@"); ok {
+		hostPort = rest
+	}
+	if strings.HasPrefix(hostPort, "[") {
+		if end := strings.Index(hostPort, "]"); end >= 0 {
+			host := hostPort[1:end]
+			port := defaultPort
+			if rest := strings.TrimPrefix(hostPort[end+1:], ":"); rest != hostPort[end+1:] {
+				if parsed, err := strconv.ParseUint(rest, 10, 16); err == nil {
+					port = uint16(parsed)
+				}
+			}
+			if host == "" {
+				return ProxySocketAddressParts{}, fmt.Errorf("missing host in network proxy address")
+			}
+			return ProxySocketAddressParts{Host: host, Port: port}, nil
+		}
+	}
+	if strings.Count(hostPort, ":") == 1 {
+		host, portText, _ := strings.Cut(hostPort, ":")
+		if host == "" {
+			return ProxySocketAddressParts{}, fmt.Errorf("missing host in network proxy address")
+		}
+		port := defaultPort
+		if parsed, err := strconv.ParseUint(portText, 10, 16); err == nil {
+			port = uint16(parsed)
+		}
+		return ProxySocketAddressParts{Host: host, Port: port}, nil
+	}
+	if hostPort == "" {
+		return ProxySocketAddressParts{}, fmt.Errorf("missing host in network proxy address")
+	}
+	return ProxySocketAddressParts{Host: hostPort, Port: defaultPort}, nil
+}

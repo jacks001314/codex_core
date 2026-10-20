@@ -1,0 +1,785 @@
+package execserver
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/coder/websocket"
+	"github.com/google/uuid"
+	clatter "github.com/shurlinet/go-clatter"
+
+	"codex_core/envutil"
+)
+
+const (
+	CodexExecServerNoiseRegistryURLEnvVar      = "CODEX_EXEC_SERVER_NOISE_REGISTRY_URL"
+	CodexExecServerNoiseEnvironmentIDEnvVar    = "CODEX_EXEC_SERVER_NOISE_ENVIRONMENT_ID"
+	CodexExecServerNoiseChatGPTAccountIDEnvVar = "CODEX_EXEC_SERVER_NOISE_CHATGPT_ACCOUNT_ID"
+)
+
+// Rust #39777: bounded retry window for transient environment-registry
+// failures while opening the initial Noise rendezvous connection.
+//
+// Rust #48575 (`985cf47a4e`) adds a separate fixed window for provisioned
+// executors, which may still be resuming after an earlier ready report: only
+// `environment_offline` responses on the initial connection to a provisioned
+// environment use `provisionedEnvironmentConnectTimeout`; every other error
+// keeps the four-attempt / fourteen-second limits below, and permanent errors
+// stop immediately.
+//
+// These are vars (the values are unchanged) so tests can compress the windows
+// instead of waiting them out.
+var (
+	initialRegistryMaxRetries            = 4
+	initialRegistryRequestTimeout        = 6 * time.Second
+	initialRegistryOperationTimeout      = 14 * time.Second
+	registryRecoveryInitialRetryMillis   = 500
+	registryRecoveryMaxRetryInterval     = 5 * time.Second
+	provisionedEnvironmentConnectTimeout = 5 * time.Minute
+)
+
+// ProvisionedEnvironmentConnectTimeout is the fixed window (Rust #48575
+// `PROVISIONED_ENVIRONMENT_CONNECT_TIMEOUT`) that an initial Noise rendezvous
+// connection to a provisioned environment may spend waiting for an executor
+// that is still resuming. Callers that bound the whole environment request
+// (for example the app-server's environment/info and environment/status RPCs)
+// use it instead of the ordinary connect timeout, which would cancel the
+// longer `environment_offline` retry window.
+func ProvisionedEnvironmentConnectTimeout() time.Duration {
+	return provisionedEnvironmentConnectTimeout
+}
+
+// CodexExecServerNoiseAuthTokenEnvVar is the shared execution-server credential
+// constant (single definition across the exec server and the environment
+// scrubber, mirroring Rust #38941).
+const CodexExecServerNoiseAuthTokenEnvVar = envutil.CodexExecServerNoiseAuthTokenEnvVar
+
+type NoiseRendezvousConnectBundle struct {
+	WebSocketURL            string
+	EnvironmentID           string
+	ExecutorRegistrationID  string
+	ExecutorPublicKey       RemotePublicKey
+	HarnessKeyAuthorization string
+}
+
+type NoiseRendezvousConnectProvider interface {
+	ConnectBundle(context.Context, RemotePublicKey) (*NoiseRendezvousConnectBundle, error)
+}
+
+type NoiseRendezvousConnectProviderFunc func(context.Context, RemotePublicKey) (*NoiseRendezvousConnectBundle, error)
+
+func (f NoiseRendezvousConnectProviderFunc) ConnectBundle(ctx context.Context, key RemotePublicKey) (*NoiseRendezvousConnectBundle, error) {
+	return f(ctx, key)
+}
+
+type registryNoiseRendezvousConnectProvider struct {
+	config RemoteEnvironmentConfig
+}
+
+type remoteConnectRequest struct {
+	HarnessPublicKey RemotePublicKey `json:"harness_public_key"`
+}
+
+type remoteConnectResponse struct {
+	EnvironmentID           string          `json:"environment_id"`
+	URL                     string          `json:"url"`
+	SecurityProfile         string          `json:"security_profile"`
+	ExecutorRegistrationID  string          `json:"executor_registration_id"`
+	ExecutorPublicKey       RemotePublicKey `json:"executor_public_key"`
+	HarnessKeyAuthorization string          `json:"harness_key_authorization"`
+}
+
+func NewRegistryNoiseRendezvousConnectProvider(config RemoteEnvironmentConfig) (NoiseRendezvousConnectProvider, error) {
+	config.BaseURL = strings.TrimRight(strings.TrimSpace(config.BaseURL), "/")
+	if config.BaseURL == "" {
+		return nil, errors.New("environment registry base URL is required")
+	}
+	config.EnvironmentID = strings.TrimSpace(config.EnvironmentID)
+	if config.EnvironmentID == "" {
+		return nil, errors.New("environment id is required for remote exec-server registration")
+	}
+	if config.HTTPClient == nil {
+		config.HTTPClient = remoteHTTPClient()
+	}
+	return &registryNoiseRendezvousConnectProvider{config: config}, nil
+}
+
+func RegistryNoiseRendezvousConnectProviderFromEnv() (NoiseRendezvousConnectProvider, bool, error) {
+	return registryNoiseRendezvousConnectProviderFromValues(
+		optionalNoiseEnvironmentValue(CodexExecServerNoiseRegistryURLEnvVar),
+		optionalNoiseEnvironmentValue(CodexExecServerNoiseEnvironmentIDEnvVar),
+		optionalNoiseEnvironmentValue(CodexExecServerNoiseAuthTokenEnvVar),
+		optionalNoiseEnvironmentValue(CodexExecServerNoiseChatGPTAccountIDEnvVar),
+	)
+}
+
+func registryNoiseRendezvousConnectProviderFromValues(
+	registryURL *string,
+	environmentID *string,
+	authToken *string,
+	chatGPTAccountID *string,
+) (NoiseRendezvousConnectProvider, bool, error) {
+	if registryURL == nil && environmentID == nil && authToken == nil {
+		return nil, false, nil
+	}
+	if registryURL == nil || environmentID == nil || authToken == nil {
+		return nil, false, fmt.Errorf(
+			"Noise environment requires %s, %s, and %s",
+			CodexExecServerNoiseRegistryURLEnvVar,
+			CodexExecServerNoiseEnvironmentIDEnvVar,
+			CodexExecServerNoiseAuthTokenEnvVar,
+		)
+	}
+	if !validRemoteHeaderValue(*authToken) {
+		return nil, false, errors.New("environment registry bearer token is not a valid HTTP header")
+	}
+	headers := http.Header{"Authorization": []string{"Bearer " + *authToken}}
+	if chatGPTAccountID != nil {
+		if !validRemoteHeaderValue(*chatGPTAccountID) {
+			return nil, false, errors.New("ChatGPT account id is not a valid HTTP header")
+		}
+		headers.Set("ChatGPT-Account-ID", *chatGPTAccountID)
+	}
+	provider, err := NewRegistryNoiseRendezvousConnectProvider(RemoteEnvironmentConfig{
+		BaseURL:       *registryURL,
+		EnvironmentID: *environmentID,
+		AuthHeaders:   headers,
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return provider, true, nil
+}
+
+func optionalNoiseEnvironmentValue(name string) *string {
+	value, ok := os.LookupEnv(name)
+	if !ok {
+		return nil
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+func validRemoteHeaderValue(value string) bool {
+	for i := 0; i < len(value); i++ {
+		if (value[i] < 0x20 && value[i] != '\t') || value[i] == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *registryNoiseRendezvousConnectProvider) ConnectBundle(ctx context.Context, harnessPublicKey RemotePublicKey) (*NoiseRendezvousConnectBundle, error) {
+	if p == nil {
+		return nil, errors.New("Noise rendezvous connect provider is nil")
+	}
+	body, err := json.Marshal(remoteConnectRequest{HarnessPublicKey: harnessPublicKey})
+	if err != nil {
+		return nil, err
+	}
+	connectCtx, cancel := context.WithTimeout(ctx, defaultRemoteDialTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(
+		connectCtx,
+		http.MethodPost,
+		remoteEndpointURL(p.config.BaseURL, "/cloud/environment/"+p.config.EnvironmentID+"/connect"),
+		strings.NewReader(string(body)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("environment registry request failed: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	for key, values := range p.config.AuthHeaders {
+		for _, value := range values {
+			request.Header.Add(key, value)
+		}
+	}
+	response, err := p.config.HTTPClient.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("environment registry request failed: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, remoteRegistryStatusError(response)
+	}
+	var decoded remoteConnectResponse
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1024*1024)).Decode(&decoded); err != nil {
+		return nil, fmt.Errorf("failed to decode environment registry response: %w", err)
+	}
+	if decoded.EnvironmentID != p.config.EnvironmentID {
+		return nil, errors.New("exec-server protocol error: environment registry returned a different environment id")
+	}
+	if decoded.SecurityProfile != RemoteSecurityProfile {
+		return nil, fmt.Errorf("exec-server protocol error: environment registry returned unsupported security profile `%s`", decoded.SecurityProfile)
+	}
+	if strings.TrimSpace(decoded.URL) == "" || strings.TrimSpace(decoded.ExecutorRegistrationID) == "" || strings.TrimSpace(decoded.HarnessKeyAuthorization) == "" {
+		return nil, errors.New("exec-server protocol error: environment registry returned incomplete Noise connection data")
+	}
+	return &NoiseRendezvousConnectBundle{
+		WebSocketURL:            decoded.URL,
+		EnvironmentID:           decoded.EnvironmentID,
+		ExecutorRegistrationID:  decoded.ExecutorRegistrationID,
+		ExecutorPublicKey:       decoded.ExecutorPublicKey,
+		HarnessKeyAuthorization: decoded.HarnessKeyAuthorization,
+	}, nil
+}
+
+func DialNoiseRendezvousClient(
+	ctx context.Context,
+	provider NoiseRendezvousConnectProvider,
+	options DialClientOptions,
+) (*Client, error) {
+	if provider == nil {
+		return nil, errors.New("Noise rendezvous connect provider is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	clientName := strings.TrimSpace(options.ClientName)
+	if clientName == "" {
+		clientName = "codex-go-unified-exec"
+	}
+	identity, err := generateRemoteNoiseIdentity()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate Noise harness identity: %w", err)
+	}
+	client := &Client{
+		clientName:   clientName,
+		nextID:       1,
+		nextHTTPID:   1,
+		pending:      map[int64]chan RpcCompletion{},
+		sessions:     map[string]*clientProcessSession{},
+		httpStreams:  map[string]*HTTPBodyStream{},
+		inboundIDs:   map[int64]struct{}{},
+		inboundSlots: make(chan struct{}, MaxInFlightServerRequests),
+		done:         make(chan struct{}),
+		cleanup:      identity.Destroy,
+	}
+	// openWithProvisioningDeadline builds the connection opener for one
+	// deadline. Reconnects reuse the client's opener with no provisioning
+	// deadline, so only the initial connect to a provisioned environment gets the
+	// longer environment_offline window (Rust #48575).
+	openWithProvisioningDeadline := func(provisioningDeadline time.Time) clientConnectionOpener {
+		return func(ctx context.Context, resumeSessionID string, handleNotification func(string, json.RawMessage) error) (clientConnection, *InitializeResponse, clientConnectMetadata, error) {
+			// connectBundle issues one registry request. bound, when non-zero,
+			// caps the request by the current retry deadline so a stalled request
+			// cannot outlive it; Rust wraps the sleep and the request in
+			// `timeout_at(retry_deadline, ..)` (#48575).
+			connectBundle := func(bound time.Time) (*NoiseRendezvousConnectBundle, error) {
+				timeout := initialRegistryRequestTimeout
+				if !bound.IsZero() {
+					if remaining := time.Until(bound); remaining < timeout {
+						timeout = remaining
+					}
+				}
+				if timeout <= 0 {
+					return nil, fmt.Errorf("environment registry request failed: %w", context.DeadlineExceeded)
+				}
+				connectCtx, cancel := context.WithTimeout(ctx, timeout)
+				defer cancel()
+				bundle, err := provider.ConnectBundle(connectCtx, identity.PublicKey())
+				if err != nil && connectCtx.Err() == context.DeadlineExceeded {
+					return nil, fmt.Errorf("environment registry request failed: %w", context.DeadlineExceeded)
+				}
+				return bundle, err
+			}
+			openWithBundle := func(bundle *NoiseRendezvousConnectBundle) (clientConnection, *InitializeResponse, clientConnectMetadata, error) {
+				var wire clientConnection
+				var initialized *InitializeResponse
+				err := withInitializeTimeout(ctx, options.InitializeTimeout, func(initializeCtx context.Context) error {
+					var dialErr error
+					wire, dialErr = dialNoiseHarnessConnection(initializeCtx, bundle, identity, options.HTTPClient)
+					if dialErr != nil {
+						return dialErr
+					}
+					initialized, dialErr = initializeClientConnection(initializeCtx, wire, clientName, resumeSessionID, handleNotification)
+					return dialErr
+				})
+				if err != nil {
+					if wire != nil {
+						_ = wire.CloseNow()
+					}
+					return nil, nil, clientConnectMetadata{}, err
+				}
+				executorPublicKey := bundle.ExecutorPublicKey
+				return wire, initialized, clientConnectMetadata{
+					executorRegistrationID: strings.TrimSpace(bundle.ExecutorRegistrationID),
+					executorPublicKey:      &executorPublicKey,
+				}, nil
+			}
+			// Rust #39777: retry transient registry failures (timeouts,
+			// interrupted bodies, retryable HTTP statuses, temporarily offline
+			// environments) with a per-request timeout, exponential backoff, and
+			// an overall deadline; permanent registry errors return immediately.
+			retries := 0
+			deadline := time.Now().Add(initialRegistryOperationTimeout)
+			refreshedUnauthorizedBundle := false
+			var requestBound time.Time
+			for {
+				bundle, err := connectBundle(requestBound)
+				if err != nil {
+					// Rust #48575: a provisioned executor may be resuming after an
+					// earlier ready report, so an `environment_offline` response on
+					// the initial connection waits out the fixed provisioning
+					// deadline instead of the ordinary retry window. Every other
+					// transient error keeps the four-attempt / fourteen-second
+					// limits, and permanent errors return immediately.
+					retryDeadline := time.Time{}
+					switch {
+					case !provisioningDeadline.IsZero() && isEnvironmentOfflineError(err):
+						retryDeadline = provisioningDeadline
+					case isRetryableRegistryError(err) && retries < initialRegistryMaxRetries:
+						retryDeadline = deadline
+					default:
+						return nil, nil, clientConnectMetadata{}, err
+					}
+					if !time.Now().Before(retryDeadline) {
+						return nil, nil, clientConnectMetadata{}, err
+					}
+					// Rust computes the delay from the pre-increment attempt so
+					// the first retry sleeps the base interval, and bounds the
+					// sleep plus the next registry request by the retry deadline
+					// (`timeout_at`), so a sleep that reaches the deadline stops
+					// the loop without another request.
+					delay := registryRecoveryRetryDelay(retries)
+					retries++
+					requestBound = retryDeadline
+					if remaining := time.Until(retryDeadline); remaining < delay {
+						delay = remaining
+					}
+					select {
+					case <-ctx.Done():
+						return nil, nil, clientConnectMetadata{}, err
+					case <-time.After(delay):
+					}
+					if !time.Now().Before(retryDeadline) {
+						return nil, nil, clientConnectMetadata{}, err
+					}
+					continue
+				}
+				conn, initialized, metadata, err := openWithBundle(bundle)
+				if isUnauthorizedNoiseWebSocketError(err) && !refreshedUnauthorizedBundle {
+					refreshedUnauthorizedBundle = true
+					deadline = time.Now().Add(initialRegistryOperationTimeout)
+					retries = 0
+					requestBound = time.Time{}
+					continue
+				}
+				return conn, initialized, metadata, err
+			}
+		}
+	}
+	// Reconnects keep the ordinary registry window; only the initial connect to a
+	// provisioned environment carries the provisioning deadline.
+	client.open = openWithProvisioningDeadline(time.Time{})
+	initialDeadline := time.Time{}
+	if options.Provisioned {
+		initialDeadline = time.Now().Add(provisionedEnvironmentConnectTimeout)
+	}
+	conn, initialized, metadata, err := openWithProvisioningDeadline(initialDeadline)(ctx, options.ResumeSessionID, client.handleNotification)
+	if isUnauthorizedNoiseWebSocketError(err) {
+		conn, initialized, metadata, err = openWithProvisioningDeadline(initialDeadline)(ctx, options.ResumeSessionID, client.handleNotification)
+	}
+	if err != nil {
+		identity.Destroy()
+		return nil, err
+	}
+	client.conn = conn
+	client.sessionID = initialized.SessionID
+	client.executorRegistrationID = strings.TrimSpace(metadata.executorRegistrationID)
+	client.executorPublicKey = metadata.executorPublicKey
+	client.rememberEnvironmentInfo(initialized.EnvironmentInfo)
+	go client.readLoop(conn)
+	return client, nil
+}
+
+type noiseWebSocketConnectError struct {
+	url        string
+	statusCode int
+	err        error
+}
+
+func (e *noiseWebSocketConnectError) Error() string {
+	return fmt.Sprintf("failed to connect to exec-server websocket `%s`: %v", e.url, e.err)
+}
+
+func (e *noiseWebSocketConnectError) Unwrap() error {
+	return e.err
+}
+
+func isUnauthorizedNoiseWebSocketError(err error) bool {
+	var connectError *noiseWebSocketConnectError
+	return errors.As(err, &connectError) && connectError.statusCode == http.StatusUnauthorized
+}
+
+// isEnvironmentOfflineError reports whether err is the registry's
+// `environment_offline` conflict (HTTP 409 with code `environment_offline`).
+// Rust #48575 (`985cf47a4e`) promotes Rust's `is_environment_offline_error`
+// from a test-only helper to production so a provisioned environment's initial
+// connection can wait out an executor that is still resuming, while every other
+// registry error keeps the ordinary retry limits.
+func isEnvironmentOfflineError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var statusErr *remoteRegistryHTTPError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	return statusErr.StatusCode == http.StatusConflict &&
+		statusErr.Code != nil && *statusErr.Code == "environment_offline"
+}
+
+// isRetryableRegistryError mirrors Rust is_retryable_registry_error (#39777):
+// connect/timeout failures, interrupted response bodies, retryable HTTP
+// statuses (5xx, 408, 429, 409 environment_offline) are transient, while
+// malformed complete JSON responses and other registry errors are terminal.
+func isRetryableRegistryError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var statusErr *remoteRegistryHTTPError
+	if errors.As(err, &statusErr) {
+		switch statusErr.StatusCode {
+		case http.StatusRequestTimeout, http.StatusTooManyRequests:
+			return true
+		case http.StatusConflict:
+			return isEnvironmentOfflineError(err)
+		default:
+			return statusErr.StatusCode >= 500
+		}
+	}
+	// Rust's is_retryable_registry_error treats an EnvironmentRegistryRequest
+	// whose RouteAwareRequestError is a connect/timeout/body failure as
+	// transient (codex-rs/exec-server/src/client_recovery.rs). Go surfaces the
+	// per-request timeout as an error wrapping context.DeadlineExceeded (see
+	// connectBundle above); without this branch a stalled registry request would
+	// be classified as permanent and stop the initial connect immediately
+	// instead of being bounded by the ordinary operation deadline (Rust #48575
+	// `provisioned_noise_connection_bounds_a_stalled_retry_request`).
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var syntaxErr *json.SyntaxError
+	if errors.As(err, &syntaxErr) {
+		return false
+	}
+	return false
+}
+
+// registryRecoveryRetryDelay returns the exponential backoff delay for a
+// registry retry attempt. It mirrors Rust `registry_recovery_retry_delay`
+// (codex-rs/exec-server/src/client_recovery.rs): 500ms base, 2^attempt
+// multiplier, 5s cap, plus jitter proportional to the (capped) base. The
+// proportional jitter matches the sibling registrationConflictRetryDelay and
+// keeps every delay scaled by registryRecoveryInitialRetryMillis /
+// registryRecoveryMaxRetryInterval so tests can compress the retry windows.
+func registryRecoveryRetryDelay(attempt int) time.Duration {
+	multiplier := 1 << uint(attempt)
+	if attempt > 4 {
+		multiplier = 1 << 4
+	}
+	base := time.Duration(registryRecoveryInitialRetryMillis) * time.Millisecond * time.Duration(multiplier)
+	if base > registryRecoveryMaxRetryInterval {
+		base = registryRecoveryMaxRetryInterval
+	}
+	baseMillis := int64(base / time.Millisecond)
+	if baseMillis <= 0 {
+		baseMillis = 1
+	}
+	jitter := int64(stableRegistryHash(attempt)) % (baseMillis/2 + 1)
+	return time.Duration(baseMillis)*time.Millisecond + time.Duration(jitter)*time.Millisecond
+}
+
+type noiseHarnessClientConnection struct {
+	conn            *websocket.Conn
+	streamID        string
+	transport       *clatter.TransportState
+	transportMu     sync.RWMutex
+	writeMu         sync.Mutex
+	nextSeq         uint32
+	reorder         remoteOrderedCiphertexts
+	decoder         remoteJSONRPCDecoder
+	pending         [][]byte
+	keepaliveCancel context.CancelFunc
+	closeOnce       sync.Once
+	closeErr        error
+}
+
+func dialNoiseHarnessConnection(
+	ctx context.Context,
+	bundle *NoiseRendezvousConnectBundle,
+	identity *remoteNoiseIdentity,
+	httpClient *http.Client,
+) (clientConnection, error) {
+	if bundle == nil || identity == nil {
+		return nil, errors.New("Noise rendezvous connection is incomplete")
+	}
+	remoteDH, remoteKEM, err := decodeRemoteNoisePublicKey(bundle.ExecutorPublicKey)
+	if err != nil {
+		return nil, err
+	}
+	diagnosticURL := bundle.WebSocketURL
+	if index := strings.IndexAny(diagnosticURL, "?#"); index >= 0 {
+		diagnosticURL = diagnosticURL[:index]
+	}
+	conn, response, err := websocket.Dial(ctx, bundle.WebSocketURL, &websocket.DialOptions{HTTPClient: httpClient})
+	if err != nil {
+		statusCode := 0
+		if response != nil {
+			statusCode = response.StatusCode
+		}
+		return nil, &noiseWebSocketConnectError{url: diagnosticURL, statusCode: statusCode, err: err}
+	}
+	conn.SetReadLimit(256 * 1024)
+	closeOnError := true
+	defer func() {
+		if closeOnError {
+			_ = conn.CloseNow()
+		}
+	}()
+	streamID := uuid.NewString()
+	handshake, err := clatter.NewHybridHandshake(
+		clatter.PatternHybridIK,
+		true,
+		remoteNoiseCipherSuite(),
+		clatter.WithStaticKey(identity.dh),
+		clatter.WithStaticKEMKey(identity.kem),
+		clatter.WithRemoteStatic(remoteDH),
+		clatter.WithRemoteStaticKEMKey(remoteKEM),
+		clatter.WithPrologue(noiseChannelPrologue(bundle.EnvironmentID, bundle.ExecutorRegistrationID, streamID)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start Noise relay handshake: %w", err)
+	}
+	handshakeActive := true
+	defer func() {
+		if handshakeActive {
+			handshake.Destroy()
+		}
+	}()
+	request := make([]byte, clatter.MaxMessageLen)
+	requestLen, err := handshake.WriteMessage([]byte(bundle.HarnessKeyAuthorization), request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start Noise relay handshake: %w", err)
+	}
+	for _, frame := range []relayMessageFrame{
+		newRelayResumeFrame(streamID),
+		newRelayHandshakeFrame(streamID, request[:requestLen]),
+	} {
+		encoded, err := encodeRelayMessageFrame(frame)
+		if err != nil {
+			return nil, err
+		}
+		if err := conn.Write(ctx, websocket.MessageBinary, encoded); err != nil {
+			return nil, err
+		}
+	}
+	var transport *clatter.TransportState
+	for transport == nil {
+		messageType, payload, err := conn.Read(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("Noise relay websocket ended during handshake: %w", err)
+		}
+		if messageType != websocket.MessageBinary {
+			return nil, errors.New("Noise relay transport expects binary protobuf frames")
+		}
+		frame, err := decodeRelayMessageFrame(payload)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse Noise relay frame: %w", err)
+		}
+		if frame.StreamID != streamID {
+			continue
+		}
+		switch frame.Kind {
+		case relayFrameHandshake:
+			responsePayload := make([]byte, clatter.MaxMessageLen)
+			responseLen, err := handshake.ReadMessage(frame.HandshakeBytes, responsePayload)
+			if err != nil {
+				return nil, fmt.Errorf("Noise relay handshake failed: %w", err)
+			}
+			if responseLen != 0 {
+				return nil, errors.New("Noise handshake response payload must be empty")
+			}
+			transport, err = handshake.Finalize()
+			handshakeActive = false
+			if err != nil {
+				return nil, fmt.Errorf("Noise relay handshake failed: %w", err)
+			}
+		case relayFrameReset:
+			return nil, errors.New("Noise relay stream reset")
+		case relayFrameAck, relayFrameResume, relayFrameHeartbeat:
+		case relayFrameData:
+			return nil, errors.New("Noise relay received data before handshake completion")
+		default:
+			return nil, errors.New("Noise relay received data before handshake completion")
+		}
+	}
+	closeOnError = false
+	return &noiseHarnessClientConnection{
+		conn: conn, streamID: streamID, transport: transport,
+		keepaliveCancel: startClientWebSocketKeepalive(conn),
+	}, nil
+}
+
+func decodeRemoteNoisePublicKey(key RemotePublicKey) ([]byte, []byte, error) {
+	if key.Suite != noiseChannelSuite {
+		return nil, nil, fmt.Errorf("unsupported Noise channel suite %q", key.Suite)
+	}
+	dh, err := base64.StdEncoding.DecodeString(key.X25519PublicKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid X25519 public key: %w", err)
+	}
+	kem, err := base64.StdEncoding.DecodeString(key.MLKEM768PublicKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid ML-KEM-768 public key: %w", err)
+	}
+	suite := remoteNoiseCipherSuite()
+	if len(dh) != suite.DH.PubKeyLen() {
+		return nil, nil, fmt.Errorf("invalid X25519 public key length %d", len(dh))
+	}
+	if err := suite.SKEM.ValidatePublicKey(kem); err != nil {
+		return nil, nil, fmt.Errorf("invalid ML-KEM-768 public key: %w", err)
+	}
+	return dh, kem, nil
+}
+
+func (c *noiseHarnessClientConnection) Write(ctx context.Context, message []byte) error {
+	if len(message) == 0 || len(message) > maxNoiseJSONRPCMessageLen || !json.Valid(message) {
+		return errors.New("Noise relay JSON-RPC message is invalid")
+	}
+	framed := make([]byte, 4, len(message)+4)
+	binary.BigEndian.PutUint32(framed, uint32(len(message)))
+	framed = append(framed, message...)
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	for len(framed) != 0 {
+		if c.nextSeq == ^uint32(0) {
+			return errors.New("Noise relay sequence number exhausted")
+		}
+		chunkLen := min(len(framed), noiseRecordPlaintextLen)
+		ciphertext := make([]byte, chunkLen+clatter.TagLen)
+		c.transportMu.RLock()
+		ciphertextLen, err := c.transport.Send(framed[:chunkLen], ciphertext)
+		c.transportMu.RUnlock()
+		if err != nil {
+			return fmt.Errorf("failed to encrypt JSON-RPC payload for Noise relay: %w", err)
+		}
+		encoded, err := encodeRelayMessageFrame(newRelayDataFrame(c.streamID, c.nextSeq, ciphertext[:ciphertextLen]))
+		if err != nil {
+			return err
+		}
+		if err := c.conn.Write(ctx, websocket.MessageBinary, encoded); err != nil {
+			return err
+		}
+		c.nextSeq++
+		framed = framed[chunkLen:]
+	}
+	return nil
+}
+
+func (c *noiseHarnessClientConnection) Read(ctx context.Context) ([]byte, error) {
+	if len(c.pending) != 0 {
+		message := c.pending[0]
+		c.pending = c.pending[1:]
+		return message, nil
+	}
+	for {
+		messageType, payload, err := c.conn.Read(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if messageType != websocket.MessageBinary {
+			return nil, errors.New("Noise relay transport expects binary protobuf frames")
+		}
+		frame, err := decodeRelayMessageFrame(payload)
+		if err != nil {
+			return nil, err
+		}
+		if frame.StreamID != c.streamID {
+			continue
+		}
+		switch frame.Kind {
+		case relayFrameData:
+			ciphertexts, err := c.reorder.Push(frame.Data.Seq, frame.Data.Payload)
+			if err != nil {
+				return nil, err
+			}
+			for _, ciphertext := range ciphertexts {
+				if len(ciphertext) < clatter.TagLen {
+					return nil, errors.New("Noise relay ciphertext is too short")
+				}
+				plaintext := make([]byte, len(ciphertext)-clatter.TagLen)
+				c.transportMu.RLock()
+				plaintextLen, err := c.transport.Receive(ciphertext, plaintext)
+				c.transportMu.RUnlock()
+				if err != nil {
+					return nil, fmt.Errorf("Noise relay decryption failed: %w", err)
+				}
+				messages, err := c.decoder.Push(plaintext[:plaintextLen])
+				if err != nil {
+					return nil, err
+				}
+				c.pending = append(c.pending, messages...)
+			}
+			if len(c.pending) != 0 {
+				message := c.pending[0]
+				c.pending = c.pending[1:]
+				return message, nil
+			}
+		case relayFrameReset:
+			return nil, errors.New("Noise relay stream reset")
+		case relayFrameAck, relayFrameResume, relayFrameHeartbeat:
+		case relayFrameHandshake:
+			return nil, errors.New("Noise relay received invalid post-handshake frame")
+		default:
+			return nil, errors.New("Noise relay received invalid post-handshake frame")
+		}
+	}
+}
+
+func (c *noiseHarnessClientConnection) Close() error {
+	c.closeOnce.Do(func() {
+		c.keepaliveCancel()
+		c.closeErr = c.conn.Close(websocket.StatusNormalClosure, "")
+		c.transportMu.Lock()
+		c.transport.Destroy()
+		c.transportMu.Unlock()
+	})
+	return c.closeErr
+}
+
+func (c *noiseHarnessClientConnection) CloseNow() error {
+	c.closeOnce.Do(func() {
+		c.keepaliveCancel()
+		c.closeErr = c.conn.CloseNow()
+		c.transportMu.Lock()
+		c.transport.Destroy()
+		c.transportMu.Unlock()
+	})
+	return c.closeErr
+}
+
+var _ clientConnection = (*noiseHarnessClientConnection)(nil)

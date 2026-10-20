@@ -1,0 +1,419 @@
+package model
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"codex_core/tool"
+)
+
+func TestResponsesToolsFromSpecsSerializesFunctionSearchAndFreeform(t *testing.T) {
+	specs := []tool.Spec{
+		{
+			Name:        tool.PlainName("echo"),
+			Description: "Echo text",
+			InputSchema: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"text": map[string]any{"type": "string"}},
+			},
+			OutputSchema: map[string]any{"type": "object", "required": []string{"output"}},
+		},
+		{
+			Name:        tool.PlainName(tool.ToolSearchName),
+			Description: "Search tools",
+			InputSchema: map[string]any{"type": "object"},
+		},
+		{
+			Name:        tool.PlainName(tool.DefaultApplyPatchToolName),
+			Description: "Patch files",
+			Freeform: &tool.FreeformSpec{
+				Syntax:     "lark",
+				Definition: `start: "patch"`,
+			},
+		},
+		{
+			Name:     tool.PlainName("hidden"),
+			Exposure: tool.ExposureHidden,
+		},
+		{
+			Name:     tool.PlainName("discoverable"),
+			Exposure: tool.ExposureDiscoverable,
+		},
+	}
+
+	got := ResponsesToolsFromSpecs(specs)
+	data, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	var tools []map[string]any
+	if err := json.Unmarshal(data, &tools); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if len(tools) != 3 {
+		t.Fatalf("tools = %#v", tools)
+	}
+	if tools[0]["type"] != "function" || tools[0]["name"] != "echo" || tools[0]["strict"] != false {
+		t.Fatalf("function tool = %#v", tools[0])
+	}
+	if outputSchema, ok := tools[0]["output_schema"].(map[string]any); !ok || outputSchema["type"] != "object" {
+		t.Fatalf("function output schema = %#v", tools[0]["output_schema"])
+	}
+	if tools[1]["type"] != "tool_search" || tools[1]["execution"] != "client" {
+		t.Fatalf("tool_search = %#v", tools[1])
+	}
+	format, ok := tools[2]["format"].(map[string]any)
+	if !ok || tools[2]["type"] != "custom" || tools[2]["name"] != tool.DefaultApplyPatchToolName || format["type"] != "grammar" {
+		t.Fatalf("freeform tool = %#v", tools[2])
+	}
+}
+
+func TestResponsesFunctionToolNormalizesMissingSchemaTypeToObject(t *testing.T) {
+	// Providers such as DeepSeek reject function tools whose parameters omit
+	// an explicit "type": "object". update_plan-style specs historically
+	// shipped only "required"; the serializer must normalize them.
+	got := ResponsesToolsFromSpecs([]tool.Spec{{
+		Name:        tool.PlainName("update_plan"),
+		Description: "Updates the current task plan.",
+		InputSchema: map[string]any{
+			"required": []string{"plan"},
+		},
+	}})
+	if len(got) != 1 {
+		t.Fatalf("tools = %#v", got)
+	}
+	item, ok := got[0].(map[string]any)
+	if !ok || item["type"] != "function" {
+		t.Fatalf("tool = %#v", got[0])
+	}
+	parameters, ok := item["parameters"].(map[string]any)
+	if !ok || parameters["type"] != "object" {
+		t.Fatalf("parameters = %#v", item["parameters"])
+	}
+	required, _ := parameters["required"].([]string)
+	if len(required) != 1 || required[0] != "plan" {
+		t.Fatalf("parameters required = %#v", parameters["required"])
+	}
+}
+
+func TestResponsesLoadableToolsFromValueNormalizesRawFunctionToolParameters(t *testing.T) {
+	// Stale persisted tool definitions (session history, tool search output,
+	// dynamic tools) can carry the pre-fix update_plan shape
+	// {"required": ["plan"]} or explicit nulls for "type"/"required". The
+	// raw-map fast path must sanitize them the same way ResponsesToolsFromSpecs
+	// does, so strict providers never receive an invalid parameters schema.
+	raw := []any{
+		map[string]any{
+			"type":        "function",
+			"name":        "update_plan",
+			"description": "Updates the current task plan.",
+			"parameters":  map[string]any{"required": []string{"plan"}},
+		},
+		map[string]any{
+			"type":        "function",
+			"name":        "agent__spawn_agent",
+			"description": "Spawns a sub-agent to work on a task.",
+			"parameters": map[string]any{
+				"type":     nil,
+				"required": nil,
+				"properties": map[string]any{
+					"items": map[string]any{"type": "array", "items": map[string]any{}},
+				},
+			},
+		},
+		map[string]any{
+			"type":        "namespace",
+			"name":        "mcp__memory",
+			"description": "Memory tools",
+			"tools": []any{
+				map[string]any{
+					"type":       "function",
+					"name":       "create_entities",
+					"parameters": map[string]any{"required": nil},
+				},
+			},
+		},
+	}
+	tools, ok := ResponsesLoadableToolsFromValue(raw)
+	if !ok {
+		t.Fatalf("ResponsesLoadableToolsFromValue() = %#v, want ok", tools)
+	}
+	data, err := json.Marshal(tools)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	encoded := string(data)
+	for _, forbidden := range []string{`"type":null`, `"type": null`, `"required":null`, `"required": null`} {
+		if strings.Contains(encoded, forbidden) {
+			t.Fatalf("serialized tools contain %q: %s", forbidden, encoded)
+		}
+	}
+	if len(tools) != 3 {
+		t.Fatalf("tools = %#v", tools)
+	}
+	updatePlan, _ := tools[0].(map[string]any)
+	parameters, _ := updatePlan["parameters"].(map[string]any)
+	if parameters["type"] != "object" {
+		t.Fatalf("update_plan parameters = %#v, want type object", parameters)
+	}
+	spawn, _ := tools[1].(map[string]any)
+	spawnParameters, _ := spawn["parameters"].(map[string]any)
+	if spawnParameters["type"] != "object" {
+		t.Fatalf("agent__spawn_agent parameters = %#v, want type object", spawnParameters)
+	}
+	if _, exists := spawnParameters["required"]; exists {
+		t.Fatalf("agent__spawn_agent required should be dropped: %#v", spawnParameters["required"])
+	}
+	namespace, _ := tools[2].(map[string]any)
+	children, _ := namespace["tools"].([]any)
+	if len(children) != 1 {
+		t.Fatalf("namespace children = %#v", namespace["tools"])
+	}
+	child, _ := children[0].(map[string]any)
+	childParameters, _ := child["parameters"].(map[string]any)
+	if _, exists := childParameters["required"]; exists {
+		t.Fatalf("namespace child required should be dropped: %#v", childParameters["required"])
+	}
+}
+
+func TestNormalizeResponseToolParametersPreservesWaitPropertiesShape(t *testing.T) {
+	_, waitExecutor := tool.NewCodeModeExecutors(tool.NewRegistry())
+	tools := normalizeResponseToolParameters(ResponsesToolsFromSpecs([]tool.Spec{waitExecutor.Spec()}))
+	wait, _ := tools[0].(map[string]any)
+	if wait["name"] != "wait" {
+		t.Fatalf("tool = %#v, want wait", wait)
+	}
+	parameters, _ := wait["parameters"].(map[string]any)
+	properties, _ := parameters["properties"].(map[string]any)
+	if _, exists := properties["type"]; exists {
+		t.Fatalf("properties container was mutated into a schema: %#v", properties)
+	}
+	for _, name := range []string{"cell_id", "yield_time_ms", "terminate"} {
+		if _, ok := properties[name].(map[string]any); !ok {
+			t.Fatalf("property %q = %#v, want schema object", name, properties[name])
+		}
+	}
+}
+
+// TestResponsesMultiAgentV1ToolsUseNamespaceLikeRust pins the V1 multi-agent
+// surface: Rust registers the family as one `ToolSpec::Namespace`
+// (core/src/tools/handlers/multi_agents_spec.rs), so the request carries a
+// single "multi_agent_v1" namespace with the five functions rather than the
+// flattened `multi_agent_v1__*` function tools Go used to send.
+func TestResponsesMultiAgentV1ToolsUseNamespaceLikeRust(t *testing.T) {
+	names := []string{"close_agent", "resume_agent", "send_input", "spawn_agent", "wait_agent"}
+	specs := make([]tool.Spec, 0, len(names))
+	for _, name := range names {
+		specs = append(specs, tool.Spec{
+			Name:                 tool.NamespacedName("multi_agent_v1", name),
+			Exposure:             tool.ExposureModelVisible,
+			Description:          name + " description",
+			NamespaceDescription: "Tools for spawning and managing sub-agents.",
+			InputSchema:          map[string]any{"type": "object", "properties": map[string]any{}},
+		})
+	}
+	got := ResponsesToolsFromSpecs(specs)
+	if len(got) != 1 {
+		t.Fatalf("tools = %#v", got)
+	}
+	namespace, ok := got[0].(map[string]any)
+	if !ok || namespace["type"] != "namespace" || namespace["name"] != "multi_agent_v1" {
+		t.Fatalf("namespace = %#v", got[0])
+	}
+	if namespace["description"] != "Tools for spawning and managing sub-agents." {
+		t.Fatalf("namespace description = %#v", namespace["description"])
+	}
+	children, ok := namespace["tools"].([]map[string]any)
+	if !ok || len(children) != len(names) {
+		t.Fatalf("namespace children = %#v", namespace["tools"])
+	}
+	for i, name := range names {
+		if children[i]["name"] != name || children[i]["type"] != "function" {
+			t.Fatalf("child %d = %#v, want function %s", i, children[i], name)
+		}
+	}
+}
+
+func TestResponsesMCPToolsUseNamespaceLikeRust(t *testing.T) {
+	got := ResponsesToolsFromSpecs([]tool.Spec{{
+		Name: tool.NamespacedName("mcp__memory", "create_entities"),
+	}})
+	if len(got) != 1 {
+		t.Fatalf("tools = %#v", got)
+	}
+	item, ok := got[0].(map[string]any)
+	if !ok || item["type"] != "namespace" || item["name"] != "mcp__memory" {
+		t.Fatalf("tool = %#v", got[0])
+	}
+	children, ok := item["tools"].([]map[string]any)
+	if !ok || len(children) != 1 || children[0]["name"] != "create_entities" {
+		t.Fatalf("namespace children = %#v", item["tools"])
+	}
+}
+
+func TestResponsesToolsFromSpecsSerializesClockNamespaceLikeRust(t *testing.T) {
+	got := ResponsesToolsFromSpecs([]tool.Spec{{
+		Name:                 tool.NamespacedName("clock", "curr_time"),
+		Description:          "Return the current time in UTC.",
+		NamespaceDescription: "Tools for reading and waiting on time.",
+		InputSchema: map[string]any{
+			"type":                 "object",
+			"properties":           map[string]any{},
+			"additionalProperties": false,
+		},
+	}})
+	if len(got) != 1 {
+		t.Fatalf("tools = %#v", got)
+	}
+	namespace, ok := got[0].(map[string]any)
+	if !ok || namespace["type"] != "namespace" || namespace["name"] != "clock" || namespace["description"] != "Tools for reading and waiting on time." {
+		t.Fatalf("namespace = %#v", got[0])
+	}
+	tools, ok := namespace["tools"].([]map[string]any)
+	if !ok || len(tools) != 1 || tools[0]["name"] != "curr_time" || tools[0]["type"] != "function" {
+		t.Fatalf("namespace tools = %#v", namespace["tools"])
+	}
+	if _, ok := tools[0]["strict"]; ok {
+		t.Fatalf("clock namespace tool should not include strict: %#v", tools[0])
+	}
+}
+
+func TestResponsesToolsFromSpecsSerializesDynamicNamespace(t *testing.T) {
+	got := ResponsesToolsFromSpecs([]tool.Spec{{
+		Name:                 tool.NamespacedName("codex_app", "demo_tool"),
+		Description:          "Demo dynamic tool",
+		NamespaceDescription: "Demo namespace tools",
+		InputSchema: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"city": map[string]any{"type": "string"}},
+		},
+		Search: &tool.SearchInfo{Source: &tool.SearchSourceInfo{Name: "Dynamic tools"}},
+	}})
+	if len(got) != 1 {
+		t.Fatalf("tools = %#v", got)
+	}
+	namespace, ok := got[0].(map[string]any)
+	if !ok || namespace["type"] != "namespace" || namespace["name"] != "codex_app" || namespace["description"] != "Demo namespace tools" {
+		t.Fatalf("namespace = %#v", got[0])
+	}
+	tools, ok := namespace["tools"].([]map[string]any)
+	if !ok || len(tools) != 1 || tools[0]["name"] != "demo_tool" || tools[0]["type"] != "function" {
+		t.Fatalf("namespace tools = %#v", namespace["tools"])
+	}
+	if _, ok := tools[0]["strict"]; ok {
+		t.Fatalf("dynamic namespace tool should not include strict: %#v", tools[0])
+	}
+}
+
+func TestResponsesToolsFromSpecsSerializesStandaloneWebSearchNamespace(t *testing.T) {
+	got := ResponsesToolsFromSpecs([]tool.Spec{{
+		Name:                 tool.NamespacedName("web", "run"),
+		Description:          "Tool for accessing the internet.",
+		NamespaceDescription: "Tool for accessing the internet.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"time": map[string]any{"type": "array", "description": "Get time for the given UTC offsets."},
+			},
+		},
+	}})
+	if len(got) != 1 {
+		t.Fatalf("tools = %#v", got)
+	}
+	namespace, ok := got[0].(map[string]any)
+	if !ok || namespace["type"] != "namespace" || namespace["name"] != "web" {
+		t.Fatalf("namespace = %#v", got[0])
+	}
+	tools, ok := namespace["tools"].([]map[string]any)
+	if !ok || len(tools) != 1 || tools[0]["name"] != "run" || tools[0]["type"] != "function" {
+		t.Fatalf("namespace tools = %#v", namespace["tools"])
+	}
+	properties, ok := tools[0]["parameters"].(map[string]any)["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("parameters = %#v", tools[0]["parameters"])
+	}
+	timeSchema, ok := properties["time"].(map[string]any)
+	if !ok || timeSchema["description"] != "Get time for the given UTC offsets." {
+		t.Fatalf("time schema = %#v", properties["time"])
+	}
+}
+
+func TestResponsesToolsFromSpecsSerializesImageGenerationNamespace(t *testing.T) {
+	got := ResponsesToolsFromSpecs([]tool.Spec{{
+		Name:                 tool.NamespacedName("image_gen", "imagegen"),
+		Description:          "Generate images",
+		NamespaceDescription: "Tools in the image_gen namespace.",
+		InputSchema: map[string]any{
+			"type":       "object",
+			"required":   []string{"prompt"},
+			"properties": map[string]any{"prompt": map[string]any{"type": "string"}},
+		},
+	}})
+	if len(got) != 1 {
+		t.Fatalf("tools = %#v", got)
+	}
+	namespace, ok := got[0].(map[string]any)
+	if !ok || namespace["type"] != "namespace" || namespace["name"] != "image_gen" || namespace["description"] != "Tools in the image_gen namespace." {
+		t.Fatalf("namespace = %#v", got[0])
+	}
+	tools, ok := namespace["tools"].([]map[string]any)
+	if !ok || len(tools) != 1 || tools[0]["name"] != "imagegen" || tools[0]["type"] != "function" {
+		t.Fatalf("namespace tools = %#v", namespace["tools"])
+	}
+	if _, ok := tools[0]["strict"]; ok {
+		t.Fatalf("image_gen namespace tool should not include strict: %#v", tools[0])
+	}
+}
+
+func TestResponsesLoadableToolsFromSpecsSerializesSearchOutputLikeRust(t *testing.T) {
+	got := ResponsesLoadableToolsFromSpecs([]tool.Spec{
+		{
+			Name:                 tool.NamespacedName("angr", "am_list_functions"),
+			Description:          "List functions",
+			NamespaceDescription: "angr MCP tools",
+			InputSchema: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{"filter": map[string]any{"type": "string"}},
+			},
+			Exposure: tool.ExposureDiscoverable,
+		},
+		{
+			Name:        tool.PlainName("plain_lookup"),
+			Description: "Plain lookup",
+			Exposure:    tool.ExposureDiscoverable,
+		},
+	})
+	if len(got) != 2 {
+		t.Fatalf("tools = %#v", got)
+	}
+	namespace, ok := got[0].(map[string]any)
+	if !ok || namespace["type"] != "namespace" || namespace["name"] != "angr" || namespace["description"] != "angr MCP tools" {
+		t.Fatalf("namespace = %#v", got[0])
+	}
+	children, ok := namespace["tools"].([]map[string]any)
+	if !ok || len(children) != 1 {
+		t.Fatalf("namespace children = %#v", namespace["tools"])
+	}
+	if children[0]["type"] != "function" || children[0]["name"] != "am_list_functions" || children[0]["defer_loading"] != true || children[0]["strict"] != false {
+		t.Fatalf("child = %#v", children[0])
+	}
+	plain, ok := got[1].(map[string]any)
+	if !ok || plain["type"] != "function" || plain["name"] != "plain_lookup" || plain["defer_loading"] != true || plain["strict"] != false {
+		t.Fatalf("plain tool = %#v", got[1])
+	}
+}
+
+func TestResponsesToolsUseCollaborationNamespace(t *testing.T) {
+	got := ResponsesToolsFromSpecs([]tool.Spec{{
+		Name: tool.NamespacedName("collaboration", "spawn_agent"), Exposure: tool.ExposureModelVisible,
+		NamespaceDescription: "Tools for spawning and managing sub-agents.", InputSchema: map[string]any{"type": "object"},
+	}})
+	if len(got) != 1 {
+		t.Fatalf("tools = %#v", got)
+	}
+	namespace, ok := got[0].(map[string]any)
+	if !ok || namespace["type"] != "namespace" || namespace["name"] != "collaboration" {
+		t.Fatalf("namespace = %#v", got[0])
+	}
+}

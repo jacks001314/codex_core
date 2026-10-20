@@ -1,0 +1,781 @@
+package telemetry
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	analyticsEventsQueueSize = 256
+	analyticsEventsTimeout   = 10 * time.Second
+	maxThreadProducts        = 4096
+	maxProductBatches        = 16
+	productSKUHeader         = "X-OpenAI-Product-Sku"
+)
+
+type HTTPDoer interface {
+	Do(request *http.Request) (*http.Response, error)
+}
+
+type AnalyticsAuthorizeRequestFunc func(ctx context.Context, request *http.Request, body []byte) (bool, error)
+
+type TrackEventsRequest struct {
+	Events []json.RawMessage `json:"events"`
+}
+
+type AnalyticsEventsClientOptions struct {
+	BaseURL          string
+	AuthHeaders      http.Header
+	AuthorizeRequest AnalyticsAuthorizeRequestFunc
+	HTTPClient       HTTPDoer
+	AnalyticsEnabled *bool
+	QueueSize        int
+	Timeout          time.Duration
+}
+
+type AnalyticsEventsClient struct {
+	exporter *HTTPAnalyticsExporter
+
+	mu      sync.RWMutex
+	queue   chan any
+	cancel  context.CancelFunc
+	done    chan struct{}
+	closed  bool
+	closeMu sync.Once
+}
+
+type HTTPAnalyticsExporter struct {
+	url              string
+	authHeaders      http.Header
+	authorizeRequest AnalyticsAuthorizeRequestFunc
+	httpClient       HTTPDoer
+	timeout          time.Duration
+	threadProductsMu sync.Mutex
+	threadProducts   map[string]string
+	threadOrder      []string
+}
+
+func NewAnalyticsEventsClient(options AnalyticsEventsClientOptions) *AnalyticsEventsClient {
+	if options.AnalyticsEnabled != nil && !*options.AnalyticsEnabled {
+		return &AnalyticsEventsClient{}
+	}
+	exporter := NewHTTPAnalyticsExporter(options)
+	if exporter == nil {
+		return &AnalyticsEventsClient{}
+	}
+	queueSize := options.QueueSize
+	if queueSize <= 0 {
+		queueSize = analyticsEventsQueueSize
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	client := &AnalyticsEventsClient{
+		exporter: exporter,
+		queue:    make(chan any, queueSize),
+		cancel:   cancel,
+		done:     make(chan struct{}),
+	}
+	go client.run(ctx, client.queue)
+	return client
+}
+
+func DisabledAnalyticsEventsClient() *AnalyticsEventsClient {
+	return &AnalyticsEventsClient{}
+}
+
+func NewHTTPAnalyticsExporter(options AnalyticsEventsClientOptions) *HTTPAnalyticsExporter {
+	baseURL := strings.TrimRight(strings.TrimSpace(options.BaseURL), "/")
+	if baseURL == "" {
+		return nil
+	}
+	timeout := options.Timeout
+	if timeout <= 0 {
+		timeout = analyticsEventsTimeout
+	}
+	client := options.HTTPClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	return &HTTPAnalyticsExporter{
+		url:              baseURL + "/codex/analytics-events/events",
+		authHeaders:      cloneHTTPHeader(options.AuthHeaders),
+		authorizeRequest: options.AuthorizeRequest,
+		httpClient:       client,
+		timeout:          timeout,
+		threadProducts:   map[string]string{},
+	}
+}
+
+// UpdateThreadProductSKU records best-effort product attribution for one
+// thread. A nil or blank SKU clears it (Rust #49117).
+func (c *AnalyticsEventsClient) UpdateThreadProductSKU(threadID string, productSKU *string) {
+	if c == nil || c.exporter == nil {
+		return
+	}
+	c.exporter.UpdateThreadProductSKU(threadID, productSKU)
+}
+
+// UpdateThreadProductSKU records best-effort product attribution for one
+// thread without changing the shared analytics authentication identity.
+func (e *HTTPAnalyticsExporter) UpdateThreadProductSKU(threadID string, productSKU *string) {
+	if e == nil {
+		return
+	}
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return
+	}
+	product := ""
+	if productSKU != nil {
+		product = strings.TrimSpace(*productSKU)
+	}
+	e.threadProductsMu.Lock()
+	defer e.threadProductsMu.Unlock()
+	if e.threadProducts == nil {
+		e.threadProducts = map[string]string{}
+	}
+	delete(e.threadProducts, threadID)
+	for index, id := range e.threadOrder {
+		if id == threadID {
+			e.threadOrder = append(e.threadOrder[:index], e.threadOrder[index+1:]...)
+			break
+		}
+	}
+	if product == "" {
+		return
+	}
+	if len(e.threadProducts) >= maxThreadProducts && len(e.threadOrder) > 0 {
+		oldest := e.threadOrder[0]
+		e.threadOrder = e.threadOrder[1:]
+		delete(e.threadProducts, oldest)
+	}
+	e.threadProducts[threadID] = product
+	e.threadOrder = append(e.threadOrder, threadID)
+}
+
+func (c *AnalyticsEventsClient) TrackCodexTurnEvent(ctx context.Context, event CodexTurnEventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) TrackCodexThreadInitializedEvent(ctx context.Context, event CodexThreadInitializedEventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) TrackCodexTurnSteerEvent(ctx context.Context, event CodexTurnSteerEventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) TrackCodexCompactionEvent(ctx context.Context, event CodexCompactionEventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) TrackCodexGoalEvent(ctx context.Context, event CodexGoalEventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) TrackCodexPluginInstalledEvent(ctx context.Context, event CodexPluginEventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) TrackCodexPluginUninstalledEvent(ctx context.Context, event CodexPluginEventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) TrackCodexPluginEnabledEvent(ctx context.Context, event CodexPluginEventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) TrackCodexPluginDisabledEvent(ctx context.Context, event CodexPluginEventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) TrackCodexPluginInstallFailedEvent(ctx context.Context, event CodexPluginInstallFailedEventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) TrackCodexPluginMeasurementsEvent(ctx context.Context, input CodexPluginMeasurementsInput) {
+	for _, event := range PluginMeasurementEvents(input) {
+		c.trackEvent(event)
+	}
+}
+
+func (c *AnalyticsEventsClient) TrackCodexOnboardingExternalAgentImportCompleteEvent(ctx context.Context, event CodexOnboardingExternalAgentImportCompleteEventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) TrackCodexOnboardingExternalAgentImportFailureEvent(ctx context.Context, event CodexOnboardingExternalAgentImportFailureEventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) TrackCodexHookRunEvent(ctx context.Context, event CodexHookRunEventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) TrackCodexAcceptedLineFingerprintsEvent(ctx context.Context, event CodexAcceptedLineFingerprintsEventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) TrackCodexCommandExecutionEvent(ctx context.Context, event CodexCommandExecutionEventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) TrackCodexFileChangeEvent(ctx context.Context, event CodexFileChangeEventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) TrackCodexReviewEvent(ctx context.Context, event CodexReviewEventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) TrackCodexGuardianV2Event(ctx context.Context, event GuardianV2EventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) TrackCodexMCPToolCallEvent(ctx context.Context, event CodexMCPToolCallEventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) TrackCodexDynamicToolCallEvent(ctx context.Context, event CodexDynamicToolCallEventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) TrackCodexCollabAgentToolCallEvent(ctx context.Context, event CodexCollabAgentToolCallEventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) TrackCodexWebSearchEvent(ctx context.Context, event CodexWebSearchEventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) TrackCodexImageGenerationEvent(ctx context.Context, event CodexImageGenerationEventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) TrackSkillInvocationEvent(ctx context.Context, event SkillInvocationEventRequest) {
+	c.trackEvent(event)
+}
+
+func (c *AnalyticsEventsClient) trackEvent(event any) {
+	if c == nil {
+		return
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.closed || c.queue == nil {
+		return
+	}
+	select {
+	case c.queue <- event:
+	default:
+		slog.Warn("dropping analytics event: queue is full")
+	}
+}
+
+func (c *AnalyticsEventsClient) Close() error {
+	if c == nil {
+		return nil
+	}
+	c.closeMu.Do(func() {
+		c.mu.Lock()
+		c.closed = true
+		cancel := c.cancel
+		c.cancel = nil
+		if c.queue != nil {
+			close(c.queue)
+			c.queue = nil
+		}
+		done := c.done
+		c.mu.Unlock()
+		if done != nil {
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				if cancel != nil {
+					cancel()
+				}
+			}
+		}
+	})
+	return nil
+}
+
+func (c *AnalyticsEventsClient) Enabled() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return !c.closed && c.queue != nil
+}
+
+func (c *AnalyticsEventsClient) run(ctx context.Context, queue <-chan any) {
+	defer close(c.done)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-queue:
+			if !ok {
+				return
+			}
+			if err := c.exporter.SendTrackEvents(ctx, []any{event}); err != nil {
+				slog.Warn("failed to send analytics events request", "error", err)
+			}
+		}
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackCodexTurnEvent(ctx context.Context, event CodexTurnEventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackCodexThreadInitializedEvent(ctx context.Context, event CodexThreadInitializedEventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackCodexTurnSteerEvent(ctx context.Context, event CodexTurnSteerEventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackCodexCompactionEvent(ctx context.Context, event CodexCompactionEventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackCodexGoalEvent(ctx context.Context, event CodexGoalEventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackCodexPluginInstalledEvent(ctx context.Context, event CodexPluginEventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackCodexPluginUninstalledEvent(ctx context.Context, event CodexPluginEventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackCodexPluginEnabledEvent(ctx context.Context, event CodexPluginEventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackCodexPluginDisabledEvent(ctx context.Context, event CodexPluginEventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackCodexPluginInstallFailedEvent(ctx context.Context, event CodexPluginInstallFailedEventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackCodexOnboardingExternalAgentImportCompleteEvent(ctx context.Context, event CodexOnboardingExternalAgentImportCompleteEventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackCodexOnboardingExternalAgentImportFailureEvent(ctx context.Context, event CodexOnboardingExternalAgentImportFailureEventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackCodexHookRunEvent(ctx context.Context, event CodexHookRunEventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackCodexAcceptedLineFingerprintsEvent(ctx context.Context, event CodexAcceptedLineFingerprintsEventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackCodexCommandExecutionEvent(ctx context.Context, event CodexCommandExecutionEventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackCodexFileChangeEvent(ctx context.Context, event CodexFileChangeEventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackCodexReviewEvent(ctx context.Context, event CodexReviewEventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackCodexGuardianV2Event(ctx context.Context, event GuardianV2EventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackCodexMCPToolCallEvent(ctx context.Context, event CodexMCPToolCallEventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackCodexDynamicToolCallEvent(ctx context.Context, event CodexDynamicToolCallEventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackCodexCollabAgentToolCallEvent(ctx context.Context, event CodexCollabAgentToolCallEventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackCodexWebSearchEvent(ctx context.Context, event CodexWebSearchEventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackCodexImageGenerationEvent(ctx context.Context, event CodexImageGenerationEventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) TrackSkillInvocationEvent(ctx context.Context, event SkillInvocationEventRequest) {
+	if e == nil {
+		return
+	}
+	if err := e.SendTrackEvents(ctx, []any{event}); err != nil {
+		slog.Warn("failed to send analytics events request", "error", err)
+	}
+}
+
+func (e *HTTPAnalyticsExporter) SendTrackEvents(ctx context.Context, events []any) error {
+	if e == nil || strings.TrimSpace(e.url) == "" || len(events) == 0 {
+		return nil
+	}
+	groups := e.productEventGroups(events)
+	if len(groups) == 1 {
+		for _, batch := range trackEventRequestBatches(groups[0].events) {
+			if err := e.sendTrackEventsBatch(ctx, batch, groups[0].productSKU); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	errs := make(chan error, len(groups))
+	var wg sync.WaitGroup
+	for _, group := range groups {
+		group := group
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for _, batch := range trackEventRequestBatches(group.events) {
+				if err := e.sendTrackEventsBatch(ctx, batch, group.productSKU); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type analyticsProductEventGroup struct {
+	productSKU *string
+	events     []any
+}
+
+func (e *HTTPAnalyticsExporter) productEventGroups(events []any) []analyticsProductEventGroup {
+	e.threadProductsMu.Lock()
+	products := make(map[string]string, len(e.threadProducts))
+	for threadID, product := range e.threadProducts {
+		products[threadID] = product
+	}
+	e.threadProductsMu.Unlock()
+	order := []string{}
+	byProduct := map[string][]any{}
+	for _, event := range events {
+		product := ""
+		if threadID := analyticsEventThreadID(event); threadID != "" {
+			product = products[threadID]
+		}
+		if _, exists := byProduct[product]; !exists {
+			order = append(order, product)
+		}
+		byProduct[product] = append(byProduct[product], event)
+	}
+	if len(order) > maxProductBatches {
+		return []analyticsProductEventGroup{{events: events}}
+	}
+	groups := make([]analyticsProductEventGroup, 0, len(order))
+	for _, product := range order {
+		var sku *string
+		if product != "" {
+			value := product
+			sku = &value
+		}
+		groups = append(groups, analyticsProductEventGroup{productSKU: sku, events: byProduct[product]})
+	}
+	return groups
+}
+
+func analyticsEventThreadID(event any) string {
+	raw, err := json.Marshal(event)
+	if err != nil {
+		return ""
+	}
+	var value map[string]any
+	if json.Unmarshal(raw, &value) != nil {
+		return ""
+	}
+	params, _ := value["event_params"].(map[string]any)
+	if params == nil {
+		return ""
+	}
+	if threadID, _ := params["thread_id"].(string); strings.TrimSpace(threadID) != "" {
+		return strings.TrimSpace(threadID)
+	}
+	for _, key := range []string{"base", "guardian_review", "guardian_v2", "app"} {
+		if nested, _ := params[key].(map[string]any); nested != nil {
+			if threadID, _ := nested["thread_id"].(string); strings.TrimSpace(threadID) != "" {
+				return strings.TrimSpace(threadID)
+			}
+		}
+	}
+	return ""
+}
+
+func (e *HTTPAnalyticsExporter) sendTrackEventsBatch(ctx context.Context, events []any, productSKU *string) error {
+	if e == nil || strings.TrimSpace(e.url) == "" || len(events) == 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	requestCtx := ctx
+	if _, ok := ctx.Deadline(); !ok && e.timeout > 0 {
+		var cancel context.CancelFunc
+		requestCtx, cancel = context.WithTimeout(ctx, e.timeout)
+		defer cancel()
+	}
+	request, err := e.newRequest(requestCtx, events, productSKU)
+	if err != nil || request == nil {
+		return err
+	}
+	response, err := e.httpClient.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= 200 && response.StatusCode < 300 {
+		return nil
+	}
+	body, _ := io.ReadAll(response.Body)
+	return fmt.Errorf("analytics events request failed with status %d: %s", response.StatusCode, strings.TrimSpace(string(body)))
+}
+
+func trackEventRequestBatches(events []any) [][]any {
+	batches := [][]any{}
+	currentBatch := []any{}
+	for _, event := range events {
+		if event == nil {
+			continue
+		}
+		if analyticsEventShouldSendIsolated(event) {
+			if len(currentBatch) > 0 {
+				batches = append(batches, currentBatch)
+				currentBatch = []any{}
+			}
+			batches = append(batches, []any{event})
+			continue
+		}
+		currentBatch = append(currentBatch, event)
+	}
+	if len(currentBatch) > 0 {
+		batches = append(batches, currentBatch)
+	}
+	return batches
+}
+
+func analyticsEventShouldSendIsolated(event any) bool {
+	switch event.(type) {
+	case CodexAcceptedLineFingerprintsEventRequest, *CodexAcceptedLineFingerprintsEventRequest:
+		return true
+	default:
+		return false
+	}
+}
+
+func (e *HTTPAnalyticsExporter) newRequest(ctx context.Context, events []any, productSKU *string) (*http.Request, error) {
+	rawEvents, err := marshalTrackEvents(events)
+	if err != nil {
+		return nil, err
+	}
+	if len(rawEvents) == 0 {
+		return nil, nil
+	}
+	payload := TrackEventsRequest{Events: rawEvents}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, e.url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	addHTTPHeaders(request.Header, e.authHeaders)
+	request.Header.Set("Content-Type", "application/json")
+	if productSKU != nil && strings.TrimSpace(*productSKU) != "" {
+		request.Header.Set(productSKUHeader, strings.TrimSpace(*productSKU))
+	}
+	if e.authorizeRequest != nil {
+		ok, err := e.authorizeRequest(ctx, request, body)
+		if err != nil || !ok {
+			return nil, err
+		}
+		if strings.TrimSpace(request.Header.Get("Content-Type")) == "" {
+			request.Header.Set("Content-Type", "application/json")
+		}
+	}
+	return request, nil
+}
+
+func marshalTrackEvents(events []any) ([]json.RawMessage, error) {
+	rawEvents := make([]json.RawMessage, 0, len(events))
+	for _, event := range events {
+		if event == nil {
+			continue
+		}
+		data, err := json.Marshal(event)
+		if err != nil {
+			return nil, err
+		}
+		rawEvents = append(rawEvents, json.RawMessage(data))
+	}
+	return rawEvents, nil
+}
+
+func cloneHTTPHeader(headers http.Header) http.Header {
+	if headers == nil {
+		return nil
+	}
+	clone := make(http.Header, len(headers))
+	for key, values := range headers {
+		clone[key] = append([]string(nil), values...)
+	}
+	return clone
+}
+
+func addHTTPHeaders(dst http.Header, src http.Header) {
+	for key, values := range src {
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}

@@ -1,0 +1,647 @@
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"codex_core/jsonschema"
+	"codex_core/tool"
+)
+
+const (
+	MultiAgentV2DefaultWait = 30 * time.Second
+	MultiAgentV2MinWait     = 10 * time.Second
+	MultiAgentV2MaxWait     = time.Hour
+)
+
+// multiAgentV2SpawnInheritedModelGuidance mirrors the V2 half of Rust's
+// SPAWN_AGENT_INHERITED_MODEL_GUIDANCE
+// (codex-rs/core/src/tools/handlers/multi_agents_spec.rs:17): the spawn_agent
+// description states that spawned agents inherit the current model by default
+// whenever the model overrides are exposed and the spawn metadata is not
+// hidden (Rust #26114, re-gated by #49786 for the model-catalog-in-context
+// variant, which has no Go carrier because that feature is unwired here).
+const multiAgentV2SpawnInheritedModelGuidance = "Spawned agents inherit your current model by default. Do not set the `model` field unless the user explicitly asks for a different model."
+
+var multiAgentV2TaskNamePattern = regexp.MustCompile(`^[a-z0-9_]+$`)
+
+type V2ToolController interface {
+	ToolController
+	SendMessage(context.Context, *SendMessageArgs) error
+	FollowupTask(context.Context, *FollowupTaskArgs) error
+	WaitForActivity(context.Context, *WaitForActivityArgs) (*WaitForActivityResult, error)
+	InterruptAgent(context.Context, *InterruptAgentArgs) (*InterruptAgentResult, error)
+	ListAgents(context.Context, *ListAgentsArgs) (*ListAgentsResult, error)
+}
+
+type SendMessageArgs struct {
+	Target    string `json:"target"`
+	Message   string `json:"message"`
+	Plaintext bool   `json:"-"`
+
+	ResolvedThreadID string `json:"-"`
+	ResolvedPath     string `json:"-"`
+}
+
+type FollowupTaskArgs struct {
+	Target    string `json:"target"`
+	Message   string `json:"message"`
+	Plaintext bool   `json:"-"`
+
+	ResolvedThreadID string `json:"-"`
+	ResolvedPath     string `json:"-"`
+}
+
+type WaitForActivityArgs struct {
+	TimeoutMS *int64 `json:"timeout_ms,omitempty"`
+}
+
+type WaitForActivityResult struct {
+	Message  string `json:"message"`
+	TimedOut bool   `json:"timed_out"`
+}
+
+type InterruptAgentArgs struct {
+	Target string `json:"target"`
+
+	ResolvedThreadID string `json:"-"`
+	ResolvedPath     string `json:"-"`
+}
+
+type InterruptAgentResult struct {
+	PreviousStatus any `json:"previous_status"`
+}
+
+type ListAgentsArgs struct {
+	PathPrefix *string `json:"path_prefix,omitempty"`
+}
+
+type ListedAgent struct {
+	AgentName   string `json:"agent_name"`
+	AgentStatus any    `json:"agent_status"`
+}
+
+type ListAgentsResult struct {
+	Agents []ListedAgent `json:"agents"`
+}
+
+type multiAgentV2ToolKind string
+
+const (
+	multiAgentV2Spawn     multiAgentV2ToolKind = "spawn_agent"
+	multiAgentV2Send      multiAgentV2ToolKind = "send_message"
+	multiAgentV2Followup  multiAgentV2ToolKind = "followup_task"
+	multiAgentV2Wait      multiAgentV2ToolKind = "wait_agent"
+	multiAgentV2Interrupt multiAgentV2ToolKind = "interrupt_agent"
+	multiAgentV2List      multiAgentV2ToolKind = "list_agents"
+)
+
+type multiAgentV2ToolExecutor struct {
+	kind                      multiAgentV2ToolKind
+	controller                V2ToolController
+	exposure                  tool.Exposure
+	namespace                 string
+	usageHintText             *string
+	waitMin                   time.Duration
+	waitMax                   time.Duration
+	waitDefault               time.Duration
+	hideSpawnMetadata         bool
+	exposeSpawnModelOverrides bool
+	// toolOverrides carries the catalog's per-tool overrides (Rust #46505).
+	toolOverrides map[string]MultiAgentToolOverride
+}
+
+func registerMultiAgentV2Handlers(registry *tool.Registry, options *MultiAgentHandlerOptions) error {
+	controller := options.Controller
+	if len(options.Roles) > 0 || options.Defaults != (SpawnDefaults{}) {
+		controller = NewRoleAwareToolController(controller, options.Roles, options.Defaults)
+	}
+	v2, ok := controller.(V2ToolController)
+	if !ok {
+		return fmt.Errorf("%w: multi-agent v2 controller is unavailable", tool.ErrToolInvalidCall)
+	}
+	namespace := strings.TrimSpace(options.Namespace)
+	if namespace == "" {
+		namespace = MultiAgentV2Namespace
+	}
+	waitMin, waitMax, waitDefault := options.WaitMin, options.WaitMax, options.WaitDefault
+	if !options.WaitConfigured && waitMin <= 0 {
+		waitMin = MultiAgentV2MinWait
+	}
+	if !options.WaitConfigured && waitMax <= 0 {
+		waitMax = MultiAgentV2MaxWait
+	}
+	if !options.WaitConfigured && waitDefault <= 0 {
+		waitDefault = MultiAgentV2DefaultWait
+	}
+	kinds := []multiAgentV2ToolKind{multiAgentV2Spawn}
+	// Rust #47540: disable_direct_message omits send_message and followup_task
+	// while preserving spawning, automatic child results and management tools.
+	if !options.DisableDirectMessage {
+		kinds = append(kinds, multiAgentV2Send, multiAgentV2Followup)
+	}
+	if !options.DisableWaitAgent {
+		kinds = append(kinds, multiAgentV2Wait)
+	}
+	kinds = append(kinds, multiAgentV2Interrupt, multiAgentV2List)
+	for _, kind := range kinds {
+		if err := registry.Register(&multiAgentV2ToolExecutor{
+			kind: kind, controller: v2, exposure: options.Exposure, namespace: namespace,
+			usageHintText: options.UsageHintText,
+			waitMin:       waitMin, waitMax: waitMax, waitDefault: waitDefault, hideSpawnMetadata: options.HideSpawnMetadata,
+			exposeSpawnModelOverrides: options.ExposeSpawnModelOverrides,
+			toolOverrides:             options.ToolOverrides,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *multiAgentV2ToolExecutor) Spec() tool.Spec {
+	namespace := e.namespace
+	if namespace == "" {
+		namespace = MultiAgentV2Namespace
+	}
+	spec := tool.Spec{
+		Name:                 tool.NamespacedName(namespace, string(e.kind)),
+		Exposure:             e.exposure,
+		NamespaceDescription: MultiAgentV2NamespaceDescription,
+	}
+	if spec.Exposure == "" {
+		spec.Exposure = tool.ExposureModelVisible
+	}
+	switch e.kind {
+	case multiAgentV2Spawn:
+		spec.Description = "Spawns an agent to work on the specified task. The new agent's canonical task name will be provided to it along with the message."
+		// Rust's spawn_agent handler replaces the bundled static text with the
+		// catalog description while keeping runtime guidance (Rust #46297):
+		// missing/null keeps the bundled text, an empty string suppresses the
+		// static text, and the usage hint is appended either way.
+		if override, ok := e.toolOverrides[string(e.kind)]; ok && override.Description != nil {
+			spec.Description = *override.Description
+		}
+		// Rust #26114: state the inherited-model default whenever the model
+		// overrides are exposed and the spawn metadata is not hidden. Rust
+		// composes this into the description before the usage hint, so the
+		// hint stays last (multi_agents_spec.rs:117-124).
+		if e.exposeSpawnModelOverrides && !e.hideSpawnMetadata {
+			spec.Description += "\n\n" + multiAgentV2SpawnInheritedModelGuidance
+		}
+		if e.usageHintText != nil && strings.TrimSpace(*e.usageHintText) != "" {
+			// Rust appends the configured multi_agent_v2.usage_hint_text to the
+			// spawn_agent tool description.
+			spec.Description += "\n\n" + strings.TrimSpace(*e.usageHintText)
+		}
+		// Rust #51329: only `none` and `all` are described for `fork_turns`, and the
+		// agent type applies regardless of how much history is inherited, so the old
+		// "set fork_turns to a positive integer" guidance is gone.
+		properties := map[string]any{
+			"task_name":        map[string]any{"type": "string", "description": "Task name for the new agent. Use lowercase letters, digits, and underscores."},
+			"message":          map[string]any{"type": "string", "description": "Initial plain-text task for the new agent.", "encrypted": true},
+			"agent_type":       map[string]any{"type": "string", "description": "Agent type override for the new agent. Omit unless explicitly asked. The selected role applies regardless of how much parent history is inherited."},
+			"model":            map[string]any{"type": "string", "description": "Model override for the new agent. Omit to inherit the parent model."},
+			"reasoning_effort": map[string]any{"type": "string", "description": "Reasoning effort override for the new agent. Omit to inherit the parent effort."},
+			"service_tier":     map[string]any{"type": "string", "description": "Service tier override for the new agent."},
+			"fork_turns":       map[string]any{"type": "string", "description": "Parent history to inherit. Defaults to `all`; use `none` to start without parent history. Only `all` and `none` are supported."},
+		}
+		if e.hideSpawnMetadata {
+			delete(properties, "service_tier")
+		}
+		if !e.exposeSpawnModelOverrides {
+			delete(properties, "model")
+			delete(properties, "reasoning_effort")
+		}
+		spec.InputSchema = multiAgentObjectSchema(properties, []string{"task_name", "message"})
+		outputProperties := map[string]any{"task_name": map[string]any{"type": "string", "description": "Canonical task name for the spawned agent."}}
+		required := []string{"task_name"}
+		if !e.hideSpawnMetadata {
+			outputProperties["nickname"] = map[string]any{"type": []any{"string", "null"}, "description": "User-facing nickname for the spawned agent when available."}
+			required = append(required, "nickname")
+		}
+		spec.OutputSchema = multiAgentObjectSchema(outputProperties, required)
+		// Rust's multi-agent v2 handlers do not override
+		// `supports_parallel_tool_calls`, so spawning stays serial.
+		spec.Parallel = false
+	case multiAgentV2Send:
+		spec.Description = "Send a message to an existing agent. The message will be delivered promptly. Does not trigger a new turn."
+		spec.InputSchema = targetMessageSchema("Relative or canonical task name to message (from spawn_agent).", "Message text to queue on the target agent.")
+	case multiAgentV2Followup:
+		spec.Description = "Send a follow-up task to an existing non-root target agent and trigger a turn if it is idle. If the target is already running, deliver the task promptly at message boundaries while sampling, or after the pending tool call completes."
+		spec.InputSchema = targetMessageSchema("Agent id or canonical task name to send a follow-up task to (from spawn_agent).", "Message text to send to the target agent.")
+	case multiAgentV2Wait:
+		spec.Description = "Wait for a mailbox update from any live agent, including queued messages and final-status notifications. The wait also ends early when new user input is steered into the active turn. Does not return the content; returns either a summary of which agents have updates (if any), an interruption summary for steered input, or a timeout summary if no activity arrives before the deadline."
+		spec.InputSchema = multiAgentObjectSchema(map[string]any{
+			// Rust 92b83e226d (#37189): wait_agent polling guidance moved from
+			// the tool schema into the overridable developer instructions, so
+			// it stays in sync with config changes and is only present when
+			// the tool is enabled.
+			"timeout_ms": map[string]any{"type": "number", "description": fmt.Sprintf("Timeout in milliseconds. Defaults to %d, min %d, max %d.", e.waitDefault.Milliseconds(), e.waitMin.Milliseconds(), e.waitMax.Milliseconds())},
+		}, nil)
+		spec.OutputSchema = multiAgentObjectSchema(map[string]any{
+			"message":   map[string]any{"type": "string", "description": "Brief wait summary without the agent's final content, including any timeout adjustment."},
+			"timed_out": map[string]any{"type": "boolean", "description": "Whether the wait call returned because no mailbox update arrived before the timeout."},
+		}, []string{"message", "timed_out"})
+	case multiAgentV2Interrupt:
+		spec.Description = "Interrupt an agent's current turn, if any, and return its previous status. The agent remains available for messages and follow-up tasks."
+		spec.InputSchema = targetSchema("Agent id or canonical task name to interrupt (from spawn_agent).")
+		spec.OutputSchema = previousStatusSchema("The agent status observed before the interrupt request was handled.")
+	case multiAgentV2List:
+		// Rust #52245: listing agents is read-only and parallel-safe.
+		spec.Parallel = true
+		spec.Description = "List live agents in the current root thread tree. Optionally filter by task-path prefix."
+		spec.InputSchema = multiAgentObjectSchema(map[string]any{"path_prefix": map[string]any{"type": "string", "description": "Task-path prefix filter without a trailing slash. Omit to list all live agents."}}, nil)
+		spec.OutputSchema = multiAgentObjectSchema(map[string]any{"agents": map[string]any{
+			"description": "Live agents visible in the current root thread tree.",
+			"type":        "array", "items": multiAgentObjectSchema(map[string]any{
+				"agent_name":   map[string]any{"type": "string", "description": "Canonical task name for the agent when available, otherwise the agent id."},
+				"agent_status": map[string]any{"description": "Last known status of the agent.", "allOf": []any{agentStatusSchema()}},
+			}, []string{"agent_name", "agent_status"}),
+		}}, []string{"agents"})
+	}
+	if override, ok := e.toolOverrides[string(e.kind)]; ok {
+		applyMultiAgentToolOverride(&spec, e.kind, override)
+	}
+	return spec
+}
+
+// applyMultiAgentToolOverride mirrors Rust's multi_agent_v2_handler override
+// application (#46505): the catalog description replaces the bundled text for
+// every V2 tool except `spawn_agent` (whose Spec applies the description before
+// appending runtime guidance, mirroring Rust's `description_override: None` on
+// the wrapper), and the parameter override is used only when it validates.
+func applyMultiAgentToolOverride(spec *tool.Spec, kind multiAgentV2ToolKind, override MultiAgentToolOverride) {
+	if spec == nil {
+		return
+	}
+	if kind != multiAgentV2Spawn && override.Description != nil {
+		spec.Description = *override.Description
+	}
+	if parameters, ok := resolveMultiAgentParametersOverride(spec.InputSchema, override.Parameters); ok {
+		spec.InputSchema = parameters
+	}
+}
+
+// resolveMultiAgentParametersOverride mirrors Rust's parameter-override
+// validation: the override must decode as JSON, declare an object root, and use
+// only the supported schema subset; it must also still declare every bundled
+// encrypted property, whose encryption marker the harness restores. Anything
+// else retains the bundled parameters.
+func resolveMultiAgentParametersOverride(bundled map[string]any, raw *string) (map[string]any, bool) {
+	if raw == nil {
+		return nil, false
+	}
+	var decoded any
+	if err := json.Unmarshal([]byte(*raw), &decoded); err != nil {
+		return nil, false
+	}
+	object, ok := decoded.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	if kind, _ := object["type"].(string); kind != "object" {
+		return nil, false
+	}
+	parameters, ok := jsonschema.SubsetSchema(object)
+	if !ok {
+		return nil, false
+	}
+	if !multiAgentParametersKeepEncryptedProperties(bundled, parameters) {
+		return nil, false
+	}
+	return parameters, true
+}
+
+// multiAgentParametersKeepEncryptedProperties mirrors Rust's encrypted-property
+// rule: argument transport requires the harness's encryption markers even
+// without server encryption configuration, so an override that omits a bundled
+// encrypted property is rejected and the marker is restored on the ones it keeps.
+func multiAgentParametersKeepEncryptedProperties(bundled map[string]any, override map[string]any) bool {
+	properties, _ := bundled["properties"].(map[string]any)
+	if len(properties) == 0 {
+		return true
+	}
+	overrideProperties, _ := override["properties"].(map[string]any)
+	for name, raw := range properties {
+		schema, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if encrypted, _ := schema["encrypted"].(bool); !encrypted {
+			continue
+		}
+		entry, ok := overrideProperties[name].(map[string]any)
+		if !ok {
+			return false
+		}
+		entry["encrypted"] = true
+	}
+	return true
+}
+
+func (e *multiAgentV2ToolExecutor) Execute(ctx context.Context, invocation *tool.Invocation) (*tool.Output, error) {
+	if invocation == nil || invocation.Payload.Kind != tool.PayloadFunction {
+		return nil, tool.RespondToModel("multi-agent v2 handler received unsupported payload")
+	}
+	var result any
+	var activity map[string]any
+	var err error
+	switch e.kind {
+	case multiAgentV2Spawn:
+		var args SpawnAgentArgs
+		if err = invocation.DecodeArguments(&args); err == nil {
+			if !multiAgentV2TaskNamePattern.MatchString(args.TaskName) {
+				return nil, tool.RespondToModel("task_name must match ^[a-z0-9_]+$")
+			}
+			if strings.TrimSpace(execString(args.Message)) == "" {
+				return nil, tool.RespondToModel("message is required")
+			}
+			if args.ForkContext {
+				return nil, tool.RespondToModel("fork_context is not supported in MultiAgentV2; use fork_turns instead")
+			}
+			if args.ForkTurns == nil {
+				value := "all"
+				args.ForkTurns = &value
+			}
+			if err = validateForkTurns(args.ForkTurns); err != nil {
+				return nil, tool.RespondToModel(err.Error())
+			}
+			args.Plaintext = plaintextCollaborationInvocation(invocation)
+			result, err = e.controller.SpawnAgent(ctx, &args)
+			if spawned, ok := result.(*SpawnAgentResult); ok && spawned != nil && err == nil {
+				activity = map[string]any{
+					"kind":            "started",
+					"agent_thread_id": spawned.AgentID,
+					"agent_path":      firstNonEmptyAgentString(spawned.TaskName, args.TaskName),
+				}
+				// Rust #51463: the started activity records the resolved model and
+				// reasoning effort the child actually runs with.
+				if value := strings.TrimSpace(spawned.Model); value != "" {
+					activity["model"] = value
+				}
+				if value := strings.TrimSpace(spawned.ReasoningEffort); value != "" {
+					activity["reasoning_effort"] = value
+				}
+				output := map[string]any{"task_name": firstNonEmptyAgentString(spawned.TaskName, args.TaskName)}
+				if !e.hideSpawnMetadata {
+					output["nickname"] = spawned.Nickname
+				}
+				result = output
+			}
+		}
+	case multiAgentV2Send:
+		var args SendMessageArgs
+		if err = invocation.DecodeArguments(&args); err == nil {
+			err = validateTargetMessage(args.Target, args.Message)
+		}
+		if err == nil {
+			args.Plaintext = plaintextCollaborationInvocation(invocation)
+			err = e.controller.SendMessage(ctx, &args)
+			activity = map[string]any{
+				"kind":            "interacted",
+				"agent_thread_id": firstNonEmptyAgentString(args.ResolvedThreadID, args.Target),
+				"agent_path":      firstNonEmptyAgentString(args.ResolvedPath, args.Target),
+			}
+			result = nil
+		}
+	case multiAgentV2Followup:
+		var args FollowupTaskArgs
+		if err = invocation.DecodeArguments(&args); err == nil {
+			err = validateTargetMessage(args.Target, args.Message)
+		}
+		if err == nil {
+			args.Plaintext = plaintextCollaborationInvocation(invocation)
+			err = e.controller.FollowupTask(ctx, &args)
+			activity = map[string]any{
+				"kind":            "interacted",
+				"agent_thread_id": firstNonEmptyAgentString(args.ResolvedThreadID, args.Target),
+				"agent_path":      firstNonEmptyAgentString(args.ResolvedPath, args.Target),
+			}
+			result = nil
+		}
+	case multiAgentV2Wait:
+		var args WaitForActivityArgs
+		var requestedTimeoutMS *int64
+		if err = invocation.DecodeArguments(&args); err == nil {
+			requestedTimeoutMS = args.TimeoutMS
+			if args.TimeoutMS != nil && *args.TimeoutMS > e.waitMax.Milliseconds() {
+				return nil, tool.RespondToModel(fmt.Sprintf("timeout_ms must be at most %d", e.waitMax.Milliseconds()))
+			}
+			if args.TimeoutMS != nil && *args.TimeoutMS < e.waitMin.Milliseconds() {
+				clamped := e.waitMin.Milliseconds()
+				args.TimeoutMS = &clamped
+			}
+			// Rust wait.rs:57-65 `None => default_timeout_ms`: an omitted timeout_ms
+			// runs for the configured features.multi_agent_v2.default_wait_timeout_ms.
+			// The executor owns the configured min/max/default trio, so resolve the
+			// default here rather than letting the controller fall back to its own
+			// hard-coded 30s constant.
+			if args.TimeoutMS == nil {
+				fallback := e.waitDefault.Milliseconds()
+				args.TimeoutMS = &fallback
+			}
+			result, err = e.controller.WaitForActivity(ctx, &args)
+			if waitResult, ok := result.(*WaitForActivityResult); ok && waitResult != nil && requestedTimeoutMS != nil && args.TimeoutMS != nil && *requestedTimeoutMS < *args.TimeoutMS {
+				waitResult.Message = fmt.Sprintf("%s\n\nRequested timeout of %dms was clamped to the minimum of %dms.", waitResult.Message, *requestedTimeoutMS, *args.TimeoutMS)
+			}
+		}
+	case multiAgentV2Interrupt:
+		var args InterruptAgentArgs
+		if err = invocation.DecodeArguments(&args); err == nil && strings.TrimSpace(args.Target) == "" {
+			err = fmt.Errorf("target is required")
+		}
+		if err == nil {
+			result, err = e.controller.InterruptAgent(ctx, &args)
+			activity = map[string]any{
+				"kind":            "interrupted",
+				"agent_thread_id": firstNonEmptyAgentString(args.ResolvedThreadID, args.Target),
+				"agent_path":      firstNonEmptyAgentString(args.ResolvedPath, args.Target),
+			}
+		}
+	case multiAgentV2List:
+		var args ListAgentsArgs
+		if err = invocation.DecodeArguments(&args); err == nil {
+			result, err = e.controller.ListAgents(ctx, &args)
+		}
+	default:
+		err = fmt.Errorf("unknown multi-agent v2 tool %q", e.kind)
+	}
+	if err != nil {
+		return nil, tool.RespondToModel(err.Error())
+	}
+	body := ""
+	if result != nil {
+		data, marshalErr := json.Marshal(result)
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		body = string(data)
+	}
+	data := map[string]any{"result": result}
+	if activity != nil {
+		data["subAgentActivity"] = activity
+	}
+	return &tool.Output{Success: true, Body: body, Data: data, LogPreview: body}, nil
+}
+
+func targetSchema(description string) map[string]any {
+	return multiAgentObjectSchema(map[string]any{"target": map[string]any{"type": "string", "description": description}}, []string{"target"})
+}
+
+func targetMessageSchema(targetDescription, messageDescription string) map[string]any {
+	return multiAgentObjectSchema(map[string]any{
+		"target":  map[string]any{"type": "string", "description": targetDescription},
+		"message": map[string]any{"type": "string", "description": messageDescription, "encrypted": true},
+	}, []string{"target", "message"})
+}
+
+func agentStatusSchema() map[string]any {
+	return map[string]any{"oneOf": []any{
+		map[string]any{"type": "string", "enum": []any{"pending_init", "running", "interrupted", "shutdown", "not_found"}},
+		multiAgentObjectSchema(map[string]any{"completed": map[string]any{"type": []any{"string", "null"}}}, []string{"completed"}),
+		multiAgentObjectSchema(map[string]any{"errored": map[string]any{"type": "string"}}, []string{"errored"}),
+	}}
+}
+
+func previousStatusSchema(description string) map[string]any {
+	return multiAgentObjectSchema(map[string]any{
+		"previous_status": map[string]any{"description": description, "allOf": []any{agentStatusSchema()}},
+	}, []string{"previous_status"})
+}
+
+func V2AgentStatusValue(status AgentMessageStatus) any {
+	switch status.Kind {
+	case AgentMessageStatusCompleted:
+		if status.Message == "" {
+			return map[string]any{"completed": nil}
+		}
+		return map[string]any{"completed": status.Message}
+	case AgentMessageStatusErrored:
+		return map[string]any{"errored": status.Message}
+	default:
+		return string(status.Kind)
+	}
+}
+
+func validateTargetMessage(target, message string) error {
+	if strings.TrimSpace(target) == "" {
+		return fmt.Errorf("target is required")
+	}
+	if strings.TrimSpace(message) == "" {
+		return fmt.Errorf("message is required")
+	}
+	return nil
+}
+
+// validateForkTurns mirrors Rust #51329's `parse_fork_turns`
+// (core/src/tools/handlers/multi_agents_v2/spawn.rs): `none` starts the child
+// without parent history, `all` inherits it, and a legacy positive integer
+// string is accepted but inherits the full history instead of truncating it, so
+// only `none` and `all` are described to the model. Zero and non-numeric values
+// are still rejected.
+func validateForkTurns(value *string) error {
+	if value == nil {
+		return nil
+	}
+	normalized := strings.TrimSpace(*value)
+	if strings.EqualFold(normalized, "none") || strings.EqualFold(normalized, "all") {
+		return nil
+	}
+	if count, err := strconv.ParseUint(normalized, 10, 64); err == nil && count > 0 {
+		return nil
+	}
+	return fmt.Errorf("fork_turns must be `none` or `all`")
+}
+
+func execString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+var _ tool.Executor = (*multiAgentV2ToolExecutor)(nil)
+
+func (c *MemoryToolController) SendMessage(ctx context.Context, args *SendMessageArgs) error {
+	_ = ctx
+	if args == nil || validateTargetMessage(args.Target, args.Message) != nil {
+		return fmt.Errorf("target and message are required")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ensure()
+	target := normalizeAgentTarget(args.Target)
+	if _, ok := c.statuses[target]; !ok {
+		return fmt.Errorf("agent %s not found", args.Target)
+	}
+	c.inputs[target] = append(c.inputs[target], args.Message)
+	return nil
+}
+
+func (c *MemoryToolController) FollowupTask(ctx context.Context, args *FollowupTaskArgs) error {
+	if args == nil {
+		return fmt.Errorf("target and message are required")
+	}
+	if err := c.SendMessage(ctx, &SendMessageArgs{Target: args.Target, Message: args.Message}); err != nil {
+		return err
+	}
+	c.SetStatus(args.Target, AgentMessageStatus{Kind: AgentMessageStatusRunning})
+	return nil
+}
+
+func (c *MemoryToolController) WaitForActivity(ctx context.Context, args *WaitForActivityArgs) (*WaitForActivityResult, error) {
+	timeout := MultiAgentV2DefaultWait
+	if args != nil && args.TimeoutMS != nil {
+		timeout = time.Duration(*args.TimeoutMS) * time.Millisecond
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return &WaitForActivityResult{Message: "Wait timed out.", TimedOut: true}, nil
+	}
+}
+
+func (c *MemoryToolController) InterruptAgent(_ context.Context, args *InterruptAgentArgs) (*InterruptAgentResult, error) {
+	if args == nil || strings.TrimSpace(args.Target) == "" {
+		return nil, fmt.Errorf("target is required")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ensure()
+	target := normalizeAgentTarget(args.Target)
+	previous, ok := c.statuses[target]
+	if !ok {
+		previous = AgentMessageStatus{Kind: AgentMessageStatusNotFound}
+	} else {
+		c.statuses[target] = AgentMessageStatus{Kind: AgentMessageStatusInterrupted}
+	}
+	return &InterruptAgentResult{PreviousStatus: V2AgentStatusValue(previous)}, nil
+}
+
+func (c *MemoryToolController) ListAgents(_ context.Context, args *ListAgentsArgs) (*ListAgentsResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ensure()
+	prefix := ""
+	if args != nil && args.PathPrefix != nil {
+		prefix = strings.TrimSpace(*args.PathPrefix)
+	}
+	result := &ListAgentsResult{Agents: []ListedAgent{{AgentName: "/root", AgentStatus: "running"}}}
+	for id, status := range c.statuses {
+		name := "/root/" + id
+		if prefix == "" || strings.HasPrefix(name, prefix) {
+			result.Agents = append(result.Agents, ListedAgent{AgentName: name, AgentStatus: V2AgentStatusValue(status)})
+		}
+	}
+	return result, nil
+}
+
+var _ V2ToolController = (*MemoryToolController)(nil)

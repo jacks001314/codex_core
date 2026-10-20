@@ -1,0 +1,384 @@
+package memories
+
+import (
+	_ "embed"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"unicode/utf8"
+
+	"codex_core/config"
+	"codex_core/model"
+	"codex_core/utils"
+)
+
+const (
+	DefaultStageOneRolloutTokenLimit = 150_000
+	StageOneContextWindowPercent     = 70
+	ExtensionsSubdir                 = "extensions"
+	// MemoryToolDeveloperInstructionsSummaryTokenLimit mirrors Rust
+	// MEMORY_TOOL_DEVELOPER_INSTRUCTIONS_SUMMARY_TOKEN_LIMIT (ext/memories/src/
+	// lib.rs): the memory_summary.md excerpt embedded in the developer
+	// instructions is truncated at 2,500 tokens.
+	MemoryToolDeveloperInstructionsSummaryTokenLimit = 2_500
+)
+
+//go:embed templates/stage_one_system.md
+var stageOneSystemPrompt string
+
+// stageOneSystemV2Prompt is Rust's templates/memories/stage_one_system_v2.md,
+// the summary-only extraction instructions for memories.version = v2 (#43800).
+//
+//go:embed templates/stage_one_system_v2.md
+var stageOneSystemV2Prompt string
+
+//go:embed templates/stage_one_input.md
+var stageOneInputTemplate string
+
+// stageOneInputV2Template is Rust's templates/memories/stage_one_input_v2.md
+// (#43800); it adds the rollout cwd/branch hints.
+//
+//go:embed templates/stage_one_input_v2.md
+var stageOneInputV2Template string
+
+//go:embed templates/consolidation.md
+var consolidationPromptTemplate string
+
+// consolidationV2PromptTemplate is Rust's
+// templates/memories/consolidation_v2.md, used when memories.version = v2
+// (#43813): consolidate straight into memory_summary.md without raw_memories.md.
+//
+//go:embed templates/consolidation_v2.md
+var consolidationV2PromptTemplate string
+
+// memoryToolDeveloperInstructionsV2Template is Rust's
+// templates/memories/read_path_v2.md, used when memories.version = v2 (#43813).
+//
+//go:embed templates/read_path_v2.md
+var memoryToolDeveloperInstructionsV2Template string
+
+const extensionsFolderStructure = `
+Memory extensions (under {{ memory_extensions_root }}/):
+
+- <extension_name>/instructions.md
+  - Source-specific guidance for interpreting additional memory signals. If an
+    extension folder exists, you must read its instructions.md to determine how to use this memory
+    source.
+
+If the user has any memory extensions, you MUST read the instructions for each extension to
+determine how to use the memory source. If the workspace diff shows deleted extension resource files,
+remove stale memories derived only from those resources. If it has no extension folders, continue
+with the standard memory inputs only.
+`
+
+const extensionsPrimaryInputs = `
+Optional source-specific inputs:
+Under ` + "`{{ memory_extensions_root }}/`" + `:
+
+- ` + "`<extension_name>/instructions.md`" + `
+  - If extension folders exist, read each instructions.md first and follow it when interpreting
+    that extension's memory source.
+
+If the workspace diff shows deleted memory extension resources, use that extension-specific deletion
+signal to remove stale memories derived only from those resources.
+`
+
+func StageOneSystemPrompt() string {
+	return stageOneSystemPrompt
+}
+
+// StageOneSystemPromptForVersion selects the extraction instructions for the
+// memory version (Rust #43800): v2 uses the summary-only system prompt.
+func StageOneSystemPromptForVersion(version config.MemoryVersion) string {
+	if version == config.MemoryVersionV2 {
+		return stageOneSystemV2Prompt
+	}
+	return stageOneSystemPrompt
+}
+
+func BuildStageOneInputMessage(info model.ModelInfo, rolloutPath, rolloutCWD, rolloutContents string) string {
+	limit := resolvedStageOneTokenLimit(info)
+	truncated := utils.FormattedTruncateText(rolloutContents, utils.TokensPolicy(limit))
+	return renderMemoryTemplate(stageOneInputTemplate, map[string]string{
+		"rollout_path":     rolloutPath,
+		"rollout_cwd":      rolloutCWD,
+		"rollout_contents": truncated,
+	})
+}
+
+// extractionMessageChunkBytes mirrors Rust's 8,900-byte v2 extraction chunk
+// limit (#43808).
+const extractionMessageChunkBytes = 8_900
+
+// ExtractionMessageChunks splits already-budgeted extraction input into bounded,
+// Unicode-safe chunks in order, preserving all evidence (Rust
+// rollout_input::extraction_messages).
+func ExtractionMessageChunks(text string) []string {
+	chunks := []string{}
+	for len(text) > 0 {
+		end := len(text)
+		if end > extractionMessageChunkBytes {
+			end = extractionMessageChunkBytes
+		}
+		for end > 0 && !utf8.ValidString(text[:end]) {
+			end--
+		}
+		if end == 0 {
+			break
+		}
+		chunks = append(chunks, text[:end])
+		text = text[end:]
+	}
+	return chunks
+}
+
+// BuildStageOneInputForVersion renders the extraction input for the memory
+// version (Rust #43800). v2 uses the cwd/branch-hint input template.
+func BuildStageOneInputForVersion(version config.MemoryVersion, info model.ModelInfo, rolloutPath, rolloutCWD, rolloutGitBranch, rolloutContents string) string {
+	if version != config.MemoryVersionV2 {
+		return BuildStageOneInputMessage(info, rolloutPath, rolloutCWD, rolloutContents)
+	}
+	branch := strings.TrimSpace(rolloutGitBranch)
+	if branch == "" {
+		branch = "unknown"
+	}
+	return renderMemoryTemplate(stageOneInputV2Template, map[string]string{
+		"rollout_path":       rolloutPath,
+		"rollout_cwd":        rolloutCWD,
+		"rollout_git_branch": branch,
+		// v2 evidence is already budgeted by serialize_tiered_input upstream.
+		"rollout_contents": rolloutContents,
+	})
+}
+
+func BuildConsolidationPrompt(root string) string {
+	return BuildConsolidationPromptForVersion(root, config.MemoryVersionV1)
+}
+
+// BuildConsolidationPromptForVersion renders the consolidation subagent prompt
+// for the selected memory version (Rust #43813); v2 uses the summary-only
+// consolidation template.
+func BuildConsolidationPromptForVersion(root string, version config.MemoryVersion) string {
+	extensionsRoot := filepath.Join(root, ExtensionsSubdir)
+	folderBlock := ""
+	inputsBlock := ""
+	if info, err := os.Stat(extensionsRoot); err == nil && info.IsDir() {
+		values := map[string]string{"memory_extensions_root": extensionsRoot}
+		folderBlock = renderMemoryTemplate(extensionsFolderStructure, values)
+		inputsBlock = renderMemoryTemplate(extensionsPrimaryInputs, values)
+	}
+	template := consolidationPromptTemplate
+	if version == config.MemoryVersionV2 {
+		template = consolidationV2PromptTemplate
+	}
+	return renderMemoryTemplate(template, map[string]string{
+		"memory_root":                        root,
+		"memory_extensions_folder_structure": folderBlock,
+		"memory_extensions_primary_inputs":   inputsBlock,
+		"phase2_workspace_diff_file":         WorkspaceDiffFilename,
+	})
+}
+
+// BuildMemoryToolDeveloperInstructions mirrors Rust
+// build_memory_tool_developer_instructions (ext/memories/src/prompts.rs): it
+// renders the model-visible "## Memory" developer-policy fragment from the
+// persisted memory_summary.md, truncated at 2,500 tokens. Returns "" when the
+// summary is missing or empty (Rust returns None), so callers can skip the
+// fragment exactly like Rust.
+func BuildMemoryToolDeveloperInstructions(codexHome string) string {
+	return BuildMemoryToolDeveloperInstructionsForVersion(codexHome, config.MemoryVersionV1)
+}
+
+// BuildMemoryToolDeveloperInstructionsForVersion renders the fragment from the
+// selected memory version's summary (Rust #43797); v2 reads the isolated
+// `memories_v2` root.
+func BuildMemoryToolDeveloperInstructionsForVersion(codexHome string, version config.MemoryVersion) string {
+	basePath := RootForVersion(codexHome, version)
+	summaryPath := filepath.Join(basePath, MemorySummaryFilename)
+	data, err := os.ReadFile(summaryPath)
+	if err != nil {
+		return ""
+	}
+	memorySummary := strings.TrimSpace(string(data))
+	if memorySummary == "" {
+		return ""
+	}
+	memorySummary = utils.FormattedTruncateText(memorySummary, utils.TokensPolicy(MemoryToolDeveloperInstructionsSummaryTokenLimit))
+	template := memoryToolDeveloperInstructionsTemplate
+	if version == config.MemoryVersionV2 {
+		// v2 uses dedicated read instructions (Rust #43813).
+		template = memoryToolDeveloperInstructionsV2Template
+	}
+	return renderMemoryTemplate(template, map[string]string{
+		"base_path":      basePath,
+		"memory_summary": memorySummary,
+	})
+}
+
+// memoryToolDeveloperInstructionsTemplate mirrors Rust
+// ext/memories/templates/memories/read_path.md byte-for-byte ({{ base_path }}
+// and {{ memory_summary }} are the only substitutions).
+const memoryToolDeveloperInstructionsTemplate = `## Memory
+
+You have access to a memory folder with guidance from prior runs. It can save
+time and help you stay consistent. Use it whenever it is likely to help.
+
+Decision boundary: should you use memory for a new user query?
+
+- Skip memory ONLY when the request is clearly self-contained and does not need
+  workspace history, conventions, or prior decisions.
+- Hard skip examples: current time/date, simple translation, simple sentence
+  rewrite, one-line shell command, trivial formatting.
+- Use memory by default when ANY of these are true:
+  - the query mentions workspace/repo/module/path/files in MEMORY_SUMMARY below,
+  - the user asks for prior context / consistency / previous decisions,
+  - the task is ambiguous and could depend on earlier project choices,
+  - the ask is a non-trivial and related to MEMORY_SUMMARY below.
+- If unsure, do a quick memory pass.
+
+Memory layout (general -> specific):
+
+- {{ base_path }}/memory_summary.md (already provided below; do NOT open again)
+- {{ base_path }}/MEMORY.md (searchable registry; primary file to query)
+- {{ base_path }}/skills/<skill-name>/ (skill folder)
+  - SKILL.md (entrypoint instructions)
+  - scripts/ (optional helper scripts)
+  - examples/ (optional example outputs)
+  - templates/ (optional templates)
+- {{ base_path }}/rollout_summaries/ (per-rollout recaps + evidence snippets)
+  - The paths of these entries can be found in {{ base_path }}/MEMORY.md or {{ base_path }}/rollout_summaries/ as ` + "`rollout_path`" + `
+  - These files are append-only ` + "`jsonl`" + `: ` + "`session_meta.payload.id`" + ` identifies the session, ` + "`turn_context`" + ` marks turn boundaries, ` + "`event_msg`" + ` is the lightweight status stream, and ` + "`response_item`" + ` contains actual messages, tool calls, and tool outputs.
+  - For efficient lookup, prefer matching the filename suffix or ` + "`session_meta.payload.id`" + `; avoid broad full-content scans unless needed.
+
+Quick memory pass (when applicable):
+
+1. Skim the MEMORY_SUMMARY below and extract task-relevant keywords.
+2. Search {{ base_path }}/MEMORY.md using those keywords.
+3. Only if MEMORY.md directly points to rollout summaries/skills, open the 1-2
+   most relevant files under {{ base_path }}/rollout_summaries/ or
+   {{ base_path }}/skills/.
+4. If above are not clear and you need exact commands, error text, or precise evidence, search over ` + "`rollout_path`" + ` for more evidence.
+5. If there are no relevant hits, stop memory lookup and continue normally.
+
+Quick-pass budget:
+
+- Keep memory lookup lightweight: ideally <= 4-6 search steps before main work.
+- Avoid broad scans of all rollout summaries.
+
+During execution: if you hit repeated errors, confusing behavior, or suspect
+relevant prior context, redo the quick memory pass.
+
+How to decide whether to verify memory:
+
+- Consider both risk of drift and verification effort.
+- If a fact is likely to drift and is cheap to verify, verify it before
+  answering.
+- If a fact is likely to drift but verification is expensive, slow, or
+  disruptive, it is acceptable to answer from memory in an interactive turn,
+  but you should say that it is memory-derived, note that it may be stale, and
+  consider offering to refresh it live.
+- If a fact is lower-drift and expensive to verify, it is usually fine to
+  answer from memory directly.
+
+When answering from memory without current verification:
+
+- If you rely on memory for a fact that you did not verify in the current turn,
+  say so briefly in the final answer.
+- If that fact is plausibly drift-prone or comes from an older note, older
+  snapshot, or prior run summary, say that it may be stale or outdated.
+- If live verification was skipped and a refresh would be useful in the
+  interactive context, consider offering to verify or refresh it live.
+- Do not present unverified memory-derived facts as confirmed-current.
+- Prefer a short refresh offer for interactive questions, especially about prior
+  results, commands, timing, or older snapshots.
+
+Memory citation requirements:
+
+- If ANY relevant memory files were used: append exactly one
+` + "`<oai-mem-citation>`" + ` block as the VERY LAST content of the final reply.
+  Normal responses should include the answer first, then append the
+` + "`<oai-mem-citation>`" + ` block at the end.
+- Use this exact structure for programmatic parsing:
+` + "```" + `
+<oai-mem-citation>
+<citation_entries>
+MEMORY.md:234-236|note=[responsesapi citation extraction code pointer]
+rollout_summaries/2026-02-17T21-23-02-LN3m-example.md:10-12|note=[weekly report format]
+</citation_entries>
+<rollout_ids>
+019c6e27-e55b-73d1-87d8-4e01f1f75043
+019c7714-3b77-74d1-9866-e1f484aae2ab
+</rollout_ids>
+</oai-mem-citation>
+` + "```" + `
+- ` + "`citation_entries`" + ` is for rendering:
+  - one citation entry per line
+  - format: ` + "`<file>:<line_start>-<line_end>|note=[<how memory was used>]`" + `
+  - use file paths relative to the memory base path (for example, ` + "`MEMORY.md`" + `,
+    ` + "`rollout_summaries/...`" + `, ` + "`skills/...`" + `)
+  - only cite files actually used under the memory base path (do not cite
+    workspace files as memory citations)
+  - if you used ` + "`MEMORY.md`" + ` and then a rollout summary/skill file, cite both
+  - list entries in order of importance (most important first)
+  - ` + "`note`" + ` should be short, single-line, and use simple characters only (avoid
+    unusual symbols, no newlines)
+- ` + "`rollout_ids`" + ` is for us to track what previous rollouts you find useful:
+  - include one rollout id per line
+  - rollout ids should look like UUIDs (for example,
+    ` + "`019c6e27-e55b-73d1-87d8-4e01f1f75043`" + `)
+  - include unique ids only; do not repeat ids
+  - an empty ` + "`<rollout_ids>`" + ` section is allowed if no rollout ids are available
+  - you can find rollout ids in rollout summary files and MEMORY.md
+  - do not include file paths or notes in this section
+  - For every ` + "`citation_entries`" + `, try to find and cite the corresponding rollout id if possible
+- Never include memory citations inside pull-request messages.
+- Never cite blank lines; double-check ranges.
+
+Updating memories:
+
+You can update the memories **only** when explicitly asked by the user. This must always come from a direct request from the user.
+- Write your update in {{ base_path }}/extensions/ad_hoc/notes/
+- Each update must be one small file containing what you want to add/delete/update from the memories.
+- The name of this file must be ` + "`<timestamp>-<short slug>.md`" + `
+- Do not try to edit the memory files yourself, only add one update note in {{ base_path }}/extensions/ad_hoc/notes/
+
+========= MEMORY_SUMMARY BEGINS =========
+{{ memory_summary }}
+========= MEMORY_SUMMARY ENDS =========
+
+When memory is likely relevant, start with the quick memory pass above before
+deep repo exploration.
+`
+
+func resolvedStageOneTokenLimit(info model.ModelInfo) int {
+	window := info.ContextWindow
+	if window <= 0 {
+		window = info.MaxContextWindow
+	}
+	if window <= 0 {
+		return DefaultStageOneRolloutTokenLimit
+	}
+	effectivePercent := info.EffectiveContextWindowPercent
+	if effectivePercent <= 0 {
+		effectivePercent = 100
+	}
+	limit := window * int64(effectivePercent) / 100
+	limit = limit * StageOneContextWindowPercent / 100
+	if limit < 1 {
+		limit = 1
+	}
+	maxInt := int64(^uint(0) >> 1)
+	if limit > maxInt {
+		return int(maxInt)
+	}
+	return int(limit)
+}
+
+func renderMemoryTemplate(source string, values map[string]string) string {
+	result := source
+	for key, value := range values {
+		result = strings.ReplaceAll(result, fmt.Sprintf("{{ %s }}", key), value)
+	}
+	return result
+}

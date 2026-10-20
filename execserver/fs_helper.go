@@ -1,0 +1,592 @@
+package execserver
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+
+	"codex_core/envutil"
+	"codex_core/sandbox"
+	"codex_core/sandbox/windowssandbox"
+	"codex_core/utils"
+)
+
+const FSHelperArg1 = "--codex-run-as-fs-helper"
+
+const (
+	// fsHelperExitTimeout bounds how long the parent waits to reap the fs helper
+	// after it has responded, killing a stuck helper instead of hanging foreever
+	// (Rust #40808 FS_HELPER_EXIT_TIMEOUT).
+	fsHelperExitTimeout = 2 * time.Second
+	// maxFSHelperStderrBytes bounds the retained stderr diagnostic from a noisy
+	// helper (Rust #40808 MAX_FS_HELPER_STDERR_BYTES).
+	maxFSHelperStderrBytes = 4096
+)
+
+var fsHelperCommandForExecutable = func(executable string) []string {
+	return []string{executable, FSHelperArg1}
+}
+
+func windowsSandboxProxySettingsModeForFS(mode WindowsSandboxProxySettingsMode) windowssandbox.ProxySettingsMode {
+	if mode == WindowsSandboxProxySettingsPreserve {
+		return windowssandbox.ProxySettingsPreserve
+	}
+	return windowssandbox.ProxySettingsReconcile
+}
+
+type fsHelperRequest struct {
+	Operation string          `json:"operation"`
+	Params    json.RawMessage `json:"params"`
+}
+
+type fsHelperPayload struct {
+	Operation string          `json:"operation"`
+	Response  json.RawMessage `json:"response"`
+}
+
+type fsHelperResponse struct {
+	Status  string          `json:"status"`
+	Payload json.RawMessage `json:"payload"`
+}
+
+type fsHelperError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+func RunFSHelper(stdin io.Reader, stdout io.Writer, stderr io.Writer) int {
+	input, err := io.ReadAll(stdin)
+	if err != nil {
+		fmt.Fprintf(stderr, "fs sandbox helper failed: %v\n", err)
+		return 1
+	}
+	var request fsHelperRequest
+	if err := json.Unmarshal(input, &request); err != nil {
+		fmt.Fprintf(stderr, "fs sandbox helper failed: %v\n", err)
+		return 1
+	}
+	response, operationErr := runDirectFSHelperRequest(&request)
+	var envelope any
+	if operationErr != nil {
+		failure := fsOperationFailure(operationErr)
+		envelope = struct {
+			Status  string        `json:"status"`
+			Payload fsHelperError `json:"payload"`
+		}{Status: "error", Payload: fsHelperError{Code: failure.code, Message: failure.message}}
+	} else {
+		envelope = struct {
+			Status  string          `json:"status"`
+			Payload fsHelperPayload `json:"payload"`
+		}{Status: "ok", Payload: fsHelperPayload{Operation: request.Operation, Response: response}}
+	}
+	if err := json.NewEncoder(stdout).Encode(envelope); err != nil {
+		fmt.Fprintf(stderr, "fs sandbox helper failed: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func runDirectFSHelperRequest(request *fsHelperRequest) (json.RawMessage, error) {
+	if request == nil {
+		return nil, errors.New("fs helper request is required")
+	}
+	marshalResponse := func(value any, err error) (json.RawMessage, error) {
+		if err != nil {
+			return nil, err
+		}
+		data, marshalErr := json.Marshal(value)
+		return data, marshalErr
+	}
+	switch request.Operation {
+	case MethodFSReadFile:
+		var params FSReadFileParams
+		if err := json.Unmarshal(request.Params, &params); err != nil {
+			return nil, err
+		}
+		params.Sandbox = nil
+		response, err := readFile(&params)
+		return marshalResponse(response, err)
+	case MethodFSWriteFile:
+		var params FSWriteFileParams
+		if err := json.Unmarshal(request.Params, &params); err != nil {
+			return nil, err
+		}
+		params.Sandbox = nil
+		response, err := writeFile(&params)
+		return marshalResponse(response, err)
+	case MethodFSCreateDirectory:
+		var params FSCreateDirectoryParams
+		if err := json.Unmarshal(request.Params, &params); err != nil {
+			return nil, err
+		}
+		params.Sandbox = nil
+		response, err := createDirectory(&params)
+		return marshalResponse(response, err)
+	case MethodFSGetMetadata:
+		var params FSGetMetadataParams
+		if err := json.Unmarshal(request.Params, &params); err != nil {
+			return nil, err
+		}
+		params.Sandbox = nil
+		response, err := getMetadata(&params)
+		return marshalResponse(response, err)
+	case MethodFSCanonicalize:
+		var params FSCanonicalizeParams
+		if err := json.Unmarshal(request.Params, &params); err != nil {
+			return nil, err
+		}
+		params.Sandbox = nil
+		response, err := canonicalize(&params)
+		return marshalResponse(response, err)
+	case MethodFSReadDirectory:
+		var params FSReadDirectoryParams
+		if err := json.Unmarshal(request.Params, &params); err != nil {
+			return nil, err
+		}
+		params.Sandbox = nil
+		response, err := readDirectory(&params)
+		return marshalResponse(response, err)
+	case MethodFSWalk:
+		var params FSWalkParams
+		if err := json.Unmarshal(request.Params, &params); err != nil {
+			return nil, err
+		}
+		params.Sandbox = nil
+		response, err := walkPath(&params)
+		return marshalResponse(response, err)
+	case MethodFSRemove:
+		var params FSRemoveParams
+		if err := json.Unmarshal(request.Params, &params); err != nil {
+			return nil, err
+		}
+		params.Sandbox = nil
+		response, err := removePath(&params)
+		return marshalResponse(response, err)
+	case MethodFSCopy:
+		var params FSCopyParams
+		if err := json.Unmarshal(request.Params, &params); err != nil {
+			return nil, err
+		}
+		params.Sandbox = nil
+		response, err := copyPath(&params)
+		return marshalResponse(response, err)
+	default:
+		return nil, requestError(-32602, fmt.Sprintf("unknown fs helper operation %s", request.Operation))
+	}
+}
+
+func runSandboxedFSOperation(ctx *FileSystemSandboxContext, operation string, params any, target any) (bool, error) {
+	required, profile, profileJSON, cwd, workspaceRoots, err := prepareFSSandboxForOperation(ctx, operation)
+	if err != nil || !required {
+		return required, err
+	}
+	paramsJSON, err := json.Marshal(params)
+	if err != nil {
+		return true, err
+	}
+	var paramsObject map[string]any
+	if err := json.Unmarshal(paramsJSON, &paramsObject); err != nil {
+		return true, err
+	}
+	paramsObject["sandbox"] = nil
+	paramsJSON, err = json.Marshal(paramsObject)
+	if err != nil {
+		return true, err
+	}
+	requestJSON, err := json.Marshal(fsHelperRequest{Operation: operation, Params: paramsJSON})
+	if err != nil {
+		return true, err
+	}
+	allowedSymlinkedCodexHome := ""
+	if ctx != nil {
+		allowedSymlinkedCodexHome = ctx.allowedSymlinkedCodexHome
+	}
+	command, env, err := fsSandboxCommand(ctx, profile, profileJSON, cwd, workspaceRoots, allowedSymlinkedCodexHome)
+	if err != nil {
+		return true, err
+	}
+	cmd := exec.Command(command[0], command[1:]...)
+	cmd.Dir = cwd
+	cmd.Env = envPairs(env)
+	// Rust #48483: the helper is piped, so it must not allocate a console window
+	// when the exec server itself has no console.
+	envutil.SuppressConsoleWindow(cmd)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return true, requestError(-32603, fmt.Sprintf("fs sandbox helper stdin pipe failed: %v", err))
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return true, requestError(-32603, fmt.Sprintf("fs sandbox helper stdout pipe failed: %v", err))
+	}
+	stderr := &boundedBuffer{}
+	cmd.Stderr = stderr
+	if err := cmd.Start(); err != nil {
+		return true, requestError(-32603, fmt.Sprintf("fs sandbox helper start failed: %v", err))
+	}
+	// Write the newline-delimited request. If the pipe fails, terminate the
+	// helper so an elevated process cannot survive a disconnected control pipe
+	// (Rust #40808).
+	if _, err := stdin.Write(append(requestJSON, '\n')); err != nil {
+		terminateFSHelper(cmd)
+		return true, requestError(-32603, fmt.Sprintf("fs sandbox helper pipe failed: %v", err))
+	}
+	_ = stdin.Close()
+
+	// Read the newline-delimited response without an operation deadline, then
+	// reap the helper with a bounded timeout, killing a stuck helper.
+	line, err := readHelperResponse(stdout)
+	if err != nil {
+		terminateFSHelper(cmd)
+		return true, requestError(-32603, fmt.Sprintf("fs sandbox helper failed: %v", err))
+	}
+	if err := reapFSHelper(cmd); err != nil {
+		return true, requestError(-32603, fmt.Sprintf("fs sandbox helper failed with status %v: %s", err, strings.TrimSpace(stderr.String())))
+	}
+	var response fsHelperResponse
+	if err := json.Unmarshal(line, &response); err != nil {
+		return true, requestError(-32603, fmt.Sprintf("invalid fs sandbox helper response: %v", err))
+	}
+	if response.Status == "error" {
+		var helperErr fsHelperError
+		if err := json.Unmarshal(response.Payload, &helperErr); err != nil {
+			return true, requestError(-32603, fmt.Sprintf("invalid fs sandbox helper error response: %v", err))
+		}
+		return true, requestError(helperErr.Code, helperErr.Message)
+	}
+	if response.Status != "ok" {
+		return true, requestError(-32603, fmt.Sprintf("invalid fs sandbox helper status %q", response.Status))
+	}
+	var payload fsHelperPayload
+	if err := json.Unmarshal(response.Payload, &payload); err != nil {
+		return true, requestError(-32603, fmt.Sprintf("invalid fs sandbox helper payload: %v", err))
+	}
+	if payload.Operation != operation {
+		return true, requestError(-32603, fmt.Sprintf("unexpected fs sandbox helper response: expected %s, got %s", operation, payload.Operation))
+	}
+	if target != nil {
+		if err := json.Unmarshal(payload.Response, target); err != nil {
+			return true, requestError(-32603, fmt.Sprintf("invalid fs sandbox helper operation response: %v", err))
+		}
+	}
+	return true, nil
+}
+
+func prepareFSSandbox(ctx *FileSystemSandboxContext) (bool, *sandbox.PermissionProfile, string, string, []string, error) {
+	return prepareFSSandboxForOperation(ctx, "")
+}
+
+func prepareFSSandboxForOperation(ctx *FileSystemSandboxContext, operation string) (bool, *sandbox.PermissionProfile, string, string, []string, error) {
+	if ctx == nil {
+		return false, nil, "", "", nil, nil
+	}
+	if !hasJSONValue(ctx.Permissions) {
+		return true, nil, "", "", nil, requestError(-32602, "file system sandbox context permissions are required")
+	}
+	if err := ctx.SandboxOverride.Validate(); err != nil {
+		return true, nil, "", "", nil, requestError(-32602, "file system sandbox context: "+err.Error())
+	}
+	profileJSON, err := nativePermissionProfileJSON(ctx.Permissions)
+	if err != nil {
+		return true, nil, "", "", nil, requestError(-32602, fmt.Sprintf("invalid sandbox permission path URI: %v", err))
+	}
+	profile, err := sandbox.ParseRuntimePermissionProfileJSON(profileJSON)
+	if err != nil {
+		return true, nil, "", "", nil, requestError(-32602, fmt.Sprintf("invalid sandbox permission profile: %v", err))
+	}
+	if profile.Disabled {
+		return false, profile, profileJSON, "", nil, nil
+	}
+	if operation == "" && profile.LegacySandboxPolicy().HasFullDiskWriteAccess() {
+		return false, profile, profileJSON, "", nil, nil
+	}
+	cwd := ""
+	if strings.TrimSpace(ctx.CWD) != "" {
+		cwd, err = nativeExecServerPath(ctx.CWD, "file system sandbox cwd")
+		if err != nil {
+			return true, nil, "", "", nil, err
+		}
+	} else {
+		if fsPermissionsDependOnCWD(ctx.Permissions) {
+			return true, nil, "", "", nil, requestError(-32602, "file system sandbox context with dynamic permissions requires cwd")
+		}
+		cwd, err = os.Getwd()
+		if err != nil {
+			return true, nil, "", "", nil, err
+		}
+	}
+	if !filepath.IsAbs(cwd) {
+		return true, nil, "", "", nil, requestError(-32602, fmt.Sprintf("current directory is not absolute: %s", cwd))
+	}
+	convention := fsSandboxPathConvention(cwd)
+	if operation != "" && !fsOperationRequiresSandbox(operation, profile, convention) {
+		return false, profile, profileJSON, "", nil, nil
+	}
+	workspaceRoots := make([]string, 0, len(ctx.WorkspaceRoots))
+	for _, root := range ctx.WorkspaceRoots {
+		native, pathErr := nativeExecServerPath(root, "workspace root")
+		if pathErr != nil {
+			return true, nil, "", "", nil, pathErr
+		}
+		workspaceRoots = append(workspaceRoots, native)
+	}
+	if len(workspaceRoots) == 0 {
+		workspaceRoots = []string{cwd}
+	}
+	return true, profile, profileJSON, cwd, workspaceRoots, nil
+}
+
+// fsOperationRequiresSandbox selects sandboxing independently for reads and
+// writes (Rust #46122). A full-disk-write policy may still carry deny-read
+// entries, so read operations cannot skip enforcement merely because writes are
+// unrestricted. Copy is a write operation in Rust's routing.
+func fsOperationRequiresSandbox(operation string, profile *sandbox.PermissionProfile, convention utils.PathConvention) bool {
+	if profile == nil || profile.Disabled {
+		return false
+	}
+	policy := profile.LegacySandboxPolicy()
+	writeRestricted := !policy.HasFullDiskWriteAccess()
+	readRestricted := profile.HasDenyReadEntriesForConvention(convention) || !policy.HasFullDiskReadAccess()
+	switch strings.TrimSpace(operation) {
+	case MethodFSReadFile, MethodFSGetMetadata, MethodFSCanonicalize, MethodFSReadDirectory, MethodFSWalk:
+		return readRestricted
+	case MethodFSWriteFile, MethodFSCreateDirectory, MethodFSRemove, MethodFSCopy:
+		return writeRestricted
+	default:
+		return writeRestricted
+	}
+}
+
+// fsSandboxPathConvention infers the executor convention from its cwd. An
+// unknown convention is passed through as the zero value so symbolic
+// `:slash_tmp` denials still force sandboxing (Rust #46122).
+func fsSandboxPathConvention(cwd string) utils.PathConvention {
+	legacy := utils.NewLegacyAppPathString(strings.TrimSpace(cwd))
+	if convention, ok := legacy.InferAbsolutePathConvention(); ok {
+		return convention
+	}
+	return ""
+}
+
+func fsPermissionsDependOnCWD(raw json.RawMessage) bool {
+	var wire struct {
+		Type       string `json:"type"`
+		FileSystem struct {
+			Type    string `json:"type"`
+			Entries []struct {
+				Path struct {
+					Type    string `json:"type"`
+					Pattern string `json:"pattern"`
+					Value   struct {
+						Kind string `json:"kind"`
+					} `json:"value"`
+				} `json:"path"`
+			} `json:"entries"`
+		} `json:"file_system"`
+	}
+	if json.Unmarshal(raw, &wire) != nil || wire.Type != "managed" || wire.FileSystem.Type != "restricted" {
+		return false
+	}
+	for _, entry := range wire.FileSystem.Entries {
+		if entry.Path.Type == "glob_pattern" && !filepath.IsAbs(entry.Path.Pattern) {
+			return true
+		}
+		if entry.Path.Type == "special" && entry.Path.Value.Kind == "project_roots" {
+			return true
+		}
+	}
+	return false
+}
+
+func fsSandboxCommand(ctx *FileSystemSandboxContext, profile *sandbox.PermissionProfile, profileJSON string, cwd string, workspaceRoots []string, allowedSymlinkedCodexHome string) ([]string, map[string]string, error) {
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, nil, err
+	}
+	executable, err = filepath.Abs(executable)
+	if err != nil {
+		return nil, nil, err
+	}
+	env := fsHelperEnvironment()
+	helperCommand := fsHelperCommandForExecutable(executable)
+	plan, err := sandbox.BuildCommandRunPlan(&sandbox.CommandRunRequest{
+		ResolvedPermissionProfile:     profile,
+		ResolvedPermissionProfileID:   "exec-server-fs-helper",
+		ResolvedPermissionProfileJSON: profileJSON,
+		CWD:                           cwd,
+		// Rust #38561: filesystem helpers only need access to their own
+		// executables; granting the containing directory would make unrelated
+		// sibling files readable.
+		SandboxReadableRoots:      fsHelperReadableRoots(executable),
+		UseLegacyLandlock:         ctx.UseLegacyLandlock,
+		AllowedSymlinkedCodexHome: allowedSymlinkedCodexHome,
+		Command:                   helperCommand,
+	})
+	if err != nil {
+		return nil, nil, requestError(-32602, fmt.Sprintf("failed to prepare fs sandbox: %v", err))
+	}
+	if err := plan.UnsupportedError(); err != nil {
+		return nil, nil, requestError(-32602, fmt.Sprintf("failed to prepare fs sandbox: %v", err))
+	}
+	runSandboxIntegrityChecks(plan, string(ctx.SandboxOverride), cwd, plan.Command, env)
+	if runtime.GOOS != "windows" {
+		return plan.Command, env, nil
+	}
+	selection, err := selectWindowsSandboxForExecutor(ctx.WindowsSandboxLevel, cwd)
+	if err != nil {
+		return nil, nil, requestError(-32602, fmt.Sprintf("failed to prepare fs sandbox: %v", err))
+	}
+	if selection == WindowsSandboxSelectionMXC {
+		return nil, nil, requestError(-32602, "failed to prepare fs sandbox: native MXC is unavailable on this executor")
+	}
+	if selection == WindowsSandboxSelectionDisabled {
+		return helperCommand, env, nil
+	}
+	level := selection.restrictedTokenLevel()
+	args, err := windowssandbox.CreateWindowsSandboxCommandArgsForPermissionProfile(windowssandbox.WindowsSandboxCommandArgsRequest{
+		Command:                          helperCommand,
+		CommandCWD:                       cwd,
+		WorkspaceRoots:                   workspaceRoots,
+		Env:                              env,
+		PermissionProfile:                profile,
+		WindowsSandboxLevel:              level,
+		WindowsSandboxPrivateDesktop:     ctx.WindowsSandboxPrivateDesktop,
+		ProxySettingsMode:                windowsSandboxProxySettingsModeForFS(ctx.WindowsSandboxProxySettingsMode),
+		ReadRootsIncludePlatformDefaults: true,
+		CodexHome:                        fsHelperCodexHome(),
+	})
+	if err != nil {
+		return nil, nil, requestError(-32602, fmt.Sprintf("failed to prepare fs sandbox: %v", err))
+	}
+	return append([]string{executable}, args...), env, nil
+}
+
+// fsHelperReadableRoots returns the absolute readable roots for a filesystem
+// helper: only the helper executable itself (Rust helper_read_roots #38561).
+func fsHelperReadableRoots(executable string) []string {
+	executable = strings.TrimSpace(executable)
+	if executable == "" {
+		return nil
+	}
+	return []string{filepath.Clean(executable)}
+}
+
+func fsHelperEnvironment() map[string]string {
+	env := map[string]string{}
+	for _, key := range []string{"PATH", "TMPDIR", "TMP", "TEMP"} {
+		if value, ok := os.LookupEnv(key); ok {
+			env[key] = value
+		}
+	}
+	return env
+}
+
+func fsHelperCodexHome() string {
+	if value := strings.TrimSpace(os.Getenv("GCODE_HOME")); value != "" && filepath.IsAbs(value) {
+		return filepath.Clean(value)
+	}
+	if value := strings.TrimSpace(os.Getenv("CODEX_HOME")); value != "" && filepath.IsAbs(value) {
+		return filepath.Clean(value)
+	}
+	home, err := os.UserHomeDir()
+	if err == nil && filepath.IsAbs(home) {
+		return filepath.Join(home, ".gcode")
+	}
+	return filepath.Join(filepath.VolumeName(os.TempDir())+string(filepath.Separator), ".gcode")
+}
+
+func fsOperationFailure(err error) *requestFailure {
+	var failure *requestFailure
+	if errors.As(err, &failure) {
+		return failure
+	}
+	switch {
+	case os.IsNotExist(err):
+		return &requestFailure{code: -32004, message: err.Error()}
+	case os.IsPermission(err), errors.Is(err, os.ErrInvalid):
+		return &requestFailure{code: fsPermissionErrorCode, message: err.Error()}
+	default:
+		return &requestFailure{code: -32603, message: err.Error()}
+	}
+}
+
+func mapFSRequestError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fsOperationFailure(err)
+}
+
+// boundedBuffer retains a bounded prefix of helper stderr so a noisy helper
+// cannot exhaust memory (Rust #40808 MAX_FS_HELPER_STDERR_BYTES).
+type boundedBuffer struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.buf) < maxFSHelperStderrBytes {
+		remaining := maxFSHelperStderrBytes - len(b.buf)
+		if len(p) > remaining {
+			b.buf = append(b.buf, p[:remaining]...)
+		} else {
+			b.buf = append(b.buf, p...)
+		}
+	}
+	return len(p), nil
+}
+
+func (b *boundedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(b.buf)
+}
+
+// readHelperResponse reads the newline-delimited fs helper response from stdout
+// without imposing an operation deadline, mirroring Rust read_helper_response.
+func readHelperResponse(stdout io.Reader) ([]byte, error) {
+	line, err := bufio.NewReader(stdout).ReadBytes('\n')
+	if err != nil && len(line) == 0 {
+		return nil, errors.New("fs sandbox helper closed stdout without responding")
+	}
+	return bytes.TrimSpace(line), nil
+}
+
+// reapFSHelper waits up to fsHelperExitTimeout for the helper to exit after it
+// has responded, killing a stuck helper (Rust #40808).
+func reapFSHelper(cmd *exec.Cmd) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(fsHelperExitTimeout):
+		_ = cmd.Process.Kill()
+		<-done
+		return errors.New("fs sandbox helper did not exit after responding")
+	}
+}
+
+// terminateFSHelper kills and reaps a helper whose control pipe failed so an
+// elevated process cannot survive a disconnected control pipe (Rust #40808).
+func terminateFSHelper(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	_ = cmd.Process.Kill()
+	_ = cmd.Wait()
+}

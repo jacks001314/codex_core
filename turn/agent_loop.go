@@ -1,0 +1,1048 @@
+package turn
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"codex_core/codexapi"
+	"codex_core/eventmap"
+	"codex_core/model"
+	"codex_core/protocol"
+	"codex_core/state"
+	"codex_core/tool"
+)
+
+type AgentLoopOptions struct {
+	Agent                   model.AgentRunner
+	Dispatcher              *ToolDispatcher
+	SteerMailbox            *SteerMailbox
+	MaxTurns                int
+	Now                     func() time.Time
+	ExecutedToolCalls       *ExecutedToolCallRecorder
+	ToolRegistrationMetrics ToolRegistrationMetricSink
+	ToolRegistrationCounts  func() tool.RegistrationCounts
+	// DeferMailboxPreemption mirrors the `features.defer_mailbox_preemption`
+	// gate (#47913, UnderDevelopment, default off): when set, a response keeps
+	// its remaining tool calls even after a commentary/partial-answer boundary
+	// completed while inter-agent mail is queued. The default keeps Rust's
+	// behavior, where the sampling request stops at that boundary and the queued
+	// mail reaches the next request (#49262, #51249).
+	DeferMailboxPreemption bool
+}
+
+type SamplingFollowUpContext struct {
+	Response     *model.AgentResponse
+	Usage        model.AgentUsage
+	Iteration    int
+	HasToolCalls bool
+}
+
+type SamplingFollowUp func(*SamplingFollowUpContext) []any
+
+// StepInputItemsProvider supplies request-scoped context that must be rebuilt
+// from the model captured for each sampling step. The returned items join the
+// turn's input history so later steps continue to see the same world-state
+// transition exactly once.
+type StepInputItemsProvider func(ctx context.Context, iteration int, modelID string, reasoningEffort string) ([]any, error)
+
+// SamplingCompactionContext carries the state of an in-flight sampling
+// iteration to a mid-turn compaction callback.
+type SamplingCompactionContext struct {
+	// Context is the sampling loop context; cancelled turns must not launch new
+	// speculative work.
+	Context      context.Context
+	Response     *model.AgentResponse
+	Usage        model.AgentUsage
+	Iteration    int
+	HasToolCalls bool
+	// Result is the agent loop's in-progress result. The callback may read
+	// the accumulated responses, tool executions, and input items to build
+	// the compaction request.
+	Result *AgentLoopResult
+}
+
+// SamplingCompactionResult describes a mid-turn roll-over compaction.
+type SamplingCompactionResult struct {
+	// Compacted reports whether the callback compacted the conversation.
+	Compacted bool
+	// ResetWindow reports a context-window reset that does not replace the
+	// conversation history (Rust's token-budget new_context tool). The loop
+	// keeps the sampled responses and pending tool calls when set.
+	ResetWindow bool
+	// InputItems replaces the in-memory conversation items the loop continues
+	// with after the compaction.
+	InputItems []any
+	// PreviousResponseID restarts the conversation after the compaction.
+	// Empty starts a fresh stored response for the compacted history.
+	PreviousResponseID string
+}
+
+// SamplingCompaction is invoked while a turn still needs follow-up and the
+// caller's compaction policy reports the token limit is reached. It mirrors
+// Rust's mid-turn roll-over: the turn's history is compacted in place and the
+// sampling loop continues against the compacted context instead of executing
+// the pending tool calls.
+type SamplingCompaction func(*SamplingCompactionContext) (*SamplingCompactionResult, error)
+type AssistantMessageCallback func(response *model.AgentResponse, iteration int, hasToolCalls bool)
+type ClientMetadataTransform func(map[string]string) map[string]string
+type WarningCallback func(message string)
+type TokenUsageCallback func(usage model.AgentUsage)
+
+// IncompleteResponseUsageCallback receives the usage a terminal incomplete
+// response reported (Rust #53670). The loop invokes it immediately before it
+// returns that response's terminal error, so the spend a response reported
+// before it stopped is still accounted for even though the turn fails.
+type IncompleteResponseUsageCallback func(usage model.AgentUsage)
+
+type AgentLoop struct {
+	agent                   model.AgentRunner
+	dispatcher              *ToolDispatcher
+	steerMailbox            *SteerMailbox
+	now                     func() time.Time
+	executedToolCalls       *ExecutedToolCallRecorder
+	toolRegistrationMetrics ToolRegistrationMetricSink
+	toolRegistrationCounts  func() tool.RegistrationCounts
+	deferMailboxPreemption  bool
+}
+
+// AgentStepSettings are the execution settings that issue one sampling step
+// (Rust session::step_settings::ResolvedStepSettings as the loop observes it).
+// The loop asks for them before every step after the first, so a mid-turn
+// turn/settings/update applies to the following step instead of only to the
+// next turn.
+type AgentStepSettings struct {
+	Model            string
+	ReasoningEffort  string
+	ReasoningSummary string
+	ServiceTier      string
+	ClientMetadata   map[string]string
+}
+
+type AgentLoopRequest struct {
+	Prompt                  string
+	Instructions            string
+	Model                   string
+	ToolMode                string
+	DisableCodeModeFallback bool
+	ProviderID              string
+	TaskKind                model.AgentTaskKind
+	ThreadID                string
+	TurnID                  string
+	// Ephemeral mirrors Rust's `turn_context.config.ephemeral`: the thread
+	// intentionally skips durable persistence, so attachment uploads made while
+	// preparing this turn's requests carry that intent (Rust #51517).
+	Ephemeral  bool
+	Originator string
+	InputItems []any
+	// PostPromptInputItems are appended after the prompt's user message (and
+	// after InputItems when there is no prompt) for the first sampling request,
+	// then folded into the turn's input for later iterations. Rust records
+	// trusted reasoning-effort configuration updates after accepted input.
+	PostPromptInputItems []any
+	SteerMailbox         *SteerMailbox
+	Tools                []any
+	// ToolsForStep rebuilds the tool list when a later sampling step selects a
+	// different model. It lets model-catalog Code Mode messages follow mid-turn
+	// model changes (Rust #47118).
+	ToolsForStep       func(model string) []any
+	HostedTools        []any
+	Store              bool
+	PreviousResponseID string
+	ParallelToolCalls  bool
+	ReasoningEffort    string
+	ReasoningSummary   string
+	// DropReasoningEffortUpdates removes saved configuration_update items from
+	// the request copy when the effective model/provider does not support them
+	// (Rust #46530).
+	DropReasoningEffortUpdates   bool
+	ConcurrentReasoningSummaries bool
+	ModelVerbosity               string
+	IncludeTimingMetrics         bool
+	BetaFeaturesHeader           string
+	ItemIDsEnabled               bool
+	ServiceTier                  string
+	// UsageTags carries the turn's scalar-only usage diagnostics document (Rust
+	// core::feedback_config::usage_tags, #46501); the sampling-request span
+	// records it as the `tags_json` field.
+	UsageTags      map[string]string
+	PromptCacheKey string
+	// CyberAccessProgram is the turn's selected cyber access program (core
+	// snake_case, empty when none was selected or the provider is not OpenAI).
+	// Rust carries it on the turn context and copies it into every Prompt
+	// (#44893), so it reaches the request body only for a ChatGPT account.
+	CyberAccessProgram      string
+	ClientMetadata          map[string]string
+	ClientMetadataTransform ClientMetadataTransform
+	// Trace is the W3C trace context of the request that started this turn
+	// (Rust's `request_trace`), forwarded to every model request the turn makes.
+	Trace *protocol.W3CTraceContext
+	// CWD is the turn's working directory, reported on the sampling-request span
+	// like Rust's `run_sampling_request` instrumentation.
+	CWD string
+	// Tracer, when set, opens the turn loop's spans (Rust's per-turn
+	// instrumentation).
+	Tracer SpanTracer
+	// StepSettings, when set, refreshes the model, reasoning effort, and client
+	// metadata of every step after the first (Rust Session::update_step_settings
+	// reaching a later sampling step).
+	StepSettings func() *AgentStepSettings
+	// StepInputItems, when set, rebuilds request-scoped context for the model
+	// selected for this step (Rust context/world_state built from StepContext).
+	StepInputItems               StepInputItemsProvider
+	AttestationProvider          codexapi.AttestationProvider
+	OutputSchema                 any
+	DisableHostedImageGeneration bool
+	PostToolInputItems           ToolPostExecutionInputItems
+	OnToolStarted                ToolStartedCallback
+	OnToolCompleted              ToolCompletedCallback
+	EmitCodeModeNestedLifecycle  bool
+	OnCodeModeNotify             CodeModeNotifyCallback
+	OnWarning                    WarningCallback
+	Timing                       *TimingState
+	SamplingFollowUp             SamplingFollowUp
+	SamplingCompaction           SamplingCompaction
+	OnAssistantMessage           AssistantMessageCallback
+	// OnCompletedResponseItem receives every completed model response item.
+	// Hosts use it for opt-in telemetry that must observe a final answer before
+	// it is folded into the turn result (Rust #47649).
+	OnCompletedResponseItem         func(model.AgentItem)
+	OnTokenUsage                    TokenUsageCallback
+	StreamHandler                   model.ResponsesStreamHandler
+	ExecutedToolCallMetadataEnabled bool
+	OnSteerCommitted                func(count int)
+	// InstructionsProvider, when set, supplies the instructions for each model
+	// request so a long turn can refresh them between steps. An empty result
+	// means the instructions were cleared (Rust #44675).
+	InstructionsProvider func() string
+	// PreSamplingValidation, when set, runs before every sampling request of the
+	// turn; a non-nil error fails the turn before its model request (Rust #51157
+	// validates required environment skills there, as a fatal error). It mirrors
+	// Rust's `run_turn` placement: the step's world state is recorded first and
+	// the check runs immediately before inference.
+	PreSamplingValidation AgentPreSamplingValidation
+	// OnIncompleteResponseUsage receives the usage a terminal incomplete
+	// response reported, before the loop returns that response's error (Rust
+	// #53670 `Session::record_incomplete_response_usage`). The model layer
+	// only carries a usage the server actually reported, so the callback is
+	// skipped for a missing or malformed usage instead of charging an
+	// estimate made up from the partial response.
+	OnIncompleteResponseUsage IncompleteResponseUsageCallback
+}
+
+// AgentPreSamplingValidation is the pre-sampling gate of a turn, invoked with
+// the sampling iteration before every model request (Rust #51157).
+type AgentPreSamplingValidation func(ctx context.Context, iteration int) error
+
+type AgentLoopResult struct {
+	Response          *model.AgentResponse
+	Responses         []*model.AgentResponse
+	ToolExecutions    []ToolExecutionResult
+	InputItems        []any
+	SteerInputItems   []any
+	InitialInputCount int
+	Usage             model.AgentUsage
+	Iterations        int
+	TimingProfile     *Profile
+	SamplingFollowUps int
+	Compactions       int
+}
+
+// postPromptInputItemsForIteration only supplies the turn-level post-prompt
+// items to the first sampling request. Later iterations already carry them in
+// the accumulated input history, so re-sending them would duplicate the items.
+func postPromptInputItemsForIteration(items []any, iteration int) []any {
+	if iteration == 0 {
+		return items
+	}
+	return nil
+}
+
+func (r *AgentLoopResult) ModelResponses() []*model.AgentResponse {
+	if r == nil {
+		return nil
+	}
+	out := make([]*model.AgentResponse, 0, len(r.Responses)+1)
+	seen := map[*model.AgentResponse]struct{}{}
+	for _, response := range r.Responses {
+		if response == nil {
+			continue
+		}
+		if _, ok := seen[response]; ok {
+			continue
+		}
+		seen[response] = struct{}{}
+		out = append(out, response)
+	}
+	if r.Response != nil {
+		if _, ok := seen[r.Response]; !ok {
+			out = append(out, r.Response)
+		}
+	}
+	return out
+}
+
+func NewAgentLoop(options *AgentLoopOptions) *AgentLoop {
+	if options == nil {
+		options = &AgentLoopOptions{}
+	}
+	now := options.Now
+	if now == nil {
+		now = time.Now
+	}
+	return &AgentLoop{
+		agent:                   options.Agent,
+		dispatcher:              options.Dispatcher,
+		steerMailbox:            options.SteerMailbox,
+		now:                     now,
+		executedToolCalls:       options.ExecutedToolCalls,
+		toolRegistrationMetrics: options.ToolRegistrationMetrics,
+		toolRegistrationCounts:  options.ToolRegistrationCounts,
+		deferMailboxPreemption:  options.DeferMailboxPreemption,
+	}
+}
+
+func (l *AgentLoop) Run(ctx context.Context, request *AgentLoopRequest) (*AgentLoopResult, error) {
+	if l == nil || l.agent == nil {
+		return nil, errors.New("agent loop runner is nil")
+	}
+	if request == nil {
+		return nil, model.ErrInvalidAgentRequest
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result := &AgentLoopResult{
+		InputItems:        append([]any(nil), request.InputItems...),
+		InitialInputCount: len(request.InputItems),
+	}
+	timing := request.Timing
+	if timing == nil {
+		timing = NewTimingState()
+	}
+	timing.MarkTurnStarted(l.now())
+	prompt := strings.TrimSpace(request.Prompt)
+	promptAppended := false
+	postPromptItems := request.PostPromptInputItems
+	postPromptAppended := false
+	previousResponseID := strings.TrimSpace(request.PreviousResponseID)
+	clientMetadata := transformClientMetadata(request.ClientMetadata, request.ClientMetadataTransform)
+	for iteration := 0; ; iteration++ {
+		// Rust session/turn.rs accepts mailbox delivery for the current turn
+		// whenever a sampling request reported needs_follow_up: the turn is
+		// continuing, so mail queued after a terminal-looking item is consumed by
+		// this turn instead of waiting for a later one.
+		if iteration > 0 {
+			l.steerMailbox.AcceptMailboxDeliveryForCurrentTurn(request.ThreadID, request.TurnID)
+		}
+		// The step's captured settings refresh the step first, so a mid-turn
+		// settings update applies here (Rust Session::update_step_settings); a
+		// steer's own metadata then wins for the keys it defines, and later
+		// steps keep it because the steer path records it on the turn.
+		stepModel := strings.TrimSpace(request.Model)
+		stepReasoningEffort := request.ReasoningEffort
+		stepReasoningSummary := request.ReasoningSummary
+		stepServiceTier := request.ServiceTier
+		if iteration > 0 && request.StepSettings != nil {
+			if settings := request.StepSettings(); settings != nil {
+				if modelID := strings.TrimSpace(settings.Model); modelID != "" {
+					stepModel = modelID
+				}
+				stepReasoningEffort = settings.ReasoningEffort
+				stepReasoningSummary = settings.ReasoningSummary
+				stepServiceTier = settings.ServiceTier
+				if len(settings.ClientMetadata) > 0 {
+					clientMetadata = transformClientMetadata(settings.ClientMetadata, request.ClientMetadataTransform)
+				}
+			}
+		}
+		if steer := drainSteer(l.steerMailbox, request); steer != nil {
+			if len(steer.InputItems) > 0 {
+				result.InputItems = append(result.InputItems, steer.InputItems...)
+				result.SteerInputItems = append(result.SteerInputItems, steer.InputItems...)
+				if count := userMessageInputItemCount(steer.InputItems); count > 0 && request.OnSteerCommitted != nil {
+					request.OnSteerCommitted(count)
+				}
+			}
+			if len(steer.ClientMetadata) > 0 {
+				clientMetadata = transformClientMetadata(steer.ClientMetadata, request.ClientMetadataTransform)
+			}
+		}
+		l.dispatcher.SetStepModel(stepModel)
+		if request.StepInputItems != nil {
+			items, err := request.StepInputItems(ctx, iteration, stepModel, stepReasoningEffort)
+			if err != nil {
+				return nil, err
+			}
+			if len(items) > 0 {
+				result.InputItems = append(result.InputItems, items...)
+			}
+		}
+		inputItems := append([]any(nil), result.InputItems...)
+		if iteration > 0 && len(inputItems) == 0 {
+			if userMessage := model.UserMessageInputItem(prompt); userMessage != nil {
+				inputItems = append(inputItems, userMessage)
+			}
+		}
+		var executedToolCallAttachment *ExecutedToolCallAttachment
+		if l.executedToolCalls != nil {
+			inputItems, executedToolCallAttachment = l.executedToolCalls.AttachPendingToPrompt(inputItems)
+		} else {
+			// Capture is disabled for this turn: direct records already in
+			// history must not reach inference (Rust #45185).
+			StripDirectCallMetadata(inputItems)
+		}
+		// Rust #51157: required environment skills are validated after the step's
+		// world state is recorded and before inference, so a missing skill fails
+		// the turn without a model request.
+		if request.PreSamplingValidation != nil {
+			if err := request.PreSamplingValidation(ctx, iteration); err != nil {
+				return nil, err
+			}
+		}
+		sampling := timing.BeginSampling(l.now())
+		// Rust #50964: before each sampling request the client compares the full
+		// model-visible tool list with the list retained from the previous request
+		// (`ModelClientSession::inference_tools_changed`) and, when it changed, the
+		// turn profile counts it (`TurnTimingState::record_tools_change`). The
+		// retained list survives turns and connection resets, so the first request
+		// only establishes the baseline.
+		if tracker, ok := l.agent.(model.InferenceToolTracker); ok && tracker.InferenceToolsChanged(request.ThreadID, request.Tools) {
+			timing.RecordToolsChange()
+		}
+		instructions := request.Instructions
+		if request.InstructionsProvider != nil {
+			instructions = request.InstructionsProvider()
+		}
+		// Rust instruments the sampling request with `run_sampling_request`, so the
+		// client's spans and records land inside the turn's span tree.
+		stepCtx, samplingSpan := startSamplingRequestSpan(ctx, request, stepModel)
+		// Rust #49262: `codex.sampling` brackets the sampling phase and ends
+		// before the step's tools drain, so a blocked tool does not keep
+		// sampling open.
+		samplingPhaseSpan := startTurnPhaseSpan(ctx, request, samplingSpan, SamplingPhaseSpanName, TurnPhaseSampling, request.ThreadID, request.TurnID)
+		samplingPhaseEnded := false
+		endSamplingPhaseSpan := func() {
+			if samplingPhaseEnded {
+				return
+			}
+			samplingPhaseEnded = true
+			if samplingPhaseSpan != nil {
+				samplingPhaseSpan.End()
+			}
+		}
+		// Rust #48135: an instant-interrupt sampling request owns a preemption
+		// signal whose watcher cancels it as soon as the turn's queued input
+		// holds a user message. The signal reaches every code-mode call this
+		// request issues through the step context, including calls received later
+		// in the same response.
+		stepPreempt, stopStepPreempt := l.dispatcher.BeginStepPreempt(l.steerMailbox)
+		if stepPreempt != nil {
+			stepCtx = tool.WithCodeModePreempt(stepCtx, stepPreempt)
+		}
+		// Rust keeps `run_sampling_request` open until the step's in-flight tool
+		// futures have been drained, so the step's tool spans (mcp.tools.call and
+		// the tool records) nest under it. endSamplingRequestSpan closes the span
+		// exactly once on every path that leaves the step.
+		samplingSpanEnded := false
+		endSamplingRequestSpan := func() {
+			if samplingSpanEnded {
+				return
+			}
+			samplingSpanEnded = true
+			endSamplingPhaseSpan()
+			if stopStepPreempt != nil {
+				stopStepPreempt()
+				stopStepPreempt = nil
+			}
+			if samplingSpan != nil {
+				samplingSpan.End()
+			}
+		}
+		if samplingSpan != nil {
+			// The turn's tool dispatches and code-mode calls propagate this span's
+			// W3C carrier (Rust reads it from the current span), and the dispatch
+			// context keeps the span itself so spans opened during it parent to the
+			// sampling request implicitly.
+			ctx = withSpanTraceContext(ctx, samplingSpan)
+			stepCtx = withSpanTraceContext(stepCtx, samplingSpan)
+		}
+		var toolRegistrationCounts tool.RegistrationCounts
+		if l.toolRegistrationCounts != nil {
+			toolRegistrationCounts = l.toolRegistrationCounts()
+		}
+		recordToolRegistrationMetrics(l.toolRegistrationMetrics, toolRegistrationCounts, request.ToolMode)
+		stepTools := request.Tools
+		if iteration > 0 && request.ToolsForStep != nil {
+			stepTools = request.ToolsForStep(stepModel)
+		}
+		response, err := l.agent.Run(stepCtx, &model.AgentRequest{
+			Prompt:                       prompt,
+			Instructions:                 instructions,
+			InputItems:                   inputItems,
+			PostPromptInputItems:         postPromptInputItemsForIteration(postPromptItems, iteration),
+			Tools:                        append([]any(nil), stepTools...),
+			Model:                        stepModel,
+			ProviderID:                   request.ProviderID,
+			TaskKind:                     request.TaskKind,
+			ThreadID:                     request.ThreadID,
+			TurnID:                       request.TurnID,
+			Ephemeral:                    request.Ephemeral,
+			Originator:                   request.Originator,
+			Store:                        request.Store,
+			PreviousResponseID:           previousResponseID,
+			ParallelToolCalls:            request.ParallelToolCalls,
+			ReasoningEffort:              stepReasoningEffort,
+			ReasoningSummary:             stepReasoningSummary,
+			DropReasoningEffortUpdates:   request.DropReasoningEffortUpdates,
+			ConcurrentReasoningSummaries: request.ConcurrentReasoningSummaries,
+			ModelVerbosity:               request.ModelVerbosity,
+			IncludeTimingMetrics:         request.IncludeTimingMetrics,
+			BetaFeaturesHeader:           request.BetaFeaturesHeader,
+			ItemIDsEnabled:               request.ItemIDsEnabled,
+			ServiceTier:                  stepServiceTier,
+			PromptCacheKey:               request.PromptCacheKey,
+			CyberAccessProgram:           request.CyberAccessProgram,
+			ClientMetadata:               cloneStringMap(clientMetadata),
+			Trace:                        request.Trace,
+			AttestationProvider:          request.AttestationProvider,
+			OutputSchema:                 request.OutputSchema,
+			DisableHostedImageGeneration: request.DisableHostedImageGeneration,
+			StreamHandler:                combineResponsesStreamHandlers(request.StreamHandler, timingStreamHandler(timing, l.now)),
+			OnWireInputBounded: func(original, bounded []any) {
+				if l.executedToolCalls != nil {
+					l.executedToolCalls.InvalidateWireInventoryLoss(original, bounded)
+				}
+			},
+			// Rust #48141: new user input preempts the unfinished sampling
+			// request so the queued input reaches the model without waiting.
+			Preempt: stepPreempt.Done(),
+			// Rust #49119: a sampling block records its recovery guidance into
+			// the conversation before the retry is issued. The model layer
+			// appends the item to the retried request; recording it here keeps
+			// the turn's input items (and therefore the persisted history and
+			// the next iteration's request) in step.
+			OnConversationItem: func(item any) {
+				if item == nil {
+					return
+				}
+				result.InputItems = append(result.InputItems, item)
+			},
+		})
+		sampling.CloseAt(l.now())
+		if err != nil {
+			endSamplingRequestSpan()
+			// Rust #53670 (session/turn.rs `try_run_sampling_request`): a
+			// terminal incomplete response still reports the usage it consumed,
+			// and that usage is accounted for before the original error is
+			// returned - the error itself is never replaced. Rust charges an
+			// already-received terminal error even when cancellation raced it;
+			// the sampling call has already returned here, so the accounting
+			// below runs for whichever response failed the step.
+			if request.OnIncompleteResponseUsage != nil {
+				var incomplete model.ResponseIncompleteError
+				if errors.As(err, &incomplete) && incomplete.Usage != nil {
+					request.OnIncompleteResponseUsage(*incomplete.Usage)
+				}
+			}
+			return nil, err
+		}
+		if response.Preempted {
+			// A signaled step produced no assistant output: the turn continues
+			// with the queued input (drained at the top of the next iteration),
+			// and the replacement request sends full history.
+			endSamplingRequestSpan()
+			previousResponseID = ""
+			continue
+		}
+		if l.executedToolCalls != nil {
+			l.executedToolCalls.CommitAttachment(executedToolCallAttachment)
+		}
+		recordResponseTiming(timing, response, l.now())
+		result.Response = response
+		result.Responses = append(result.Responses, response)
+		if request.OnCompletedResponseItem != nil {
+			for i := range response.Items {
+				request.OnCompletedResponseItem(response.Items[i])
+			}
+		}
+		result.Usage = addAgentUsage(result.Usage, response.Usage)
+		if request.OnTokenUsage != nil {
+			request.OnTokenUsage(result.Usage)
+		}
+		result.Iterations = iteration + 1
+		if responseID := strings.TrimSpace(response.ResponseID); responseID != "" {
+			previousResponseID = responseID
+		}
+		if prompt != "" && !promptAppended {
+			if userMessage := model.UserMessageInputItem(prompt); userMessage != nil {
+				result.InputItems = append(result.InputItems, userMessage)
+				promptAppended = true
+			}
+		}
+		prompt = ""
+		if !postPromptAppended && len(postPromptItems) > 0 {
+			for _, item := range postPromptItems {
+				if item != nil {
+					result.InputItems = append(result.InputItems, item)
+				}
+			}
+			postPromptAppended = true
+		}
+		for i := range response.Items {
+			if !isToolAgentItem(&response.Items[i]) {
+				item := response.Items[i]
+				// An item that did not resolve to a local tool dispatch cannot
+				// later establish Code Mode completeness by reusing its ID
+				// (Rust #45185 observe_non_dispatched_call).
+				if l.executedToolCalls != nil {
+					l.executedToolCalls.ObserveNonDispatchedCall(&item)
+				}
+				result.InputItems = append(result.InputItems, &item)
+			}
+		}
+
+		toolItems := toolAgentItems(response)
+		if request.OnAssistantMessage != nil && responseHasAssistantMessage(response) {
+			request.OnAssistantMessage(response, iteration, len(toolItems) > 0)
+		}
+		// Rust #51249 (session/stream_events_utils.rs): a completed assistant
+		// message that carries the turn's user-visible answer switches the
+		// turn's mailbox delivery phase to the next turn, so late child mail
+		// waits there instead of extending an answer that was already shown.
+		// Commentary and partial-answer fragments keep the current turn open; a
+		// queued user message keeps it open too.
+		if responseDefersMailboxDelivery(response) && !l.steerMailbox.HasPendingUserInput(request.ThreadID, request.TurnID) {
+			l.steerMailbox.SetMailboxDeliveryPhase(request.ThreadID, request.TurnID, state.MailboxNextTurn)
+		}
+		// Rust #49262 (`codex.mailbox_preemption`): a completed assistant
+		// commentary/partial-answer message or reasoning item is the boundary at
+		// which queued inter-agent mail reaches the model without waiting for the
+		// rest of the response. The host cuts the response off here (its planned
+		// tool calls are not dispatched, matching the Rust snapshot for the
+		// non-deferred case in tests/suite/scenarios_mailbox_preemption_tests.rs),
+		// emits the trace-safe event, and the next iteration drains the mail.
+		if !l.deferMailboxPreemption && responsePreemptsForMailboxMail(response) && l.steerMailbox.HasPendingMailboxItems(request.ThreadID, request.TurnID) {
+			emitMailboxPreemptionEvent(stepCtx, request, request.ThreadID, request.TurnID)
+			endSamplingRequestSpan()
+			continue
+		}
+		if len(toolItems) > 0 && request.SamplingCompaction != nil {
+			// Rust #49262: the automatic compaction runs in its own
+			// `codex.compaction` phase span.
+			compactionSpan := startTurnPhaseSpan(ctx, request, samplingSpan, CompactionPhaseSpanName, TurnPhaseCompaction, request.ThreadID, request.TurnID)
+			compacted, err := request.SamplingCompaction(&SamplingCompactionContext{
+				Context:      ctx,
+				Response:     response,
+				Usage:        result.Usage,
+				Iteration:    iteration,
+				HasToolCalls: true,
+				Result:       result,
+			})
+			if compactionSpan != nil {
+				compactionSpan.End()
+			}
+			if err != nil {
+				endSamplingRequestSpan()
+				return nil, err
+			}
+			if compacted != nil && compacted.Compacted {
+				if !compacted.ResetWindow {
+					// The compacted history supersedes every response sampled
+					// before the compaction, so drop them and let the turn's
+					// persisted items start at the post-compaction boundary
+					// (Rust replaces the pre-compaction history with the
+					// summary).
+					result.InputItems = compacted.InputItems
+					result.Response = nil
+					result.Responses = nil
+					result.ToolExecutions = nil
+					previousResponseID = compacted.PreviousResponseID
+				}
+				result.Compactions++
+				endSamplingRequestSpan()
+				continue
+			}
+		}
+		if len(toolItems) == 0 && request.SamplingFollowUp != nil {
+			followUp := request.SamplingFollowUp(&SamplingFollowUpContext{Response: response, Usage: result.Usage, Iteration: iteration, HasToolCalls: len(toolItems) > 0})
+			if len(followUp) > 0 {
+				result.InputItems = append(result.InputItems, followUp...)
+				result.SamplingFollowUps++
+				endSamplingRequestSpan()
+				continue
+			}
+		}
+		if len(toolItems) == 0 {
+			// Rust InputQueue::get_pending_input only drains the turn's pending
+			// input while the turn still accepts mailbox delivery (#48982): once
+			// the response carried the turn's final answer the phase is NextTurn,
+			// so queued child mail stays for a later turn instead of reopening the
+			// finalized answer with one more sampling request. A steered user
+			// message reopens the phase (SteerMailbox::Enqueue), so explicit
+			// same-turn work still continues the turn here.
+			if l.steerMailbox.AcceptsMailboxDeliveryForCurrentTurn(request.ThreadID, request.TurnID) {
+				if steer := drainSteer(l.steerMailbox, request); steer != nil && (len(steer.InputItems) > 0 || len(steer.ClientMetadata) > 0) {
+					result.InputItems = append(result.InputItems, steer.InputItems...)
+					result.SteerInputItems = append(result.SteerInputItems, steer.InputItems...)
+					if len(steer.ClientMetadata) > 0 {
+						clientMetadata = transformClientMetadata(steer.ClientMetadata, request.ClientMetadataTransform)
+					}
+					if count := userMessageInputItemCount(steer.InputItems); count > 0 && request.OnSteerCommitted != nil {
+						request.OnSteerCommitted(count)
+					}
+					endSamplingRequestSpan()
+					continue
+				}
+			}
+		}
+		if len(toolItems) == 0 {
+			profile := timing.CompleteProfile(l.now())
+			result.TimingProfile = &profile
+			endSamplingRequestSpan()
+			return result, nil
+		}
+		if l.dispatcher == nil {
+			endSamplingRequestSpan()
+			return nil, errors.New("agent requested tool calls but tool dispatcher is nil")
+		}
+		for i := range toolItems {
+			item := toolItems[i]
+			result.InputItems = append(result.InputItems, &item)
+		}
+		// Rust #49262: sampling has ended by now; the step's tools drain inside
+		// their own `codex.tool_blocking` phase span. The span is not entered, so
+		// the dispatch still runs under the sampling-request span.
+		endSamplingPhaseSpan()
+		toolBlockingSpan := startTurnPhaseSpan(ctx, request, samplingSpan, ToolBlockingPhaseSpanName, TurnPhaseToolBlocking, request.ThreadID, request.TurnID)
+		toolBlocking := timing.BeginToolBlocking(l.now())
+		executions, err := l.dispatcher.ExecuteToolItems(stepCtx, toolItems)
+		toolBlocking.CloseAt(l.now())
+		if toolBlockingSpan != nil {
+			toolBlockingSpan.End()
+		}
+		endSamplingRequestSpan()
+		if err != nil {
+			return nil, err
+		}
+		result.ToolExecutions = append(result.ToolExecutions, executions...)
+		for i := range executions {
+			if executions[i].Response != nil {
+				result.InputItems = append(result.InputItems, executions[i].Response)
+			}
+			if len(executions[i].InputItems) > 0 {
+				result.InputItems = append(result.InputItems, executions[i].InputItems...)
+			}
+		}
+		if request.SamplingFollowUp != nil {
+			followUp := request.SamplingFollowUp(&SamplingFollowUpContext{Response: response, Usage: result.Usage, Iteration: iteration, HasToolCalls: true})
+			if len(followUp) > 0 {
+				result.InputItems = append(result.InputItems, followUp...)
+				result.SamplingFollowUps++
+			}
+		}
+	}
+}
+
+// mailboxPreemptionEventName mirrors the tracing event name Rust emits when a
+// sampling request stops to deliver queued inter-agent mail (Rust #49262).
+const mailboxPreemptionEventName = "codex.mailbox_preemption"
+
+// responseDefersMailboxDelivery reports whether the response completed an
+// assistant message that carries the turn's user-visible answer, which defers
+// mailbox delivery to the next turn
+// (eventmap.CompletedItemDefersMailboxDeliveryToNextTurn, Rust #51249).
+// Commentary and partial-answer fragments and every non-message item do not
+// defer.
+func responseDefersMailboxDelivery(response *model.AgentResponse) bool {
+	if response == nil {
+		return false
+	}
+	for i := range response.Items {
+		item := &response.Items[i]
+		if isToolAgentItem(item) {
+			continue
+		}
+		if eventmap.CompletedItemDefersMailboxDeliveryToNextTurn(mailboxDeliveryItem(item), false) {
+			return true
+		}
+	}
+	return false
+}
+
+// responsePreemptsForMailboxMail mirrors
+// core/src/session/turn.rs::preempt_for_mailbox_mail (#49262, extended by
+// #51249): a completed reasoning item, or an assistant message whose phase is
+// commentary or partial_answer, is a boundary where queued mailbox mail may
+// preempt the rest of the response and reach the next model request. An untagged
+// or final_answer assistant message already answers the turn and does not
+// preempt, and neither do mail items (Rust ResponseItem::AgentMessage) nor tool
+// calls.
+func responsePreemptsForMailboxMail(response *model.AgentResponse) bool {
+	if response == nil {
+		return false
+	}
+	for i := range response.Items {
+		item := &response.Items[i]
+		switch strings.TrimSpace(item.Type) {
+		case "reasoning":
+			return true
+		case "agent_message", "message", "":
+			switch agentItemPhase(item) {
+			case "commentary", "partial_answer":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// agentItemPhase reads the message phase a model response item carries (Rust
+// ResponseItem::Message::phase).
+func agentItemPhase(item *model.AgentItem) string {
+	if item == nil || len(item.Data) == 0 {
+		return ""
+	}
+	for _, key := range []string{"phase", "messagePhase", "message_phase"} {
+		if value, ok := item.Data[key]; ok {
+			if phase := strings.TrimSpace(fmt.Sprint(value)); phase != "" {
+				return phase
+			}
+		}
+	}
+	return ""
+}
+
+// mailboxDeliveryItem adapts a model-visible item to the event map's response
+// item so the loop can reuse Rust's deferral predicate. Only assistant messages
+// convert; every other kind falls through to the predicate's non-message arm.
+func mailboxDeliveryItem(item *model.AgentItem) *eventmap.ResponseItem {
+	if item == nil {
+		return nil
+	}
+	switch strings.TrimSpace(item.Type) {
+	case "agent_message", "message", "":
+	default:
+		return nil
+	}
+	return &eventmap.ResponseItem{
+		Kind:    eventmap.ResponseMessage,
+		ID:      item.ID,
+		Role:    "assistant",
+		Phase:   agentItemPhase(item),
+		Content: []eventmap.ContentItem{{Kind: eventmap.ContentOutputText, Text: item.Text}},
+	}
+}
+
+// emitMailboxPreemptionEvent records Rust's `codex.mailbox_preemption` event
+// (target `codex_otel.trace_safe`, INFO, conversation.id/turn.id) on the span the
+// sampling request opened. A tracer without the trace-event sink drops it, the
+// way Rust's tracing layer drops an event that has no enclosing span.
+func emitMailboxPreemptionEvent(ctx context.Context, request *AgentLoopRequest, threadID string, turnID string) {
+	if request == nil {
+		return
+	}
+	emitter, ok := request.Tracer.(TraceEventEmitter)
+	if !ok {
+		return
+	}
+	emitter.EmitTraceSafeEvent(ctx, mailboxPreemptionEventName, map[string]string{
+		"conversation.id": strings.TrimSpace(threadID),
+		"turn.id":         strings.TrimSpace(turnID),
+	})
+}
+
+func userMessageInputItemCount(items []any) int {
+	count := 0
+	for _, item := range items {
+		raw, ok := item.(map[string]any)
+		if ok && strings.EqualFold(strings.TrimSpace(fmt.Sprint(raw["type"])), "message") && strings.EqualFold(strings.TrimSpace(fmt.Sprint(raw["role"])), "user") {
+			count++
+		}
+	}
+	return count
+}
+
+func transformClientMetadata(metadata map[string]string, transform ClientMetadataTransform) map[string]string {
+	out := cloneStringMap(metadata)
+	if transform != nil {
+		out = transform(out)
+	}
+	return out
+}
+
+func combineResponsesStreamHandlers(handlers ...model.ResponsesStreamHandler) model.ResponsesStreamHandler {
+	active := make([]model.ResponsesStreamHandler, 0, len(handlers))
+	for _, handler := range handlers {
+		if handler != nil {
+			active = append(active, handler)
+		}
+	}
+	if len(active) == 0 {
+		return nil
+	}
+	return func(event *model.ResponsesStreamEvent) {
+		for _, handler := range active {
+			handler(event)
+		}
+	}
+}
+
+func responseHasAssistantMessage(response *model.AgentResponse) bool {
+	if response == nil {
+		return false
+	}
+	if strings.TrimSpace(response.Message) != "" {
+		return true
+	}
+	for i := range response.Items {
+		itemType := strings.TrimSpace(response.Items[i].Type)
+		if (itemType == "" || itemType == "message" || itemType == "agent_message") && strings.TrimSpace(response.Items[i].Text) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func ResponseAssistantMessages(response *model.AgentResponse) []model.AgentItem {
+	if response == nil {
+		return nil
+	}
+	out := []model.AgentItem{}
+	for i := range response.Items {
+		item := response.Items[i]
+		itemType := strings.TrimSpace(item.Type)
+		if (itemType == "" || itemType == "message" || itemType == "agent_message") && strings.TrimSpace(item.Text) != "" {
+			out = append(out, item)
+		}
+	}
+	if len(out) == 0 && strings.TrimSpace(response.Message) != "" {
+		out = append(out, model.AgentItem{Type: "agent_message", Text: response.Message})
+	}
+	return out
+}
+
+func recordResponseTiming(timing *TimingState, response *model.AgentResponse, now time.Time) {
+	if timing == nil || response == nil {
+		return
+	}
+	hasMessage := strings.TrimSpace(response.Message) != ""
+	if !hasMessage {
+		for i := range response.Items {
+			if response.Items[i].Type == "" || response.Items[i].Type == "agent_message" {
+				if strings.TrimSpace(response.Items[i].Text) != "" {
+					hasMessage = true
+					break
+				}
+			}
+		}
+	}
+	if hasMessage {
+		timing.RecordTTFT(now)
+		timing.RecordTTFM(now)
+	}
+}
+
+func timingStreamHandler(timing *TimingState, now func() time.Time) model.ResponsesStreamHandler {
+	if timing == nil {
+		return nil
+	}
+	if now == nil {
+		now = time.Now
+	}
+	return func(event *model.ResponsesStreamEvent) {
+		if responseStreamEventRecordsTTFT(event) {
+			timing.RecordTTFT(now())
+		}
+	}
+}
+
+func responseStreamEventRecordsTTFT(event *model.ResponsesStreamEvent) bool {
+	if event == nil {
+		return false
+	}
+	switch event.Kind {
+	case model.ResponsesStreamEventOutputText,
+		model.ResponsesStreamEventReasoningSummaryTextDelta,
+		model.ResponsesStreamEventReasoningTextDelta:
+		return true
+	case model.ResponsesStreamEventOutputAdded, model.ResponsesStreamEventOutputDone:
+		return agentItemRecordsTTFT(event.Item)
+	default:
+		return false
+	}
+}
+
+func agentItemRecordsTTFT(item *model.AgentItem) bool {
+	if item == nil {
+		return false
+	}
+	switch item.Type {
+	case "", "message", "agent_message", "reasoning":
+		return strings.TrimSpace(item.Text) != ""
+	case "function_call", "custom_tool_call", "tool_search_call", "web_search_call":
+		return true
+	case "image_generation_call":
+		return true
+	default:
+		return false
+	}
+}
+
+func drainSteer(mailbox *SteerMailbox, request *AgentLoopRequest) *SteerDrainResult {
+	if mailbox == nil && request != nil {
+		mailbox = request.SteerMailbox
+	}
+	if mailbox == nil || request == nil {
+		return nil
+	}
+	return mailbox.DrainWithMetadata(&SteerDrainParams{ThreadID: request.ThreadID, TurnID: request.TurnID})
+}
+
+func addAgentUsage(left model.AgentUsage, right model.AgentUsage) model.AgentUsage {
+	left.InputTokens += right.InputTokens
+	left.CachedInputTokens += right.CachedInputTokens
+	left.CacheWriteInputTokens += right.CacheWriteInputTokens
+	left.OutputTokens += right.OutputTokens
+	left.ReasoningOutputTokens += right.ReasoningOutputTokens
+	left.TotalTokens += model.AgentUsageTotalTokens(right)
+	return left
+}
+
+func toolAgentItems(response *model.AgentResponse) []model.AgentItem {
+	if response == nil {
+		return nil
+	}
+	out := make([]model.AgentItem, 0, len(response.Items))
+	for i := range response.Items {
+		if isToolAgentItem(&response.Items[i]) {
+			out = append(out, response.Items[i])
+		}
+	}
+	return out
+}
+
+func isToolAgentItem(item *model.AgentItem) bool {
+	if item == nil {
+		return false
+	}
+	switch item.Type {
+	case "function_call", "custom_tool_call", "tool_search_call":
+		return true
+	default:
+		return false
+	}
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	out := make(map[string]string, len(values))
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
+}

@@ -1,0 +1,2482 @@
+package turn
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"unicode/utf8"
+
+	"codex_core/agent"
+	"codex_core/mcp"
+	"codex_core/model"
+	"codex_core/plugin"
+	"codex_core/skillprovider"
+	"codex_core/tool"
+	"codex_core/utils"
+)
+
+func TestDynamicToolPreservesInlineAudioContent(t *testing.T) {
+	items, ok := normalizeDynamicToolContentItems([]DynamicToolCallOutputContentItem{{Type: "inputAudio", AudioURL: "data:audio/wav;base64,YXVkaW8="}})
+	if !ok || len(items) != 1 || items[0].Type != "inputAudio" {
+		t.Fatalf("items = %#v ok=%v", items, ok)
+	}
+	modelItems := dynamicToolModelContentItemsAny(items)
+	item := modelItems[0].(map[string]any)
+	if item["type"] != "input_audio" || item["audio_url"] != "data:audio/wav;base64,YXVkaW8=" {
+		t.Fatalf("model item = %#v", item)
+	}
+}
+
+func TestMcpActorConfirmationPoliciesMapping(t *testing.T) {
+	browser := "# Browser confirmations\n\nKeep.\n"
+	computer := "# Native confirmations."
+	cp := &model.ConfirmationPolicies{BrowserUse: &browser, ComputerUse: &computer}
+	actor := mcpActorConfirmationPolicies(cp)
+	if actor == nil || actor.BrowserUse != browser || actor.ComputerUse != computer {
+		t.Fatalf("actor confirmation policies = %#v", actor)
+	}
+	// Empty-string overrides are preserved (Rust forwards text verbatim).
+	empty := ""
+	cpEmpty := &model.ConfirmationPolicies{BrowserUse: &empty}
+	actorEmpty := mcpActorConfirmationPolicies(cpEmpty)
+	if actorEmpty == nil || actorEmpty.BrowserUse != "" || actorEmpty.ComputerUse != "" {
+		t.Fatalf("empty override actor policies = %#v", actorEmpty)
+	}
+	// A nil input maps to nil so the executor attaches an empty object.
+	if mcpActorConfirmationPolicies(nil) != nil {
+		t.Fatal("nil model confirmation policies should map to nil actor policies")
+	}
+}
+
+func TestSkillsReadAliasResolutionAndExecutorSkillRoot(t *testing.T) {
+	entries := []skillprovider.CatalogEntry{
+		{Authority: skillprovider.Authority{Kind: skillprovider.SourceExecutor, ID: "root-1"}, PackageID: "skill://root-1/skills/foo/SKILL.md", MainResource: "skill://root-1/skills/foo/SKILL.md", Enabled: true, PromptVisible: true},
+		{Authority: skillprovider.Authority{Kind: skillprovider.SourceExecutor, ID: "root-1"}, PackageID: "skill://root-1/skills/bar/SKILL.md", MainResource: "skill://root-1/skills/bar/SKILL.md", Enabled: true, PromptVisible: true},
+	}
+	for _, tt := range []struct {
+		packageID string
+		candidate string
+		want      bool
+	}{
+		{packageID: "skill://root-1/skills/foo/SKILL.md", candidate: "skill://root-1/skills/foo/SKILL.md", want: true},
+		{packageID: "skill://root-1/skills/foo/SKILL.md", candidate: "e0/foo/SKILL.md", want: true},
+		{packageID: "skill://root-1/skills/bar/SKILL.md", candidate: "e0/bar/SKILL.md", want: true},
+		{packageID: "skill://root-1/skills/foo/SKILL.md", candidate: "e0/bar/SKILL.md", want: false},
+	} {
+		if got := skillPackageMatchesAlias(entries, tt.packageID, tt.candidate); got != tt.want {
+			t.Fatalf("skillPackageMatchesAlias(%q, %q) = %v, want %v", tt.packageID, tt.candidate, got, tt.want)
+		}
+	}
+	if got := executorSkillRoot("skill://root-1/skills/foo/SKILL.md"); got != "skill://root-1/skills/foo" {
+		t.Fatalf("executorSkillRoot() = %q", got)
+	}
+}
+
+// TestMultiAgentToolOverridesFromCatalogMatchesRust mirrors Rust #46505's
+// resolution: only the tools whose catalog entry declares a description or
+// parameters appear, keyed by the tool's stable name.
+func TestMultiAgentToolOverridesFromCatalogMatchesRust(t *testing.T) {
+	if overrides := MultiAgentToolOverridesFromCatalog(nil); overrides != nil {
+		t.Fatalf("nil messages produced %#v", overrides)
+	}
+	empty := &model.ModelMessages{}
+	if overrides := MultiAgentToolOverridesFromCatalog(empty); overrides != nil {
+		t.Fatalf("empty messages produced %#v", overrides)
+	}
+	parameters := `{"type":"object"}`
+	description := "Catalog text."
+	messages := &model.ModelMessages{Tools: &model.ToolMessages{MultiAgent: &model.MultiAgentToolMessages{
+		SpawnAgent: &model.ToolMessage{Description: &description, Parameters: &parameters},
+		ListAgents: &model.ToolMessage{},
+		WaitAgent:  &model.ToolMessage{Parameters: &parameters},
+	}}}
+	overrides := MultiAgentToolOverridesFromCatalog(messages)
+	if len(overrides) != 2 {
+		t.Fatalf("overrides = %#v", overrides)
+	}
+	spawn, ok := overrides["spawn_agent"]
+	if !ok || spawn.Description == nil || *spawn.Description != description || spawn.Parameters == nil || *spawn.Parameters != parameters {
+		t.Fatalf("spawn_agent override = %#v", spawn)
+	}
+	wait, ok := overrides["wait_agent"]
+	if !ok || wait.Description != nil || wait.Parameters == nil {
+		t.Fatalf("wait_agent override = %#v", wait)
+	}
+	if _, ok := overrides["list_agents"]; ok {
+		t.Fatalf("a tool without overrides appeared: %#v", overrides)
+	}
+}
+
+// TestBuildToolRegistryAppliesSpawnCatalogDescriptionLikeRust mirrors Rust
+// #46297 end to end: the resolved catalog description override reaches the
+// registered spawn_agent tool spec, replacing its bundled static text while
+// keeping the configured usage hint.
+func TestBuildToolRegistryAppliesSpawnCatalogDescriptionLikeRust(t *testing.T) {
+	description := "Catalog spawn description."
+	hint := "Configured usage hint."
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableAgents = true
+	options.AgentVersion = agent.VersionV2
+	options.AgentExposure = tool.ExposureModelVisible
+	options.AgentUsageHintText = &hint
+	options.AgentToolOverrides = map[string]agent.MultiAgentToolOverride{
+		"spawn_agent": {Description: &description},
+	}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry() error = %v", err)
+	}
+	spawn, ok := registry.Lookup(tool.NamespacedName(agent.MultiAgentV2Namespace, "spawn_agent"))
+	if !ok {
+		t.Fatal("spawn_agent was not registered")
+	}
+	got := spawn.Spec().Description
+	if !strings.Contains(got, description) {
+		t.Fatalf("spawn_agent description = %q, want the catalog override", got)
+	}
+	if strings.Contains(got, "Spawns an agent to work on the specified task.") {
+		t.Fatalf("spawn_agent description = %q, want the bundled text replaced", got)
+	}
+	if !strings.HasSuffix(got, hint) {
+		t.Fatalf("spawn_agent description = %q, want the usage hint appended", got)
+	}
+}
+
+// TestBuildToolRegistryRegistersMCPResourceHelpersInCodeModeOnlyLikeRust mirrors
+// Rust #50546 (add_mcp_resource_tools): the three MCP resource helpers are
+// registered whenever servers are configured, and always in CodeModeOnly so
+// their definitions stay stable as the first server is added or the last is
+// removed.
+func TestBuildToolRegistryRegistersMCPResourceHelpersInCodeModeOnlyLikeRust(t *testing.T) {
+	resourceNames := []tool.ToolName{
+		tool.PlainName("list_mcp_resources"),
+		tool.PlainName("list_mcp_resource_templates"),
+		tool.PlainName("read_mcp_resource"),
+	}
+	assertRegistered := func(t *testing.T, registry *tool.Registry, want bool) {
+		t.Helper()
+		for _, name := range resourceNames {
+			if _, ok := registry.Lookup(name); ok != want {
+				t.Fatalf("tool %s registered = %v, want %v", name.Key(), ok, want)
+			}
+		}
+	}
+
+	// CodeModeOnly without any configured server still exposes the helpers.
+	codeModeOnly := DefaultToolRegistryOptions(t.TempDir())
+	codeModeOnly.EnableMCP = false
+	codeModeOnly.MCPService = mcp.NewMCPService(nil)
+	codeModeOnly.ToolMode = model.ToolModeCodeModeOnly
+	registry, err := BuildToolRegistry(codeModeOnly)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry(CodeModeOnly) error = %v", err)
+	}
+	assertRegistered(t, registry, true)
+
+	// A server appearing or going away keeps the definitions registered: the
+	// same CodeModeOnly gate holds with servers configured.
+	codeModeOnlyWithServer := DefaultToolRegistryOptions(t.TempDir())
+	codeModeOnlyWithServer.EnableMCP = false
+	codeModeOnlyWithServer.MCPService = mcp.NewMCPService(nil)
+	codeModeOnlyWithServer.MCPService.SetServerConfig("calendar", &mcp.ServerConfig{Enabled: true})
+	codeModeOnlyWithServer.ToolMode = model.ToolModeCodeModeOnly
+	registry, err = BuildToolRegistry(codeModeOnlyWithServer)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry(CodeModeOnly, server) error = %v", err)
+	}
+	assertRegistered(t, registry, true)
+
+	// Direct mode without servers leaves the helpers off.
+	direct := DefaultToolRegistryOptions(t.TempDir())
+	direct.EnableMCP = false
+	direct.MCPService = mcp.NewMCPService(nil)
+	direct.ToolMode = model.ToolModeDirect
+	registry, err = BuildToolRegistry(direct)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry(direct) error = %v", err)
+	}
+	assertRegistered(t, registry, false)
+
+	// A configured server still exposes the helpers outside CodeModeOnly.
+	directWithServer := DefaultToolRegistryOptions(t.TempDir())
+	directWithServer.EnableMCP = false
+	directWithServer.MCPService = mcp.NewMCPService(nil)
+	directWithServer.MCPService.SetServerConfig("calendar", &mcp.ServerConfig{Enabled: true})
+	directWithServer.ToolMode = model.ToolModeDirect
+	registry, err = BuildToolRegistry(directWithServer)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry(direct, server) error = %v", err)
+	}
+	assertRegistered(t, registry, true)
+}
+
+func TestBuildToolRegistryHonorsToolDisableOptions(t *testing.T) {
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.DisableUpdatePlan = true
+	options.DisableWaitAgent = true
+	options.DisableGetContextRemaining = true
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry() error = %v", err)
+	}
+	for _, name := range []tool.ToolName{
+		tool.PlainName("update_plan"),
+		tool.PlainName("get_context_remaining"),
+		tool.NamespacedName(agent.MultiAgentV1Namespace, string(agent.MultiAgentToolWait)),
+	} {
+		if _, ok := registry.Lookup(name); ok {
+			t.Fatalf("disabled tool %s was registered", name.Key())
+		}
+	}
+	if _, ok := registry.Lookup(tool.NamespacedName(agent.MultiAgentV1Namespace, string(agent.MultiAgentToolSpawn))); !ok {
+		t.Fatal("disabling wait_agent should not disable other agent tools")
+	}
+}
+
+type fakeDynamicToolCaller struct {
+	method string
+	params *DynamicToolCallParams
+	result *DynamicToolCallResponse
+	err    error
+}
+
+func (c *fakeDynamicToolCaller) Request(ctx context.Context, method string, params any, target any) error {
+	_ = ctx
+	c.method = method
+	if typed, ok := params.(*DynamicToolCallParams); ok {
+		copied := *typed
+		c.params = &copied
+	}
+	if c.err != nil {
+		return c.err
+	}
+	if c.result == nil {
+		return nil
+	}
+	if typed, ok := target.(*DynamicToolCallResponse); ok {
+		*typed = *c.result
+	}
+	return nil
+}
+
+func writeTurnTestMCPResponse(t *testing.T, w http.ResponseWriter, id int64, result any) {
+	t.Helper()
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"result":  result,
+	}); err != nil {
+		t.Fatalf("Encode response = %v", err)
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestBuildToolRegistryIncludesCoreAndRuntimeTools(t *testing.T) {
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.MCPTools = []mcp.RuntimeToolInfo{{
+		ServerName: "calendar",
+		Tool: mcp.RuntimeTool{
+			Name:        "create_event",
+			Description: "Create calendar events",
+		},
+	}}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry() error = %v", err)
+	}
+	for _, name := range []tool.ToolName{
+		tool.PlainName("update_plan"),
+		tool.PlainName(tool.DefaultShellCommandToolName),
+		tool.PlainName(tool.DefaultApplyPatchToolName),
+		tool.NamespacedName("mcp__calendar", "create_event"),
+		tool.NamespacedName(agent.MultiAgentV1Namespace, string(agent.MultiAgentToolSpawn)),
+		tool.PlainName(tool.ToolSearchName),
+	} {
+		if _, ok := registry.Lookup(name); !ok {
+			t.Fatalf("missing tool %s", name.Key())
+		}
+	}
+}
+
+func TestBuildToolRegistryAppliesConfiguredAgentRoles(t *testing.T) {
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.AgentRoles = map[string]agent.RoleConfig{"reviewer": {Description: "Reviews changes."}}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, ok := registry.Lookup(tool.NamespacedName(agent.MultiAgentV1Namespace, string(agent.MultiAgentToolSpawn)))
+	if !ok || !strings.Contains(executor.Spec().Description, "`reviewer`: Reviews changes.") {
+		t.Fatalf("spawn spec = %#v, found=%v", executor, ok)
+	}
+}
+
+func TestBuildToolRegistryViewImageFollowsModelCapabilityOption(t *testing.T) {
+	options := DefaultToolRegistryOptions(t.TempDir())
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry(default) error = %v", err)
+	}
+	if _, ok := registry.Lookup(tool.PlainName(tool.ViewImageToolName)); ok {
+		t.Fatal("view_image should not be exposed without image model capability")
+	}
+
+	options.ViewImage = &tool.ViewImageOptions{CWD: options.Shell.Validation.CWD, CanRequestOriginalDetail: true}
+	registry, err = BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry(view_image) error = %v", err)
+	}
+	if _, ok := registry.Lookup(tool.PlainName(tool.ViewImageToolName)); !ok {
+		t.Fatal("view_image not registered when explicitly enabled")
+	}
+}
+
+func TestSkillsToolsListAndReadOrchestratorResourcesLikeRust(t *testing.T) {
+	var methods []string
+	skillPackage := "skill://drive/docs"
+	mainResource := skillPackage + "/SKILL.md"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			ID     int64           `json:"id"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("Decode() error = %v", err)
+		}
+		methods = append(methods, request.Method)
+		switch request.Method {
+		case "initialize":
+			writeTurnTestMCPResponse(t, w, request.ID, map[string]any{
+				"protocolVersion": "2025-06-18",
+				"capabilities":    map[string]any{},
+				"serverInfo":      map[string]string{"name": "codex_apps", "version": "test"},
+			})
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/list":
+			writeTurnTestMCPResponse(t, w, request.ID, map[string]any{"tools": []any{}})
+		case "resources/list":
+			writeTurnTestMCPResponse(t, w, request.ID, map[string]any{
+				"resources": []map[string]any{
+					{
+						"uri":         skillPackage,
+						"name":        "docs",
+						"description": "Use <docs> & keep quotes \"as-is\"",
+						"mimeType":    "mcp/skill",
+						"_meta": map[string]any{
+							"plugin_name": "Drive",
+							"skill_name":  "doc search",
+						},
+					},
+					{
+						"uri":         "skill://drive/bad",
+						"name":        "bad",
+						"description": "missing plugin name",
+						"mimeType":    "mcp/skill",
+						"_meta":       map[string]any{"skill_name": "bad"},
+					},
+				},
+			})
+		case "resources/templates/list":
+			writeTurnTestMCPResponse(t, w, request.ID, map[string]any{"resourceTemplates": []any{}})
+		case "resources/read":
+			var params struct {
+				URI string `json:"uri"`
+			}
+			if err := json.Unmarshal(request.Params, &params); err != nil {
+				t.Fatalf("resources/read params = %v", err)
+			}
+			writeTurnTestMCPResponse(t, w, request.ID, map[string]any{
+				"contents": []map[string]string{{"uri": params.URI, "text": "# Docs\nUse this skill."}},
+			})
+		default:
+			writeTurnTestMCPResponse(t, w, request.ID, map[string]any{})
+		}
+	}))
+	defer server.Close()
+
+	mcpService := mcp.NewMCPService(&mcp.RuntimeConfig{Servers: map[string]mcp.ServerRegistration{
+		mcp.RuntimeCodexAppsMCPServerName: {Config: mcp.ServerConfig{URL: server.URL, Enabled: true}},
+	}})
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableCore = false
+	options.EnableShell = false
+	options.EnableApplyPatch = false
+	options.EnableMCP = false
+	options.EnableAgents = false
+	options.EnableToolSearch = false
+	options.MCPService = mcpService
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry() error = %v", err)
+	}
+	router := tool.NewRouter(registry)
+	listOutput, err := router.Dispatch(context.Background(), &tool.Invocation{
+		CallID:   "skills-list",
+		ToolName: tool.NamespacedName("skills", "list"),
+		Payload:  tool.Payload{Kind: tool.PayloadFunction, Arguments: `{"authority":{"kind":"orchestrator"}}`},
+	})
+	if err != nil {
+		t.Fatalf("skills.list error = %v", err)
+	}
+	var listed skillsListResponse
+	if err := json.Unmarshal([]byte(listOutput.Body), &listed); err != nil {
+		t.Fatalf("skills.list JSON = %v in %s", err, listOutput.Body)
+	}
+	if len(listed.Skills) != 1 {
+		t.Fatalf("listed skills = %#v", listed.Skills)
+	}
+	got := listed.Skills[0]
+	if got.Authority.Kind != "orchestrator" || got.Package != skillPackage || got.MainResource != mainResource || got.Name != "Drive:doc search" {
+		t.Fatalf("listed skill = %#v", got)
+	}
+	if got.Description != "Use &lt;docs&gt; &amp; keep quotes \"as-is\"" {
+		t.Fatalf("description = %q", got.Description)
+	}
+	if len(listed.Warnings) != 1 || listed.Warnings[0] != "Skipped 1 malformed orchestrator skill resources." {
+		t.Fatalf("warnings = %#v", listed.Warnings)
+	}
+
+	readOutput, err := router.Dispatch(context.Background(), &tool.Invocation{
+		CallID:   "skills-read",
+		ToolName: tool.NamespacedName("skills", "read"),
+		Payload:  tool.Payload{Kind: tool.PayloadFunction, Arguments: `{"authority":{"kind":"orchestrator"},"package":"` + skillPackage + `","resource":"` + mainResource + `"}`},
+	})
+	if err != nil {
+		t.Fatalf("skills.read error = %v", err)
+	}
+	var read skillsReadResponse
+	if err := json.Unmarshal([]byte(readOutput.Body), &read); err != nil {
+		t.Fatalf("skills.read JSON = %v in %s", err, readOutput.Body)
+	}
+	if read.Resource != mainResource || !strings.Contains(read.Contents, "Use this skill") {
+		t.Fatalf("read = %#v", read)
+	}
+	mainReadOutput, err := router.Dispatch(context.Background(), &tool.Invocation{
+		CallID:   "skills-read-main",
+		ToolName: tool.NamespacedName("skills", "read"),
+		Payload:  tool.Payload{Kind: tool.PayloadFunction, Arguments: `{"authority":{"kind":"orchestrator"},"package":"` + skillPackage + `"}`},
+	})
+	if err != nil {
+		t.Fatalf("skills.read without resource error = %v", err)
+	}
+	var mainRead skillsReadResponse
+	if err := json.Unmarshal([]byte(mainReadOutput.Body), &mainRead); err != nil {
+		t.Fatalf("skills.read without resource JSON = %v in %s", err, mainReadOutput.Body)
+	}
+	if mainRead.Resource != mainResource || !strings.Contains(mainRead.Contents, "Use this skill") {
+		t.Fatalf("omitted-resource read = %#v, want main resource %q", mainRead, mainResource)
+	}
+	if !containsString(methods, "resources/list") || !containsString(methods, "resources/read") {
+		t.Fatalf("methods = %#v", methods)
+	}
+	resourceLists := 0
+	resourceReads := 0
+	for _, method := range methods {
+		if method == "resources/list" {
+			resourceLists++
+		}
+		if method == "resources/read" {
+			resourceReads++
+		}
+	}
+	if resourceLists != 1 || resourceReads != 1 {
+		t.Fatalf("methods = %#v, want shared list/read catalog cache", methods)
+	}
+}
+
+func TestSkillsToolsRejectUnsupportedAuthorityLikeRust(t *testing.T) {
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableCore = false
+	options.EnableShell = false
+	options.EnableApplyPatch = false
+	options.EnableMCP = false
+	options.EnableAgents = false
+	options.EnableToolSearch = false
+	options.MCPService = mcp.NewMCPService(nil)
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry() error = %v", err)
+	}
+	_, err = tool.NewRouter(registry).Dispatch(context.Background(), &tool.Invocation{
+		CallID:   "skills-list",
+		ToolName: tool.NamespacedName("skills", "list"),
+		Payload:  tool.Payload{Kind: tool.PayloadFunction, Arguments: `{"authority":{"kind":"host"}}`},
+	})
+	var callErr *tool.FunctionCallError
+	if !errors.As(err, &callErr) || !callErr.RespondsToModel() || !strings.Contains(callErr.ModelMessage(), "expected `orchestrator` or `executor`") {
+		t.Fatalf("error = %#v", err)
+	}
+}
+
+func TestExecutorSkillsToolsListReadPaginateAndValidateAuthorityLikeRust(t *testing.T) {
+	visible := skillprovider.CatalogEntry{
+		PackageID: "skill://demo@1/plugin/skills/deploy",
+		Authority: skillprovider.Authority{Kind: skillprovider.SourceExecutor, ID: "demo@1"},
+		Name:      "demo:deploy", Description: "Deploy through the executor.",
+		MainResource: "skill://demo@1/plugin/skills/deploy/SKILL.md", Enabled: true, PromptVisible: true,
+	}
+	hidden := visible
+	hidden.PackageID = "skill://demo@1/plugin/skills/hidden"
+	hidden.MainResource = hidden.PackageID + "/SKILL.md"
+	hidden.Name = "demo:hidden"
+	hidden.PromptVisible = false
+	contents := "MARKER\n" + strings.Repeat("x", maxSkillToolResponseBytes+1024)
+	provider := skillprovider.ProviderFuncs{
+		ListFunc: func(context.Context, skillprovider.ListQuery) (skillprovider.Catalog, error) {
+			return skillprovider.Catalog{Entries: []skillprovider.CatalogEntry{visible, hidden}}, nil
+		},
+		ReadFunc: func(_ context.Context, request skillprovider.ReadRequest) (skillprovider.ReadResult, error) {
+			if request.Authority.ID != "demo@1" || request.Resource == "" || request.PackageID != visible.PackageID && request.PackageID != hidden.PackageID {
+				return skillprovider.ReadResult{}, errors.New("unexpected read request")
+			}
+			return skillprovider.ReadResult{Resource: request.Resource, Contents: contents}, nil
+		},
+	}
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableCore = false
+	options.EnableShell = false
+	options.EnableApplyPatch = false
+	options.EnableMCP = false
+	options.EnableAgents = false
+	options.EnableToolSearch = false
+	options.SkillProviders = skillprovider.NewRegistry(skillprovider.Source{Kind: skillprovider.SourceExecutor, Label: "executor", Provider: provider})
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry() error = %v", err)
+	}
+	router := tool.NewRouter(registry)
+	listOutput, err := router.Dispatch(context.Background(), &tool.Invocation{CallID: "list", ToolName: tool.NamespacedName("skills", "list"), Payload: tool.Payload{Kind: tool.PayloadFunction, Arguments: `{"authority":{"kind":"executor"}}`}})
+	if err != nil {
+		t.Fatalf("skills.list error = %v", err)
+	}
+	var listed skillsListResponse
+	if err := json.Unmarshal([]byte(listOutput.Body), &listed); err != nil {
+		t.Fatalf("skills.list JSON = %v", err)
+	}
+	if len(listed.Skills) != 1 || listed.Skills[0].Authority.ID != "demo@1" || listed.Skills[0].Package != visible.PackageID || listed.NextCursor != nil {
+		t.Fatalf("skills.list = %#v", listed)
+	}
+	resource := visible.PackageID + "/references/details.md"
+	readOutput, err := router.Dispatch(context.Background(), &tool.Invocation{CallID: "read", ToolName: tool.NamespacedName("skills", "read"), Payload: tool.Payload{Kind: tool.PayloadFunction, Arguments: `{"authority":{"kind":"executor","id":"demo@1"},"package":"` + visible.PackageID + `","resource":"` + resource + `"}`}})
+	if err != nil {
+		t.Fatalf("skills.read error = %v", err)
+	}
+	var first skillsReadResponse
+	if err := json.Unmarshal([]byte(readOutput.Body), &first); err != nil {
+		t.Fatalf("skills.read JSON = %v", err)
+	}
+	if !strings.Contains(first.Contents, "MARKER") || first.NextCursor == nil || len(readOutput.Body) > maxSkillToolResponseBytes {
+		t.Fatalf("first page = len(body)=%d response=%#v", len(readOutput.Body), first)
+	}
+	mainOutput, err := router.Dispatch(context.Background(), &tool.Invocation{CallID: "read-main", ToolName: tool.NamespacedName("skills", "read"), Payload: tool.Payload{Kind: tool.PayloadFunction, Arguments: `{"authority":{"kind":"executor","id":"demo@1"},"package":"` + visible.PackageID + `"}`}})
+	if err != nil {
+		t.Fatalf("skills.read without resource error = %v", err)
+	}
+	var mainRead skillsReadResponse
+	if err := json.Unmarshal([]byte(mainOutput.Body), &mainRead); err != nil {
+		t.Fatalf("skills.read without resource JSON = %v", err)
+	}
+	if mainRead.Resource != visible.MainResource {
+		t.Fatalf("omitted-resource read = %#v, want main resource %q", mainRead, visible.MainResource)
+	}
+	secondOutput, err := router.Dispatch(context.Background(), &tool.Invocation{CallID: "read-2", ToolName: tool.NamespacedName("skills", "read"), Payload: tool.Payload{Kind: tool.PayloadFunction, Arguments: `{"authority":{"kind":"executor","id":"demo@1"},"package":"` + visible.PackageID + `","resource":"` + resource + `","cursor":"` + *first.NextCursor + `"}`}})
+	if err != nil {
+		t.Fatalf("skills.read second page error = %v", err)
+	}
+	var second skillsReadResponse
+	if err := json.Unmarshal([]byte(secondOutput.Body), &second); err != nil || len(second.Contents) == 0 {
+		t.Fatalf("second page = %#v err=%v", second, err)
+	}
+	for name, arguments := range map[string]string{
+		"authority substitution": `{"authority":{"kind":"executor","id":"other@1"},"package":"` + visible.PackageID + `","resource":"` + resource + `"}`,
+		"path traversal":         `{"authority":{"kind":"executor","id":"demo@1"},"package":"` + visible.PackageID + `","resource":"` + visible.PackageID + `/../secret"}`,
+		"unknown package":        `{"authority":{"kind":"executor","id":"demo@1"},"package":"skill://demo@1/plugin/skills/missing","resource":"skill://demo@1/plugin/skills/missing/SKILL.md"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := router.Dispatch(context.Background(), &tool.Invocation{CallID: name, ToolName: tool.NamespacedName("skills", "read"), Payload: tool.Payload{Kind: tool.PayloadFunction, Arguments: arguments}})
+			var callErr *tool.FunctionCallError
+			if !errors.As(err, &callErr) || !callErr.RespondsToModel() {
+				t.Fatalf("error = %#v", err)
+			}
+		})
+	}
+}
+
+// Rust #50050: overlapping step refreshes return their own executor catalogs
+// instead of reading whichever catalog another step published last.
+func TestExecutorSkillsListReturnsCurrentStepCatalogLikeRust(t *testing.T) {
+	entry := func(root string) skillprovider.CatalogEntry {
+		return skillprovider.CatalogEntry{
+			PackageID:     "skill://" + root + "/" + root,
+			Authority:     skillprovider.Authority{Kind: skillprovider.SourceExecutor, ID: root},
+			Name:          root,
+			Description:   root + " skill",
+			MainResource:  "skill://" + root + "/" + root + "/SKILL.md",
+			Enabled:       true,
+			PromptVisible: true,
+		}
+	}
+	var current atomic.Value
+	current.Store([]skillprovider.CatalogEntry{entry("first-root")})
+	provider := skillprovider.ProviderFuncs{
+		ListFunc: func(context.Context, skillprovider.ListQuery) (skillprovider.Catalog, error) {
+			return skillprovider.Catalog{Entries: current.Load().([]skillprovider.CatalogEntry)}, nil
+		},
+	}
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableCore = false
+	options.EnableShell = false
+	options.EnableApplyPatch = false
+	options.EnableMCP = false
+	options.EnableAgents = false
+	options.EnableToolSearch = false
+	options.SkillProviders = skillprovider.NewRegistry(skillprovider.Source{Kind: skillprovider.SourceExecutor, Label: "executor", Provider: provider})
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry() error = %v", err)
+	}
+	router := tool.NewRouter(registry)
+	list := func(callID string) skillsListResponse {
+		t.Helper()
+		output, err := router.Dispatch(context.Background(), &tool.Invocation{
+			CallID:   callID,
+			ToolName: tool.NamespacedName("skills", "list"),
+			Payload:  tool.Payload{Kind: tool.PayloadFunction, Arguments: `{"authority":{"kind":"executor"}}`},
+		})
+		if err != nil {
+			t.Fatalf("skills.list(%s) error = %v", callID, err)
+		}
+		var listed skillsListResponse
+		if err := json.Unmarshal([]byte(output.Body), &listed); err != nil {
+			t.Fatalf("skills.list(%s) JSON = %v", callID, err)
+		}
+		return listed
+	}
+	if listed := list("first"); len(listed.Skills) != 1 || listed.Skills[0].Name != "first-root" {
+		t.Fatalf("first step skills.list = %#v", listed)
+	}
+	current.Store([]skillprovider.CatalogEntry{entry("next-root")})
+	if listed := list("next"); len(listed.Skills) != 1 || listed.Skills[0].Name != "next-root" {
+		t.Fatalf("next step skills.list = %#v", listed)
+	}
+}
+
+func TestSkillsReadHonorsResponseBudgetAndReusesExecutorSnapshotLikeRust(t *testing.T) {
+	entry := skillprovider.CatalogEntry{
+		PackageID:    "skill://budget@1/plugin/skills/budget",
+		Authority:    skillprovider.Authority{Kind: skillprovider.SourceExecutor, ID: "budget@1"},
+		Name:         "budget:skill",
+		Description:  "Budget test skill.",
+		MainResource: "skill://budget@1/plugin/skills/budget/SKILL.md",
+		Enabled:      true, PromptVisible: true,
+	}
+	contents := "BUDGET_MARKER\n" + strings.Repeat("x", 5000)
+	var reads atomic.Int64
+	provider := skillprovider.ProviderFuncs{
+		ListFunc: func(context.Context, skillprovider.ListQuery) (skillprovider.Catalog, error) {
+			return skillprovider.Catalog{Entries: []skillprovider.CatalogEntry{entry}}, nil
+		},
+		ReadFunc: func(_ context.Context, request skillprovider.ReadRequest) (skillprovider.ReadResult, error) {
+			reads.Add(1)
+			return skillprovider.ReadResult{Resource: request.Resource, Contents: contents}, nil
+		},
+	}
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableCore = false
+	options.EnableShell = false
+	options.EnableApplyPatch = false
+	options.EnableMCP = false
+	options.EnableAgents = false
+	options.EnableToolSearch = false
+	options.SkillProviders = skillprovider.NewRegistry(skillprovider.Source{Kind: skillprovider.SourceExecutor, Label: "executor", Provider: provider})
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry() error = %v", err)
+	}
+	router := tool.NewRouter(registry)
+	budget := utils.BytesPolicy(500)
+	firstOutput, err := router.Dispatch(context.Background(), &tool.Invocation{
+		CallID:     "first",
+		ToolName:   tool.NamespacedName("skills", "read"),
+		Truncation: &budget,
+		Payload: tool.Payload{Kind: tool.PayloadFunction, Arguments: `{"authority":{"kind":"executor","id":"budget@1"},"package":"` +
+			entry.PackageID + `","resource":"` + entry.MainResource + `"}`},
+	})
+	if err != nil {
+		t.Fatalf("first skills.read error = %v", err)
+	}
+	var first skillsReadResponse
+	if err := json.Unmarshal([]byte(firstOutput.Body), &first); err != nil {
+		t.Fatalf("first skills.read JSON = %v", err)
+	}
+	if first.NextCursor == nil || len(firstOutput.Body) > 600 || !strings.HasPrefix(contents, first.Contents) {
+		t.Fatalf("first page len=%d response=%#v", len(firstOutput.Body), first)
+	}
+	secondOutput, err := router.Dispatch(context.Background(), &tool.Invocation{
+		CallID:     "second",
+		ToolName:   tool.NamespacedName("skills", "read"),
+		Truncation: &budget,
+		Payload: tool.Payload{Kind: tool.PayloadFunction, Arguments: `{"authority":{"kind":"executor","id":"budget@1"},"package":"` +
+			entry.PackageID + `","resource":"` + entry.MainResource + `","cursor":"` + *first.NextCursor + `"}`},
+	})
+	if err != nil {
+		t.Fatalf("second skills.read error = %v", err)
+	}
+	if reads.Load() != 1 {
+		t.Fatalf("executor reads = %d, want one retained snapshot", reads.Load())
+	}
+	var second skillsReadResponse
+	if err := json.Unmarshal([]byte(secondOutput.Body), &second); err != nil {
+		t.Fatalf("second skills.read JSON = %v", err)
+	}
+	if len(secondOutput.Body) > 600 || !strings.HasPrefix(contents[len(first.Contents):], second.Contents) {
+		t.Fatalf("second page len=%d response=%#v", len(secondOutput.Body), second)
+	}
+
+	for _, limit := range []int{0, 1} {
+		tiny := utils.BytesPolicy(limit)
+		_, err = router.Dispatch(context.Background(), &tool.Invocation{
+			CallID:     "tiny",
+			ToolName:   tool.NamespacedName("skills", "read"),
+			Truncation: &tiny,
+			Payload: tool.Payload{Kind: tool.PayloadFunction, Arguments: `{"authority":{"kind":"executor","id":"budget@1"},"package":"` +
+				entry.PackageID + `","resource":"` + entry.MainResource + `"}`},
+		})
+		var callErr *tool.FunctionCallError
+		if !errors.As(err, &callErr) || !strings.Contains(callErr.ModelMessage(), "response budget leaves no room for contents") {
+			t.Fatalf("budget %d error = %#v", limit, err)
+		}
+	}
+}
+
+func TestBuildToolRegistryAppliesModelFunctionDescriptionPrefixesLikeRust(t *testing.T) {
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableCore = true
+	options.EnableShell = false
+	options.EnableApplyPatch = false
+	options.EnableMCP = false
+	options.EnableAgents = false
+	options.EnableToolSearch = false
+	options.FunctionDescriptionPrefixes = map[string]string{
+		"exec":        "Exec guidance.",
+		"unavailable": "Ignored.",
+	}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, ok := registry.Spec(tool.PlainName(tool.CodeModeExecToolName))
+	if !ok {
+		t.Fatal("exec tool is missing")
+	}
+	if !strings.HasPrefix(spec.Description, "Exec guidance.\n\n") {
+		t.Fatalf("exec description = %q", spec.Description)
+	}
+}
+
+type indirectPrefixMCPServerExecutor struct {
+	spec       tool.Spec
+	serverName string
+}
+
+func (e indirectPrefixMCPServerExecutor) Spec() tool.Spec { return e.spec }
+
+func (e indirectPrefixMCPServerExecutor) Execute(context.Context, *tool.Invocation) (*tool.Output, error) {
+	return &tool.Output{Success: true, Body: "ok"}, nil
+}
+
+func (e indirectPrefixMCPServerExecutor) MCPServerName() string { return e.serverName }
+
+func TestBuildToolRegistryAppliesIndirectDescriptionPrefixesLikeRust(t *testing.T) {
+	runtime := tool.NewCodeModeRuntime(nil, false)
+	options := &ToolRegistryOptions{
+		EnableCodeMode:        true,
+		EnableToolSearch:      true,
+		CodeModeRuntime:       runtime,
+		OmitToolSearchSources: true,
+		IndirectDescriptionPrefixes: &tool.IndirectDescriptionPrefixes{
+			Namespaces: map[string]string{"functions": "Function guidance."},
+			MCPServers: map[string]string{"drive": "Drive guidance."},
+		},
+		ExtraTools: []tool.Executor{
+			indirectPrefixMCPServerExecutor{
+				serverName: "drive",
+				spec: tool.Spec{
+					Name:                 tool.NamespacedName("mcp__drive", "search"),
+					Description:          "Search Drive.",
+					NamespaceDescription: "Drive tools.",
+					Exposure:             tool.ExposureCodeModeOnly,
+				},
+			},
+			tool.NewExecutorFunc(tool.Spec{
+				Name:        tool.PlainName("lookup"),
+				Description: "Lookup.",
+				Exposure:    tool.ExposureModelVisible,
+			}, func(context.Context, *tool.Invocation) (*tool.Output, error) {
+				return &tool.Output{Success: true, Body: "ok"}, nil
+			}),
+			indirectPrefixMCPServerExecutor{
+				serverName: "drive",
+				spec: tool.Spec{
+					Name:                 tool.NamespacedName("mcp__drive", "find"),
+					Description:          "Find Drive.",
+					NamespaceDescription: "Drive tools.",
+					Exposure:             tool.ExposureDiscoverable,
+					Search:               &tool.SearchInfo{Text: "Find Drive."},
+				},
+			},
+		},
+	}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry() error = %v", err)
+	}
+	direct, ok := registry.Spec(tool.NamespacedName("mcp__drive", "search"))
+	if !ok || direct.Description != "Search Drive." || direct.NamespaceDescription != "Drive tools." {
+		t.Fatalf("direct MCP spec was changed = %#v", direct)
+	}
+	resolved, err := tool.NewIndirectNamespacePrefixes(options.IndirectDescriptionPrefixes, registry.MCPServerNamespaces())
+	if err != nil {
+		t.Fatalf("NewIndirectNamespacePrefixes() error = %v", err)
+	}
+	var codeModeMCP tool.Spec
+	for _, spec := range tool.NewRouter(registry).CodeModeToolSpecs() {
+		if spec.Name.Key() == "mcp__drive.search" {
+			codeModeMCP = spec
+			break
+		}
+	}
+	if codeModeMCP.Description != "Drive guidance.\n\nSearch Drive." || codeModeMCP.NamespaceDescription != "Drive guidance.\n\nDrive tools." {
+		t.Fatalf("code-mode MCP spec = %#v", codeModeMCP)
+	}
+	execSpec, ok := registry.Spec(tool.PlainName(tool.CodeModeExecToolName))
+	if !ok {
+		t.Fatal("code-mode exec spec is missing")
+	}
+	promptSpecs := codeModeOnlyExecPromptSpecs([]tool.Spec{execSpec}, tool.NewRouter(registry).CodeModeToolSpecs(), resolved)
+	if len(promptSpecs) == 0 || !strings.Contains(promptSpecs[0].Description, "## functions\nFunction guidance.") ||
+		!strings.Contains(promptSpecs[0].Description, "## mcp__drive\nDrive guidance.") {
+		t.Fatalf("code-mode-only exec description = %#v", promptSpecs)
+	}
+	executor, ok := registry.Lookup(tool.PlainName(tool.ToolSearchName))
+	if !ok {
+		t.Fatal("tool_search executor is missing")
+	}
+	handler, ok := executor.(*tool.ToolSearchHandler)
+	if !ok {
+		t.Fatalf("tool_search executor = %T", executor)
+	}
+	output, err := handler.Execute(context.Background(), &tool.Invocation{Payload: tool.Payload{
+		Kind:   tool.PayloadToolSearch,
+		Search: map[string]any{"query": "drive"},
+	}})
+	if err != nil || output == nil {
+		t.Fatalf("tool search = %#v, %v", output, err)
+	}
+	var result tool.ToolSearchResult
+	if err := json.Unmarshal([]byte(output.Body), &result); err != nil {
+		t.Fatalf("decode tool search: %v", err)
+	}
+	if len(result.Tools) != 1 || result.Tools[0].Description != "Drive guidance.\n\nDrive tools.\n\nFind Drive." {
+		t.Fatalf("tool search results = %#v", result.Tools)
+	}
+}
+
+func TestBuildToolRegistryOrdersCodeModeToolDescriptionsLikeRust(t *testing.T) {
+	for _, test := range []struct {
+		name                 string
+		toolDescriptionFirst bool
+		want                 string
+	}{
+		{name: "namespace first", want: "Drive tools.\n\nFind Drive."},
+		{name: "tool first", toolDescriptionFirst: true, want: "Find Drive.\n\nDrive tools."},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			options := &ToolRegistryOptions{
+				EnableToolSearch:             true,
+				CodeModeToolDescriptionFirst: test.toolDescriptionFirst,
+				ExtraTools: []tool.Executor{
+					indirectPrefixMCPServerExecutor{
+						serverName: "drive",
+						spec: tool.Spec{
+							Name:                 tool.NamespacedName("mcp__drive", "find"),
+							Description:          "Find Drive.",
+							NamespaceDescription: "Drive tools.",
+							Exposure:             tool.ExposureDiscoverable,
+							Search:               &tool.SearchInfo{Text: "Find Drive."},
+						},
+					},
+				},
+			}
+			registry, err := BuildToolRegistry(options)
+			if err != nil {
+				t.Fatalf("BuildToolRegistry() error = %v", err)
+			}
+			executor, ok := registry.Lookup(tool.PlainName(tool.ToolSearchName))
+			if !ok {
+				t.Fatal("tool_search executor is missing")
+			}
+			output, err := executor.Execute(context.Background(), &tool.Invocation{Payload: tool.Payload{
+				Kind:   tool.PayloadToolSearch,
+				Search: map[string]any{"query": "drive"},
+			}})
+			if err != nil || output == nil {
+				t.Fatalf("tool search = %#v, %v", output, err)
+			}
+			var result tool.ToolSearchResult
+			if err := json.Unmarshal([]byte(output.Body), &result); err != nil {
+				t.Fatalf("decode tool search: %v", err)
+			}
+			if len(result.Tools) != 1 || result.Tools[0].Description != test.want {
+				t.Fatalf("tool search results = %#v, want description %q", result.Tools, test.want)
+			}
+		})
+	}
+}
+
+func TestBuildToolRegistryStrictThirdPartyToolsLikeRust(t *testing.T) {
+	output := func(context.Context, *tool.Invocation) (*tool.Output, error) {
+		return &tool.Output{Success: true}, nil
+	}
+	for _, test := range []struct {
+		name     string
+		mode     string
+		enabled  bool
+		deferred bool
+	}{
+		{name: "strict code mode only", mode: model.ToolModeCodeModeOnly, enabled: true, deferred: true},
+		{name: "strict disabled", mode: model.ToolModeCodeModeOnly, deferred: false},
+		{name: "strict direct mode", mode: model.ToolModeDirect, enabled: true, deferred: false},
+		{name: "strict code mode", mode: model.ToolModeCodeMode, enabled: true, deferred: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			options := DefaultToolRegistryOptions(t.TempDir())
+			options.EnableMCP = true
+			options.EnableAgents = false
+			options.ToolMode = test.mode
+			options.CodeModeOnlyStrictThirdPartyTools = test.enabled
+			options.MCPTools = []mcp.RuntimeToolInfo{{
+				ServerName: "calendar",
+				Tool: mcp.RuntimeTool{
+					Name:        "lookup",
+					Description: "Look up calendar entries.",
+					InputSchema: map[string]any{"type": "object"},
+				},
+			}}
+			options.MCPExposure = tool.ExposureDirectModelOnly
+			options.DynamicToolCaller = &fakeDynamicToolCaller{result: &DynamicToolCallResponse{Success: true}}
+			options.DynamicTools = []DynamicToolSpec{{
+				Type: "function",
+				Function: &DynamicToolFunctionSpec{
+					Name:        "client_lookup",
+					Description: "Client lookup.",
+					InputSchema: map[string]any{"type": "object"},
+				},
+			}}
+			options.ExtraTools = []tool.Executor{
+				tool.NewExecutorFunc(tool.Spec{
+					Name:        tool.NamespacedName("client", "direct"),
+					Description: "Direct client tool.",
+					Exposure:    tool.ExposureDirectModelOnly,
+					ThirdParty:  true,
+				}, output),
+				tool.NewExecutorFunc(tool.Spec{
+					Name:        tool.PlainName("hidden_client"),
+					Description: "Hidden client tool.",
+					Exposure:    tool.ExposureHidden,
+					ThirdParty:  true,
+				}, output),
+				tool.NewExecutorFunc(tool.Spec{
+					Name:        tool.PlainName("builtin_like"),
+					Description: "Built-in tool.",
+					Exposure:    tool.ExposureModelVisible,
+				}, output),
+			}
+			registry, err := BuildToolRegistry(options)
+			if err != nil {
+				t.Fatalf("BuildToolRegistry() error = %v", err)
+			}
+
+			for _, name := range []tool.ToolName{
+				tool.PlainName("client_lookup"),
+				tool.NamespacedName("client", "direct"),
+				tool.NamespacedName("mcp__calendar", "lookup"),
+			} {
+				spec, ok := registry.Spec(name)
+				if !ok {
+					t.Fatalf("%s missing", name.Key())
+				}
+				want := tool.ExposureModelVisible
+				if name.Namespace != "" {
+					want = tool.ExposureDirectModelOnly
+				}
+				if test.deferred {
+					want = tool.ExposureDiscoverable
+				}
+				if spec.Exposure != want {
+					t.Fatalf("%s exposure = %q, want %q", name.Key(), spec.Exposure, want)
+				}
+				if test.deferred {
+					found := false
+					for _, metadata := range tool.NewRouter(registry).CodeModeToolNames() {
+						if metadata.Name == name.Name &&
+							(name.Namespace == "" || metadata.Namespace != nil && *metadata.Namespace == name.Namespace) {
+							found = true
+							break
+						}
+					}
+					if !found {
+						t.Fatalf("%s missing from Code Mode tools: %#v", name.Key(), tool.NewRouter(registry).CodeModeToolNames())
+					}
+				}
+			}
+			if spec, _ := registry.Spec(tool.PlainName("hidden_client")); spec.Exposure != tool.ExposureHidden {
+				t.Fatalf("hidden_client exposure = %q, want hidden", spec.Exposure)
+			}
+			if spec, _ := registry.Spec(tool.PlainName("builtin_like")); spec.Exposure != tool.ExposureModelVisible {
+				t.Fatalf("builtin_like exposure = %q, want model_visible", spec.Exposure)
+			}
+		})
+	}
+}
+
+func TestSkillReadPageHonorsEscapedAndMultibyteBudgetsLikeRust(t *testing.T) {
+	contents := strings.Repeat("quote \" slash \\ newline\n emoji 😀 ", 40)
+	for _, budget := range []int{180, 300, 1024} {
+		t.Run(strconv.Itoa(budget), func(t *testing.T) {
+			start := 0
+			var reconstructed strings.Builder
+			for {
+				response, err := skillReadPage("skill://budget/SKILL.md", contents, nil, start, budget)
+				if err != nil {
+					t.Fatalf("skillReadPage(start=%d) error = %v", start, err)
+				}
+				if serialized := skillToolSerializedLen(response); serialized > budget {
+					t.Fatalf("page size = %d, want <= %d", serialized, budget)
+				}
+				if response.Contents == "" || !utf8.ValidString(response.Contents) {
+					t.Fatalf("page contents are not valid UTF-8: %q", response.Contents)
+				}
+				reconstructed.WriteString(response.Contents)
+				if response.NextCursor == nil {
+					break
+				}
+				next, err := parseSkillToolCursor(response.NextCursor, contents, "skills.read")
+				if err != nil {
+					t.Fatalf("parseSkillToolCursor() error = %v", err)
+				}
+				if next <= start {
+					t.Fatalf("cursor advanced %d -> %d", start, next)
+				}
+				start = next
+			}
+			if reconstructed.String() != contents {
+				t.Fatalf("reconstructed %d bytes, want %d", reconstructed.Len(), len(contents))
+			}
+		})
+	}
+}
+
+func TestSkillsListTruncatesCatalogDescriptionLikeRust(t *testing.T) {
+	description := strings.Repeat("x", maxCatalogSkillDescriptionChars+1)
+	got := truncateCatalogSkillDescription(description)
+	if got != strings.Repeat("x", maxCatalogSkillDescriptionChars-len(skillDescriptionTruncatedSuffix))+skillDescriptionTruncatedSuffix {
+		t.Fatalf("truncated description len=%d value suffix=%q", len(got), got[len(got)-3:])
+	}
+}
+
+func TestBuildToolRegistryClockToolsFollowOptions(t *testing.T) {
+	options := DefaultToolRegistryOptions(t.TempDir())
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry(default) error = %v", err)
+	}
+	if _, ok := registry.Lookup(tool.NamespacedName("clock", "curr_time")); ok {
+		t.Fatal("clock.curr_time should be disabled by default")
+	}
+	if _, ok := registry.Lookup(tool.NamespacedName("clock", "sleep")); ok {
+		t.Fatal("clock.sleep should be disabled by default")
+	}
+	if _, ok := registry.Lookup(tool.PlainName("sleep")); ok {
+		t.Fatal("legacy plain sleep should not be part of turn core tools")
+	}
+
+	options = DefaultToolRegistryOptions(t.TempDir())
+	options.EnableCurrentTimeTool = true
+	registry, err = BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry(current time) error = %v", err)
+	}
+	if _, ok := registry.Lookup(tool.NamespacedName("clock", "curr_time")); !ok {
+		t.Fatal("clock.curr_time missing")
+	}
+	if _, ok := registry.Lookup(tool.NamespacedName("clock", "sleep")); ok {
+		t.Fatal("clock.sleep should follow sleep_tool")
+	}
+
+	options.EnableSleepTool = true
+	registry, err = BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry(sleep) error = %v", err)
+	}
+	if _, ok := registry.Lookup(tool.NamespacedName("clock", "sleep")); !ok {
+		t.Fatal("clock.sleep missing")
+	}
+}
+
+func TestBuildToolRegistryMapsLegacyAsyncCapabilityToRequestUserInputAsync(t *testing.T) {
+	// Rust #51908: an older model catalog's send_user_message_async capability
+	// now registers the structured request_user_input_async tool.
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.ExperimentalSupportedTools = []string{tool.DefaultSendUserMessageAsyncToolName}
+	override := "Ask the user a clarifying question."
+	options.RequestUserInputAsyncDescription = &override
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry(legacy async capability) error = %v", err)
+	}
+	spec, ok := registry.Spec(tool.PlainName(tool.DefaultRequestUserInputAsyncToolName))
+	if !ok {
+		t.Fatal("request_user_input_async tool missing")
+	}
+	if spec.Description != override {
+		t.Fatalf("description = %q, want %q", spec.Description, override)
+	}
+	if _, ok := registry.Spec(tool.PlainName(tool.DefaultSendUserMessageAsyncToolName)); ok {
+		t.Fatal("legacy send_user_message_async tool should not be registered")
+	}
+
+	defaultSpec := (&tool.RequestUserInputAsyncHandler{}).Spec()
+	options2 := DefaultToolRegistryOptions(t.TempDir())
+	options2.ExperimentalSupportedTools = []string{tool.DefaultSendUserMessageAsyncToolName}
+	registry2, err := BuildToolRegistry(options2)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry(legacy async capability nil) error = %v", err)
+	}
+	spec2, ok := registry2.Spec(tool.PlainName(tool.DefaultRequestUserInputAsyncToolName))
+	if !ok {
+		t.Fatal("request_user_input_async tool missing (nil description)")
+	}
+	if spec2.Description != defaultSpec.Description {
+		t.Fatalf("default description = %q, want built-in %q", spec2.Description, defaultSpec.Description)
+	}
+}
+
+func TestBuildToolRegistryHonorsDisabledRequestUserInputLikeRust(t *testing.T) {
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.DisableRequestUserInput = true
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry(disabled request_user_input) error = %v", err)
+	}
+	if _, ok := registry.Spec(tool.PlainName("request_user_input")); ok {
+		t.Fatal("request_user_input registered while disabled")
+	}
+}
+
+func TestBuildToolRegistryRegistersFreeformAsyncMessageTool(t *testing.T) {
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.ExperimentalSupportedTools = []string{tool.DefaultSendMessageToUserAsyncToolName}
+	options.SendUserMessageAsync = func(string) {}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry(free-form async) error = %v", err)
+	}
+	spec, ok := registry.Spec(tool.PlainName(tool.DefaultSendMessageToUserAsyncToolName))
+	if !ok {
+		t.Fatal("send_message_to_user_async tool missing")
+	}
+	if spec.Name.Key() != tool.DefaultSendMessageToUserAsyncToolName {
+		t.Fatalf("tool name = %q", spec.Name.Key())
+	}
+	if _, ok := registry.Spec(tool.PlainName(tool.DefaultSendUserMessageAsyncToolName)); ok {
+		t.Fatal("legacy async tool should not register from the free-form catalog name")
+	}
+}
+
+func TestBuildToolRegistryUnifiedExecFeatureGatesWriteStdinLikeRust(t *testing.T) {
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableUnifiedExec = false
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry(disabled) error = %v", err)
+	}
+	if _, ok := registry.Lookup(tool.PlainName(tool.DefaultWriteStdinToolName)); ok {
+		t.Fatal("write_stdin registered while unified_exec disabled")
+	}
+	shellSpec, ok := registry.Spec(tool.PlainName(tool.DefaultShellCommandToolName))
+	if !ok || shellSpec.Exposure != tool.ExposureHidden {
+		t.Fatalf("shell_command spec = %#v", shellSpec)
+	}
+	// Rust #41393: with unified_exec disabled, exec_command stays available in a
+	// completion-only (one-shot) mode rather than being dropped.
+	oneShotSpec, ok := registry.Spec(tool.PlainName(tool.DefaultExecCommandToolName))
+	if !ok || !strings.Contains(oneShotSpec.Description, "cannot be resumed") {
+		t.Fatalf("one-shot exec_command spec = %#v", oneShotSpec)
+	}
+	oneShotProps, _ := oneShotSpec.InputSchema["properties"].(map[string]any)
+	if _, hasTTY := oneShotProps["tty"]; hasTTY {
+		t.Fatalf("one-shot exec_command exposes tty: %#v", oneShotProps)
+	}
+	shellRequired, _ := shellSpec.InputSchema["required"].([]string)
+	if len(shellRequired) != 1 || shellRequired[0] != "command" {
+		t.Fatalf("shell_command required = %#v", shellSpec.InputSchema["required"])
+	}
+	codeModeSpec, ok := registry.Spec(tool.PlainName(tool.CodeModeExecToolName))
+	if !ok || !strings.Contains(codeModeSpec.Description, "tools.shell_command") {
+		t.Fatalf("code-mode spec = %#v", codeModeSpec)
+	}
+
+	options = DefaultToolRegistryOptions(t.TempDir())
+	options.EnableUnifiedExec = true
+	registry, err = BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry(enabled) error = %v", err)
+	}
+	if _, ok := registry.Lookup(tool.PlainName(tool.DefaultWriteStdinToolName)); !ok {
+		t.Fatal("write_stdin missing while unified_exec enabled")
+	}
+	execSpec, ok := registry.Spec(tool.PlainName(tool.DefaultExecCommandToolName))
+	if !ok || !strings.Contains(execSpec.Description, "session ID") {
+		t.Fatalf("exec_command spec = %#v", execSpec)
+	}
+	legacySpec, ok := registry.Spec(tool.PlainName(tool.DefaultShellCommandToolName))
+	if !ok || legacySpec.Exposure != tool.ExposureHidden {
+		t.Fatalf("legacy shell_command spec = %#v", legacySpec)
+	}
+	codeModeSpec, ok = registry.Spec(tool.PlainName(tool.CodeModeExecToolName))
+	if !ok || !strings.Contains(codeModeSpec.Description, "tools.exec_command") || strings.Contains(codeModeSpec.Description, "tools.shell_command") {
+		t.Fatalf("unified code-mode spec = %#v", codeModeSpec)
+	}
+	visible := registry.ModelVisibleSpecs()
+	for i := range visible {
+		if visible[i].Name.Key() == tool.DefaultShellCommandToolName {
+			t.Fatalf("legacy shell_command is model-visible with unified_exec: %#v", visible)
+		}
+	}
+}
+
+func TestBuildToolRegistryRestrictsLegacyShellCommandToSingleLocalEnvironmentLikeRust(t *testing.T) {
+	for _, ids := range [][]string{{"remote"}, {"local", "remote"}, {"local", "local"}} {
+		options := DefaultToolRegistryOptions(t.TempDir())
+		options.EnableUnifiedExec = true
+		options.SelectedEnvironmentIDs = ids
+		registry, err := BuildToolRegistry(options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := registry.Lookup(tool.PlainName(tool.DefaultShellCommandToolName)); ok {
+			t.Fatalf("shell_command registered for environments %#v", ids)
+		}
+		if _, ok := registry.Lookup(tool.PlainName(tool.DefaultExecCommandToolName)); !ok {
+			t.Fatalf("exec_command missing for environments %#v", ids)
+		}
+	}
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableUnifiedExec = false
+	options.SelectedEnvironmentIDs = []string{"remote"}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{tool.DefaultShellCommandToolName, tool.DefaultExecCommandToolName, tool.DefaultWriteStdinToolName} {
+		if _, ok := registry.Lookup(tool.PlainName(name)); ok {
+			t.Fatalf("%s registered for remote-only non-unified turn", name)
+		}
+	}
+}
+
+func TestBuildToolRegistryGatesAdditionalPermissionsSchemaLikeRust(t *testing.T) {
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableUnifiedExec = true
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry(default) error = %v", err)
+	}
+	execSpec, ok := registry.Spec(tool.PlainName(tool.DefaultExecCommandToolName))
+	if !ok {
+		t.Fatal("exec_command spec missing")
+	}
+	properties := execSpec.InputSchema["properties"].(map[string]any)
+	if _, ok := properties["additional_permissions"]; ok {
+		t.Fatalf("default exec_command schema exposes additional_permissions: %#v", properties)
+	}
+
+	options = DefaultToolRegistryOptions(t.TempDir())
+	options.EnableUnifiedExec = true
+	options.Shell.Validation.AdditionalPermissionsAllowed = true
+	registry, err = BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry(enabled) error = %v", err)
+	}
+	execSpec, ok = registry.Spec(tool.PlainName(tool.DefaultExecCommandToolName))
+	if !ok {
+		t.Fatal("exec_command spec missing with exec_permission_approvals")
+	}
+	properties = execSpec.InputSchema["properties"].(map[string]any)
+	if _, ok := properties["additional_permissions"]; !ok {
+		t.Fatalf("enabled exec_command schema lacks additional_permissions: %#v", properties)
+	}
+}
+
+func TestBuildToolRegistryOmitsEmptyToolSearchLikeRust(t *testing.T) {
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableAgents = false
+	options.EnableMCP = false
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry() error = %v", err)
+	}
+	if _, ok := registry.Lookup(tool.PlainName(tool.ToolSearchName)); ok {
+		t.Fatal("tool_search registered without discoverable tools")
+	}
+}
+
+func TestBuildToolRegistryToolSearchFindsDeferredTools(t *testing.T) {
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableCore = false
+	options.EnableShell = false
+	options.EnableApplyPatch = false
+	options.MCPTools = []mcp.RuntimeToolInfo{{
+		ServerName: "drive",
+		Tool: mcp.RuntimeTool{
+			Name:        "create_doc",
+			Description: "Create Google Docs files",
+		},
+	}}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry() error = %v", err)
+	}
+	output, err := tool.NewRouter(registry).Dispatch(context.Background(), &tool.Invocation{
+		CallID:   "search",
+		ToolName: tool.PlainName(tool.ToolSearchName),
+		Payload:  tool.Payload{Kind: tool.PayloadFunction, Arguments: `{"query":"google docs create"}`},
+	})
+	if err != nil {
+		t.Fatalf("Dispatch(tool_search) error = %v", err)
+	}
+	if !strings.Contains(output.Body, "create_doc") || strings.Contains(output.Body, "exposure") {
+		t.Fatalf("tool_search output = %q", output.Body)
+	}
+}
+
+func TestBuildToolRegistryProtectsHostSyntheticToolsFromDynamicCollisions(t *testing.T) {
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableCore = false
+	options.EnableShell = false
+	options.EnableApplyPatch = false
+	options.EnableAgents = false
+	options.EnableCodeMode = true
+	options.MCPTools = []mcp.RuntimeToolInfo{{
+		ServerName: "drive",
+		Tool:       mcp.RuntimeTool{Name: "create_doc", Description: "searchable MCP tool"},
+	}}
+	options.DynamicTools = []DynamicToolSpec{
+		{Type: "function", Function: &DynamicToolFunctionSpec{Name: tool.ToolSearchName, Description: "client shadow", InputSchema: map[string]any{"type": "object"}}},
+		{Type: "function", Function: &DynamicToolFunctionSpec{Name: tool.CodeModeExecToolName, Description: "exec shadow", InputSchema: map[string]any{"type": "object"}}},
+		{Type: "function", Function: &DynamicToolFunctionSpec{Name: "wait", Description: "wait shadow", InputSchema: map[string]any{"type": "object"}}},
+	}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	searchExecutor, ok := registry.Lookup(tool.PlainName(tool.ToolSearchName))
+	if !ok {
+		t.Fatal("host tool_search is missing")
+	}
+	if _, ok := searchExecutor.(*tool.ToolSearchHandler); !ok {
+		t.Fatalf("tool_search runtime = %T, want host handler", searchExecutor)
+	}
+	execSpec, ok := registry.Spec(tool.PlainName(tool.CodeModeExecToolName))
+	if !ok || execSpec.Freeform == nil || execSpec.Description == "exec shadow" {
+		t.Fatalf("exec spec = %#v", execSpec)
+	}
+	waitSpec, ok := registry.Spec(tool.PlainName("wait"))
+	if !ok || waitSpec.Description == "wait shadow" {
+		t.Fatalf("wait spec = %#v", waitSpec)
+	}
+}
+
+func TestBuildToolRegistryExternalCollisionKeepsMCPRuntime(t *testing.T) {
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableCore = false
+	options.EnableShell = false
+	options.EnableApplyPatch = false
+	options.EnableAgents = false
+	options.EnableCodeMode = false
+	options.EnableToolSearch = false
+	options.MCPTools = []mcp.RuntimeToolInfo{{
+		ServerName: "drive",
+		Tool:       mcp.RuntimeTool{Name: "create_doc", Description: "MCP winner"},
+	}}
+	options.DynamicTools = []DynamicToolSpec{{
+		Type: "namespace",
+		Namespace: &DynamicToolNamespaceSpec{Name: "mcp__drive", Tools: []DynamicToolFunctionSpec{{
+			Name: "create_doc", Description: "dynamic shadow", InputSchema: map[string]any{"type": "object"},
+		}}},
+	}}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, ok := registry.Spec(tool.NamespacedName("mcp__drive", "create_doc"))
+	if !ok || spec.Description != "MCP winner" {
+		t.Fatalf("winning spec = %#v", spec)
+	}
+}
+
+func TestBuildToolRegistryCodeModeUsesFirstNormalizedDynamicTool(t *testing.T) {
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableCore = false
+	options.EnableShell = false
+	options.EnableApplyPatch = false
+	options.EnableAgents = false
+	options.EnableMCP = false
+	options.EnableToolSearch = false
+	options.EnableCodeMode = true
+	options.DynamicTools = []DynamicToolSpec{
+		{Type: "function", Function: &DynamicToolFunctionSpec{Name: "foo-bar", Description: "first winner", InputSchema: map[string]any{"type": "object"}}},
+		{Type: "function", Function: &DynamicToolFunctionSpec{Name: "foo_bar", Description: "shadowed tool", InputSchema: map[string]any{"type": "object"}}},
+	}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := tool.NewRouter(registry)
+	metadata := router.CodeModeToolNames()
+	if len(metadata) != 1 || metadata["foo_bar"].Name != "foo-bar" {
+		t.Fatalf("code mode metadata = %#v", metadata)
+	}
+	winners := router.CodeModeToolSpecs()
+	if len(winners) != 1 || winners[0].Name.Key() != "foo-bar" {
+		t.Fatalf("code mode winners = %#v", winners)
+	}
+	visible := augmentCodeModeWinnerSpecs(registry.ModelVisibleSpecs(), winners)
+	byName := map[string]tool.Spec{}
+	for _, spec := range visible {
+		byName[spec.Name.Key()] = spec
+	}
+	if !strings.Contains(byName["foo-bar"].Description, "exec tool declaration") {
+		t.Fatalf("winning description was not augmented: %q", byName["foo-bar"].Description)
+	}
+	if byName["foo_bar"].Description != "shadowed tool" {
+		t.Fatalf("shadowed description = %q", byName["foo_bar"].Description)
+	}
+}
+
+func TestBuildToolRegistryMCPToolSearchDispatchesUniqueBareName(t *testing.T) {
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableCore = false
+	options.EnableShell = false
+	options.EnableApplyPatch = false
+	options.EnableAgents = false
+	options.MCPService = mcp.NewMCPService(nil)
+	options.MCPTools = []mcp.RuntimeToolInfo{{
+		ServerName: "geogebra",
+		Tool: mcp.RuntimeTool{
+			Name:        "geogebra_create_circle",
+			Description: "Create a GeoGebra circle",
+			InputSchema: map[string]any{"type": "object"},
+		},
+	}}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry() error = %v", err)
+	}
+	router := tool.NewRouter(registry)
+	searchOutput, err := router.Dispatch(context.Background(), &tool.Invocation{
+		CallID:   "search",
+		ToolName: tool.PlainName(tool.ToolSearchName),
+		Payload:  tool.Payload{Kind: tool.PayloadFunction, Arguments: `{"query":"geogebra circle"}`},
+	})
+	if err != nil {
+		t.Fatalf("Dispatch(tool_search) error = %v", err)
+	}
+	var searchResult tool.ToolSearchResult
+	if err := json.Unmarshal([]byte(searchOutput.Body), &searchResult); err != nil {
+		t.Fatalf("Unmarshal(tool_search) error = %v", err)
+	}
+	if len(searchResult.Tools) != 1 || searchResult.Tools[0].Name.Key() != "mcp__geogebra.geogebra_create_circle" {
+		t.Fatalf("tool_search result = %#v", searchResult.Tools)
+	}
+
+	invocation, ok, err := router.BuildToolCall(tool.ResponseItem{
+		Type:      "function_call",
+		Name:      "geogebra_create_circle",
+		CallID:    "call-circle",
+		Arguments: `{"radius":3}`,
+	})
+	if err != nil || !ok {
+		t.Fatalf("BuildToolCall() ok=%v err=%v", ok, err)
+	}
+	if invocation.ToolName.Key() != "mcp__geogebra.geogebra_create_circle" {
+		t.Fatalf("resolved tool = %s", invocation.ToolName.Key())
+	}
+	output, err := router.Dispatch(context.Background(), invocation)
+	if err != nil {
+		t.Fatalf("Dispatch(MCP) error = %v", err)
+	}
+	if !output.Success || output.Data["server"] != "geogebra" || output.Data["tool"] != "geogebra_create_circle" {
+		t.Fatalf("MCP output = %#v", output)
+	}
+}
+
+// Mirrors Rust ToolInvocation::originating_call (#40866/#45409): a dispatched
+// call item records its Responses item id as the invocation's origin, which MCP
+// requests report as `_meta.itemId`.
+func TestBuildToolCallCarriesOriginItemIDLikeRust(t *testing.T) {
+	router := tool.NewRouter(tool.NewRegistry())
+	invocation, ok, err := router.BuildToolCall(tool.ResponseItem{
+		Type:   "function_call",
+		ID:     "ctc_before_compaction",
+		Name:   "echo",
+		CallID: "call-echo",
+	})
+	if err != nil || !ok {
+		t.Fatalf("BuildToolCall() ok=%v err=%v", ok, err)
+	}
+	if got, _ := invocation.Context[tool.OriginItemIDContextKey].(string); got != "ctc_before_compaction" {
+		t.Fatalf("origin item id = %#v (context %#v)", invocation.Context[tool.OriginItemIDContextKey], invocation.Context)
+	}
+
+	withoutItem := tool.ResponseItem{Type: "function_call", Name: "echo", CallID: "call-echo-2"}
+	plain, ok, err := router.BuildToolCall(withoutItem)
+	if err != nil || !ok {
+		t.Fatalf("BuildToolCall() ok=%v err=%v", ok, err)
+	}
+	if _, present := plain.Context[tool.OriginItemIDContextKey]; present {
+		t.Fatalf("an item without an id must not record an origin: %#v", plain.Context)
+	}
+}
+
+func TestBuildToolRegistryMCPToolsDirectWhenToolSearchDisabled(t *testing.T) {
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableCore = false
+	options.EnableShell = false
+	options.EnableApplyPatch = false
+	options.EnableAgents = false
+	options.EnableToolSearch = false
+	options.MCPTools = []mcp.RuntimeToolInfo{{
+		ServerName: "drive",
+		Tool: mcp.RuntimeTool{
+			Name:        "create_doc",
+			Description: "Create Google Docs files",
+		},
+	}}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry() error = %v", err)
+	}
+	if _, ok := registry.Lookup(tool.PlainName(tool.ToolSearchName)); ok {
+		t.Fatal("tool_search should not be registered when disabled")
+	}
+	if _, ok := registry.Lookup(tool.NamespacedName("mcp__drive", "create_doc")); !ok {
+		t.Fatal("mcp tool missing")
+	}
+	visible := specKeySet(registry.ModelVisibleSpecs())
+	if !visible["mcp__drive.create_doc"] {
+		t.Fatalf("model-visible specs = %#v, want mcp__drive.create_doc", visible)
+	}
+	if discoverable := registry.DiscoverableSpecs(); len(discoverable) != 0 {
+		t.Fatalf("discoverable specs = %#v, want none when tool_search is disabled", specKeySet(discoverable))
+	}
+}
+
+func TestBuildToolRegistryRegistersMCPResourceToolsWithServersEvenWithToolSearch(t *testing.T) {
+	newOptions := func(withServers bool) *ToolRegistryOptions {
+		options := DefaultToolRegistryOptions(t.TempDir())
+		options.EnableCore = false
+		options.EnableShell = false
+		options.EnableApplyPatch = false
+		options.EnableAgents = false
+		options.EnableToolSearch = true
+		if withServers {
+			service := mcp.NewMCPService(nil)
+			service.SetServerConfig("docs", &mcp.ServerConfig{Enabled: true, Command: "docs"})
+			options.MCPService = service
+		}
+		return options
+	}
+	resourceTools := []string{"list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"}
+
+	t.Run("servers configured", func(t *testing.T) {
+		registry, err := BuildToolRegistry(newOptions(true))
+		if err != nil {
+			t.Fatalf("BuildToolRegistry() error = %v", err)
+		}
+		visible := specKeySet(registry.ModelVisibleSpecs())
+		for _, name := range resourceTools {
+			if !visible[name] {
+				t.Fatalf("model-visible specs = %#v, missing MCP resource tool %q", visible, name)
+			}
+		}
+	})
+
+	t.Run("no servers", func(t *testing.T) {
+		registry, err := BuildToolRegistry(newOptions(false))
+		if err != nil {
+			t.Fatalf("BuildToolRegistry() error = %v", err)
+		}
+		visible := specKeySet(registry.ModelVisibleSpecs())
+		for _, name := range resourceTools {
+			if visible[name] {
+				t.Fatalf("model-visible specs = %#v, unexpected MCP resource tool %q without servers", visible, name)
+			}
+		}
+	})
+}
+
+func TestBuildToolRegistryAppliesPerServerOmitToolsFrom(t *testing.T) {
+	newOptions := func(searchEnabled bool) *ToolRegistryOptions {
+		options := DefaultToolRegistryOptions(t.TempDir())
+		options.EnableCore = false
+		options.EnableShell = false
+		options.EnableApplyPatch = false
+		options.EnableAgents = false
+		options.EnableToolSearch = searchEnabled
+		service := mcp.NewMCPService(nil)
+		service.SetServerConfig("calendar", &mcp.ServerConfig{Enabled: true, OmitToolsFrom: []string{"code_mode"}})
+		service.SetServerConfig("drive", &mcp.ServerConfig{Enabled: true, OmitToolsFrom: []string{"deferred", "code_mode"}})
+		service.SetServerConfig("notes", &mcp.ServerConfig{Enabled: true, OmitToolsFrom: []string{"direct"}})
+		options.MCPService = service
+		options.MCPTools = []mcp.RuntimeToolInfo{
+			{ServerName: "calendar", Tool: mcp.RuntimeTool{Name: "create_event", Description: "Calendar events"}},
+			{ServerName: "drive", Tool: mcp.RuntimeTool{Name: "create_doc", Description: "Drive docs"}},
+			{ServerName: "notes", Tool: mcp.RuntimeTool{Name: "list", Description: "Notes list"}},
+		}
+		return options
+	}
+	specByName := func(registry *tool.Registry, name string) (tool.Spec, bool) {
+		return registry.Spec(tool.NamespacedName("mcp__"+name, "create_event"))
+	}
+
+	t.Run("tool search enabled", func(t *testing.T) {
+		registry, err := BuildToolRegistry(newOptions(true))
+		if err != nil {
+			t.Fatalf("BuildToolRegistry() error = %v", err)
+		}
+		calendar, _ := specByName(registry, "calendar")
+		drive, ok := registry.Spec(tool.NamespacedName("mcp__drive", "create_doc"))
+		if !ok {
+			t.Fatal("drive tool missing")
+		}
+		notes, ok := registry.Spec(tool.NamespacedName("mcp__notes", "list"))
+		if !ok {
+			t.Fatal("notes tool missing")
+		}
+		// calendar omits code_mode: deferred + code_mode -> discoverable but not
+		// nested-callable nor model-visible.
+		if calendar.Exposure != tool.ExposureDeferredModelOnly {
+			t.Fatalf("calendar exposure = %q, want deferred_model_only", calendar.Exposure)
+		}
+		// drive omits deferred + code_mode: direct only.
+		if drive.Exposure != tool.ExposureDirectModelOnly {
+			t.Fatalf("drive exposure = %q, want direct_model_only", drive.Exposure)
+		}
+		// notes omits direct: discoverable + code_mode.
+		if notes.Exposure != tool.ExposureDiscoverable {
+			t.Fatalf("notes exposure = %q, want discoverable", notes.Exposure)
+		}
+		visible := specKeySet(registry.ModelVisibleSpecs())
+		if !visible["mcp__drive.create_doc"] || visible["mcp__calendar.create_event"] || visible["mcp__notes.list"] {
+			t.Fatalf("model-visible = %#v, want drive but not calendar/notes", visible)
+		}
+		if discoverable := registry.DiscoverableSpecs(); len(discoverable) != 2 {
+			t.Fatalf("discoverable = %#v, want calendar and notes", specKeySet(discoverable))
+		}
+	})
+
+	t.Run("tool search disabled", func(t *testing.T) {
+		registry, err := BuildToolRegistry(newOptions(false))
+		if err != nil {
+			t.Fatalf("BuildToolRegistry() error = %v", err)
+		}
+		calendar, _ := specByName(registry, "calendar")
+		drive, _ := registry.Spec(tool.NamespacedName("mcp__drive", "create_doc"))
+		notes, _ := registry.Spec(tool.NamespacedName("mcp__notes", "list"))
+		if calendar.Exposure != tool.ExposureDirectModelOnly {
+			t.Fatalf("calendar exposure = %q, want direct_model_only", calendar.Exposure)
+		}
+		if drive.Exposure != tool.ExposureDirectModelOnly {
+			t.Fatalf("drive exposure = %q, want direct_model_only", drive.Exposure)
+		}
+		if notes.Exposure != tool.ExposureCodeModeOnly {
+			t.Fatalf("notes exposure = %q, want code_mode_only", notes.Exposure)
+		}
+		visible := specKeySet(registry.ModelVisibleSpecs())
+		if !visible["mcp__calendar.create_event"] || !visible["mcp__drive.create_doc"] || visible["mcp__notes.list"] {
+			t.Fatalf("model-visible = %#v, want calendar and drive but not notes", visible)
+		}
+		if discoverable := registry.DiscoverableSpecs(); len(discoverable) != 0 {
+			t.Fatalf("discoverable = %#v, want none", specKeySet(discoverable))
+		}
+	})
+}
+
+func TestBuildToolRegistryOmitsDeferredSourcesFromSearchDescription(t *testing.T) {
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableCore = false
+	options.EnableShell = false
+	options.EnableApplyPatch = false
+	options.EnableAgents = false
+	options.OmitToolSearchSources = true
+	options.MCPTools = []mcp.RuntimeToolInfo{{
+		ServerName:           "drive",
+		NamespaceDescription: "Drive tools",
+		Tool:                 mcp.RuntimeTool{Name: "create_doc", Description: "Create Google Docs files"},
+	}}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry() error = %v", err)
+	}
+	spec, ok := registry.Spec(tool.PlainName(tool.ToolSearchName))
+	if !ok {
+		t.Fatal("tool_search missing")
+	}
+	if strings.Contains(spec.Description, "following sources") || strings.Contains(spec.Description, "Drive tools") {
+		t.Fatalf("tool_search description = %q", spec.Description)
+	}
+	if got := registry.DeferredToolNamespaces(); got["mcp__drive"] != "Drive tools" {
+		t.Fatalf("deferred namespaces = %#v", got)
+	}
+}
+
+func TestBuildToolRegistryBoundsMCPNamespaceDescriptionAndForwardsReadiness(t *testing.T) {
+	expected := strings.Repeat("é", 499)
+	full := expected + "🦀keep the complete MCP metadata"
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableCore = false
+	options.EnableShell = false
+	options.EnableApplyPatch = false
+	options.EnableAgents = false
+	options.MCPService = mcp.NewMCPService(nil)
+	options.MCPTools = []mcp.RuntimeToolInfo{{
+		ServerName:           "drive",
+		NamespaceDescription: full,
+		Tool:                 mcp.RuntimeTool{Name: "create_doc", Description: "Create a document"},
+	}}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := tool.NamespacedName("mcp__drive", "create_doc")
+	spec, ok := registry.Spec(name)
+	if !ok || spec.NamespaceDescription != expected || spec.Search == nil || spec.Search.Source == nil || spec.Search.Source.Description != expected {
+		t.Fatalf("MCP spec = %#v", spec)
+	}
+	if full == spec.NamespaceDescription {
+		t.Fatal("model-facing namespace description was not bounded")
+	}
+	if !tool.NewRouter(registry).HasReadinessWait(name) {
+		t.Fatal("MCP readiness hook was not forwarded through the spec override")
+	}
+}
+
+func TestBuildToolRegistryWaitForEnvironmentFeatureGateAndHostDescription(t *testing.T) {
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableCore = false
+	options.EnableShell = false
+	options.EnableApplyPatch = false
+	options.EnableAgents = false
+	options.EnableMCP = false
+	options.EnableToolSearch = false
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := registry.Spec(tool.PlainName(tool.WaitForEnvironmentToolName)); ok {
+		t.Fatal("wait_for_environment visible without feature gate")
+	}
+
+	options.EnableWaitForEnvironment = true
+	options.SelectedEnvironmentIDs = []string{"env-1"}
+	options.WaitForEnvironmentToolConfig = &tool.WaitForEnvironmentToolConfig{
+		ToolDescription:          "Host wait description",
+		EnvironmentIDDescription: "Host environment ID description",
+	}
+	registry, err = BuildToolRegistry(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, ok := registry.Spec(tool.PlainName(tool.WaitForEnvironmentToolName))
+	if !ok || spec.Description != "Host wait description" {
+		t.Fatalf("wait spec = %#v, ok=%v", spec, ok)
+	}
+}
+
+func TestBuildToolRegistryMCPExposureFiltersHiddenAndDisabledConnectors(t *testing.T) {
+	visible := true
+	hidden := false
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableCore = false
+	options.EnableShell = false
+	options.EnableApplyPatch = false
+	options.EnableAgents = false
+	options.MCPTools = []mcp.RuntimeToolInfo{
+		{ServerName: "drive", Tool: mcp.RuntimeTool{Name: "read", Description: "Read Drive files", ModelVisible: &visible}},
+		{ServerName: "drive", Tool: mcp.RuntimeTool{Name: "secret", Description: "Hidden Drive tool", ModelVisible: &hidden}},
+		{ServerName: mcp.RuntimeCodexAppsMCPServerName, ConnectorID: "calendar", Tool: mcp.RuntimeTool{Name: "create_event", Description: "Create calendar event", ModelVisible: &visible}},
+		{ServerName: mcp.RuntimeCodexAppsMCPServerName, ConnectorID: "mail", Tool: mcp.RuntimeTool{Name: "send_mail", Description: "Send mail", ModelVisible: &visible}},
+	}
+	options.MCPConnectors = []mcp.RuntimeConnector{
+		{ID: "calendar", Enabled: true},
+		{ID: "mail", Enabled: false},
+	}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry() error = %v", err)
+	}
+	visibleSpecs := specKeySet(registry.ModelVisibleSpecs())
+	if !visibleSpecs[tool.ToolSearchName] || visibleSpecs["mcp__drive.read"] || visibleSpecs["mcp__codex_apps__calendar.create_event"] {
+		t.Fatalf("model-visible specs = %#v, want only tool_search from MCP surface", visibleSpecs)
+	}
+	discoverable := specKeySet(registry.DiscoverableSpecs())
+	for _, want := range []string{"mcp__drive.read", "mcp__codex_apps__calendar.create_event"} {
+		if !discoverable[want] {
+			t.Fatalf("discoverable specs = %#v, missing %s", discoverable, want)
+		}
+	}
+	for _, unwanted := range []string{"mcp__drive.secret", "mcp__codex_apps__mail.send_mail"} {
+		if discoverable[unwanted] {
+			t.Fatalf("discoverable specs = %#v, should not include %s", discoverable, unwanted)
+		}
+	}
+}
+
+func TestBuildToolRegistryMCPWrapperKeepsHookInterfaces(t *testing.T) {
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableCore = false
+	options.EnableShell = false
+	options.EnableApplyPatch = false
+	options.EnableAgents = false
+	options.MCPTools = []mcp.RuntimeToolInfo{{
+		ServerName: "memory",
+		Tool:       mcp.RuntimeTool{Name: "create_entities"},
+	}}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry() error = %v", err)
+	}
+	executor, ok := registry.Lookup(tool.NamespacedName("mcp__memory", "create_entities"))
+	if !ok {
+		t.Fatal("mcp tool missing")
+	}
+	provider, ok := executor.(tool.PreToolUsePayloadProvider)
+	if !ok {
+		t.Fatalf("wrapped MCP executor lost PreToolUsePayloadProvider")
+	}
+	payload, ok := provider.PreToolUsePayload(&tool.Invocation{
+		ToolName: tool.NamespacedName("mcp__memory", "create_entities"),
+		Payload:  tool.Payload{Kind: tool.PayloadFunction, Arguments: `{"name":"Ada"}`},
+	})
+	if !ok || payload.ToolName == nil || payload.ToolName.Name != "mcp__memory__create_entities" {
+		t.Fatalf("payload = %#v/%v", payload, ok)
+	}
+}
+
+type mcpPermissionHookRunner struct {
+	pre *tool.PreToolUseHookOutcome
+}
+
+func (h *mcpPermissionHookRunner) RunPreToolUse(ctx context.Context, invocation *tool.Invocation, payload *tool.PreToolUsePayload) (*tool.PreToolUseHookOutcome, error) {
+	return h.pre, nil
+}
+
+func (h *mcpPermissionHookRunner) RunPostToolUse(ctx context.Context, invocation *tool.Invocation, payload *tool.PostToolUsePayload) (*tool.PostToolUseHookOutcome, error) {
+	return nil, nil
+}
+
+// TestDispatchWithHooksPermissionHookResolvesMcpToolCallBeforeReviewLikeRust
+// mirrors Rust #38108 hooks_mcp.rs: permission hooks resolve MCP tool calls
+// before any user or guardian review, so an allow lets the call execute and a
+// deny blocks it without surfacing an approval (elicitation) to a reviewer.
+func TestDispatchWithHooksPermissionHookResolvesMcpToolCallBeforeReviewLikeRust(t *testing.T) {
+	service := mcp.NewMCPService(nil)
+	var elicitations atomic.Int32
+	service.SetElicitationHandler(mcp.MCPElicitationHandlerFunc(func(ctx context.Context, request *mcp.MCPElicitationRequest) (*mcp.MCPElicitationResponse, error) {
+		elicitations.Add(1)
+		return &mcp.MCPElicitationResponse{Action: mcp.MCPElicitationActionDecline}, nil
+	}))
+	registry := tool.NewRegistry()
+	if err := mcp.RegisterToolExecutors(registry, service, []mcp.RuntimeToolInfo{{
+		ServerName: "memory",
+		Tool:       mcp.RuntimeTool{Name: "create_entities"},
+	}}); err != nil {
+		t.Fatalf("RegisterToolExecutors() error = %v", err)
+	}
+	router := tool.NewRouter(registry)
+	invocation := &tool.Invocation{
+		CallID:   "call-mcp",
+		ToolName: tool.NamespacedName("mcp__memory", "create_entities"),
+		Payload:  tool.Payload{Kind: tool.PayloadFunction, Arguments: `{"name":"Ada"}`},
+	}
+
+	denied, err := router.DispatchWithHooks(context.Background(), invocation, &mcpPermissionHookRunner{pre: &tool.PreToolUseHookOutcome{
+		Blocked:     true,
+		BlockReason: "MCP tool access denied by the integration-test hook",
+	}})
+	if err == nil || !strings.Contains(err.Error(), "MCP tool access denied by the integration-test hook") {
+		t.Fatalf("deny error = %v", err)
+	}
+	if denied != nil {
+		t.Fatalf("deny output = %#v", denied)
+	}
+	if elicitations.Load() != 0 {
+		t.Fatalf("deny should not reach user/guardian review: %d elicitations", elicitations.Load())
+	}
+
+	allowed, err := router.DispatchWithHooks(context.Background(), invocation, &mcpPermissionHookRunner{})
+	if err != nil {
+		t.Fatalf("allow error = %v", err)
+	}
+	if allowed == nil || !allowed.Success {
+		t.Fatalf("allow output = %#v", allowed)
+	}
+	if elicitations.Load() != 0 {
+		t.Fatalf("allow should not reach user/guardian review: %d elicitations", elicitations.Load())
+	}
+}
+
+func TestBuildToolRegistryRegistersPluginInstallSuggestionTools(t *testing.T) {
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableCore = false
+	options.EnableShell = false
+	options.EnableApplyPatch = false
+	options.EnableMCP = false
+	options.EnableAgents = false
+	options.EnableToolSearch = false
+	options.PluginInstallCandidates = []plugin.DiscoverableInfo{{ID: "docs@market", Name: "Docs"}}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry() error = %v", err)
+	}
+	if _, ok := registry.Lookup(tool.PlainName(tool.ListAvailablePluginsToInstallToolName)); !ok {
+		t.Fatal("list_available_plugins_to_install missing")
+	}
+	if _, ok := registry.Lookup(tool.PlainName(tool.RequestPluginInstallToolName)); !ok {
+		t.Fatal("request_plugin_install missing")
+	}
+	modelVisible := specKeySet(registry.ModelVisibleSpecs())
+	if !modelVisible[tool.ListAvailablePluginsToInstallToolName] || !modelVisible[tool.RequestPluginInstallToolName] {
+		t.Fatalf("plugin install tools should be model-visible: %#v", modelVisible)
+	}
+	if discoverable := specKeySet(registry.DiscoverableSpecs()); discoverable[tool.ListAvailablePluginsToInstallToolName] || discoverable[tool.RequestPluginInstallToolName] {
+		t.Fatalf("plugin install tools should not be discoverable: %#v", discoverable)
+	}
+
+	options.PluginInstallRecommendationContext = true
+	registry, err = BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry(recommendation) error = %v", err)
+	}
+	if _, ok := registry.Lookup(tool.PlainName(tool.ListAvailablePluginsToInstallToolName)); ok {
+		t.Fatal("list_available_plugins_to_install should not be registered for recommendation context")
+	}
+	if _, ok := registry.Lookup(tool.PlainName(tool.RequestPluginInstallToolName)); !ok {
+		t.Fatal("request_plugin_install missing for recommendation context")
+	}
+	modelVisible = specKeySet(registry.ModelVisibleSpecs())
+	if !modelVisible[tool.RequestPluginInstallToolName] || modelVisible[tool.ListAvailablePluginsToInstallToolName] {
+		t.Fatalf("recommendation plugin tools = %#v, want only request_plugin_install", modelVisible)
+	}
+
+	// Rust #45806: the option marks a delegated subagent's turn, and the
+	// registered handler rejects the call with the root-only guidance.
+	options.NonRootAgent = true
+	subagentRegistry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry(subagent) error = %v", err)
+	}
+	executor, ok := subagentRegistry.Lookup(tool.PlainName(tool.RequestPluginInstallToolName))
+	if !ok {
+		t.Fatal("request_plugin_install missing for subagent registry")
+	}
+	_, execErr := executor.Execute(context.Background(), &tool.Invocation{
+		CallID:  "subagent-install",
+		Payload: tool.Payload{Kind: tool.PayloadFunction, Arguments: `{"plugin_id":"docs@market","suggest_reason":"Use docs"}`},
+	})
+	var callErr *tool.FunctionCallError
+	if !tool.AsFunctionCallError(execErr, &callErr) || callErr.ModelMessage() != "request_plugin_install can only be used by the root thread" {
+		t.Fatalf("subagent install error = %v", execErr)
+	}
+}
+
+func TestBuildToolRegistryRegistersDynamicTools(t *testing.T) {
+	caller := &fakeDynamicToolCaller{result: &DynamicToolCallResponse{
+		Success: true,
+		ContentItems: []DynamicToolCallOutputContentItem{{
+			Type: "inputText",
+			Text: "dynamic-ok",
+		}},
+	}}
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableCore = false
+	options.EnableShell = false
+	options.EnableApplyPatch = false
+	options.EnableMCP = false
+	options.EnableAgents = false
+	options.DynamicToolCaller = caller
+	options.ThreadID = "thread-1"
+	options.TurnID = "turn-1"
+	options.DynamicTools = []DynamicToolSpec{{
+		Type: "namespace",
+		Namespace: &DynamicToolNamespaceSpec{
+			Name:        "codex_app",
+			Description: "Demo namespace tools",
+			Tools: []DynamicToolFunctionSpec{{
+				Name:        "demo_tool",
+				Description: "Demo dynamic tool",
+				InputSchema: map[string]any{"type": "object"},
+			}},
+		},
+	}}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry() error = %v", err)
+	}
+	executor, ok := registry.Lookup(tool.NamespacedName("codex_app", "demo_tool"))
+	if !ok {
+		t.Fatal("dynamic tool missing")
+	}
+	output, err := executor.Execute(context.Background(), &tool.Invocation{
+		CallID:   "dyn-call-1",
+		ToolName: tool.NamespacedName("codex_app", "demo_tool"),
+		Payload:  tool.Payload{Kind: tool.PayloadFunction, Arguments: `{"city":"Paris"}`},
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if caller.method != "item/tool/call" || caller.params == nil || caller.params.ThreadID != "thread-1" || caller.params.TurnID != "turn-1" {
+		t.Fatalf("caller = %#v method=%s", caller.params, caller.method)
+	}
+	if caller.params.Namespace == nil || caller.params.Tool != "demo_tool" {
+		t.Fatalf("params = %#v", caller.params)
+	}
+	if !output.Success || output.Body != "dynamic-ok" || output.Data["dynamicToolCall"] != true {
+		t.Fatalf("output = %#v", output)
+	}
+	items, ok := output.Data["content_items"].([]any)
+	if !ok || len(items) != 1 {
+		t.Fatalf("model content_items = %#v", output.Data["content_items"])
+	}
+}
+
+func TestDynamicToolRemoteImageOutputBecomesModelVisibleError(t *testing.T) {
+	caller := &fakeDynamicToolCaller{result: &DynamicToolCallResponse{
+		Success: true,
+		ContentItems: []DynamicToolCallOutputContentItem{{
+			Type:     "inputImage",
+			ImageURL: "https://example.com/tool.png",
+		}},
+	}}
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableCore = false
+	options.EnableShell = false
+	options.EnableApplyPatch = false
+	options.EnableMCP = false
+	options.EnableAgents = false
+	options.DynamicToolCaller = caller
+	options.ThreadID = "thread-1"
+	options.TurnID = "turn-1"
+	options.DynamicTools = []DynamicToolSpec{{
+		Type: "function",
+		Function: &DynamicToolFunctionSpec{
+			Name:        "demo_tool",
+			Description: "Demo dynamic tool",
+			InputSchema: map[string]any{"type": "object"},
+		},
+	}}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry() error = %v", err)
+	}
+	executor, ok := registry.Lookup(tool.PlainName("demo_tool"))
+	if !ok {
+		t.Fatal("dynamic tool missing")
+	}
+	output, err := executor.Execute(context.Background(), &tool.Invocation{
+		CallID:   "dyn-call-remote-image",
+		ToolName: tool.PlainName("demo_tool"),
+		Payload:  tool.Payload{Kind: tool.PayloadFunction, Arguments: `{}`},
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if output.Success || output.Body != remoteImageURLError {
+		t.Fatalf("output = %#v", output)
+	}
+	items, ok := output.Data["contentItems"].([]any)
+	if !ok || len(items) != 1 {
+		t.Fatalf("contentItems = %#v", output.Data["contentItems"])
+	}
+	modelItems, ok := output.Data["content_items"].([]any)
+	if !ok || len(modelItems) != 1 {
+		t.Fatalf("content_items = %#v", output.Data["content_items"])
+	}
+	if !strings.Contains(inputItemTextForDynamicToolTest(items), remoteImageURLError) ||
+		!strings.Contains(inputItemTextForDynamicToolTest(modelItems), remoteImageURLError) {
+		t.Fatalf("content items = %#v model = %#v", items, modelItems)
+	}
+}
+
+// TestDynamicToolFileImageOutputKeepsTheFileReference mirrors Rust #45794: a
+// dynamic tool may return an uploaded-file image reference, which skips the
+// inline/remote URL rules and reaches the model as `file_id` (and the v2
+// content shape as `fileId`).
+func TestDynamicToolFileImageOutputKeepsTheFileReference(t *testing.T) {
+	items, valid := normalizeDynamicToolContentItems([]DynamicToolCallOutputContentItem{
+		{Type: "inputImage", FileID: "file_dynamic"},
+		{Type: "inputText", Text: "done"},
+	})
+	if !valid {
+		t.Fatalf("normalizeDynamicToolContentItems() = %#v, valid = %v", items, valid)
+	}
+	if items[0].Type != "inputImage" || items[0].FileID != "file_dynamic" {
+		t.Fatalf("normalized item = %#v", items[0])
+	}
+	wire := dynamicToolContentItemsAny(items)
+	image, ok := wire[0].(map[string]any)
+	if !ok || image["type"] != "inputImage" || image["fileId"] != "file_dynamic" {
+		t.Fatalf("v2 content item = %#v", wire[0])
+	}
+	model := dynamicToolModelContentItemsAny(items)
+	modelImage, ok := model[0].(map[string]any)
+	if !ok || modelImage["type"] != "input_image" || modelImage["file_id"] != "file_dynamic" {
+		t.Fatalf("model content item = %#v", model[0])
+	}
+
+	// An inline data URL still travels as `image_url`, and a remote URL is
+	// still rejected (the file reference is what skips those rules).
+	inline, valid := normalizeDynamicToolContentItems([]DynamicToolCallOutputContentItem{
+		{Type: "inputImage", ImageURL: "data:image/png;base64,AAA"},
+	})
+	if !valid || inline[0].ImageURL == "" {
+		t.Fatalf("inline image = %#v, valid = %v", inline, valid)
+	}
+	rejected, valid := normalizeDynamicToolContentItems([]DynamicToolCallOutputContentItem{
+		{Type: "inputImage", ImageURL: "https://example.com/tool.png"},
+	})
+	if valid || len(rejected) != 1 || rejected[0].Text != remoteImageURLError {
+		t.Fatalf("remote image = %#v, valid = %v", rejected, valid)
+	}
+}
+
+func TestDynamicToolClientErrorUsesRustFallbackResponse(t *testing.T) {
+	caller := &fakeDynamicToolCaller{err: errors.New("client disconnected")}
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableCore = false
+	options.EnableShell = false
+	options.EnableApplyPatch = false
+	options.EnableMCP = false
+	options.EnableAgents = false
+	options.DynamicToolCaller = caller
+	options.DynamicTools = []DynamicToolSpec{{Type: "function", Function: &DynamicToolFunctionSpec{
+		Name: "demo_tool", InputSchema: map[string]any{"type": "object"},
+	}}}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry() error = %v", err)
+	}
+	executor, ok := registry.Lookup(tool.PlainName("demo_tool"))
+	if !ok {
+		t.Fatal("dynamic tool missing")
+	}
+	output, err := executor.Execute(context.Background(), &tool.Invocation{
+		CallID: "dyn-fallback", ToolName: tool.PlainName("demo_tool"),
+		Payload: tool.Payload{Kind: tool.PayloadFunction, Arguments: `{}`},
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if output.Success || output.Body != "dynamic tool request failed" || output.Error != output.Body {
+		t.Fatalf("output = %#v", output)
+	}
+}
+
+func inputItemTextForDynamicToolTest(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case []any:
+		parts := []string{}
+		for _, item := range typed {
+			parts = append(parts, inputItemTextForDynamicToolTest(item))
+		}
+		return strings.Join(parts, "\n")
+	case map[string]any:
+		parts := []string{}
+		for _, item := range typed {
+			parts = append(parts, inputItemTextForDynamicToolTest(item))
+		}
+		return strings.Join(parts, "\n")
+	default:
+		return ""
+	}
+}
+
+func specKeySet(specs []tool.Spec) map[string]bool {
+	out := make(map[string]bool, len(specs))
+	for _, spec := range specs {
+		if key := spec.Name.Key(); key != "" {
+			out[key] = true
+		}
+	}
+	return out
+}
+
+func TestBuildToolRegistryRegistersTestSyncWhenModelDeclaresItLikeRust(t *testing.T) {
+	// Mirrors Rust spec_plan.rs: test_sync_tool is registered only when the
+	// model's experimental_supported_tools declares it.
+	without := DefaultToolRegistryOptions(t.TempDir())
+	registry, err := BuildToolRegistry(without)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry: %v", err)
+	}
+	if _, ok := registry.Lookup(tool.PlainName("test_sync_tool")); ok {
+		t.Fatal("test_sync_tool registered without model declaration")
+	}
+
+	with := DefaultToolRegistryOptions(t.TempDir())
+	with.ExperimentalSupportedTools = []string{"test_sync_tool"}
+	registry, err = BuildToolRegistry(with)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry with declaration: %v", err)
+	}
+	executor, ok := registry.Lookup(tool.PlainName("test_sync_tool"))
+	if !ok {
+		t.Fatal("test_sync_tool not registered when model declares it")
+	}
+	spec := executor.Spec()
+	if spec.Name.Key() != "test_sync_tool" {
+		t.Fatalf("spec name = %q", spec.Name.Key())
+	}
+}
+
+// originCodeModeProvider is a code-mode host double that issues one nested tool
+// call while the exec invocation that started the cell is still active.
+type originCodeModeProvider struct {
+	mu       sync.Mutex
+	delegate tool.CodeModeRemoteDelegate
+	origins  []map[string]any
+}
+
+func (p *originCodeModeProvider) NewSession(delegate tool.CodeModeRemoteDelegate) tool.CodeModeRemoteSession {
+	p.mu.Lock()
+	p.delegate = delegate
+	p.mu.Unlock()
+	return &originCodeModeSession{provider: p}
+}
+
+type originCodeModeSession struct{ provider *originCodeModeProvider }
+
+func (s *originCodeModeSession) Execute(ctx context.Context, _ tool.CodeModeRemoteExecuteRequest, _ *tool.YieldSignal) (tool.CodeModeRemoteResponse, error) {
+	if _, err := s.provider.delegate.Invoke(ctx, tool.CodeModeRemoteNestedCall{
+		CellID: "turn-origin-cell", RuntimeToolCallID: "exec-origin-call-nested",
+		ToolName: tool.PlainName("nested-echo"), Kind: tool.PayloadFunction, Input: json.RawMessage(`{}`),
+	}); err != nil {
+		return tool.CodeModeRemoteResponse{}, err
+	}
+	return tool.CodeModeRemoteResponse{
+		CellID: "turn-origin-cell", State: "completed",
+		ContentItems: []map[string]any{{"type": "input_text", "text": "done"}},
+	}, nil
+}
+
+func (s *originCodeModeSession) Wait(context.Context, string, uint64, *tool.YieldSignal) (tool.CodeModeRemoteResponse, error) {
+	return tool.CodeModeRemoteResponse{CellID: "turn-origin-cell", State: "completed"}, nil
+}
+
+func (s *originCodeModeSession) Terminate(context.Context, string) (tool.CodeModeRemoteResponse, error) {
+	return tool.CodeModeRemoteResponse{}, nil
+}
+
+func (s *originCodeModeSession) Close() error { return nil }
+
+// Mirrors Rust #45409 through the router: the turn's window identity is bound to
+// the Code Mode runtime, so the nested call a cell issues reports the cell's
+// originating Responses item and the window the cell started in.
+func TestBuildToolRegistryBindsTheTurnWindowToCodeModeCellsLikeRust(t *testing.T) {
+	provider := &originCodeModeProvider{}
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableMCP = false
+	options.EnableAgents = false
+	options.WindowID = "thread-origin:0"
+	codeModeRuntime := tool.NewCodeModeRuntime(provider, false)
+	defer func() { _ = codeModeRuntime.Close() }()
+	options.CodeModeRuntime = codeModeRuntime
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry() error = %v", err)
+	}
+	if err := registry.Register(tool.NewExecutorFunc(tool.Spec{Name: tool.PlainName("nested-echo")}, func(_ context.Context, invocation *tool.Invocation) (*tool.Output, error) {
+		provider.mu.Lock()
+		context := map[string]any{}
+		for key, value := range invocation.Context {
+			context[key] = value
+		}
+		provider.origins = append(provider.origins, context)
+		provider.mu.Unlock()
+		return &tool.Output{Success: true, Body: "ok"}, nil
+	})); err != nil {
+		t.Fatalf("register nested-echo: %v", err)
+	}
+
+	router := tool.NewRouter(registry)
+	invocation, ok, err := router.BuildToolCall(tool.ResponseItem{
+		Type: "custom_tool_call", ID: "fc-turn", Name: tool.CodeModeExecToolName,
+		CallID: "exec-origin-call", Input: `text("x")`,
+	})
+	if err != nil || !ok {
+		t.Fatalf("BuildToolCall() ok=%v err=%v", ok, err)
+	}
+	if _, err := router.Dispatch(context.Background(), invocation); err != nil {
+		t.Fatalf("Dispatch(exec) error = %v", err)
+	}
+	provider.mu.Lock()
+	origins := append([]map[string]any(nil), provider.origins...)
+	provider.mu.Unlock()
+	if len(origins) != 1 {
+		t.Fatalf("nested invocations = %d, want 1", len(origins))
+	}
+	if origins[0][tool.OriginItemIDContextKey] != "fc-turn" || origins[0][tool.OriginWindowIDContextKey] != "thread-origin:0" {
+		t.Fatalf("nested origin = %#v/%#v", origins[0][tool.OriginItemIDContextKey], origins[0][tool.OriginWindowIDContextKey])
+	}
+}
+
+func TestBuildToolRegistrySourcesRequestUserInputAsyncCatalogEntry(t *testing.T) {
+	// Rust #47773: request_user_input_async reads the same catalog entry as
+	// send_user_message_async, so its description and parameters both come
+	// from that block; an invalid parameter override keeps the bundled schema.
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.ExperimentalSupportedTools = []string{tool.DefaultRequestUserInputAsyncToolName}
+	description := "Catalog async question description."
+	parameters := `{"type":"object","properties":{"question":{"type":"string"}},"required":["question"],"additionalProperties":false}`
+	options.RequestUserInputAsyncDescription = &description
+	options.RequestUserInputAsyncParameters = &parameters
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry(request_user_input_async) error = %v", err)
+	}
+	spec, ok := registry.Spec(tool.PlainName(tool.DefaultRequestUserInputAsyncToolName))
+	if !ok {
+		t.Fatal("request_user_input_async tool missing")
+	}
+	if spec.Description != description {
+		t.Fatalf("description = %q, want %q", spec.Description, description)
+	}
+	properties, _ := spec.InputSchema["properties"].(map[string]any)
+	if _, ok := properties["question"]; !ok {
+		t.Fatalf("catalog properties missing: %#v", spec.InputSchema)
+	}
+	if _, ok := properties["questions"]; ok {
+		t.Fatalf("bundled properties kept alongside catalog schema: %#v", spec.InputSchema)
+	}
+	if spec.Exposure != tool.ExposureDirectModelOnly {
+		t.Fatalf("exposure = %q, want direct_model_only", spec.Exposure)
+	}
+
+	invalid := "{not json"
+	options2 := DefaultToolRegistryOptions(t.TempDir())
+	options2.ExperimentalSupportedTools = []string{tool.DefaultRequestUserInputAsyncToolName}
+	options2.RequestUserInputAsyncDescription = &description
+	options2.RequestUserInputAsyncParameters = &invalid
+	registry2, err := BuildToolRegistry(options2)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry(invalid catalog parameters) error = %v", err)
+	}
+	spec2, ok := registry2.Spec(tool.PlainName(tool.DefaultRequestUserInputAsyncToolName))
+	if !ok {
+		t.Fatal("request_user_input_async tool missing with invalid parameters")
+	}
+	if spec2.Description != description {
+		t.Fatalf("fallback description = %q, want catalog description", spec2.Description)
+	}
+	bundled := (&tool.RequestUserInputAsyncHandler{}).Spec()
+	if !reflect.DeepEqual(spec2.InputSchema, bundled.InputSchema) {
+		t.Fatalf("fallback schema = %#v, want bundled %#v", spec2.InputSchema, bundled.InputSchema)
+	}
+}
+
+// TestBuildToolRegistrySourcesMCPResourceCatalogEntriesLikeRust mirrors Rust
+// #47677: the three MCP resource helpers take mcp_resources entries from the
+// model catalog; descriptions and parameters override independently and an
+// invalid parameter override keeps the bundled schema.
+func TestBuildToolRegistrySourcesMCPResourceCatalogEntriesLikeRust(t *testing.T) {
+	listDescription := "Catalog list description."
+	readDescription := "Catalog read description."
+	parameters := `{"type":"object","properties":{"server":{"type":"string"}},"additionalProperties":false}`
+	invalid := `{"type":"array"}`
+
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableMCP = false
+	options.MCPService = mcp.NewMCPService(nil)
+	options.ToolMode = model.ToolModeCodeModeOnly
+	options.MCPResourceMessages = &model.McpResourceToolMessages{
+		ListMCPResources: &model.ToolMessage{Description: &listDescription, Parameters: &parameters},
+		ReadMCPResource:  &model.ToolMessage{Description: &readDescription, Parameters: &invalid},
+	}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry() error = %v", err)
+	}
+
+	listSpec, ok := registry.Spec(tool.PlainName("list_mcp_resources"))
+	if !ok {
+		t.Fatal("list_mcp_resources missing")
+	}
+	if listSpec.Description != listDescription {
+		t.Fatalf("list description = %q, want %q", listSpec.Description, listDescription)
+	}
+	listProperties, _ := listSpec.InputSchema["properties"].(map[string]any)
+	if _, ok := listProperties["server"]; !ok {
+		t.Fatalf("catalog properties missing: %#v", listSpec.InputSchema)
+	}
+	if _, ok := listProperties["cursor"]; ok {
+		t.Fatalf("bundled properties kept alongside catalog schema: %#v", listSpec.InputSchema)
+	}
+
+	// No catalog entry for the templates helper: its bundled spec is untouched.
+	templateSpec, ok := registry.Spec(tool.PlainName("list_mcp_resource_templates"))
+	if !ok {
+		t.Fatal("list_mcp_resource_templates missing")
+	}
+	if templateSpec.Description == listDescription {
+		t.Fatal("templates helper picked up the list helper's description")
+	}
+	templateProperties, _ := templateSpec.InputSchema["properties"].(map[string]any)
+	if _, ok := templateProperties["cursor"]; !ok {
+		t.Fatalf("templates helper lost its bundled schema: %#v", templateSpec.InputSchema)
+	}
+
+	readSpec, ok := registry.Spec(tool.PlainName("read_mcp_resource"))
+	if !ok {
+		t.Fatal("read_mcp_resource missing")
+	}
+	if readSpec.Description != readDescription {
+		t.Fatalf("read description = %q, want catalog description", readSpec.Description)
+	}
+	required, _ := readSpec.InputSchema["required"].([]string)
+	if len(required) != 2 || required[0] != "server" || required[1] != "uri" {
+		t.Fatalf("invalid parameter override did not fall back: %#v", readSpec.InputSchema)
+	}
+}

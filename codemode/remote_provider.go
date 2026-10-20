@@ -1,0 +1,1066 @@
+package codemode
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"codex_core/protocol"
+	"codex_core/tool"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+// codeModeTraceContextFromContext carries the active trace context across the
+// code-mode gRPC boundary (Rust #41017). Rust injects the current span's W3C
+// context into the gRPC metadata
+// (code-mode/src/grpc_session/mod.rs::inject_span_traceparent), so a context with
+// no span context sends no carrier.
+func codeModeTraceContextFromContext(ctx context.Context) *CodeModeTraceContext {
+	trace, ok := protocol.TraceContextFromContext(ctx)
+	if !ok {
+		return nil
+	}
+	return &CodeModeTraceContext{
+		Traceparent: strings.TrimSpace(trace.Traceparent),
+		Tracestate:  strings.TrimSpace(trace.Tracestate),
+	}
+}
+
+// defaultHostWaitTransportTimeout mirrors Rust's DEFAULT_HOST_WAIT_TRANSPORT_TIMEOUT:
+// a stalled code-mode host must answer wait/terminate requests within this
+// transport allowance or the connection is invalidated so the next execution
+// reconnects (Rust 8e3b5d3e87).
+var defaultHostWaitTransportTimeout = 60 * time.Second
+
+// errCodeModeHostRequestTimeout is returned when a code-mode wait/terminate
+// request exceeds its transport deadline; the connection is invalidated so the
+// next execution reconnects to the host.
+var errCodeModeHostRequestTimeout = errors.New("code-mode host timed out waiting for response")
+
+type WebSocketProvider struct {
+	url        string
+	httpClient *http.Client
+
+	mu          sync.Mutex
+	connection  *remoteConnection
+	nextSession atomic.Uint64
+}
+
+type remoteSessionProvider interface {
+	connect(context.Context) (*remoteConnection, error)
+}
+
+type remoteTransport interface {
+	Read(context.Context, any) (bool, error)
+	Write(context.Context, any) error
+	Close() error
+}
+
+func NewWebSocketProvider(url string, httpClient *http.Client) *WebSocketProvider {
+	return &WebSocketProvider{url: url, httpClient: httpClient}
+}
+
+func (p *WebSocketProvider) Availability() error { return nil }
+
+func (p *WebSocketProvider) TakeUnavailableWarning(string) string { return "" }
+
+func (p *WebSocketProvider) NewSession(delegate tool.CodeModeRemoteDelegate) tool.CodeModeRemoteSession {
+	value := p.nextSession.Add(1)
+	return &remoteSession{provider: p, delegate: delegate, id: SessionID(fmt.Sprintf("session-%d", value))}
+}
+
+func (p *WebSocketProvider) Prewarm(ctx context.Context) error {
+	_, err := p.connect(ctx)
+	return err
+}
+
+func (p *WebSocketProvider) Close() error {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	connection := p.connection
+	p.connection = nil
+	p.mu.Unlock()
+	if connection != nil {
+		return connection.Close()
+	}
+	return nil
+}
+
+func (p *WebSocketProvider) connect(ctx context.Context) (*remoteConnection, error) {
+	if p == nil {
+		return nil, fmt.Errorf("code-mode websocket provider is nil")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.connection != nil && p.connection.Alive() {
+		return p.connection, nil
+	}
+	transport, _, err := DialWebSocket(ctx, p.url, p.httpClient)
+	if err != nil {
+		return nil, err
+	}
+	connection, err := connectWebSocketRemoteTransport(ctx, transport, p.url, p.httpClient)
+	if err != nil {
+		return nil, err
+	}
+	p.connection = connection
+	return connection, nil
+}
+
+func connectRemoteTransport(ctx context.Context, transport remoteTransport) (*remoteConnection, error) {
+	return connectRemoteTransportWithHandshake(ctx, transport, nil)
+}
+
+// connectWebSocketRemoteTransport negotiates a dual-WebSocket connection:
+// after the handshake, a host advertising the dual-websocket-v1 capability
+// must return a bulk pairing token, and the client opens a second WebSocket at
+// `{url}/bulk/{token}` carrying delegate callbacks and their responses
+// (Rust 60c722e075).
+func connectWebSocketRemoteTransport(ctx context.Context, transport remoteTransport, websocketURL string, httpClient *http.Client) (*remoteConnection, error) {
+	return connectRemoteTransportWithHandshake(ctx, transport, &remoteConnectOptions{
+		websocketURL: websocketURL,
+		httpClient:   httpClient,
+	})
+}
+
+type remoteConnectOptions struct {
+	websocketURL string
+	httpClient   *http.Client
+}
+
+func connectRemoteTransportWithHandshake(ctx context.Context, transport remoteTransport, options *remoteConnectOptions) (*remoteConnection, error) {
+	versions, _ := NewSupportedProtocolVersions(ProtocolV1)
+	dual, _ := NewCapability(DualWebSocketCapability)
+	// Rust's connection hello asks for the session cell-execution limits and the
+	// yield-observation capability (the latter #48123) as optional capabilities.
+	limits, _ := NewCapability(SessionCellExecutionResourceLimitsCapability)
+	yield, _ := NewCapability(YieldObservationCapability)
+	requested := []Capability{limits, yield}
+	if options != nil && strings.TrimSpace(options.websocketURL) != "" {
+		requested = append(requested, dual)
+	}
+	optional, _ := NewCapabilitySet(requested...)
+	hello, _ := NewClientHello(versions, CapabilitySet{}, optional)
+	if err := transport.Write(ctx, ClientHelloMessage(hello)); err != nil {
+		_ = transport.Close()
+		return nil, err
+	}
+	var response HostToClient
+	ok, err := transport.Read(ctx, &response)
+	if err != nil {
+		_ = transport.Close()
+		return nil, err
+	}
+	if !ok {
+		_ = transport.Close()
+		return nil, fmt.Errorf("code-mode host closed during handshake")
+	}
+	if response.Type == "connection/rejected" {
+		_ = transport.Close()
+		return nil, fmt.Errorf("code-mode host rejected handshake: %s", handshakeRejectMessage(response.Reason))
+	}
+	if response.Type != "connection/ready" || response.Hello == nil || response.Hello.SelectedVersion != ProtocolV1 {
+		_ = transport.Close()
+		return nil, fmt.Errorf("code-mode host returned an invalid handshake response")
+	}
+	var bulk remoteTransport
+	if response.Hello.Capabilities.Contains(dual) {
+		if options == nil || strings.TrimSpace(options.websocketURL) == "" {
+			_ = transport.Close()
+			return nil, fmt.Errorf("code-mode host negotiated an unsupported bulk websocket")
+		}
+		token := response.Hello.BulkConnectionToken
+		if token == nil || strings.TrimSpace(*token) == "" {
+			_ = transport.Close()
+			return nil, fmt.Errorf("code-mode host advertised dual websockets without a pairing token")
+		}
+		bulkURL, err := bulkWebSocketURL(options.websocketURL, *token)
+		if err != nil {
+			_ = transport.Close()
+			return nil, err
+		}
+		bulkTransport, _, err := DialWebSocket(ctx, bulkURL, options.httpClient)
+		if err != nil {
+			_ = transport.Close()
+			return nil, fmt.Errorf("code-mode host bulk websocket unavailable: %w", err)
+		}
+		bulk = bulkTransport
+	} else if response.Hello.BulkConnectionToken != nil {
+		_ = transport.Close()
+		return nil, fmt.Errorf("code-mode host returned an unexpected bulk pairing token")
+	}
+	connection := newRemoteConnection(transport, bulk)
+	connection.capabilities = response.Hello.Capabilities
+	go connection.readLoop()
+	if bulk != nil {
+		go connection.readBulkLoop()
+	}
+	return connection, nil
+}
+
+func bulkWebSocketURL(base string, token string) (string, error) {
+	parsed, err := url.Parse(base)
+	if err != nil {
+		return "", fmt.Errorf("failed to build code-mode host bulk websocket URL: %w", err)
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/bulk/" + token
+	return parsed.String(), nil
+}
+
+func handshakeRejectMessage(reason *HandshakeRejectReason) string {
+	if reason == nil {
+		return "unknown reason"
+	}
+	if reason.Message != "" {
+		return reason.Message
+	}
+	return reason.Type
+}
+
+type remoteSession struct {
+	provider   remoteSessionProvider
+	delegate   tool.CodeModeRemoteDelegate
+	id         SessionID
+	generation uint64
+
+	openMu   sync.Mutex
+	mu       sync.Mutex
+	openedOn *remoteConnection
+	closed   bool
+}
+
+const execRuntimeResetError = "The exec runtime was replaced. Stored values and running cells were lost. Prior external tool operations may have completed; inspect their results before retrying. You may continue with a fresh exec call."
+
+func (s *remoteSession) bindingGeneration() (uint64, bool) {
+	if s == nil {
+		return 0, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.openedOn == nil || !s.openedOn.Alive() {
+		// A fresh call after connection loss must be allowed to open the
+		// replacement runtime; only calls created against a live old binding
+		// are rejected when recovery replaces it.
+		return 0, false
+	}
+	return s.generation, true
+}
+
+// ensureGeneration rejects a call created against an older runtime binding.
+// Calls created before the first binding (hadBinding=false) join the first
+// opened generation, matching Rust's binding_for_request(None).
+func (s *remoteSession) ensureGeneration(generation uint64, hadBinding bool) error {
+	if s == nil || !hadBinding {
+		return nil
+	}
+	current, _ := s.bindingGeneration()
+	if current != generation {
+		return errors.New(execRuntimeResetError)
+	}
+	return nil
+}
+
+func (s *remoteSession) existingConnection() (*remoteConnection, error) {
+	if s == nil {
+		return nil, errors.New("code mode session is shutting down")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.openedOn == nil {
+		return nil, errors.New("code mode session is shutting down")
+	}
+	return s.openedOn, nil
+}
+
+func (s *remoteSession) Execute(ctx context.Context, request tool.CodeModeRemoteExecuteRequest, preempt *tool.YieldSignal) (tool.CodeModeRemoteResponse, error) {
+	generation, hadBinding := s.bindingGeneration()
+	connection, err := s.connection(ctx)
+	if err != nil {
+		return tool.CodeModeRemoteResponse{}, err
+	}
+	if err := s.ensureGeneration(generation, hadBinding); err != nil {
+		return tool.CodeModeRemoteResponse{}, err
+	}
+	actualGeneration, _ := s.bindingGeneration()
+	definitions := make([]ProtocolToolDefinition, 0, len(request.EnabledTools))
+	for _, definition := range request.EnabledTools {
+		kind := ProtocolToolKindFunction
+		if definition.Kind == tool.PayloadCustom {
+			kind = ProtocolToolKindFreeform
+		}
+		var namespace *string
+		if definition.ToolName.Namespace != "" {
+			value := definition.ToolName.Namespace
+			namespace = &value
+		}
+		definitions = append(definitions, ProtocolToolDefinition{
+			Name:                definition.Name,
+			ToolName:            ToolName{Name: definition.ToolName.Name, Namespace: namespace},
+			Description:         definition.Description,
+			Kind:                kind,
+			InputSchema:         append(json.RawMessage(nil), definition.InputSchema...),
+			InputSchemaMaxBytes: definition.InputSchemaMaxBytes,
+			OutputSchema:        append(json.RawMessage(nil), definition.OutputSchema...),
+		})
+	}
+	delegate := s.delegateForGeneration(actualGeneration)
+	response, err := connection.Execute(ctx, s.id, delegate, ExecuteRequest{
+		ToolCallID: request.ToolCallID, EnabledTools: definitions, Source: request.Source,
+		YieldTimeMS: request.YieldTimeMS, MaxOutputTokens: request.MaxOutputTokens,
+		TraceContext: codeModeTraceContextFromContext(ctx),
+	}, preempt)
+	s.invalidateSessionOnNotFound(connection, err)
+	return publicRemoteResponseForGeneration(response, actualGeneration), err
+}
+
+func (s *remoteSession) Wait(ctx context.Context, cellID string, yieldTimeMS uint64, preempt *tool.YieldSignal) (tool.CodeModeRemoteResponse, error) {
+	generation, hadBinding := s.bindingGeneration()
+	connection, err := s.connection(ctx)
+	if err != nil {
+		return tool.CodeModeRemoteResponse{}, err
+	}
+	if err := s.ensureGeneration(generation, hadBinding); err != nil {
+		return tool.CodeModeRemoteResponse{}, err
+	}
+	actualGeneration, _ := s.bindingGeneration()
+	// Account for the runtime's one-second yield grace separately from transport
+	// (mirrors Rust wait()).
+	runtimeTimeout := time.Duration(yieldTimeMS)*time.Millisecond + time.Second
+	remoteCellID, err := remoteCellIDForGeneration(actualGeneration, cellID)
+	if err != nil {
+		return tool.CodeModeRemoteResponse{}, err
+	}
+	outcome, err := connection.withTransportDeadline(runtimeTimeout, "wait", func(ctx context.Context) (HostResponse, error) {
+		return connection.RequestWithYield(ctx, WaitSessionRequest(s.id, WaitRequest{CellID: remoteCellID, YieldTimeMS: yieldTimeMS}), preempt)
+	})
+	if err != nil {
+		s.invalidateSessionOnNotFound(connection, err)
+		if errors.Is(err, errCodeModeHostRequestTimeout) {
+			s.invalidateConnection(connection)
+		}
+		return tool.CodeModeRemoteResponse{}, err
+	}
+	if outcome.Outcome == nil {
+		return tool.CodeModeRemoteResponse{}, fmt.Errorf("code-mode host returned an invalid wait response")
+	}
+	return publicRemoteResponseForGeneration(outcome.Outcome.Response, actualGeneration), nil
+}
+
+func (s *remoteSession) Terminate(ctx context.Context, cellID string) (tool.CodeModeRemoteResponse, error) {
+	connection, err := s.existingConnection()
+	if err != nil {
+		return tool.CodeModeRemoteResponse{}, err
+	}
+	generation, _ := s.bindingGeneration()
+	remoteCellID, err := remoteCellIDForGeneration(generation, cellID)
+	if err != nil {
+		return tool.CodeModeRemoteResponse{}, err
+	}
+	outcome, err := connection.withTransportDeadline(0, "terminate", func(ctx context.Context) (HostResponse, error) {
+		return connection.Request(ctx, TerminateSessionRequest(s.id, remoteCellID))
+	})
+	if err != nil {
+		s.invalidateSessionOnNotFound(connection, err)
+		if errors.Is(err, errCodeModeHostRequestTimeout) {
+			s.invalidateConnection(connection)
+		}
+		return tool.CodeModeRemoteResponse{}, err
+	}
+	if outcome.Outcome == nil {
+		return tool.CodeModeRemoteResponse{}, fmt.Errorf("code-mode host returned an invalid terminate response")
+	}
+	return publicRemoteResponseForGeneration(outcome.Outcome.Response, generation), nil
+}
+
+// invalidateSessionOnNotFound mirrors Rust #52235: Execute, Wait and Terminate
+// reserve NOT_FOUND for an unknown session. Retire only the session binding so
+// the next execution opens a fresh session; the failed call itself is never
+// replayed. CompleteToolCall NOT_FOUND is intentionally excluded because it may
+// identify a missing invocation in an otherwise live session.
+func (s *remoteSession) invalidateSessionOnNotFound(connection *remoteConnection, err error) {
+	if s == nil || connection == nil || err == nil {
+		return
+	}
+	var grpcStatus interface{ GRPCStatus() *status.Status }
+	if !errors.As(err, &grpcStatus) {
+		return
+	}
+	st := grpcStatus.GRPCStatus()
+	if st != nil && st.Code() == codes.NotFound {
+		s.invalidateConnection(connection)
+	}
+}
+
+// invalidateConnection drops the session's association with a dead connection so
+// the next execution opens a fresh host connection.
+func (s *remoteSession) invalidateConnection(connection *remoteConnection) {
+	if s == nil || connection == nil {
+		return
+	}
+	s.openMu.Lock()
+	defer s.openMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.openedOn == connection {
+		s.openedOn = nil
+	}
+}
+
+func (s *remoteSession) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.openMu.Lock()
+	defer s.openMu.Unlock()
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	connection := s.openedOn
+	s.openedOn = nil
+	s.mu.Unlock()
+	if connection == nil {
+		return nil
+	}
+	connection.RemoveDelegate(s.id)
+	ctx, cancel := context.WithTimeout(context.Background(), WebSocketCloseTimeout)
+	defer cancel()
+	_, err := connection.Request(ctx, ShutdownSessionRequest(s.id))
+	return err
+}
+
+func (s *remoteSession) connection(ctx context.Context) (*remoteConnection, error) {
+	if s == nil || s.provider == nil {
+		return nil, fmt.Errorf("code-mode remote session is nil")
+	}
+	s.openMu.Lock()
+	defer s.openMu.Unlock()
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("code mode session is shutting down")
+	}
+	s.mu.Unlock()
+	// Rust #51185: the gRPC code-mode provider retries transient connection and
+	// session/open admissions (Unavailable/ResourceExhausted). Every other
+	// provider - including the WebSocket provider - keeps its single attempt, so
+	// this is a no-op for them. The loop only ever wraps admission; established
+	// execute/wait/terminate requests never pass through here, so no execution
+	// can be replayed.
+	attempts := 1
+	if retrier, ok := s.provider.(sessionAdmissionRetrier); ok {
+		if limit := retrier.sessionAdmissionRetries(); limit > attempts {
+			attempts = limit
+		}
+	}
+	for attempt := 1; ; attempt++ {
+		connection, err := s.admit(ctx)
+		if err == nil {
+			return connection, nil
+		}
+		if attempt >= attempts || !retryableSessionAdmissionError(err) {
+			return nil, err
+		}
+		delay := sessionAdmissionRetryDelay(attempt)
+		if ctx == nil {
+			time.Sleep(delay)
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return nil, err
+		case <-time.After(delay):
+		}
+	}
+}
+
+// admit performs a single admission attempt: establish (or reuse) the provider
+// connection, then complete the session/open handshake. It reproduces the
+// pre-#51185 connection() body verbatim so non-retrying providers observe
+// identical behavior.
+func (s *remoteSession) admit(ctx context.Context) (*remoteConnection, error) {
+	connection, err := s.provider.connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("code mode session is shutting down")
+	}
+	if s.openedOn == connection {
+		s.mu.Unlock()
+		return connection, nil
+	}
+	s.mu.Unlock()
+	response, err := connection.Request(ctx, OpenSessionRequest(s.id))
+	if err != nil {
+		return nil, err
+	}
+	if response.Type != "session/ready" || response.SessionID != s.id {
+		return nil, fmt.Errorf("code-mode host returned an invalid open-session response")
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("code mode session is shutting down")
+	}
+	s.openedOn = connection
+	s.generation++
+	s.mu.Unlock()
+	connection.SetDelegate(s.id, s.delegateForGeneration(s.generation))
+	return connection, nil
+}
+
+func publicRemoteResponseForGeneration(response RuntimeResponse, generation uint64) tool.CodeModeRemoteResponse {
+	state := "completed"
+	if response.Variant == "Yielded" {
+		state = "yielded"
+	} else if response.Variant == "Terminated" {
+		state = "terminated"
+	}
+	items := make([]map[string]any, 0, len(response.ContentItems))
+	for _, item := range response.ContentItems {
+		value := map[string]any{"type": item.Type}
+		if item.Text != "" {
+			value["text"] = item.Text
+		}
+		if item.ImageURL != "" {
+			value["image_url"] = item.ImageURL
+			if item.Detail != nil {
+				value["detail"] = string(*item.Detail)
+			}
+		}
+		if item.AudioURL != "" {
+			value["audio_url"] = item.AudioURL
+		}
+		items = append(items, value)
+	}
+	errorText := ""
+	if response.ErrorText != nil {
+		errorText = *response.ErrorText
+	}
+	cellID := response.CellID.String()
+	if generation > 1 {
+		cellID = "g" + strconv.FormatUint(generation, 10) + ":" + cellID
+	}
+	return tool.CodeModeRemoteResponse{
+		CellID:         cellID,
+		State:          state,
+		ContentItems:   items,
+		ErrorText:      errorText,
+		HostDurationNS: response.CodeModeHostDurationNS,
+	}
+}
+
+type codeModeGenerationDelegate struct {
+	delegate   tool.CodeModeRemoteDelegate
+	generation uint64
+}
+
+func (d *codeModeGenerationDelegate) Invoke(ctx context.Context, call tool.CodeModeRemoteNestedCall) (json.RawMessage, error) {
+	call.CellID = publicCodeModeCellID(d.generation, call.CellID)
+	return d.delegate.Invoke(ctx, call)
+}
+
+func (d *codeModeGenerationDelegate) Notify(ctx context.Context, callID string, cellID string, text string) error {
+	return d.delegate.Notify(ctx, callID, publicCodeModeCellID(d.generation, cellID), text)
+}
+
+func (d *codeModeGenerationDelegate) CellClosed(cellID string) {
+	d.delegate.CellClosed(publicCodeModeCellID(d.generation, cellID))
+}
+
+func (s *remoteSession) delegateForGeneration(generation uint64) tool.CodeModeRemoteDelegate {
+	if s.delegate == nil {
+		return nil
+	}
+	if generation <= 1 {
+		return s.delegate
+	}
+	return &codeModeGenerationDelegate{delegate: s.delegate, generation: generation}
+}
+
+func publicCodeModeCellID(generation uint64, cellID string) string {
+	if generation <= 1 || strings.TrimSpace(cellID) == "" {
+		return cellID
+	}
+	return "g" + strconv.FormatUint(generation, 10) + ":" + cellID
+}
+
+func remoteCellIDForGeneration(generation uint64, cellID string) (CellID, error) {
+	cellID = strings.TrimSpace(cellID)
+	if generation <= 1 {
+		return CellID(cellID), nil
+	}
+	prefix := "g" + strconv.FormatUint(generation, 10) + ":"
+	if !strings.HasPrefix(cellID, prefix) {
+		return "", fmt.Errorf("cell belongs to a stale code-mode host generation")
+	}
+	return CellID(strings.TrimPrefix(cellID, prefix)), nil
+}
+
+type remotePending struct {
+	response chan remoteResult
+	initial  chan remoteInitialResult
+}
+
+type remoteResult struct {
+	response HostResponse
+	err      error
+}
+
+type remoteInitialResult struct {
+	response RuntimeResponse
+	err      error
+}
+
+type remoteConnection struct {
+	transport remoteTransport
+	bulk      remoteTransport
+	writeMu   sync.Mutex
+	bulkMu    sync.Mutex
+	mu        sync.Mutex
+	alive     bool
+	nextID    RequestID
+	pending   map[RequestID]*remotePending
+	delegates map[SessionID]tool.CodeModeRemoteDelegate
+	cancels   map[DelegateRequestID]context.CancelFunc
+	// capabilities are the host's negotiated capabilities (Rust
+	// Connection::capabilities), used to decide whether a yield frame may be
+	// sent to this host (#48123).
+	capabilities CapabilitySet
+}
+
+func newRemoteConnection(transport remoteTransport, bulk ...remoteTransport) *remoteConnection {
+	connection := &remoteConnection{transport: transport, alive: true, nextID: 1, pending: map[RequestID]*remotePending{}, delegates: map[SessionID]tool.CodeModeRemoteDelegate{}, cancels: map[DelegateRequestID]context.CancelFunc{}}
+	if len(bulk) > 0 {
+		connection.bulk = bulk[0]
+	}
+	return connection
+}
+
+func (c *remoteConnection) Alive() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.alive
+}
+
+// MarkDead invalidates the connection and fails every pending request with
+// reason, so waiters unblock and the next execution reconnects to the host.
+func (c *remoteConnection) MarkDead(reason string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.alive = false
+	pending := c.pending
+	c.pending = make(map[RequestID]*remotePending)
+	c.mu.Unlock()
+	for _, p := range pending {
+		select {
+		case p.response <- remoteResult{err: errors.New(reason)}:
+		default:
+		}
+		if p.initial != nil {
+			select {
+			case p.initial <- remoteInitialResult{err: errors.New(reason)}:
+			default:
+			}
+		}
+	}
+}
+
+// withTransportDeadline runs request under a combined runtime + transport
+// deadline and invalidates the connection when the host stalls (mirrors Rust's
+// Connection::with_transport_deadline).
+func (c *remoteConnection) withTransportDeadline(runtimeTimeout time.Duration, requestType string, request func(context.Context) (HostResponse, error)) (HostResponse, error) {
+	deadline := runtimeTimeout + defaultHostWaitTransportTimeout
+	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	defer cancel()
+	response, err := request(ctx)
+	if err == nil {
+		return response, nil
+	}
+	if ctx.Err() == nil {
+		return HostResponse{}, err
+	}
+	reason := fmt.Sprintf("code-mode host timed out waiting for %s response", requestType)
+	c.MarkDead(reason)
+	return HostResponse{}, errCodeModeHostRequestTimeout
+}
+
+func (c *remoteConnection) SetDelegate(sessionID SessionID, delegate tool.CodeModeRemoteDelegate) {
+	c.mu.Lock()
+	if delegate != nil {
+		c.delegates[sessionID] = delegate
+	}
+	c.mu.Unlock()
+}
+
+func (c *remoteConnection) RemoveDelegate(sessionID SessionID) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	delete(c.delegates, sessionID)
+	c.mu.Unlock()
+}
+
+func (c *remoteConnection) Request(ctx context.Context, request HostRequest) (HostResponse, error) {
+	return c.requestWithYield(ctx, request, nil)
+}
+
+// RequestWithYield is Request with Rust #48123's preempt signal: firing it sends
+// an `operation/yield` frame so the host ends the observation early.
+func (c *remoteConnection) RequestWithYield(ctx context.Context, request HostRequest, preempt *tool.YieldSignal) (HostResponse, error) {
+	return c.requestWithYield(ctx, request, preempt)
+}
+
+func (c *remoteConnection) requestWithYield(ctx context.Context, request HostRequest, preempt *tool.YieldSignal) (HostResponse, error) {
+	pending, id, err := c.sendRequest(ctx, request, false)
+	if err != nil {
+		return HostResponse{}, err
+	}
+	stopYield := c.watchYield(id, c.supportedYieldSignal(preempt))
+	defer stopYield()
+	select {
+	case result := <-pending.response:
+		return result.response, result.err
+	case <-ctx.Done():
+		c.cancelRequest(id)
+		return HostResponse{}, ctx.Err()
+	}
+}
+
+// supportedYieldSignal drops a caller's preempt signal when the host did not
+// negotiate `yield-observation`, so an older host keeps its normal timeout
+// behavior (Rust Connection::supported_yield_signal, #48123).
+func (c *remoteConnection) supportedYieldSignal(signal *tool.YieldSignal) *tool.YieldSignal {
+	if c == nil || signal == nil {
+		return nil
+	}
+	c.mu.Lock()
+	supported := c.capabilities.Contains(Capability(YieldObservationCapability))
+	c.mu.Unlock()
+	if !supported {
+		return nil
+	}
+	return signal
+}
+
+// watchYield emits the `operation/yield` frame when the preempt signal fires and
+// returns a stop function the caller runs once the observation settles.
+func (c *remoteConnection) watchYield(id RequestID, signal *tool.YieldSignal) func() {
+	if signal == nil {
+		return func() {}
+	}
+	stopped := make(chan struct{})
+	go func() {
+		select {
+		case <-signal.Done():
+			_ = c.write(context.Background(), YieldRequest(id))
+		case <-stopped:
+		}
+	}()
+	return func() { close(stopped) }
+}
+
+func (c *remoteConnection) Execute(ctx context.Context, sessionID SessionID, delegate tool.CodeModeRemoteDelegate, request ExecuteRequest, preempt *tool.YieldSignal) (RuntimeResponse, error) {
+	c.SetDelegate(sessionID, delegate)
+	pending, id, err := c.sendRequest(ctx, ExecuteSessionRequest(sessionID, request), true)
+	if err != nil {
+		return RuntimeResponse{}, err
+	}
+	// Rust keeps the yield watcher alive until the observation's final response
+	// arrives, so the frame can still be sent while the initial response is in
+	// flight.
+	stopYield := c.watchYield(id, c.supportedYieldSignal(preempt))
+	select {
+	case result := <-pending.response:
+		if result.err != nil {
+			stopYield()
+			return RuntimeResponse{}, result.err
+		}
+		if result.response.Type != "execution/started" {
+			stopYield()
+			return RuntimeResponse{}, fmt.Errorf("code-mode host returned an invalid execute response")
+		}
+	case <-ctx.Done():
+		stopYield()
+		c.cancelRequest(id)
+		return RuntimeResponse{}, ctx.Err()
+	}
+	select {
+	case result := <-pending.initial:
+		stopYield()
+		return result.response, result.err
+	case <-ctx.Done():
+		stopYield()
+		c.cancelRequest(id)
+		return RuntimeResponse{}, ctx.Err()
+	}
+}
+
+func (c *remoteConnection) sendRequest(ctx context.Context, request HostRequest, initial bool) (*remotePending, RequestID, error) {
+	if c == nil {
+		return nil, 0, fmt.Errorf("code-mode remote connection is nil")
+	}
+	c.mu.Lock()
+	if !c.alive {
+		c.mu.Unlock()
+		return nil, 0, fmt.Errorf("code-mode host connection closed")
+	}
+	id := c.nextID
+	c.nextID++
+	pending := &remotePending{response: make(chan remoteResult, 1)}
+	if initial {
+		pending.initial = make(chan remoteInitialResult, 1)
+	}
+	c.pending[id] = pending
+	c.mu.Unlock()
+	if err := c.write(ctx, OperationRequest(id, request)); err != nil {
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
+		return nil, 0, err
+	}
+	return pending, id, nil
+}
+
+func (c *remoteConnection) cancelRequest(id RequestID) {
+	c.mu.Lock()
+	delete(c.pending, id)
+	c.mu.Unlock()
+	_ = c.write(context.Background(), CancelRequest(id))
+}
+
+func (c *remoteConnection) write(ctx context.Context, message any) error {
+	lane := TransportLaneControl
+	if m, ok := message.(ClientToHost); ok {
+		lane = m.transportLane()
+	}
+	if lane == TransportLaneBulk && c.bulk != nil {
+		c.bulkMu.Lock()
+		defer c.bulkMu.Unlock()
+		return c.bulk.Write(ctx, message)
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.transport.Write(ctx, message)
+}
+
+func (c *remoteConnection) readLoop() {
+	for {
+		var message HostToClient
+		ok, err := c.transport.Read(context.Background(), &message)
+		if err != nil || !ok {
+			if err == nil {
+				err = fmt.Errorf("code-mode host connection closed")
+			}
+			c.fail(err)
+			return
+		}
+		if c.bulk != nil && message.transportLane() != TransportLaneControl {
+			c.fail(fmt.Errorf("code-mode host sent a bulk message on the control websocket"))
+			return
+		}
+		c.handle(message)
+	}
+}
+
+func (c *remoteConnection) readBulkLoop() {
+	for {
+		var message HostToClient
+		ok, err := c.bulk.Read(context.Background(), &message)
+		if err != nil || !ok {
+			if err == nil {
+				err = fmt.Errorf("code-mode host bulk websocket closed")
+			}
+			c.fail(err)
+			return
+		}
+		if message.transportLane() != TransportLaneBulk {
+			c.fail(fmt.Errorf("code-mode host sent a control message on the bulk websocket"))
+			return
+		}
+		c.handle(message)
+	}
+}
+
+func (c *remoteConnection) handle(message HostToClient) {
+	switch message.Type {
+	case "operation/response":
+		c.mu.Lock()
+		pending := c.pending[message.ID]
+		if pending != nil && pending.initial == nil {
+			delete(c.pending, message.ID)
+		}
+		c.mu.Unlock()
+		if pending == nil {
+			c.fail(fmt.Errorf("code-mode host returned unknown request ID %d", message.ID))
+			return
+		}
+		response, err := message.Result.IntoResult()
+		pending.response <- remoteResult{response: response, err: err}
+	case "execute/initialResponse":
+		c.mu.Lock()
+		pending := c.pending[message.ID]
+		delete(c.pending, message.ID)
+		c.mu.Unlock()
+		if pending == nil || pending.initial == nil {
+			c.fail(fmt.Errorf("code-mode host returned initial response for unknown request ID %d", message.ID))
+			return
+		}
+		response, err := message.Initial.IntoResult()
+		pending.initial <- remoteInitialResult{response: response, err: err}
+	case "delegate/request":
+		go c.handleDelegate(message)
+	case "delegate/cancel":
+		c.mu.Lock()
+		cancel := c.cancels[message.DelegateID]
+		delete(c.cancels, message.DelegateID)
+		c.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+	case "cell/closed":
+		// Release the owning execution's retained callbacks. The public executor
+		// already drops cells after a terminal wait response, so this covers the
+		// host closing a cell the client never settled (Rust #44865).
+		c.mu.Lock()
+		delegate := c.delegates[message.SessionID]
+		c.mu.Unlock()
+		if delegate != nil && strings.TrimSpace(message.CellID.String()) != "" {
+			delegate.CellClosed(message.CellID.String())
+		}
+	case "connection/ready", "connection/rejected":
+		c.fail(fmt.Errorf("code-mode host sent a second handshake response"))
+	}
+}
+
+func (c *remoteConnection) handleDelegate(message HostToClient) {
+	c.mu.Lock()
+	delegate := c.delegates[message.SessionID]
+	c.mu.Unlock()
+	ctx, cancel, ok := c.reserveDelegate(message.DelegateID)
+	if !ok {
+		_ = c.write(context.Background(), DelegateResponseMessage(message.DelegateID, ResultErr[DelegateResponse](fmt.Sprintf("code-mode host exceeded the limit of %d pending delegate calls", MaxPendingDelegateCalls))))
+		return
+	}
+	defer c.releaseDelegate(message.DelegateID, cancel)
+	if delegate == nil || message.Request == nil {
+		_ = c.write(context.Background(), DelegateResponseMessage(message.DelegateID, ResultErr[DelegateResponse]("code-mode session delegate is unavailable")))
+		return
+	}
+	var response DelegateResponse
+	var err error
+	switch message.Request.Type {
+	case "tool/invoke":
+		if message.Request.Invocation == nil {
+			err = fmt.Errorf("delegate tool invocation is missing")
+			break
+		}
+		call := message.Request.Invocation
+		kind := tool.PayloadFunction
+		if call.ProtocolToolKind == ProtocolToolKindFreeform {
+			kind = tool.PayloadCustom
+		}
+		name := tool.ToolName{Name: call.ToolName.Name}
+		if call.ToolName.Namespace != nil {
+			name.Namespace = *call.ToolName.Namespace
+		}
+		var result json.RawMessage
+		result, err = delegate.Invoke(ctx, tool.CodeModeRemoteNestedCall{CellID: call.CellID.String(), RuntimeToolCallID: call.RuntimeToolCallID, ToolName: name, Kind: kind, Input: call.Input})
+		response = ToolResultResponse(result)
+	case "notification/send":
+		err = delegate.Notify(ctx, message.Request.CallID, message.Request.CellID.String(), message.Request.Text)
+		response = NotificationDeliveredResponse()
+	default:
+		err = fmt.Errorf("unknown code-mode delegate request %q", message.Request.Type)
+	}
+	if err != nil {
+		_ = c.write(context.Background(), DelegateResponseMessage(message.DelegateID, ResultErr[DelegateResponse](err.Error())))
+		return
+	}
+	_ = c.write(context.Background(), DelegateResponseMessage(message.DelegateID, ResultOK(response)))
+}
+
+func (c *remoteConnection) reserveDelegate(id DelegateRequestID) (context.Context, context.CancelFunc, bool) {
+	if c == nil {
+		return nil, nil, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.cancels) >= MaxPendingDelegateCalls {
+		return nil, nil, false
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c.cancels[id] = cancel
+	return ctx, cancel, true
+}
+
+func (c *remoteConnection) releaseDelegate(id DelegateRequestID, cancel context.CancelFunc) {
+	if cancel != nil {
+		cancel()
+	}
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	delete(c.cancels, id)
+	c.mu.Unlock()
+}
+
+func (c *remoteConnection) fail(err error) {
+	c.mu.Lock()
+	if !c.alive {
+		c.mu.Unlock()
+		return
+	}
+	c.alive = false
+	pending := c.pending
+	c.pending = map[RequestID]*remotePending{}
+	cancels := c.cancels
+	c.cancels = map[DelegateRequestID]context.CancelFunc{}
+	c.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	for _, request := range pending {
+		request.response <- remoteResult{err: err}
+		if request.initial != nil {
+			request.initial <- remoteInitialResult{err: err}
+		}
+	}
+}
+
+func (c *remoteConnection) Close() error {
+	if c == nil {
+		return nil
+	}
+	c.fail(fmt.Errorf("code-mode host connection closed"))
+	firstErr := c.transport.Close()
+	if c.bulk != nil {
+		if bulkErr := c.bulk.Close(); bulkErr != nil && firstErr == nil {
+			firstErr = bulkErr
+		}
+	}
+	return firstErr
+}

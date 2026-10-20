@@ -1,0 +1,582 @@
+package install
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+)
+
+const (
+	binDirname                = "bin"
+	packageMetadataFilename   = "codex-package.json"
+	pathDirname               = "codex-path"
+	releasesDirname           = "releases"
+	resourcesDirname          = "codex-resources"
+	standalonePackagesDirname = "standalone"
+	zshDirname                = "zsh"
+)
+
+func codeModeHostExecutableName() string {
+	if runtime.GOOS == "windows" {
+		return "codex-code-mode-host.exe"
+	}
+	return "codex-code-mode-host"
+}
+
+type StandalonePlatform string
+
+const (
+	StandaloneUnix    StandalonePlatform = "unix"
+	StandaloneWindows StandalonePlatform = "windows"
+)
+
+type InstallMethodKind string
+
+const (
+	InstallStandalone InstallMethodKind = "standalone"
+	InstallNPM        InstallMethodKind = "npm"
+	InstallBun        InstallMethodKind = "bun"
+	InstallPnpm       InstallMethodKind = "pnpm"
+	// InstallVitePlus is a Codex binary launched through the Vite+-managed
+	// `codex.js` shim (Rust InstallMethod::VitePlus).
+	InstallVitePlus InstallMethodKind = "vite-plus"
+	InstallBrew     InstallMethodKind = "brew"
+	InstallOther    InstallMethodKind = "other"
+)
+
+type CodexPackageLayout struct {
+	PackageDir   string  `json:"packageDir"`
+	BinDir       string  `json:"binDir"`
+	ResourcesDir *string `json:"resourcesDir,omitempty"`
+	PathDir      *string `json:"pathDir,omitempty"`
+}
+
+// CodexPackageManifest is the version metadata recorded in a bundled Codex
+// runtime package (codex-package.json).
+type CodexPackageManifest struct {
+	Version string `json:"version"`
+}
+
+type InstallMethod struct {
+	Kind         InstallMethodKind   `json:"kind"`
+	ReleaseDir   string              `json:"releaseDir,omitempty"`
+	ResourcesDir *string             `json:"resourcesDir,omitempty"`
+	Platform     *StandalonePlatform `json:"platform,omitempty"`
+}
+
+type InstallContext struct {
+	Method        InstallMethod       `json:"method"`
+	PackageLayout *CodexPackageLayout `json:"packageLayout,omitempty"`
+}
+
+type ExecutableIdentity struct {
+	Digest string `json:"digest"`
+	// PathDigest digests the resolved executable path so two release
+	// generations that ship identical executable bytes are still
+	// distinguishable (Rust `ExecutableIdentity::path_digest`, #50559).
+	// An empty value means the identity came from bytes alone, matching
+	// Rust's `path_digest: None` from `executable_identity_from_reader`.
+	PathDigest string `json:"pathDigest,omitempty"`
+}
+
+// SameContents mirrors Rust `ExecutableIdentity::same_contents`: package
+// preparation and manual-update reporting compare executable contents only,
+// while restart and handoff decisions compare the whole identity.
+func (i ExecutableIdentity) SameContents(other ExecutableIdentity) bool {
+	return i.Digest == other.Digest
+}
+
+// CanonicalExecutablePath mirrors Rust's `std::fs::canonicalize(&path)` with the
+// original path as the fallback when resolution fails.
+func CanonicalExecutablePath(path string) string {
+	if resolved, err := resolveFinalPath(path); err == nil && strings.TrimSpace(resolved) != "" {
+		return resolved
+	}
+	return path
+}
+
+// ExecutableIdentityFromDataAndPath combines already-read executable bytes with
+// the digest of the resolved path. Callers that inject their own reader use this
+// so their identity matches `ExecutableIdentityFromFile`.
+func ExecutableIdentityFromDataAndPath(path string, data []byte) ExecutableIdentity {
+	sum := sha256.Sum256(data)
+	executable := CanonicalExecutablePath(path)
+	pathSum := sha256.Sum256([]byte(executable))
+	pathDigest := hex.EncodeToString(pathSum[:])
+	return ExecutableIdentity{Digest: hex.EncodeToString(sum[:]), PathDigest: pathDigest}
+}
+
+type DaemonSettings struct {
+	RemoteControlEnabled bool `json:"remoteControlEnabled"`
+}
+
+var (
+	currentOnce sync.Once
+	current     *InstallContext
+)
+
+func Current() *InstallContext {
+	currentOnce.Do(func() {
+		exe, _ := os.Executable()
+		codexHome := os.Getenv("GCODE_HOME")
+		if codexHome == "" {
+			codexHome = os.Getenv("CODEX_HOME")
+		}
+		current = FromExe(
+			runtime.GOOS == "darwin",
+			exe,
+			os.Getenv("CODEX_MANAGED_BY_VITE_PLUS") != "",
+			os.Getenv("CODEX_MANAGED_BY_PNPM") != "",
+			os.Getenv("CODEX_MANAGED_BY_NPM") != "",
+			os.Getenv("CODEX_MANAGED_BY_BUN") != "",
+			codexHome,
+		)
+	})
+	return cloneContext(current)
+}
+
+// FromExe resolves the install context for an executable. The managed-by
+// overrides are checked in Rust's precedence order: Vite+, then pnpm, npm, bun.
+func FromExe(isMacOS bool, currentExe string, managedByVitePlus bool, managedByPnpm bool, managedByNPM bool, managedByBun bool, codexHome string) *InstallContext {
+	layout := PackageLayoutFromExe(currentExe)
+	method := InstallMethod{Kind: InstallOther}
+	switch {
+	case managedByVitePlus:
+		method = InstallMethod{Kind: InstallVitePlus}
+	case managedByPnpm:
+		method = InstallMethod{Kind: InstallPnpm}
+	case managedByNPM:
+		method = InstallMethod{Kind: InstallNPM}
+	case managedByBun:
+		method = InstallMethod{Kind: InstallBun}
+	case currentExe != "":
+		method = installMethodFromExe(currentExe, codexHome, layout, isMacOS)
+	}
+	return &InstallContext{Method: method, PackageLayout: layout}
+}
+
+// PackagePathDir returns the packaged `codex-path` directory that holds the
+// bundled command shims (the ripgrep binary, and `apply_patch` for packaged
+// installs), or "" when this install has no package layout. Rust
+// `InstallContext::package_layout.path_dir`: the CLI puts it on PATH so commands
+// the model or the user runs resolve Codex's own tools.
+func (c *InstallContext) PackagePathDir() string {
+	if c == nil || c.PackageLayout == nil || c.PackageLayout.PathDir == nil {
+		return ""
+	}
+	return strings.TrimSpace(*c.PackageLayout.PathDir)
+}
+
+// PackagePathDirOfExe resolves the package path directory for an executable,
+// which the arg0 launcher needs before the install context exists.
+func PackagePathDirOfExe(currentExe string) string {
+	layout := PackageLayoutFromExe(currentExe)
+	if layout == nil || layout.PathDir == nil {
+		return ""
+	}
+	return strings.TrimSpace(*layout.PathDir)
+}
+
+func (c *InstallContext) RGCommand() string {
+	if c != nil && c.PackageLayout != nil && c.PackageLayout.PathDir != nil {
+		candidate := filepath.Join(*c.PackageLayout.PathDir, defaultRGCommand())
+		if isFile(candidate) {
+			return candidate
+		}
+	}
+	if c != nil && c.Method.Kind == InstallStandalone && c.Method.ResourcesDir != nil {
+		candidate := filepath.Join(*c.Method.ResourcesDir, defaultRGCommand())
+		if isFile(candidate) {
+			return candidate
+		}
+	}
+	return defaultRGCommand()
+}
+
+// CodeModeHostProgram resolves the standalone host next to the installed
+// Codex executable without requiring the host to be started.
+func (c *InstallContext) CodeModeHostProgram() string {
+	exe, _ := os.Executable()
+	return c.CodeModeHostProgramFromExe(exe)
+}
+
+func (c *InstallContext) CodeModeHostProgramFromExe(currentExe string) string {
+	if resource := c.BundledResource(codeModeHostExecutableName()); resource != nil {
+		return *resource
+	}
+	executableDir := ""
+	if c != nil && c.PackageLayout != nil {
+		executableDir = c.PackageLayout.BinDir
+	} else if c != nil && c.Method.Kind == InstallStandalone {
+		executableDir = c.Method.ReleaseDir
+	} else if currentExe != "" {
+		if parent, err := filepath.Abs(filepath.Dir(currentExe)); err == nil {
+			if resolved, resolveErr := filepath.EvalSymlinks(parent); resolveErr == nil {
+				parent = resolved
+			}
+			executableDir = parent
+		}
+	}
+	if executableDir != "" {
+		candidate := filepath.Join(executableDir, codeModeHostExecutableName())
+		if isFile(candidate) {
+			return candidate
+		}
+	}
+	if currentExe != "" {
+		return filepath.Join(filepath.Dir(currentExe), codeModeHostExecutableName())
+	}
+	return codeModeHostExecutableName()
+}
+
+func (c *InstallContext) BundledResource(fileName string) *string {
+	if strings.TrimSpace(fileName) == "" {
+		return nil
+	}
+	if c != nil && c.PackageLayout != nil && c.PackageLayout.ResourcesDir != nil {
+		candidate := filepath.Join(*c.PackageLayout.ResourcesDir, fileName)
+		if isFile(candidate) {
+			return &candidate
+		}
+	}
+	if c != nil && c.Method.Kind == InstallStandalone && c.Method.ResourcesDir != nil {
+		candidate := filepath.Join(*c.Method.ResourcesDir, fileName)
+		if isFile(candidate) {
+			return &candidate
+		}
+	}
+	return nil
+}
+
+func (c *InstallContext) BundledResourceDir(dirName string) *string {
+	if strings.TrimSpace(dirName) == "" {
+		return nil
+	}
+	if c != nil && c.PackageLayout != nil && c.PackageLayout.ResourcesDir != nil {
+		candidate := filepath.Join(*c.PackageLayout.ResourcesDir, dirName)
+		if dir := existingDir(candidate); dir != nil {
+			return dir
+		}
+	}
+	if c != nil && c.Method.Kind == InstallStandalone && c.Method.ResourcesDir != nil {
+		candidate := filepath.Join(*c.Method.ResourcesDir, dirName)
+		if dir := existingDir(candidate); dir != nil {
+			return dir
+		}
+	}
+	return nil
+}
+
+func (c *InstallContext) BundledZshPath() *string {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	return c.BundledResource(filepath.Join(zshDirname, binDirname, "zsh"))
+}
+
+func (c *InstallContext) BundledZshBinDir() *string {
+	zsh := c.BundledZshPath()
+	if zsh == nil {
+		return nil
+	}
+	dir := filepath.Dir(*zsh)
+	return &dir
+}
+
+// PackageManifest reads the manifest for the package that contains the current
+// executable. It returns nil when no package layout is known or the manifest is
+// missing or malformed (mirrors the Rust install-context behavior).
+func (c *InstallContext) PackageManifest() *CodexPackageManifest {
+	if c == nil || c.PackageLayout == nil {
+		return nil
+	}
+	data, err := os.ReadFile(filepath.Join(c.PackageLayout.PackageDir, packageMetadataFilename))
+	if err != nil {
+		return nil
+	}
+	var manifest struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return nil
+	}
+	if !validPackageManifestVersion(manifest.Version) {
+		return nil
+	}
+	return &CodexPackageManifest{Version: manifest.Version}
+}
+
+func validPackageManifestVersion(version string) bool {
+	parts := strings.Split(strings.TrimSpace(version), ".")
+	if len(parts) < 3 {
+		return false
+	}
+	for i := 0; i < 3; i++ {
+		if parts[i] == "" {
+			return false
+		}
+		if _, err := strconv.Atoi(parts[i]); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// ManagedCodexBin returns the pre-dedicated standalone package's executable
+// path. A daemon that owns its package resolves the executable it launches with
+// appserverdaemon.ManagedCodexBin instead, which prefers the dedicated
+// packages/app-server-daemon root (Rust managed_install::managed_codex_bin).
+func ManagedCodexBin(codexHome string) string {
+	return filepath.Join(codexHome, "packages", standalonePackagesDirname, "current", managedCodexFileName())
+}
+
+func ParseCodexVersion(output string) (string, error) {
+	fields := strings.Fields(output)
+	if len(fields) < 2 || fields[1] == "" {
+		return "", fmt.Errorf("managed Codex version output was malformed")
+	}
+	return fields[1], nil
+}
+
+func ExecutableIdentityFromBytes(data []byte) ExecutableIdentity {
+	sum := sha256.Sum256(data)
+	return ExecutableIdentity{Digest: hex.EncodeToString(sum[:])}
+}
+
+// ExecutableIdentityFromReader mirrors Rust #47591's
+// `executable_identity_from_reader`: hash the executable in a stream so debug
+// builds of a few hundred megabytes do not need a whole-file allocation. The
+// digest format is unchanged, so identities recorded by whole-file hashing stay
+// valid.
+func ExecutableIdentityFromReader(reader io.Reader) (ExecutableIdentity, error) {
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, reader); err != nil {
+		return ExecutableIdentity{}, err
+	}
+	return ExecutableIdentity{Digest: hex.EncodeToString(hasher.Sum(nil))}, nil
+}
+
+// packageLayoutFromRootMetadata resolves an executable that sits at the package
+// root, which is the layout a locally built or WinGet-installed CLI uses. Only
+// metadata that names this exact executable proves the layout.
+func packageLayoutFromRootMetadata(canonicalExe string, exeDir string) *CodexPackageLayout {
+	data, err := os.ReadFile(filepath.Join(exeDir, packageMetadataFilename))
+	if err != nil {
+		return nil
+	}
+	var metadata struct {
+		LayoutVersion *int   `json:"layoutVersion"`
+		Entrypoint    string `json:"entrypoint"`
+	}
+	if json.Unmarshal(data, &metadata) != nil {
+		return nil
+	}
+	if metadata.LayoutVersion == nil || *metadata.LayoutVersion != 1 {
+		return nil
+	}
+	if metadata.Entrypoint != filepath.Base(canonicalExe) {
+		return nil
+	}
+	return &CodexPackageLayout{
+		PackageDir:   exeDir,
+		BinDir:       exeDir,
+		ResourcesDir: existingDir(filepath.Join(exeDir, resourcesDirname)),
+		PathDir:      existingDir(filepath.Join(exeDir, pathDirname)),
+	}
+}
+
+// ExecutableIdentityFromFile returns the identity of the executable at path
+// without holding it in memory, so debug builds of a few hundred megabytes can
+// be hashed without a matching allocation.
+func ExecutableIdentityFromFile(path string) (ExecutableIdentity, error) {
+	executable := CanonicalExecutablePath(path)
+	file, err := os.Open(executable)
+	if err != nil {
+		return ExecutableIdentity{}, err
+	}
+	defer file.Close()
+	identity, err := ExecutableIdentityFromReader(file)
+	if err != nil {
+		return ExecutableIdentity{}, err
+	}
+	pathSum := sha256.Sum256([]byte(executable))
+	pathDigest := hex.EncodeToString(pathSum[:])
+	identity.PathDigest = pathDigest
+	return identity, nil
+}
+
+func PackageLayoutFromExe(exePath string) *CodexPackageLayout {
+	if exePath == "" {
+		return nil
+	}
+	canonicalExe, err := filepath.Abs(exePath)
+	if err != nil {
+		return nil
+	}
+	if resolved, err := filepath.EvalSymlinks(canonicalExe); err == nil {
+		canonicalExe = resolved
+	}
+	exeDir := filepath.Dir(canonicalExe)
+	// WinGet preserves a target-qualified executable at the package root. Only
+	// recognize that layout when metadata names this exact executable.
+	if runtime.GOOS == "windows" {
+		if layout := packageLayoutFromRootMetadata(canonicalExe, exeDir); layout != nil {
+			return layout
+		}
+	}
+	binDir := exeDir
+	switch filepath.Base(exeDir) {
+	case binDirname:
+		// The executable lives directly in the package bin/ directory.
+		if existingDir(binDir) == nil {
+			return nil
+		}
+	case resourcesDirname:
+		// The executable lives in the package codex-resources/ directory;
+		// resolve the sibling bin/ directory and require it to exist.
+		binDir = filepath.Join(filepath.Dir(exeDir), binDirname)
+		if existingDir(binDir) == nil {
+			return nil
+		}
+	default:
+		return nil
+	}
+	packageDir := filepath.Dir(binDir)
+	if !isFile(filepath.Join(packageDir, packageMetadataFilename)) {
+		return nil
+	}
+	return &CodexPackageLayout{
+		PackageDir:   packageDir,
+		BinDir:       binDir,
+		ResourcesDir: existingDir(filepath.Join(packageDir, resourcesDirname)),
+		PathDir:      existingDir(filepath.Join(packageDir, pathDirname)),
+	}
+}
+
+func installMethodFromExe(exePath string, codexHome string, layout *CodexPackageLayout, isMacOS bool) InstallMethod {
+	if method, ok := standaloneInstallMethod(exePath, codexHome, layout); ok {
+		return method
+	}
+	if isMacOS && (strings.HasPrefix(exePath, "/opt/homebrew") || strings.HasPrefix(exePath, "/usr/local")) {
+		return InstallMethod{Kind: InstallBrew}
+	}
+	return InstallMethod{Kind: InstallOther}
+}
+
+func standaloneInstallMethod(exePath string, codexHome string, layout *CodexPackageLayout) (InstallMethod, bool) {
+	if codexHome == "" {
+		return InstallMethod{}, false
+	}
+	canonicalHome, err := filepath.Abs(codexHome)
+	if err != nil {
+		return InstallMethod{}, false
+	}
+	if resolved, err := filepath.EvalSymlinks(canonicalHome); err == nil {
+		canonicalHome = resolved
+	}
+	releaseDir := ""
+	if layout != nil {
+		releaseDir = layout.PackageDir
+	} else {
+		canonicalExe, err := filepath.Abs(exePath)
+		if err != nil {
+			return InstallMethod{}, false
+		}
+		if resolved, err := filepath.EvalSymlinks(canonicalExe); err == nil {
+			canonicalExe = resolved
+		}
+		releaseDir = filepath.Dir(canonicalExe)
+	}
+	releasesRoot := filepath.Join(canonicalHome, "packages", standalonePackagesDirname, releasesDirname)
+	rel, err := filepath.Rel(releasesRoot, releaseDir)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return InstallMethod{}, false
+	}
+	resourcesDir := filepath.Join(releaseDir, resourcesDirname)
+	method := InstallMethod{Kind: InstallStandalone, ReleaseDir: releaseDir, ResourcesDir: existingDir(resourcesDir)}
+	platform := StandaloneUnix
+	if runtime.GOOS == "windows" {
+		platform = StandaloneWindows
+	}
+	method.Platform = &platform
+	return method, true
+}
+
+func managedCodexFileName() string {
+	if runtime.GOOS == "windows" {
+		return "codex.exe"
+	}
+	return "codex"
+}
+
+func defaultRGCommand() string {
+	if runtime.GOOS == "windows" {
+		return "rg.exe"
+	}
+	return "rg"
+}
+
+func existingDir(path string) *string {
+	stat, err := os.Stat(path)
+	if err != nil || !stat.IsDir() {
+		return nil
+	}
+	return &path
+}
+
+func isFile(path string) bool {
+	stat, err := os.Stat(path)
+	return err == nil && stat.Mode().IsRegular()
+}
+
+func cloneContext(value *InstallContext) *InstallContext {
+	if value == nil {
+		return &InstallContext{Method: InstallMethod{Kind: InstallOther}}
+	}
+	return &InstallContext{Method: cloneMethod(value.Method), PackageLayout: cloneLayout(value.PackageLayout)}
+}
+
+func cloneMethod(value InstallMethod) InstallMethod {
+	return InstallMethod{
+		Kind:         value.Kind,
+		ReleaseDir:   value.ReleaseDir,
+		ResourcesDir: cloneString(value.ResourcesDir),
+		Platform:     clonePlatform(value.Platform),
+	}
+}
+
+func cloneLayout(value *CodexPackageLayout) *CodexPackageLayout {
+	if value == nil {
+		return nil
+	}
+	return &CodexPackageLayout{
+		PackageDir:   value.PackageDir,
+		BinDir:       value.BinDir,
+		ResourcesDir: cloneString(value.ResourcesDir),
+		PathDir:      cloneString(value.PathDir),
+	}
+}
+
+func cloneString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func clonePlatform(value *StandalonePlatform) *StandalonePlatform {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}

@@ -1,0 +1,1156 @@
+package tool
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"codex_core/execpolicy"
+	"codex_core/execserver"
+	"codex_core/network"
+	"codex_core/sandbox"
+	"codex_core/utils"
+)
+
+func TestShellExecutorRunsCommandAndFormatsOutput(t *testing.T) {
+	runner := &fakeShellRunner{result: &ShellResult{
+		ExitCode: 7,
+		Stdout:   "out\n",
+		Stderr:   "err\n",
+		Duration: 1500 * time.Millisecond,
+	}}
+	executor := NewShellExecutor(&ShellExecutorOptions{
+		Runner:              runner,
+		Shell:               &Shell{Type: ShellBash, Path: "/bin/sh"},
+		UnifiedExecThreadID: "thread-1",
+		Validation: ShellValidationOptions{
+			AdditionalPermissionsAllowed: true,
+			ApprovalPolicy:               sandbox.ApprovalOnRequest,
+			CWD:                          t.TempDir(),
+			DefaultTimeoutMS:             5000,
+		},
+	})
+
+	output, err := executor.Execute(context.Background(), &Invocation{
+		CallID:   "call-1",
+		ToolName: PlainName(DefaultExecCommandToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"cmd":"printf hi","max_output_tokens":100}`},
+	})
+
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !output.Success {
+		t.Fatalf("Success = false")
+	}
+	if runner.request == nil || runner.request.HookCommand != "printf hi" || runner.request.TimeoutMS != 5000 {
+		t.Fatalf("request = %#v", runner.request)
+	}
+	if runner.request.ThreadID != "thread-1" || runner.request.ToolCallID == nil || *runner.request.ToolCallID != "call-1" {
+		t.Fatalf("originating execution metadata = thread %q, call %v", runner.request.ThreadID, runner.request.ToolCallID)
+	}
+	if !strings.Contains(output.Body, "Process exited with code 7") || !strings.Contains(output.Body, "out\n\nstderr:\nerr\n") {
+		t.Fatalf("Body = %q", output.Body)
+	}
+	if !regexp.MustCompile(`(?m)^Chunk ID: [0-9a-f]{6}$`).MatchString(output.Body) || !strings.Contains(output.Body, "Original token count:") {
+		t.Fatalf("Body metadata = %q", output.Body)
+	}
+	if output.Data["exit_code"] != 7 || output.Data["hook_response"] != "out\n\nstderr:\nerr\n" {
+		t.Fatalf("Data = %#v", output.Data)
+	}
+	chunkID, _ := output.Data["chunk_id"].(string)
+	if !regexp.MustCompile(`^[0-9a-f]{6}$`).MatchString(chunkID) || output.Data["wall_time_seconds"] != 1.5 || output.Data["original_token_count"] == nil || output.Data["output"] != "out\n\nstderr:\nerr\n" {
+		t.Fatalf("metadata Data = %#v", output.Data)
+	}
+}
+
+// Mirrors Rust #42716 propagation: the host-resolved CODEX_HOME symlink
+// opt-out travels from turn validation options to the shell request.
+func TestShellExecutorCarriesAllowedSymlinkedCodexHomeLikeRust(t *testing.T) {
+	runner := &fakeShellRunner{result: &ShellResult{ExitCode: 0}}
+	allowed := t.TempDir()
+	executor := NewShellExecutor(&ShellExecutorOptions{
+		Runner: runner,
+		Shell:  &Shell{Type: ShellBash, Path: "/bin/sh"},
+		Validation: ShellValidationOptions{
+			CWD:                       t.TempDir(),
+			AllowedSymlinkedCodexHome: allowed,
+			PathConvention:            utils.ConventionPosix,
+		},
+	})
+	if _, err := executor.Execute(context.Background(), &Invocation{
+		ToolName: PlainName(DefaultExecCommandToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"cmd":"true"}`},
+	}); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if runner.request == nil || runner.request.AllowedSymlinkedCodexHome != allowed {
+		t.Fatalf("request allowed home = %#v, want %q", runner.request, allowed)
+	}
+	if runner.request.PathConvention != utils.ConventionPosix {
+		t.Fatalf("request path convention = %q, want posix", runner.request.PathConvention)
+	}
+}
+
+func TestShellExecutorMarksTruncatedOutput(t *testing.T) {
+	runner := &fakeShellRunner{result: &ShellResult{
+		ExitCode: 0,
+		Stdout:   strings.Repeat("stdout line\n", 20),
+		Stderr:   strings.Repeat("stderr line\n", 20),
+		Duration: time.Second,
+	}}
+	executor := NewShellExecutor(&ShellExecutorOptions{
+		Runner: runner,
+		Shell:  &Shell{Type: ShellBash, Path: "/bin/sh"},
+		Validation: ShellValidationOptions{
+			ApprovalPolicy:   sandbox.ApprovalOnRequest,
+			CWD:              t.TempDir(),
+			DefaultTimeoutMS: 5000,
+		},
+	})
+
+	output, err := executor.Execute(context.Background(), &Invocation{
+		CallID:   "call-truncate",
+		ToolName: PlainName(DefaultExecCommandToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"cmd":"printf hi","max_output_tokens":5}`},
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if output.Data["hook_response_truncated"] != true {
+		t.Fatalf("Data = %#v", output.Data)
+	}
+	if !strings.Contains(output.Body, "Warning: truncated output") {
+		t.Fatalf("Body = %q", output.Body)
+	}
+}
+
+func TestShellExecutorClampsModelMaxOutputTokensToPolicyLikeRust(t *testing.T) {
+	policy := 50
+	for _, tc := range []struct {
+		name      string
+		requested *int
+		want      int
+	}{
+		{name: "uses policy when omitted", want: 50},
+		{name: "keeps smaller request", requested: intPtr(5), want: 5},
+		{name: "clamps larger request", requested: intPtr(70_000), want: 50},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &fakeShellRunner{result: &ShellResult{Stdout: strings.Repeat("line\n", 100)}}
+			executor := NewShellExecutor(&ShellExecutorOptions{
+				Runner:          runner,
+				Shell:           &Shell{Type: ShellBash, Path: "/bin/sh"},
+				MaxOutputTokens: &policy,
+				Validation: ShellValidationOptions{
+					ApprovalPolicy: sandbox.ApprovalOnRequest,
+					CWD:            t.TempDir(),
+				},
+			})
+			arguments := map[string]any{"cmd": "printf hi"}
+			if tc.requested != nil {
+				arguments["max_output_tokens"] = *tc.requested
+			}
+			encoded, err := json.Marshal(arguments)
+			if err != nil {
+				t.Fatalf("Marshal() error = %v", err)
+			}
+			output, err := executor.Execute(context.Background(), &Invocation{
+				ToolName: PlainName(DefaultExecCommandToolName),
+				Payload:  Payload{Kind: PayloadFunction, Arguments: string(encoded)},
+			})
+			if err != nil {
+				t.Fatalf("Execute() error = %v", err)
+			}
+			if runner.request == nil || runner.request.MaxOutputTokens == nil || *runner.request.MaxOutputTokens != tc.want {
+				t.Fatalf("request.MaxOutputTokens = %v, want %d", runner.request, tc.want)
+			}
+			if output == nil || output.Data["hook_response_truncated"] != true {
+				t.Fatalf("output = %#v, want truncated hook response", output)
+			}
+		})
+	}
+}
+
+func intPtr(value int) *int {
+	return &value
+}
+
+func TestShellResultHookResponseSeparatesStderr(t *testing.T) {
+	stdoutOnly := ShellResultHookResponse(&ShellResult{Stdout: "out\n"}, nil)
+	if stdoutOnly != "out\n" {
+		t.Fatalf("stdoutOnly = %q", stdoutOnly)
+	}
+	withStderr := ShellResultHookResponse(&ShellResult{Stdout: "out\n", Stderr: "err\n"}, nil)
+	if withStderr != "out\n\nstderr:\nerr\n" {
+		t.Fatalf("withStderr = %q", withStderr)
+	}
+}
+
+func TestShellExecutorSpecIncludesRuntimeFields(t *testing.T) {
+	spec := NewShellExecutor(&ShellExecutorOptions{}).Spec()
+	properties, ok := spec.InputSchema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties = %#v", spec.InputSchema["properties"])
+	}
+	for _, name := range []string{"cwd", "workdir", "env", "timeout_ms"} {
+		if _, ok := properties[name]; !ok {
+			t.Fatalf("property %q missing from schema %#v", name, properties)
+		}
+	}
+}
+
+func TestShellExecutorUnifiedExecTTYGateLikeRust(t *testing.T) {
+	manager := NewUnifiedExecManager()
+	defer manager.Close()
+
+	disabled := false
+	disabledSpec := NewShellExecutor(&ShellExecutorOptions{UnifiedExec: manager, AllowTTY: &disabled}).Spec()
+	properties, ok := disabledSpec.InputSchema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties = %#v", disabledSpec.InputSchema["properties"])
+	}
+	if properties["tty"] != nil {
+		t.Fatalf("tty should be omitted when unified_exec_tty is disabled: %#v", properties["tty"])
+	}
+
+	enabledSpec := NewShellExecutor(&ShellExecutorOptions{UnifiedExec: manager}).Spec()
+	enabledProperties, ok := enabledSpec.InputSchema["properties"].(map[string]any)
+	if !ok || enabledProperties["tty"] == nil {
+		t.Fatalf("tty should be present by default: %#v", enabledProperties)
+	}
+
+	disabledExecutor := NewShellExecutor(&ShellExecutorOptions{UnifiedExec: manager, AllowTTY: &disabled})
+	_, err := disabledExecutor.Execute(context.Background(), &Invocation{
+		CallID:   "tty-call",
+		ToolName: PlainName(DefaultExecCommandToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"cmd":"printf hi","tty":true}`},
+	})
+	if err == nil || err.Error() != "TTY execution is disabled by config; omit `tty` or set it to false." {
+		t.Fatalf("explicit TTY error = %v", err)
+	}
+}
+
+func TestUnifiedExecSpecsMatchRustSchemas(t *testing.T) {
+	manager := NewUnifiedExecManager()
+	defer manager.Close()
+	execSpec := NewShellExecutor(&ShellExecutorOptions{
+		UnifiedExec: manager,
+		UnifiedExecEnvironments: []UnifiedExecEnvironment{
+			{ID: "primary", CWD: "/primary", Shell: &Shell{Type: ShellBash, Path: "/bin/bash"}},
+			{ID: "remote", CWD: "/remote", Shell: &Shell{Type: ShellBash, Path: "/bin/bash"}, ExecServerURL: "ws://example.test"},
+		},
+		Validation: ShellValidationOptions{
+			AllowLoginShell:              true,
+			AdditionalPermissionsAllowed: true,
+		},
+	}).Spec()
+	properties, ok := execSpec.InputSchema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("exec properties = %#v", execSpec.InputSchema)
+	}
+	for _, name := range []string{"cmd", "workdir", "tty", "yield_time_ms", "max_output_tokens", "shell", "login", "environment_id", "sandbox_permissions", "additional_permissions", "justification", "prefix_rule"} {
+		if properties[name] == nil {
+			t.Fatalf("unified exec property %q missing from %#v", name, properties)
+		}
+	}
+	for _, name := range []string{"cwd", "env", "timeout_ms"} {
+		if properties[name] != nil {
+			t.Fatalf("Go-only unified exec property %q present in %#v", name, properties)
+		}
+	}
+	yieldDescription := properties["yield_time_ms"].(map[string]any)["description"].(string)
+	if runtime.GOOS == "windows" && !strings.Contains(yieldDescription, "10000-30000 ms") {
+		t.Fatalf("Windows yield description = %q", yieldDescription)
+	}
+	if execSpec.InputSchema["additionalProperties"] != false {
+		t.Fatalf("exec additionalProperties = %#v", execSpec.InputSchema["additionalProperties"])
+	}
+	if execSpec.OutputSchema["additionalProperties"] != false {
+		t.Fatalf("exec output schema = %#v", execSpec.OutputSchema)
+	}
+
+	writeSpec := NewWriteStdinExecutor(manager, nil).Spec()
+	writeProperties, ok := writeSpec.InputSchema["properties"].(map[string]any)
+	if !ok || writeProperties["session_id"].(map[string]any)["type"] != "number" {
+		t.Fatalf("write_stdin properties = %#v", writeSpec.InputSchema)
+	}
+	if writeSpec.InputSchema["additionalProperties"] != false || writeSpec.OutputSchema["additionalProperties"] != false {
+		t.Fatalf("write_stdin schemas = input:%#v output:%#v", writeSpec.InputSchema, writeSpec.OutputSchema)
+	}
+}
+
+func TestResolveRemoteUnifiedExecCWDUsesEnvironmentPathConventionLikeRust(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		base    string
+		workdir string
+		want    string
+	}{
+		{name: "posix relative", base: "/workspace/repo", workdir: "sub/../src", want: "/workspace/repo/src"},
+		{name: "posix spaces are significant", base: "/workspace/repo", workdir: " child ", want: "/workspace/repo/ child "},
+		{name: "posix absolute", base: "/workspace/repo", workdir: "/tmp/build", want: "/tmp/build"},
+		{name: "windows relative", base: `C:\workspace\repo`, workdir: `sub\..\src`, want: `C:\workspace\repo\src`},
+		{name: "windows absolute", base: `C:\workspace\repo`, workdir: `D:\build`, want: `D:\build`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveRemoteUnifiedExecCWD(tc.base, tc.workdir)
+			if err != nil || got != tc.want {
+				t.Fatalf("resolveRemoteUnifiedExecCWD() = %q, %v, want %q", got, err, tc.want)
+			}
+		})
+	}
+	if _, err := resolveRemoteUnifiedExecCWD("/workspace", `C:\build`); err == nil {
+		t.Fatal("cross-convention absolute workdir should fail")
+	}
+}
+
+func TestResolveUnifiedExecEnvironmentMatchesRustWithoutTrimmingID(t *testing.T) {
+	executor := NewShellExecutor(&ShellExecutorOptions{UnifiedExecEnvironments: []UnifiedExecEnvironment{
+		{ID: "primary"},
+		{ID: "remote"},
+	}})
+	environment, err := executor.resolveUnifiedExecEnvironment("remote")
+	if err != nil || environment == nil || environment.ID != "remote" {
+		t.Fatalf("resolve exact id = %#v, %v", environment, err)
+	}
+	if _, err := executor.resolveUnifiedExecEnvironment(" remote "); err == nil || err.Error() != "unknown turn environment id ` remote `" {
+		t.Fatalf("resolve whitespace-padded id error = %v", err)
+	}
+}
+
+func TestShellExecutorResolvesManagedNetworkForSelectedEnvironmentLikeRust(t *testing.T) {
+	runner := &fakeShellRunner{result: &ShellResult{ExitCode: 0}}
+	type resolvedEnvironment struct {
+		id     string
+		remote bool
+	}
+	var resolved []resolvedEnvironment
+	cwd := t.TempDir()
+	executor := NewShellExecutor(&ShellExecutorOptions{
+		Runner: runner,
+		Shell:  &Shell{Type: ShellBash, Path: "/bin/sh"},
+		Validation: ShellValidationOptions{
+			ApprovalPolicy: sandbox.ApprovalOnRequest,
+			CWD:            cwd,
+		},
+		UnifiedExecEnvironments: []UnifiedExecEnvironment{{ID: "primary", CWD: cwd}, {ID: "remote", CWD: cwd, ExecServerURL: "ws://remote.invalid"}},
+		ManagedNetworkResolver: func(environmentID string, remote bool) (*ManagedNetworkResolution, error) {
+			resolved = append(resolved, resolvedEnvironment{id: environmentID, remote: remote})
+			if remote {
+				timeoutMS := uint64(30_000)
+				return &ManagedNetworkResolution{
+					RemoteNetworkProxy: &execserver.RemoteNetworkProxyLaunchConfig{
+						Proxy:                   execserver.RemoteNetworkProxyConfig{Enabled: true, Mode: string(network.ProxyModeFull)},
+						EnvironmentID:           &environmentID,
+						PolicyDecisionTimeoutMS: &timeoutMS,
+					},
+					NetworkPolicyDecisionTimeout: 30 * time.Second,
+				}, nil
+			}
+			port := uint16(41000 + len(resolved))
+			return &ManagedNetworkResolution{
+				Env:            map[string]string{"HTTP_PROXY": "http://127.0.0.1:" + fmt.Sprint(port)},
+				ManagedNetwork: &network.ProxyManagedNetworkSandboxContext{LoopbackPorts: []uint16{port}},
+			}, nil
+		},
+	})
+	for index, arguments := range []string{`{"cmd":"echo primary"}`, `{"cmd":"echo remote","environment_id":"remote"}`} {
+		if _, err := executor.Execute(context.Background(), &Invocation{CallID: "call-network", ToolName: PlainName(DefaultExecCommandToolName), Payload: Payload{Kind: PayloadFunction, Arguments: arguments}}); err != nil {
+			t.Fatal(err)
+		}
+		if runner.request == nil || !runner.request.EnforceManagedNetwork {
+			t.Fatalf("managed network request = %#v", runner.request)
+		}
+		if index == 0 {
+			if runner.request.ManagedNetwork == nil || len(runner.request.ManagedNetwork.LoopbackPorts) != 1 || runner.request.RemoteNetworkProxy != nil {
+				t.Fatalf("local managed network request = %#v", runner.request)
+			}
+			port := runner.request.ManagedNetwork.LoopbackPorts[0]
+			if runner.request.Env["HTTP_PROXY"] != "http://127.0.0.1:"+fmt.Sprint(port) {
+				t.Fatalf("local managed network env/context mismatch: %#v", runner.request)
+			}
+		} else if runner.request.RemoteNetworkProxy == nil || runner.request.ManagedNetwork != nil || runner.request.Env["HTTP_PROXY"] != "" || runner.request.RemoteNetworkProxy.EnvironmentID == nil || *runner.request.RemoteNetworkProxy.EnvironmentID != "remote" || runner.request.RemoteNetworkProxy.ExecutionID == nil || *runner.request.RemoteNetworkProxy.ExecutionID != "call-network" {
+			t.Fatalf("remote managed network launch request = %#v", runner.request)
+		}
+	}
+	if len(resolved) != 2 || resolved[0] != (resolvedEnvironment{id: "primary"}) || resolved[1] != (resolvedEnvironment{id: "remote", remote: true}) {
+		t.Fatalf("resolved environment ids = %#v", resolved)
+	}
+}
+
+// TestShellExecutorEscalationBypassesManagedNetworkLikeRust covers Rust #46499
+// (tools/runtimes/unified_exec.rs): an explicit full escalation attaches no
+// controller- or attachment-owned network proxy, while denied-read restrictions
+// preserve the sandbox and keep the proxy attached.
+func TestShellExecutorEscalationBypassesManagedNetworkLikeRust(t *testing.T) {
+	managedNetwork := func() *ManagedNetworkResolution {
+		return &ManagedNetworkResolution{
+			Env:            map[string]string{"HTTP_PROXY": "http://127.0.0.1:41234"},
+			ManagedNetwork: &network.ProxyManagedNetworkSandboxContext{LoopbackPorts: []uint16{41234}},
+		}
+	}
+	run := func(t *testing.T, profile *sandbox.PermissionProfile, arguments string) *ShellRequest {
+		t.Helper()
+		runner := &fakeShellRunner{result: &ShellResult{ExitCode: 0}}
+		executor := NewShellExecutor(&ShellExecutorOptions{
+			Runner: runner,
+			Shell:  &Shell{Type: ShellBash, Path: "/bin/sh"},
+			Validation: ShellValidationOptions{
+				ApprovalPolicy:         sandbox.ApprovalOnRequest,
+				CWD:                    t.TempDir(),
+				PermissionsPreapproved: true,
+				PermissionProfile:      profile,
+			},
+			ManagedNetworkResolver: func(environmentID string, remote bool) (*ManagedNetworkResolution, error) {
+				return managedNetwork(), nil
+			},
+		})
+		if _, err := executor.Execute(context.Background(), &Invocation{CallID: "call-escalation", ToolName: PlainName(DefaultExecCommandToolName), Payload: Payload{Kind: PayloadFunction, Arguments: arguments}}); err != nil {
+			t.Fatalf("Execute(%s) error = %v", arguments, err)
+		}
+		if runner.request == nil {
+			t.Fatalf("Execute(%s) produced no request", arguments)
+		}
+		return runner.request
+	}
+
+	escalated := run(t, nil, `{"cmd":"echo escalated","sandbox_permissions":"require_escalated","justification":"needs full access"}`)
+	if escalated.SandboxPermissions != sandbox.SandboxPermissionsRequireEscalated {
+		t.Fatalf("escalated sandbox permissions = %q", escalated.SandboxPermissions)
+	}
+	if escalated.ManagedNetwork != nil || escalated.RemoteNetworkProxy != nil || escalated.Env["HTTP_PROXY"] != "" || escalated.EnforceManagedNetwork {
+		t.Fatalf("escalated launch kept the managed network: %#v", escalated)
+	}
+
+	// A downgraded escalation keeps the sandbox so denied reads stay enforced,
+	// and therefore keeps the proxy (Rust's ESCALATED_DENY_READ regression guard).
+	restricted := sandbox.WorkspaceWritePermissionProfile()
+	restricted.DeniedReadEntries = []sandbox.FileSystemSandboxEntry{{
+		Path:   sandbox.FileSystemPath{Type: "path", Path: t.TempDir()},
+		Access: sandbox.FileSystemAccessDeny,
+	}}
+	deniedRead := run(t, &restricted, `{"cmd":"echo escalated","sandbox_permissions":"require_escalated","justification":"needs full access"}`)
+	if deniedRead.SandboxPermissions != sandbox.SandboxPermissionsUseDefault {
+		t.Fatalf("denied-read sandbox permissions = %q, want use_default", deniedRead.SandboxPermissions)
+	}
+	if !deniedRead.EnforceManagedNetwork || deniedRead.ManagedNetwork == nil || deniedRead.Env["HTTP_PROXY"] == "" {
+		t.Fatalf("denied-read launch dropped the managed network: %#v", deniedRead)
+	}
+}
+
+func TestShellExecutorUsesUnifiedExecForExplicitlyDisabledSandboxLikeRust(t *testing.T) {
+	executor := NewShellExecutor(&ShellExecutorOptions{UnifiedExec: NewUnifiedExecManager()})
+	defer executor.unifiedExec.Close()
+
+	if !executor.shouldUseUnifiedExec(&ShellRequest{}) {
+		t.Fatal("nil permission profile should use unified exec")
+	}
+	if !executor.shouldUseUnifiedExec(&ShellRequest{PermissionProfile: &sandbox.PermissionProfile{Disabled: true}}) {
+		t.Fatal("explicitly disabled sandbox should use unified exec")
+	}
+	provider := execserver.NoiseRendezvousConnectProviderFunc(func(context.Context, execserver.RemotePublicKey) (*execserver.NoiseRendezvousConnectBundle, error) {
+		return nil, errors.New("not called")
+	})
+	if !executor.shouldUseUnifiedExec(&ShellRequest{UnifiedExecNoiseProvider: provider}) {
+		t.Fatal("Noise rendezvous environment should use unified exec without a websocket URL")
+	}
+	usesSandboxedUnifiedExec := executor.shouldUseUnifiedExec(&ShellRequest{PermissionProfile: &sandbox.PermissionProfile{}})
+	if usesSandboxedUnifiedExec != (runtime.GOOS == "linux" || runtime.GOOS == "windows") {
+		t.Fatalf("active sandbox unified exec = %t on %s", usesSandboxedUnifiedExec, runtime.GOOS)
+	}
+	profileWithDeniedRead := sandbox.ReadOnlyPermissionProfile()
+	profileWithDeniedRead.DeniedReadEntries = []sandbox.FileSystemSandboxEntry{{}}
+	usesDeniedReadUnifiedExec := executor.shouldUseUnifiedExec(&ShellRequest{PermissionProfile: &profileWithDeniedRead})
+	if usesDeniedReadUnifiedExec != (runtime.GOOS == "linux" || runtime.GOOS == "windows") {
+		t.Fatalf("deny-read sandbox unified exec = %t on %s", usesDeniedReadUnifiedExec, runtime.GOOS)
+	}
+}
+
+func TestShellExecutorReturnsApprovalRequestInsteadOfRunning(t *testing.T) {
+	runner := &fakeShellRunner{}
+	profile := sandbox.WorkspaceWritePermissionProfile()
+	executor := NewShellExecutor(&ShellExecutorOptions{
+		Runner: runner,
+		Shell:  &Shell{Type: ShellBash, Path: "/bin/sh"},
+		Validation: ShellValidationOptions{
+			AdditionalPermissionsAllowed: true,
+			ApprovalPolicy:               sandbox.ApprovalOnRequest,
+			CWD:                          t.TempDir(),
+			PermissionProfile:            &profile,
+		},
+	})
+
+	output, err := executor.Execute(context.Background(), &Invocation{
+		CallID:   "call-approval",
+		ToolName: PlainName(DefaultExecCommandToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"cmd":"go test ./...","sandbox_permissions":"require_escalated","justification":"needs network","prefix_rule":["go","test"]}`},
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if output.Success {
+		t.Fatalf("Success = true")
+	}
+	if runner.request != nil {
+		t.Fatalf("runner should not be called: %#v", runner.request)
+	}
+	if output.Data["approval_required"] != true || output.Data["sandbox_permissions"] != sandbox.SandboxPermissionsRequireEscalated {
+		t.Fatalf("Data = %#v", output.Data)
+	}
+	retryContext, ok := output.Data["retry_context"].(map[string]any)
+	if !ok || retryContext["permissions_preapproved"] != true {
+		t.Fatalf("retry_context = %#v", output.Data["retry_context"])
+	}
+	if _, ok := output.Data["sandbox_profile"].(*ShellSandboxProfile); !ok {
+		t.Fatalf("sandbox_profile = %#v", output.Data["sandbox_profile"])
+	}
+	if !strings.Contains(output.Body, "needs network") {
+		t.Fatalf("Body = %q", output.Body)
+	}
+}
+
+func TestShellExecutorApprovalCallbackApprovesAndRuns(t *testing.T) {
+	runner := &fakeShellRunner{result: &ShellResult{ExitCode: 0, Stdout: "approved\n"}}
+	var approvalRequest *ShellApprovalRequest
+	executor := NewShellExecutor(&ShellExecutorOptions{
+		Runner: runner,
+		Shell:  &Shell{Type: ShellBash, Path: "/bin/sh"},
+		Validation: ShellValidationOptions{
+			AdditionalPermissionsAllowed: true,
+			ApprovalPolicy:               sandbox.ApprovalOnRequest,
+			CWD:                          t.TempDir(),
+		},
+		Approval: func(ctx context.Context, request *ShellApprovalRequest) (ShellApprovalDecision, error) {
+			_ = ctx
+			approvalRequest = request
+			return ShellApprovalDecision{Approved: true, AllowSession: true}, nil
+		},
+	})
+
+	output, err := executor.Execute(context.Background(), &Invocation{
+		CallID:   "call-callback-approved",
+		ToolName: PlainName(DefaultExecCommandToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"cmd":"echo approved","sandbox_permissions":"require_escalated"}`},
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if approvalRequest == nil || approvalRequest.Request == nil || !approvalRequest.Request.ApprovalRequired {
+		t.Fatalf("approvalRequest = %#v", approvalRequest)
+	}
+	if !output.Success || !strings.Contains(output.Body, "approved") {
+		t.Fatalf("output = %#v", output)
+	}
+	if runner.request == nil || runner.request.ApprovalRequired || runner.request.PermissionProfileID != sandbox.BuiltInPermissionProfileDangerFullAccess {
+		t.Fatalf("runner request = %#v", runner.request)
+	}
+}
+
+func TestShellExecutorApprovalCallbackDeniesWithoutRunning(t *testing.T) {
+	runner := &fakeShellRunner{}
+	executor := NewShellExecutor(&ShellExecutorOptions{
+		Runner: runner,
+		Shell:  &Shell{Type: ShellBash, Path: "/bin/sh"},
+		Validation: ShellValidationOptions{
+			AdditionalPermissionsAllowed: true,
+			ApprovalPolicy:               sandbox.ApprovalOnRequest,
+			CWD:                          t.TempDir(),
+		},
+		Approval: func(ctx context.Context, request *ShellApprovalRequest) (ShellApprovalDecision, error) {
+			_ = ctx
+			_ = request
+			return ShellApprovalDecision{}, nil
+		},
+	})
+
+	output, err := executor.Execute(context.Background(), &Invocation{
+		CallID:   "call-callback-denied",
+		ToolName: PlainName(DefaultExecCommandToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"cmd":"echo denied","sandbox_permissions":"require_escalated"}`},
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if output.Success || output.Data["approval_decision"] != "deny" {
+		t.Fatalf("output = %#v", output)
+	}
+	if runner.request != nil {
+		t.Fatalf("runner should not be called: %#v", runner.request)
+	}
+}
+
+func TestShellExecutorRunsApprovedRetryFromInvocationContext(t *testing.T) {
+	runner := &fakeShellRunner{result: &ShellResult{ExitCode: 0, Stdout: "approved\n"}}
+	executor := NewShellExecutor(&ShellExecutorOptions{
+		Runner: runner,
+		Shell:  &Shell{Type: ShellBash, Path: "/bin/sh"},
+		Validation: ShellValidationOptions{
+			AdditionalPermissionsAllowed: true,
+			ApprovalPolicy:               sandbox.ApprovalOnRequest,
+			CWD:                          t.TempDir(),
+		},
+	})
+
+	output, err := executor.Execute(context.Background(), &Invocation{
+		CallID:   "call-approved-retry",
+		ToolName: PlainName(DefaultExecCommandToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"cmd":"echo approved","sandbox_permissions":"require_escalated"}`},
+		Context:  map[string]any{"retry_context": map[string]any{"permissions_preapproved": true}},
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !output.Success || runner.request == nil {
+		t.Fatalf("output=%#v request=%#v", output, runner.request)
+	}
+	if runner.request.ApprovalRequired {
+		t.Fatalf("ApprovalRequired = true")
+	}
+}
+
+func TestShellExecutorRunsPreapprovedSandboxOverride(t *testing.T) {
+	runner := &fakeShellRunner{result: &ShellResult{ExitCode: 0, Stdout: "ok\n"}}
+	executor := NewShellExecutor(&ShellExecutorOptions{
+		Runner: runner,
+		Shell:  &Shell{Type: ShellBash, Path: "/bin/sh"},
+		Validation: ShellValidationOptions{
+			AdditionalPermissionsAllowed: true,
+			ApprovalPolicy:               sandbox.ApprovalOnRequest,
+			PermissionsPreapproved:       true,
+			CWD:                          t.TempDir(),
+		},
+	})
+
+	output, err := executor.Execute(context.Background(), &Invocation{
+		CallID:   "call-preapproved",
+		ToolName: PlainName(DefaultExecCommandToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"cmd":"echo ok","sandbox_permissions":"require_escalated"}`},
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !output.Success || runner.request == nil {
+		t.Fatalf("output=%#v request=%#v", output, runner.request)
+	}
+	if runner.request.ApprovalRequired {
+		t.Fatalf("ApprovalRequired = true")
+	}
+}
+
+func TestShellExecutorPrePostHookPayload(t *testing.T) {
+	executor := NewShellExecutor(&ShellExecutorOptions{
+		Validation: ShellValidationOptions{CWD: t.TempDir(), ApprovalPolicy: sandbox.ApprovalOnRequest},
+	})
+	invocation := &Invocation{
+		CallID:   "call-2",
+		ToolName: PlainName(DefaultExecCommandToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"cmd":"echo before","cwd":"src","env":{"A":"B"},"timeout_ms":77}`},
+	}
+
+	pre, ok := executor.PreToolUsePayload(invocation)
+	if !ok {
+		t.Fatal("PreToolUsePayload() ok = false")
+	}
+	if pre.ToolName == nil || pre.ToolName.Name != "Bash" {
+		t.Fatalf("pre.ToolName = %#v", pre.ToolName)
+	}
+	if input, ok := pre.ToolInput.(map[string]any); !ok || input["command"] != "echo before" || input["cwd"] != "src" || input["timeout_ms"] != uint64(77) {
+		t.Fatalf("pre.ToolInput = %#v", pre.ToolInput)
+	} else if env, ok := input["env"].(map[string]string); !ok || env["A"] != "B" {
+		t.Fatalf("pre.ToolInput env = %#v", input["env"])
+	}
+
+	post, ok := executor.PostToolUsePayload(invocation, &Output{
+		CallID: "event-call",
+		Body:   "model body",
+		Data:   map[string]any{"hook_response": "hook output"},
+	})
+	if !ok {
+		t.Fatal("PostToolUsePayload() ok = false")
+	}
+	if post.ToolName == nil || post.ToolName.Name != "Bash" || post.ToolUseID != "event-call" {
+		t.Fatalf("post = %#v", post)
+	}
+	if input, ok := post.ToolInput.(map[string]any); !ok || input["command"] != "echo before" || input["cwd"] != "src" {
+		t.Fatalf("post.ToolInput = %#v", post.ToolInput)
+	}
+	if post.ToolResponse != "hook output" {
+		t.Fatalf("ToolResponse = %#v", post.ToolResponse)
+	}
+}
+
+func TestShellExecutorUpdatedHookInputRewritesCmd(t *testing.T) {
+	executor := NewShellExecutor(&ShellExecutorOptions{})
+	updated, err := executor.WithUpdatedHookInput(&Invocation{
+		ToolName: PlainName(DefaultExecCommandToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"cmd":"echo old","yield_time_ms":10}`},
+	}, map[string]any{"command": "echo new"})
+	if err != nil {
+		t.Fatalf("WithUpdatedHookInput() error = %v", err)
+	}
+	var args ExecCommandArgs
+	if err := json.Unmarshal([]byte(updated.Payload.Arguments), &args); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if args.Cmd != "echo new" || args.YieldTimeMS != 10 {
+		t.Fatalf("args = %#v", args)
+	}
+
+	_, err = executor.WithUpdatedHookInput(&Invocation{
+		Payload: Payload{Kind: PayloadFunction, Arguments: `{}`},
+	}, map[string]any{"cmd": "wrong"})
+	if err == nil || !strings.Contains(err.Error(), "string field `command`") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestRegisterShellHandler(t *testing.T) {
+	registry := NewRegistry()
+	if err := RegisterShellHandler(registry, &ShellExecutorOptions{
+		Runner: &fakeShellRunner{},
+		Validation: ShellValidationOptions{
+			CWD:            t.TempDir(),
+			ApprovalPolicy: sandbox.ApprovalOnRequest,
+		},
+	}); err != nil {
+		t.Fatalf("RegisterShellHandler() error = %v", err)
+	}
+	if _, ok := registry.Lookup(PlainName(DefaultExecCommandToolName)); !ok {
+		t.Fatal("exec_command handler not registered")
+	}
+}
+
+func TestShellCommandSpecAndArgumentsMatchRustLegacyContract(t *testing.T) {
+	runner := &fakeShellRunner{result: &ShellResult{Stdout: "legacy ok\n", ExitCode: 0, HasExitCode: true}}
+	executor := NewShellExecutor(&ShellExecutorOptions{
+		Runner:     runner,
+		ToolName:   PlainName(DefaultShellCommandToolName),
+		Validation: ShellValidationOptions{CWD: t.TempDir(), ApprovalPolicy: sandbox.ApprovalNever},
+	})
+	spec := executor.Spec()
+	required, _ := spec.InputSchema["required"].([]string)
+	properties, _ := spec.InputSchema["properties"].(map[string]any)
+	if spec.Name.Key() != DefaultShellCommandToolName || len(required) != 1 || required[0] != "command" {
+		t.Fatalf("shell_command spec = %#v", spec)
+	}
+	if _, ok := properties["command"]; !ok {
+		t.Fatalf("shell_command properties = %#v", properties)
+	}
+	if _, ok := properties["cmd"]; ok {
+		t.Fatalf("shell_command exposes exec_command cmd field: %#v", properties)
+	}
+	if runtime.GOOS == "windows" && (!strings.Contains(spec.Description, "Get-ChildItem -Force") || !strings.Contains(spec.Description, "Start-Process")) {
+		t.Fatalf("shell_command Windows guidance = %q", spec.Description)
+	}
+	output, err := executor.Execute(context.Background(), &Invocation{
+		CallID:   "legacy-shell",
+		ToolName: PlainName(DefaultShellCommandToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"command":"Write-Output legacy","timeout_ms":1234}`},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output == nil || runner.request == nil || runner.request.HookCommand != "Write-Output legacy" || runner.request.TimeoutMS != 1234 {
+		t.Fatalf("output = %#v, request = %#v", output, runner.request)
+	}
+}
+
+func TestUnifiedExecSpecWindowsGuidanceFollowsExecutorPlatformLikeRust(t *testing.T) {
+	exec := func(platformOS string) *ShellExecutor {
+		return NewShellExecutor(&ShellExecutorOptions{
+			ToolName:                PlainName(DefaultExecCommandToolName),
+			UnifiedExec:             NewUnifiedExecManager(),
+			UnifiedExecEnvironments: []UnifiedExecEnvironment{{ID: "env", PlatformOS: platformOS}},
+		})
+	}
+	// A Windows executor includes Windows safety guidance.
+	if spec := exec("windows").Spec(); !strings.Contains(spec.Description, "Windows safety rules:") {
+		t.Fatalf("windows executor guidance = %q", spec.Description)
+	}
+	// A non-Windows executor omits it.
+	if spec := exec("linux").Spec(); strings.Contains(spec.Description, "Windows safety rules:") {
+		t.Fatalf("linux executor guidance = %q", spec.Description)
+	}
+	// An unknown platform falls back to the host-derived guidance.
+	unknown := NewShellExecutor(&ShellExecutorOptions{
+		ToolName:    PlainName(DefaultExecCommandToolName),
+		UnifiedExec: NewUnifiedExecManager(),
+	}).Spec()
+	if got := strings.Contains(unknown.Description, "Windows safety rules:"); got != (runtime.GOOS == "windows") {
+		t.Fatalf("unknown platform guidance = %q, want host-derived", unknown.Description)
+	}
+}
+
+func TestExecCommandArgsDecodeSnakeCasePermissions(t *testing.T) {
+	var args ExecCommandArgs
+	err := json.Unmarshal([]byte(`{
+		"cmd": "echo hi",
+		"yield_time_ms": 12,
+		"max_output_tokens": 34,
+		"sandbox_permissions": "with_additional_permissions",
+		"additional_permissions": {
+			"network": {"enabled": true},
+			"file_system": {"write": ["src"]}
+		},
+		"cwd": "src",
+		"env": {"A": "B"},
+		"timeout_ms": 56,
+		"prefix_rule": ["go", "list"]
+	}`), &args)
+	if err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if args.YieldTimeMS != 12 || args.MaxOutputTokens == nil || *args.MaxOutputTokens != 34 {
+		t.Fatalf("args = %#v", args)
+	}
+	if args.SandboxPermissions != sandbox.SandboxPermissionsWithAdditionalPermissions {
+		t.Fatalf("SandboxPermissions = %q", args.SandboxPermissions)
+	}
+	if args.AdditionalPermissions == nil || args.AdditionalPermissions.Network == nil || !*args.AdditionalPermissions.Network {
+		t.Fatalf("AdditionalPermissions = %#v", args.AdditionalPermissions)
+	}
+	if len(args.AdditionalPermissions.FileSystem) != 1 || args.AdditionalPermissions.FileSystem[0] != "src" {
+		t.Fatalf("FileSystem = %#v", args.AdditionalPermissions.FileSystem)
+	}
+	if args.CWD != "src" || args.Env["A"] != "B" || args.TimeoutMS != 56 {
+		t.Fatalf("runtime args = %#v", args)
+	}
+	if len(args.PrefixRule) != 2 || args.PrefixRule[0] != "go" {
+		t.Fatalf("PrefixRule = %#v", args.PrefixRule)
+	}
+}
+
+type fakeShellRunner struct {
+	request *ShellRequest
+	result  *ShellResult
+	err     error
+}
+
+func TestUnifiedExecSpecWarnsAboutPOSIXHeredocForSelectedPowerShellEnvironment(t *testing.T) {
+	executor := NewShellExecutor(&ShellExecutorOptions{
+		UnifiedExec: NewUnifiedExecManager(),
+		Shell:       &Shell{Type: ShellZsh, Path: "/bin/zsh"},
+		UnifiedExecEnvironments: []UnifiedExecEnvironment{{
+			ID:    "windows-vscode",
+			Shell: &Shell{Type: ShellPowerShell, Path: "powershell.exe"},
+		}},
+	})
+	description := executor.Spec().Description
+	if !strings.Contains(description, "uses PowerShell") || !strings.Contains(description, "python - <<'PY'") {
+		t.Fatalf("PowerShell exec description = %q", description)
+	}
+}
+
+func TestShellExecutorHonorsPerEnvironmentConfigLikeRust(t *testing.T) {
+	allowLoginShell := false
+	readOnly := sandbox.ReadOnlyPermissionProfile()
+	runner := &fakeShellRunner{result: &ShellResult{ExitCode: 0}}
+	cwd := t.TempDir()
+	executor := NewShellExecutor(&ShellExecutorOptions{
+		Runner: runner,
+		Shell:  &Shell{Type: ShellBash, Path: "/bin/sh"},
+		Validation: ShellValidationOptions{
+			ApprovalPolicy:   sandbox.ApprovalOnRequest,
+			CWD:              cwd,
+			AllowLoginShell:  true,
+			DefaultTimeoutMS: 5000,
+		},
+		UnifiedExecEnvironments: []UnifiedExecEnvironment{
+			{ID: "primary", CWD: cwd},
+			{ID: "read-only", CWD: cwd, AllowLoginShell: &allowLoginShell, PermissionProfile: &readOnly, PermissionProfileID: "read-only"},
+		},
+	})
+
+	// The turn-level policy allows login shells, but the attachment's resolved
+	// configuration disables them for that environment (#38673).
+	output, err := executor.Execute(context.Background(), &Invocation{
+		CallID:   "call-login-disabled",
+		ToolName: PlainName(DefaultExecCommandToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"cmd":"echo hi","environment_id":"read-only","login":true}`},
+	})
+	if err == nil {
+		t.Fatalf("login=true on login-disabled environment unexpectedly succeeded: %#v", output)
+	}
+	if !strings.Contains(err.Error(), "login shell is disabled") {
+		t.Fatalf("error = %v", err)
+	}
+
+	// Executing in the primary (thread-inherited) environment still permits login.
+	output, err = executor.Execute(context.Background(), &Invocation{
+		CallID:   "call-login-enabled",
+		ToolName: PlainName(DefaultExecCommandToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"cmd":"echo hi","environment_id":"primary","login":true}`},
+	})
+	if err != nil {
+		t.Fatalf("Execute(primary) error = %v", err)
+	}
+	if !output.Success {
+		t.Fatalf("login=true on primary environment failed: %#v", output)
+	}
+	if runner.request == nil || runner.request.UnifiedExecEnvironmentID != "primary" {
+		t.Fatalf("request environment = %#v", runner.request)
+	}
+
+	// The attachment's resolved permission profile is installed on the request.
+	_, err = executor.Execute(context.Background(), &Invocation{
+		CallID:   "call-read-only",
+		ToolName: PlainName(DefaultExecCommandToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"cmd":"echo hi","environment_id":"read-only"}`},
+	})
+	if err != nil {
+		t.Fatalf("Execute(read-only) error = %v", err)
+	}
+	if runner.request == nil || runner.request.UnifiedExecEnvironmentID != "read-only" {
+		t.Fatalf("request environment = %#v", runner.request)
+	}
+	if runner.request.PermissionProfile == nil || runner.request.PermissionProfileID != "read-only" {
+		t.Fatalf("request permission profile = %#v id=%q", runner.request.PermissionProfile, runner.request.PermissionProfileID)
+	}
+}
+
+func TestShellExecutorAppliesGrantedTurnPermissionsLikeRust(t *testing.T) {
+	runner := &fakeShellRunner{result: &ShellResult{ExitCode: 0}}
+	cwd := t.TempDir()
+	grantedPath := filepath.Join(cwd, "granted")
+	executor := NewShellExecutor(&ShellExecutorOptions{
+		Runner: runner,
+		Shell:  &Shell{Type: ShellBash, Path: "/bin/sh"},
+		Validation: ShellValidationOptions{
+			ApprovalPolicy:   sandbox.ApprovalOnRequest,
+			CWD:              cwd,
+			DefaultTimeoutMS: 5000,
+		},
+		UnifiedExecEnvironments: []UnifiedExecEnvironment{{ID: "primary", CWD: cwd}},
+		UnifiedExecTurnID:       "turn-grant",
+		GrantedPermissions: func(turnID, environmentID string) *sandbox.AdditionalPermissionProfile {
+			if turnID != "turn-grant" || environmentID != "primary" {
+				t.Fatalf("grant lookup = %q/%q", turnID, environmentID)
+			}
+			return &sandbox.AdditionalPermissionProfile{FileSystem: []string{grantedPath}}
+		},
+	})
+	output, err := executor.Execute(context.Background(), &Invocation{
+		CallID:   "call-grant",
+		ToolName: PlainName(DefaultExecCommandToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"cmd":"echo hi","environment_id":"primary"}`},
+		Context:  map[string]any{"thread_id": "thread-grant", "turn_id": "turn-grant"},
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !output.Success {
+		t.Fatalf("output = %#v", output)
+	}
+	if runner.request == nil || runner.request.SandboxPermissions != sandbox.SandboxPermissionsWithAdditionalPermissions ||
+		runner.request.AdditionalPermissions == nil ||
+		!slices.Contains(runner.request.AdditionalPermissions.FileSystem, grantedPath) {
+		t.Fatalf("request permissions = %#v", runner.request)
+	}
+	escalated, err := executor.Execute(context.Background(), &Invocation{
+		CallID:   "call-escalated",
+		ToolName: PlainName(DefaultExecCommandToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"cmd":"echo hi","environment_id":"primary","sandbox_permissions":"require_escalated"}`},
+		Context:  map[string]any{"thread_id": "thread-grant", "turn_id": "turn-grant"},
+	})
+	if err != nil || escalated == nil || escalated.Success {
+		t.Fatalf("cached grant bypassed escalation approval: %#v, %v", escalated, err)
+	}
+}
+
+// TestShellExecutorSetsEnvPolicyFromThreadAndEnvironmentLikeRust is the
+// dynamic verification for #38902: the selected turn environment's shell
+// environment policy drives the inherited-variable filtering. The thread
+// (inferred) policy applies to environments without their own resolved
+// policy, and an environment's resolved policy wins over the thread policy.
+func TestShellExecutorSetsEnvPolicyFromThreadAndEnvironmentLikeRust(t *testing.T) {
+	cwd := t.TempDir()
+	runner := &fakeShellRunner{result: &ShellResult{ExitCode: 0, Stdout: "ok\n", Duration: time.Millisecond}}
+	executor := NewShellExecutor(&ShellExecutorOptions{
+		Runner: runner,
+		Shell:  &Shell{Type: ShellBash, Path: "/bin/sh"},
+		Validation: ShellValidationOptions{
+			ApprovalPolicy:   sandbox.ApprovalOnRequest,
+			CWD:              cwd,
+			DefaultTimeoutMS: 5000,
+		},
+		ShellEnvironmentPolicy: map[string]any{
+			"inherit": "core",
+			"set":     map[string]any{"CODEX_THREAD_POLICY": "yes"},
+		},
+		UnifiedExecEnvironments: []UnifiedExecEnvironment{
+			{ID: "primary", CWD: cwd},
+			{ID: "locked", CWD: cwd, ShellEnvironmentPolicy: map[string]any{
+				"inherit": "none",
+				"set":     map[string]any{"CODEX_ENV_POLICY": "locked"},
+			}},
+		},
+	})
+
+	// The thread-derived policy applies to the primary environment (it has no
+	// resolved policy; Rust inferred_environment_config).
+	output, err := executor.Execute(context.Background(), &Invocation{
+		CallID:   "call-primary",
+		ToolName: PlainName(DefaultExecCommandToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"cmd":"echo hi","environment_id":"primary"}`},
+	})
+	if err != nil || !output.Success {
+		t.Fatalf("Execute(primary) = %#v, %v", output, err)
+	}
+	if runner.request == nil || runner.request.EnvPolicy == nil {
+		t.Fatalf("primary request EnvPolicy = %#v", runner.request)
+	}
+	if runner.request.EnvPolicy.Inherit != "core" || runner.request.EnvPolicy.Set["CODEX_THREAD_POLICY"] != "yes" {
+		t.Fatalf("primary EnvPolicy = %#v, want thread-derived core+set", runner.request.EnvPolicy)
+	}
+
+	// The environment's resolved policy wins over the thread policy.
+	output, err = executor.Execute(context.Background(), &Invocation{
+		CallID:   "call-locked",
+		ToolName: PlainName(DefaultExecCommandToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"cmd":"echo hi","environment_id":"locked"}`},
+	})
+	if err != nil || !output.Success {
+		t.Fatalf("Execute(locked) = %#v, %v", output, err)
+	}
+	if runner.request == nil || runner.request.EnvPolicy == nil {
+		t.Fatalf("locked request EnvPolicy = %#v", runner.request)
+	}
+	if runner.request.EnvPolicy.Inherit != "none" || runner.request.EnvPolicy.Set["CODEX_ENV_POLICY"] != "locked" {
+		t.Fatalf("locked EnvPolicy = %#v, want environment-resolved none+set", runner.request.EnvPolicy)
+	}
+	if runner.request.EnvPolicy.Set["CODEX_THREAD_POLICY"] != "" {
+		t.Fatalf("thread policy leaked into environment policy: %#v", runner.request.EnvPolicy.Set)
+	}
+}
+
+// TestShellEnvPolicyDifferentialLikeRust pins Rust's unified_exec suite test
+// exec_command_uses_installed_environment_shell_policy_with_explicit_overrides
+// (#38902): the installed (ready) environment's resolved shell environment
+// policy wins over the thread-derived policy, and create_env with
+// inherit=none + include_only=[KEEP] + set={KEEP:preserved, DROP:filtered}
+// yields KEEP=preserved, DROP=missing, OWNER_ONLY=missing on a parent
+// environment that provides all three.
+func TestShellEnvPolicyDifferentialLikeRustExecCommandUsesInstalledPolicy(t *testing.T) {
+	envPolicy := map[string]any{
+		"inherit":      "none",
+		"include_only": []any{"KEEP"},
+		"set":          map[string]any{"KEEP": "preserved", "DROP": "filtered"},
+	}
+	parent := map[string]string{"KEEP": "parent", "DROP": "parent", "OWNER_ONLY": "owner"}
+
+	// The environment's resolved policy wins over the thread-derived policy
+	// (TurnEnvironment.shell_environment_policy -> EnvironmentConfig).
+	policy := execpolicy.EnvPolicyFromShellEnvironmentPolicy(envPolicy, "")
+	env := execpolicy.CreateEnv(policy, nil, parent)
+	drop := env["DROP"]
+	if drop == "" {
+		drop = "missing"
+	}
+	owner := env["OWNER_ONLY"]
+	if owner == "" {
+		owner = "missing"
+	}
+	got := env["KEEP"] + ":" + drop + ":" + owner
+	if got != "preserved:missing:missing" {
+		t.Fatalf("env output = %q, want preserved:missing:missing (Rust exec_command_uses_installed_environment_shell_policy_with_explicit_overrides); env=%#v", got, env)
+	}
+}
+
+func (r *fakeShellRunner) Run(ctx context.Context, req *ShellRequest) (*ShellResult, error) {
+	_ = ctx
+	r.request = req
+	if r.err != nil {
+		return nil, r.err
+	}
+	if r.result != nil {
+		return r.result, nil
+	}
+	return &ShellResult{}, nil
+}
+
+func TestInjectSessionIDEnvShellExecutor(t *testing.T) {
+	env := injectSessionIDEnv(map[string]string{"codex_session_id": "stale"}, "session-9")
+	if env["CODEX_SESSION_ID"] != "session-9" {
+		t.Fatalf("CODEX_SESSION_ID = %q", env["CODEX_SESSION_ID"])
+	}
+	if _, ok := env["codex_session_id"]; ok {
+		t.Fatalf("stale case-variant key survived: %#v", env)
+	}
+	cleared := injectSessionIDEnv(nil, "")
+	if _, ok := cleared["CODEX_SESSION_ID"]; ok {
+		t.Fatalf("empty session id should not inject CODEX_SESSION_ID: %#v", cleared)
+	}
+}
+
+func TestInjectCodexVersionEnvShellExecutor(t *testing.T) {
+	env := injectCodexVersionEnv(map[string]string{"codex_version": "stale"}, "1.2.3")
+	if env["CODEX_VERSION"] != "1.2.3" {
+		t.Fatalf("CODEX_VERSION = %q", env["CODEX_VERSION"])
+	}
+	if _, ok := env["codex_version"]; ok {
+		t.Fatalf("stale case-variant key survived: %#v", env)
+	}
+	cleared := injectCodexVersionEnv(nil, "")
+	if _, ok := cleared["CODEX_VERSION"]; ok {
+		t.Fatalf("empty codex version should not inject CODEX_VERSION: %#v", cleared)
+	}
+}
+
+// TestOneShotExecSpecRemovesSessionArgsLikeRust verifies the R#41393
+// completion-only `exec_command` surface removes resumable/session arguments and
+// exposes `timeout_ms`.
+func TestOneShotExecSpecRemovesSessionArgsLikeRust(t *testing.T) {
+	executor := NewShellExecutor(&ShellExecutorOptions{OneShot: true, ToolName: PlainName(DefaultExecCommandToolName)})
+	spec := executor.Spec()
+	properties, _ := spec.InputSchema["properties"].(map[string]any)
+	if _, ok := properties["tty"]; ok {
+		t.Fatalf("one-shot spec still exposes tty: %#v", properties)
+	}
+	if _, ok := properties["yield_time_ms"]; ok {
+		t.Fatalf("one-shot spec still exposes yield_time_ms: %#v", properties)
+	}
+	if _, ok := properties["timeout_ms"]; !ok {
+		t.Fatalf("one-shot spec missing timeout_ms: %#v", properties)
+	}
+	if !strings.Contains(spec.Description, "cannot be resumed") {
+		t.Fatalf("one-shot spec description = %q", spec.Description)
+	}
+}
+
+// TestOneShotExecReportsExit124OnTimeoutLikeRust verifies a completion-only
+// (one-shot) command terminated on timeout reports exit code 124 (Rust #41393).
+func TestOneShotExecReportsExit124OnTimeoutLikeRust(t *testing.T) {
+	runner := &fakeShellRunner{result: &ShellResult{TimedOut: true}}
+	executor := NewShellExecutor(&ShellExecutorOptions{
+		Runner:   runner,
+		OneShot:  true,
+		ToolName: PlainName(DefaultExecCommandToolName),
+		Shell:    &Shell{Type: ShellBash, Path: "/bin/sh"},
+		Validation: ShellValidationOptions{
+			ApprovalPolicy:   sandbox.ApprovalOnRequest,
+			CWD:              t.TempDir(),
+			DefaultTimeoutMS: 5000,
+		},
+	})
+	output, err := executor.Execute(context.Background(), &Invocation{
+		CallID:   "call-timeout",
+		ToolName: PlainName(DefaultExecCommandToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"cmd":"echo hi"}`},
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	data, _ := output.Data["exit_code"].(int)
+	if data != 124 {
+		t.Fatalf("one-shot timed-out exit code = %v, want 124", output.Data["exit_code"])
+	}
+}

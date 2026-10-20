@@ -1,0 +1,10 @@
+# Ignore hidden local directories such as .tmp and .claude.
+.*/
+!/.github/
+!/.github/workflows/
+
+# Build/test artifacts.
+bin/
+!sandbox/windowssandbox/bin/
+!sandbox/windowssandbox/bin/**
+dist/

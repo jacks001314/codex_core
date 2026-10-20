@@ -1,0 +1,5132 @@
+package model
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/coder/websocket"
+
+	"codex_core/auth"
+	"codex_core/codexapi"
+	"codex_core/protocol"
+
+	"github.com/klauspost/compress/zstd"
+)
+
+func TestResponsesAgentRunnerPostsResponsesRequest(t *testing.T) {
+	var recordedPath string
+	var recordedAuth string
+	var recordedProviderHeader string
+	var recordedTimingHeader string
+	var recordedBetaFeaturesHeader string
+	var recordedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recordedPath = r.URL.String()
+		recordedAuth = r.Header.Get("Authorization")
+		recordedProviderHeader = r.Header.Get("x-provider-test")
+		recordedTimingHeader = r.Header.Get(responsesIncludeTimingMetricsHeader)
+		recordedBetaFeaturesHeader = r.Header.Get(codexapi.ClientCodexBetaFeaturesHeader)
+		if err := json.NewDecoder(r.Body).Decode(&recordedBody); err != nil {
+			t.Fatalf("Decode request body error = %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set(responsesRequestIDHeader, "req-1")
+		w.Header().Set(responsesOpenAIModelHeader, "gpt-server")
+		w.Header().Set(responsesCodexTurnStateHeader, "turn-state-1")
+		w.Header().Set(responsesModelsETagHeader, `"models-etag-1"`)
+		w.Header().Set(responsesReasoningHeader, "true")
+		w.Header().Set("x-codex-primary-used-percent", "12.5")
+		_, _ = w.Write([]byte(`{
+			"id":"resp-1",
+			"model":"gpt-test",
+			"output":[{"id":"msg-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello from api"}]}],
+			"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":12,"input_tokens_details":{"cached_tokens":2,"cache_write_tokens":4},"output_tokens_details":{"reasoning_tokens":1},"codex_rollout_budget_units":2.5}
+		}`))
+	}))
+	defer server.Close()
+
+	provider := &APIProvider{
+		Name:        OpenAIProviderName,
+		BaseURL:     server.URL + "/v1",
+		QueryParams: map[string]string{"api-version": "2026-06-30"},
+		Headers:     http.Header{"x-provider-test": []string{"provider"}},
+	}
+	authHeaders := BearerAuthHeaders("sk-test", "", false)
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: provider,
+		Auth:     &authHeaders,
+		ModelsManager: NewStaticModelsManager(ModelsResponse{Models: []ModelInfo{{
+			Slug:                       "gpt-test",
+			SupportsReasoningSummaries: true,
+			DefaultReasoningLevel:      "medium",
+			DefaultReasoningSummary:    "auto",
+			SupportVerbosity:           true,
+			DefaultVerbosity:           "low",
+			SupportedReasoningLevels:   []string{"low", "medium", "high", "xhigh", "max", "ultra"},
+		}}}),
+		ProviderID: OpenAIProviderID,
+	})
+	response, err := runner.Run(context.Background(), &AgentRequest{
+		Prompt: "say hello",
+		InputItems: []any{map[string]any{
+			"type":    "function_call_output",
+			"call_id": "call-1",
+			"output":  "done",
+		}},
+		Tools: []any{map[string]any{
+			"type":        "function",
+			"name":        "echo",
+			"description": "Echo text",
+			"parameters":  map[string]any{"type": "object"},
+			"strict":      false,
+		}},
+		Model:                        "gpt-test",
+		ProviderID:                   OpenAIProviderID,
+		ParallelToolCalls:            true,
+		ReasoningEffort:              "ultra",
+		ReasoningSummary:             "concise",
+		ConcurrentReasoningSummaries: true,
+		ModelVerbosity:               "high",
+		IncludeTimingMetrics:         true,
+		BetaFeaturesHeader:           "memories,remote_compaction_v2",
+	})
+	if err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if recordedPath != "/v1/responses?api-version=2026-06-30" {
+		t.Fatalf("path = %q", recordedPath)
+	}
+	if recordedAuth != "Bearer sk-test" || recordedProviderHeader != "provider" {
+		t.Fatalf("headers auth=%q provider=%q", recordedAuth, recordedProviderHeader)
+	}
+	if recordedTimingHeader != "true" {
+		t.Fatalf("timing metrics header = %q", recordedTimingHeader)
+	}
+	if recordedBetaFeaturesHeader != "memories,remote_compaction_v2" {
+		t.Fatalf("beta features header = %q", recordedBetaFeaturesHeader)
+	}
+	if recordedBody["model"] != "gpt-test" || recordedBody["stream"] != false || recordedBody["store"] != false {
+		t.Fatalf("body = %#v", recordedBody)
+	}
+	if recordedBody["tool_choice"] != "auto" {
+		t.Fatalf("tool_choice = %#v", recordedBody["tool_choice"])
+	}
+	if recordedBody["parallel_tool_calls"] != true {
+		t.Fatalf("parallel_tool_calls = %#v", recordedBody["parallel_tool_calls"])
+	}
+	reasoning, ok := recordedBody["reasoning"].(map[string]any)
+	if !ok || reasoning["effort"] != "max" || reasoning["summary"] != "concise" {
+		t.Fatalf("reasoning = %#v", recordedBody["reasoning"])
+	}
+	streamOptions, ok := recordedBody["stream_options"].(map[string]any)
+	if !ok || streamOptions["reasoning_summary_delivery"] != "sequential_cutoff" {
+		t.Fatalf("stream_options = %#v", recordedBody["stream_options"])
+	}
+	include, ok := recordedBody["include"].([]any)
+	if !ok || len(include) != 1 || include[0] != "reasoning.encrypted_content" {
+		t.Fatalf("include = %#v", recordedBody["include"])
+	}
+	text, ok := recordedBody["text"].(map[string]any)
+	if !ok || text["verbosity"] != "high" {
+		t.Fatalf("text = %#v", recordedBody["text"])
+	}
+	inputs, ok := recordedBody["input"].([]any)
+	if !ok || len(inputs) != 3 {
+		t.Fatalf("input = %#v", recordedBody["input"])
+	}
+	instructionsInput, ok := inputs[0].(map[string]any)
+	if !ok || instructionsInput["type"] != "message" || instructionsInput["role"] != "developer" {
+		t.Fatalf("instruction input = %#v", inputs[0])
+	}
+	if id, _ := instructionsInput["id"].(string); !strings.HasPrefix(id, "msg_") {
+		t.Fatalf("instruction input id = %q", id)
+	}
+	if raw, exists := recordedBody["instructions"]; exists && raw != nil && raw != "" {
+		t.Fatalf("top-level instructions = %#v, want omitted", raw)
+	}
+	toolOutput, ok := inputs[1].(map[string]any)
+	if !ok || toolOutput["type"] != "function_call_output" || toolOutput["output"] != "done" {
+		t.Fatalf("tool output input = %#v", inputs[1])
+	}
+	promptInput, ok := inputs[2].(map[string]any)
+	if !ok || promptInput["type"] != "message" || promptInput["role"] != "user" {
+		t.Fatalf("prompt input = %#v", inputs[2])
+	}
+	tools, ok := recordedBody["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("tools = %#v", recordedBody["tools"])
+	}
+	toolDef, ok := tools[0].(map[string]any)
+	if !ok || toolDef["type"] != "function" || toolDef["name"] != "echo" {
+		t.Fatalf("tool def = %#v", tools[0])
+	}
+	if response.Message != "hello from api" || response.Model != "gpt-test" || response.ProviderID != OpenAIProviderID {
+		t.Fatalf("response = %#v", response)
+	}
+	if response.Usage.InputTokens != 7 || response.Usage.CachedInputTokens != 2 || response.Usage.CacheWriteInputTokens != 4 || response.Usage.OutputTokens != 3 || response.Usage.ReasoningOutputTokens != 1 || response.Usage.TotalTokens != 12 {
+		t.Fatalf("usage = %#v", response.Usage)
+	}
+	if response.Usage.CodexRolloutBudgetUnits != "2.5" {
+		t.Fatalf("codex rollout budget units = %q, want 2.5", response.Usage.CodexRolloutBudgetUnits)
+	}
+	if response.RequestID != "req-1" || response.ServerModel != "gpt-server" || response.TurnState != "turn-state-1" || response.ModelsETag != `"models-etag-1"` {
+		t.Fatalf("response metadata = %#v", response)
+	}
+	if response.Headers["x-request-id"] != "req-1" || len(response.RateLimits) != 1 || response.RateLimits[0].Primary == nil || response.RateLimits[0].Primary.UsedPercent != 12.5 {
+		t.Fatalf("response headers/rate limits = %#v / %#v", response.Headers, response.RateLimits)
+	}
+	if response.ReasoningIncluded == nil || !*response.ReasoningIncluded {
+		t.Fatalf("reasoning included = %#v", response.ReasoningIncluded)
+	}
+}
+
+func TestReasoningEffortForRequestModelAwareUltraFallback(t *testing.T) {
+	levels := []string{"low", "medium", "high", "xhigh", "max", "ultra"}
+	multiAgent := "high"
+	ultraEffort := "ultra"
+	tests := []struct {
+		name   string
+		info   *ModelInfo
+		effort string
+		want   string
+	}{
+		{
+			name:   "supported catalog override wins for ultra",
+			info:   &ModelInfo{MultiAgentReasoningEffort: &multiAgent, SupportedReasoningLevels: levels},
+			effort: "ultra",
+			want:   "high",
+		},
+		{
+			name:   "unsupported override falls back to max",
+			info:   &ModelInfo{MultiAgentReasoningEffort: &multiAgent, SupportedReasoningLevels: []string{"low", "max"}},
+			effort: "ultra",
+			want:   "max",
+		},
+		{
+			name:   "ultra override is rejected and falls back to max",
+			info:   &ModelInfo{MultiAgentReasoningEffort: &ultraEffort, SupportedReasoningLevels: levels},
+			effort: "ultra",
+			want:   "max",
+		},
+		{
+			name:   "no override prefers max when supported",
+			info:   &ModelInfo{SupportedReasoningLevels: levels},
+			effort: "ultra",
+			want:   "max",
+		},
+		{
+			name:   "no max uses highest supported non-ultra",
+			info:   &ModelInfo{SupportedReasoningLevels: []string{"low", "medium", "high", "xhigh", "ultra"}},
+			effort: "ultra",
+			want:   "xhigh",
+		},
+		{
+			name:   "empty catalog falls back to medium",
+			info:   &ModelInfo{},
+			effort: "ultra",
+			want:   "medium",
+		},
+		{
+			name:   "non-ultra effort passes through",
+			info:   &ModelInfo{MultiAgentReasoningEffort: &multiAgent, SupportedReasoningLevels: levels},
+			effort: "high",
+			want:   "high",
+		},
+		{
+			name:   "nil model info passes through",
+			info:   nil,
+			effort: "ultra",
+			want:   "ultra",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := reasoningEffortForRequest(tt.info, tt.effort); got != tt.want {
+				t.Fatalf("reasoningEffortForRequest(%v, %q) = %q, want %q", tt.info, tt.effort, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUsageMetadataFromStreamEventData(t *testing.T) {
+	amount := "0.00123456789"
+	tests := []struct {
+		name string
+		data string
+		want *ResponseUsageMetadata
+		has  bool
+	}{
+		{
+			name: "string amount is preserved without numeric conversion",
+			data: `{"response":{"id":"resp-1","usage_metadata":{"amount":"0.00123456789"}}}`,
+			want: &ResponseUsageMetadata{Amount: &amount},
+			has:  true,
+		},
+		{
+			name: "empty usage_metadata object is present with null amount",
+			data: `{"response":{"id":"resp-1","usage_metadata":{}}}`,
+			want: &ResponseUsageMetadata{},
+			has:  true,
+		},
+		{
+			name: "missing usage_metadata is absent",
+			data: `{"response":{"id":"resp-1"}}`,
+			want: nil,
+			has:  false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, has := usageMetadataFromStreamEventData([]byte(tt.data))
+			if has != tt.has {
+				t.Fatalf("has = %v, want %v", has, tt.has)
+			}
+			if !has {
+				return
+			}
+			if tt.want.Amount == nil {
+				if got.Amount != nil {
+					t.Fatalf("Amount = %q, want nil", *got.Amount)
+				}
+			} else if got.Amount == nil || *got.Amount != *tt.want.Amount {
+				t.Fatalf("Amount = %v, want %q", got.Amount, *tt.want.Amount)
+			}
+		})
+	}
+}
+
+func TestUsageMetadataFromStreamEventDataPreservesRawUsage(t *testing.T) {
+	data := `{"response":{"id":"resp-1","usage_metadata":{"amount":"0.001"},"usage":{"input_tokens":10,"output_tokens":5}}}`
+	got, has := usageMetadataFromStreamEventData([]byte(data))
+	if !has || got == nil || got.Amount == nil || *got.Amount != "0.001" {
+		t.Fatalf("usage_metadata = %#v, has=%v", got, has)
+	}
+	if string(got.Metadata) != `{"input_tokens":10,"output_tokens":5}` {
+		t.Fatalf("metadata = %s", got.Metadata)
+	}
+
+	usageOnly := `{"response":{"id":"resp-2","usage":{"input_tokens":3}}}`
+	gotOnly, hasOnly := usageMetadataFromStreamEventData([]byte(usageOnly))
+	if !hasOnly || gotOnly == nil || gotOnly.Amount != nil || string(gotOnly.Metadata) != `{"input_tokens":3}` {
+		t.Fatalf("usage-only metadata = %#v, has=%v", gotOnly, hasOnly)
+	}
+}
+
+func TestResponsesAgentRunnerConcurrentReasoningSummaryStreamOptionsOmittedForNoneSummary(t *testing.T) {
+	var recordedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&recordedBody); err != nil {
+			t.Fatalf("Decode request body error = %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp-1",
+			"model":"gpt-test",
+			"output":[{"id":"msg-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],
+			"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+		}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{Name: OpenAIProviderName, BaseURL: server.URL + "/v1"},
+		ModelsManager: NewStaticModelsManager(ModelsResponse{Models: []ModelInfo{{
+			Slug:                       "gpt-test",
+			SupportsReasoningSummaries: true,
+			DefaultReasoningLevel:      "medium",
+			DefaultReasoningSummary:    "auto",
+		}}}),
+	})
+	_, err := runner.Run(context.Background(), &AgentRequest{
+		Prompt:                       "hello",
+		Model:                        "gpt-test",
+		ConcurrentReasoningSummaries: true,
+		ReasoningSummary:             "none",
+	})
+	if err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if _, ok := recordedBody["stream_options"]; ok {
+		t.Fatalf("stream_options present for summary=none: %#v", recordedBody["stream_options"])
+	}
+}
+
+func TestResponsesAgentRunnerConcurrentReasoningSummaryStreamOptionsOmittedForNonOpenAIProvider(t *testing.T) {
+	var recordedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&recordedBody); err != nil {
+			t.Fatalf("Decode request body error = %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp-1",
+			"model":"gpt-test",
+			"output":[{"id":"msg-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],
+			"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+		}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{Name: "Azure OpenAI", BaseURL: server.URL + "/v1"},
+		ModelsManager: NewStaticModelsManager(ModelsResponse{Models: []ModelInfo{{
+			Slug:                       "gpt-test",
+			SupportsReasoningSummaries: true,
+			DefaultReasoningLevel:      "medium",
+			DefaultReasoningSummary:    "auto",
+		}}}),
+	})
+	_, err := runner.Run(context.Background(), &AgentRequest{
+		Prompt:                       "hello",
+		Model:                        "gpt-test",
+		ConcurrentReasoningSummaries: true,
+		ReasoningSummary:             "concise",
+	})
+	if err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if _, ok := recordedBody["stream_options"]; ok {
+		t.Fatalf("stream_options present for non-OpenAI provider: %#v", recordedBody["stream_options"])
+	}
+}
+
+func TestResponsesAgentRunnerPrewarmUsesWebSocketGenerateFalse(t *testing.T) {
+	var received map[string]any
+	var authorization string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		authorization = request.Header.Get("Authorization")
+		conn, err := websocket.Accept(w, request, nil)
+		if err != nil {
+			t.Errorf("Accept() error = %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "done")
+		_, data, err := conn.Read(request.Context())
+		if err != nil {
+			t.Errorf("Read() error = %v", err)
+			return
+		}
+		if err := json.Unmarshal(data, &received); err != nil {
+			t.Errorf("Unmarshal() error = %v", err)
+			return
+		}
+		_ = conn.Write(request.Context(), websocket.MessageText, []byte(`{"type":"response.created","response":{"id":"warm-1"}}`))
+		_ = conn.Write(request.Context(), websocket.MessageText, []byte(`{"type":"response.completed","response":{"id":"warm-1"}}`))
+	}))
+	defer server.Close()
+	sink := &recordingMetricsSink{}
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{BaseURL: server.URL, Headers: http.Header{"x-provider-test": []string{"present"}}},
+		Auth:     &AuthHeaders{Headers: http.Header{"Authorization": []string{"Bearer secret"}}}, SupportsWebsockets: true, WebsocketConnectTimeout: time.Second,
+	})
+	runner.Metrics = sink
+	response, err := runner.Prewarm(context.Background(), &AgentRequest{Model: "gpt-test", ThreadID: "guardian-thread", ClientMetadata: map[string]string{"x-openai-subagent": "guardian"}})
+	if err != nil {
+		t.Fatalf("Prewarm() error = %v", err)
+	}
+	if response == nil || response.ResponseID != "warm-1" {
+		t.Fatalf("response = %#v", response)
+	}
+	if received["type"] != "response.create" || received["generate"] != false || received["model"] != "gpt-test" {
+		t.Fatalf("payload = %#v", received)
+	}
+	metadata, ok := received["client_metadata"].(map[string]any)
+	if !ok || metadata["x-openai-subagent"] != "guardian" {
+		t.Fatalf("metadata = %#v", received["client_metadata"])
+	}
+	if authorization != "Bearer secret" {
+		t.Fatalf("authorization = %q", authorization)
+	}
+	var continuation *recordedMetricSample
+	for index := range sink.counters {
+		if sink.counters[index].name == websocketContinuationCountMetric {
+			continuation = &sink.counters[index]
+		}
+	}
+	if continuation == nil || continuation.tags["mode"] != "full" || continuation.tags["reason"] != "prewarm" || continuation.tags["phase"] != "warmup" {
+		t.Fatalf("continuation metric = %#v", continuation)
+	}
+}
+
+// Mirrors Rust #46051: every generation response.create records the
+// continuation mode/reason/phase, including a fresh connection.
+func TestResponsesAgentRunnerWebSocketRecordsContinuationMetricLikeRust(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		conn, err := websocket.Accept(w, request, nil)
+		if err != nil {
+			t.Errorf("Accept() error = %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "done")
+		if _, _, err := conn.Read(request.Context()); err != nil {
+			t.Errorf("Read() error = %v", err)
+			return
+		}
+		_ = conn.Write(request.Context(), websocket.MessageText, []byte(`{"type":"response.created","response":{"id":"resp-metric"}}`))
+		_ = conn.Write(request.Context(), websocket.MessageText, []byte(`{"type":"response.output_text.delta","item_id":"msg-metric","delta":"done"}`))
+		_ = conn.Write(request.Context(), websocket.MessageText, []byte(`{"type":"response.output_item.done","item":{"id":"msg-metric","type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}`))
+		_ = conn.Write(request.Context(), websocket.MessageText, []byte(`{"type":"response.completed","response":{"id":"resp-metric"}}`))
+	}))
+	defer server.Close()
+	sink := &recordingMetricsSink{}
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider:                &APIProvider{BaseURL: server.URL},
+		Auth:                    &AuthHeaders{Headers: http.Header{"Authorization": []string{"Bearer secret"}}},
+		SupportsWebsockets:      true,
+		WebsocketConnectTimeout: time.Second,
+	})
+	runner.Metrics = sink
+	if _, err := runner.RunWebSocket(context.Background(), &AgentRequest{
+		Prompt:   "hello",
+		Model:    "gpt-test",
+		ThreadID: "thread-metric",
+		TurnID:   "turn-metric",
+	}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	var continuation *recordedMetricSample
+	for index := range sink.counters {
+		if sink.counters[index].name == websocketContinuationCountMetric {
+			continuation = &sink.counters[index]
+		}
+	}
+	if continuation == nil || continuation.tags["mode"] != "full" ||
+		continuation.tags["reason"] != "initial" || continuation.tags["phase"] != "generation" {
+		t.Fatalf("continuation metric = %#v", continuation)
+	}
+}
+
+// Rust #51440: a websocket rate-limit error event preserves nested
+// Retry-After advice so the caller can retry with the server's deadline.
+func TestResponsesAgentRunnerWebSocketErrorHonorsRetryAfterLikeRust(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		event     string
+		want      time.Duration
+		retryable bool
+	}{
+		{
+			name:      "nested advice",
+			event:     `{"type":"error","error":{"code":"rate_limit_exceeded","message":"slow down","headers":{"retry-after":"2"}}}`,
+			want:      2 * time.Second,
+			retryable: true,
+		},
+		{
+			name:      "top-level fallback",
+			event:     `{"type":"error","error":{"code":"rate_limit_exceeded","message":"slow down"},"headers":{"retry-after":"3"}}`,
+			want:      3 * time.Second,
+			retryable: true,
+		},
+		{
+			name:  "headerless stays terminal",
+			event: `{"type":"error","error":{"code":"rate_limit_exceeded","message":"slow down"}}`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				conn, err := websocket.Accept(w, request, nil)
+				if err != nil {
+					t.Errorf("Accept() error = %v", err)
+					return
+				}
+				defer conn.Close(websocket.StatusNormalClosure, "done")
+				if _, _, err := conn.Read(request.Context()); err != nil {
+					t.Errorf("Read() error = %v", err)
+					return
+				}
+				_ = conn.Write(request.Context(), websocket.MessageText, []byte(`{"type":"response.created","response":{"id":"resp-retry"}}`))
+				_ = conn.Write(request.Context(), websocket.MessageText, []byte(test.event))
+			}))
+			defer server.Close()
+			runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+				Provider: &APIProvider{BaseURL: server.URL}, SupportsWebsockets: true, WebsocketConnectTimeout: time.Second,
+			})
+			_, err := runner.RunWebSocket(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"})
+			if err == nil {
+				t.Fatal("RunWebSocket() = nil, want a retryable error")
+			}
+			var apiErr *codexapi.APIError
+			if !test.retryable {
+				if errors.As(err, &apiErr) {
+					t.Fatalf("error = %v, want the generic terminal path", err)
+				}
+				return
+			}
+			if !errors.As(err, &apiErr) || apiErr.Kind != codexapi.ErrorRateLimitExceeded {
+				t.Fatalf("error = %v, want a rate-limit API error", err)
+			}
+			delay, ok := codexapi.RetryDelayInfo(err)
+			if !ok || delay < test.want-time.Second || delay > test.want {
+				t.Fatalf("retry delay = %v, %v, want about %v", delay, ok, test.want)
+			}
+		})
+	}
+}
+
+// The websocket payload carries the request's W3C trace context in its client
+// metadata, the way codex-api's response_create_client_metadata merges
+// request_trace (Rust's stream_responses_websocket).
+func TestResponsesAgentRunnerWebSocketCarriesRequestTraceLikeRust(t *testing.T) {
+	var received map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		conn, err := websocket.Accept(w, request, nil)
+		if err != nil {
+			t.Errorf("Accept() error = %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "done")
+		_, data, err := conn.Read(request.Context())
+		if err != nil {
+			t.Errorf("Read() error = %v", err)
+			return
+		}
+		if err := json.Unmarshal(data, &received); err != nil {
+			t.Errorf("Unmarshal() error = %v", err)
+			return
+		}
+		_ = conn.Write(request.Context(), websocket.MessageText, []byte(`{"type":"response.created","response":{"id":"warm-1"}}`))
+		_ = conn.Write(request.Context(), websocket.MessageText, []byte(`{"type":"response.completed","response":{"id":"warm-1"}}`))
+	}))
+	defer server.Close()
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{BaseURL: server.URL}, SupportsWebsockets: true, WebsocketConnectTimeout: time.Second,
+	})
+	_, err := runner.Prewarm(context.Background(), &AgentRequest{
+		Model:          "gpt-test",
+		ClientMetadata: map[string]string{"x-openai-subagent": "guardian"},
+		Trace: &protocol.W3CTraceContext{
+			Traceparent: "00-00000000000000000000000000000001-0000000000000002-01",
+			Tracestate:  "example=alpha:one",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Prewarm() error = %v", err)
+	}
+	metadata, ok := received["client_metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("client_metadata = %#v", received["client_metadata"])
+	}
+	if metadata["ws_request_header_traceparent"] != "00-00000000000000000000000000000001-0000000000000002-01" ||
+		metadata["ws_request_header_tracestate"] != "example=alpha:one" ||
+		metadata["x-openai-subagent"] != "guardian" {
+		t.Fatalf("client_metadata = %#v", metadata)
+	}
+}
+
+// Without a trace the payload keeps the request's metadata and adds nothing.
+func TestWebsocketClientMetadataWithoutTraceLikeRust(t *testing.T) {
+	if got := websocketClientMetadata(nil, nil); got != nil {
+		t.Fatalf("metadata = %#v", got)
+	}
+	metadata := websocketClientMetadata(map[string]string{"thread_id": "thread-1"}, &protocol.W3CTraceContext{})
+	if len(metadata) != 1 || metadata["thread_id"] != "thread-1" {
+		t.Fatalf("metadata = %#v", metadata)
+	}
+}
+
+func TestResponsesAgentRunnerPrewarmNoopsWithoutWebSocketSupport(t *testing.T) {
+	runner := NewResponsesAgentRunner(nil)
+	response, err := runner.Prewarm(context.Background(), &AgentRequest{Model: "gpt-test"})
+	if err != nil || response != nil {
+		t.Fatalf("response=%#v err=%v", response, err)
+	}
+}
+
+func TestResponsesAgentRunnerPrewarmReportsResponseIncomplete(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		conn, err := websocket.Accept(w, request, nil)
+		if err != nil {
+			t.Errorf("Accept() error = %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "done")
+		_, _, _ = conn.Read(request.Context())
+		_ = conn.Write(request.Context(), websocket.MessageText, []byte(`{"type":"response.incomplete","response":{"id":"warm-1","incomplete_details":{"reason":"max_output_tokens"}}}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{Provider: &APIProvider{BaseURL: server.URL}, SupportsWebsockets: true})
+	_, err := runner.Prewarm(context.Background(), &AgentRequest{Model: "gpt-test"})
+	if err == nil || err.Error() != "Incomplete response returned, reason: max_output_tokens" {
+		t.Fatalf("Prewarm() error = %v", err)
+	}
+}
+
+func TestResponsesAgentRunnerRunWebSocketUsesPreviousResponseID(t *testing.T) {
+	var received map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		conn, err := websocket.Accept(w, request, nil)
+		if err != nil {
+			t.Errorf("Accept() error = %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "done")
+		_, data, _ := conn.Read(request.Context())
+		_ = json.Unmarshal(data, &received)
+		_ = conn.Write(request.Context(), websocket.MessageText, []byte(`{"type":"response.output_text.delta","delta":"{\"outcome\":"}`))
+		_ = conn.Write(request.Context(), websocket.MessageText, []byte(`{"type":"response.output_text.delta","delta":"\"allow\"}"}`))
+		_ = conn.Write(request.Context(), websocket.MessageText, []byte(`{"type":"response.completed","response":{"id":"review-1"}}`))
+	}))
+	defer server.Close()
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{Provider: &APIProvider{BaseURL: server.URL}, SupportsWebsockets: true})
+	response, err := runner.RunWebSocket(context.Background(), &AgentRequest{Model: "gpt-test", Prompt: "review", PreviousResponseID: "warm-1"})
+	if err != nil || response == nil || response.ResponseID != "review-1" || response.Message != `{"outcome":"allow"}` {
+		t.Fatalf("response=%#v err=%v", response, err)
+	}
+	if received["previous_response_id"] != "warm-1" {
+		t.Fatalf("payload=%#v", received)
+	}
+	if _, ok := received["generate"]; ok {
+		t.Fatalf("normal request should omit generate: %#v", received)
+	}
+}
+
+func TestResponsesAgentRunnerRunWebSocketParsesFullResponsesEventModel(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		conn, err := websocket.Accept(w, request, nil)
+		if err != nil {
+			t.Errorf("Accept() error = %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "done")
+		_, _, _ = conn.Read(request.Context())
+		events := []string{
+			`{"type":"response.created","response":{"id":"resp-ws-full","model":"gpt-test"}}`,
+			`{"type":"response.function_call_arguments.delta","item_id":"call-item","call_id":"call-1","delta":"{\"path\":"}`,
+			`{"type":"response.function_call_arguments.delta","item_id":"call-item","call_id":"call-1","delta":"\"plan.md\"}"}`,
+			`{"type":"response.output_item.done","item":{"id":"call-item","type":"function_call","name":"read_file","call_id":"call-1","arguments":""}}`,
+			`{"type":"response.completed","response":{"id":"resp-ws-full","model":"gpt-test","output":[],"usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18}}}`,
+		}
+		for _, event := range events {
+			_ = conn.Write(request.Context(), websocket.MessageText, []byte(event))
+		}
+	}))
+	defer server.Close()
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{Provider: &APIProvider{BaseURL: server.URL}, SupportsWebsockets: true})
+	response, err := runner.RunWebSocket(context.Background(), &AgentRequest{Model: "gpt-test", Prompt: "read plan"})
+	if err != nil || response == nil {
+		t.Fatalf("response=%#v err=%v", response, err)
+	}
+	if response.ResponseID != "resp-ws-full" || response.Usage.InputTokens != 11 || response.Usage.OutputTokens != 7 || response.Usage.TotalTokens != 18 {
+		t.Fatalf("response=%#v", response)
+	}
+	if len(response.Items) != 1 || response.Items[0].Type != "function_call" || response.Items[0].Name != "read_file" || response.Items[0].Arguments != `{"path":"plan.md"}` {
+		t.Fatalf("items=%#v", response.Items)
+	}
+}
+
+func TestResponsesAgentRunnerRunWebSocketReadsModelsETagFromMetadataEvent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		conn, err := websocket.Accept(w, request, nil)
+		if err != nil {
+			t.Errorf("Accept() error = %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "done")
+		_, _, _ = conn.Read(request.Context())
+		events := []string{
+			`{"type":"codex.response.metadata","headers":{"x-models-etag":"etag-ws-123"}}`,
+			`{"type":"response.created","response":{"id":"resp-ws-etag"}}`,
+			`{"type":"response.output_text.delta","delta":"ok"}`,
+			`{"type":"response.completed","response":{"id":"resp-ws-etag","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+		}
+		for _, event := range events {
+			_ = conn.Write(request.Context(), websocket.MessageText, []byte(event))
+		}
+	}))
+	defer server.Close()
+
+	var events []ResponsesStreamEvent
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider:           &APIProvider{BaseURL: server.URL},
+		SupportsWebsockets: true,
+		StreamHandler: func(event *ResponsesStreamEvent) {
+			if event != nil {
+				events = append(events, *event)
+			}
+		},
+	})
+	response, err := runner.RunWebSocket(context.Background(), &AgentRequest{Model: "gpt-test", Prompt: "read etag"})
+	if err != nil || response == nil {
+		t.Fatalf("response=%#v err=%v", response, err)
+	}
+	etag := firstEventByKind(events, ResponsesStreamEventModelsETag)
+	if etag == nil || etag.ModelsETag != "etag-ws-123" {
+		t.Fatalf("models etag event = %#v", etag)
+	}
+}
+
+// Mirrors Rust's
+// `websocket_safety_buffering_event_controls_visibility_when_header_disables_it`:
+// a WebSocket event's own JSON headers supply the safety-buffering treatment, so
+// a payload that omits its wire `retry_model` still falls back to the header's
+// faster model, and the delivered payload asks the UI to show even when the
+// payload tries to disable it.
+func TestResponsesAgentRunnerRunWebSocketSafetyBufferingUsesEventHeadersLikeRust(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		conn, err := websocket.Accept(w, request, nil)
+		if err != nil {
+			t.Errorf("Accept() error = %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "done")
+		_, _, _ = conn.Read(request.Context())
+		events := []string{
+			`{"type":"codex.response.metadata","headers":{"x-codex-safety-buffering-enabled":"false","x-codex-safety-buffering-faster-model":"gpt-fast-header"}}`,
+			`{"type":"response.output_text.delta","delta":"hi","safety_buffering":{"use_cases":["cyber"],"reasons":["user_risk"],"show_buffering_ui":false}}`,
+			`{"type":"response.completed","response":{"id":"resp-ws-buffering","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+		}
+		for _, event := range events {
+			_ = conn.Write(request.Context(), websocket.MessageText, []byte(event))
+		}
+	}))
+	defer server.Close()
+
+	var events []ResponsesStreamEvent
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider:           &APIProvider{BaseURL: server.URL},
+		SupportsWebsockets: true,
+		StreamHandler: func(event *ResponsesStreamEvent) {
+			if event != nil {
+				events = append(events, *event)
+			}
+		},
+	})
+	if _, err := runner.RunWebSocket(context.Background(), &AgentRequest{Model: "gpt-test", Prompt: "buffer me"}); err != nil {
+		t.Fatalf("RunWebSocket() error = %v", err)
+	}
+	buffering := firstEventByKind(events, ResponsesStreamEventSafetyBuffer)
+	if buffering == nil || buffering.SafetyBuffering == nil {
+		t.Fatalf("safety buffering event = %#v", buffering)
+	}
+	if !buffering.SafetyBuffering.ShowBufferingUI {
+		t.Fatal("a delivered payload must ask the UI to show")
+	}
+	faster := buffering.SafetyBuffering.FasterModel
+	if faster == nil || *faster != "gpt-fast-header" {
+		t.Fatalf("faster model = %v, want the event header's model", faster)
+	}
+}
+func TestResponsesAgentRunnerRunWebSocketRecoversDeclaredCustomToolCall(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		conn, err := websocket.Accept(w, request, nil)
+		if err != nil {
+			t.Errorf("Accept() error = %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "done")
+		_, _, _ = conn.Read(request.Context())
+		events := []string{
+			`{"type":"response.created","response":{"id":"resp-ws-custom"}}`,
+			`{"type":"response.custom_tool_call_input.delta","item_id":"ctc-1","call_id":"call-1","delta":"text(\"OK\")"}`,
+			`{"type":"response.output_item.done","item":{"id":"ctc-1","type":"function_call","name":"exec","call_id":"call-1","arguments":""}}`,
+			`{"type":"response.completed","response":{"id":"resp-ws-custom","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+		}
+		for _, event := range events {
+			_ = conn.Write(request.Context(), websocket.MessageText, []byte(event))
+		}
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{Provider: &APIProvider{BaseURL: server.URL}, SupportsWebsockets: true})
+	response, err := runner.RunWebSocket(context.Background(), &AgentRequest{
+		Model:  "gpt-test",
+		Prompt: "run exec",
+		Tools:  []any{map[string]any{"type": "custom", "name": "exec"}},
+	})
+	if err != nil || response == nil {
+		t.Fatalf("response=%#v err=%v", response, err)
+	}
+	if len(response.Items) != 1 || response.Items[0].Type != "custom_tool_call" || response.Items[0].Name != "exec" || response.Items[0].Input != `text("OK")` {
+		t.Fatalf("items=%#v", response.Items)
+	}
+}
+
+func TestResponsesAgentRunnerNonStreamingRecoversDeclaredCustomToolCall(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp-custom",
+			"model":"gpt-test",
+			"output":[{"id":"ctc-1","type":"function_call","name":"exec","call_id":"call-1","arguments":"text(\"OK\")"}],
+			"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+		}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{Provider: &APIProvider{BaseURL: server.URL}})
+	response, err := runner.Run(context.Background(), &AgentRequest{
+		Model:  "gpt-test",
+		Prompt: "run exec",
+		Tools:  []any{map[string]any{"type": "custom", "name": "exec"}},
+	})
+	if err != nil || response == nil {
+		t.Fatalf("response=%#v err=%v", response, err)
+	}
+	if len(response.Items) != 1 || response.Items[0].Type != "custom_tool_call" || response.Items[0].Name != "exec" || response.Items[0].Input != `text("OK")` || response.Items[0].Arguments != "" {
+		t.Fatalf("items=%#v", response.Items)
+	}
+}
+
+func TestResponsesAgentRunnerRunWebSocketReusesConnectionWithinTurn(t *testing.T) {
+	connections := 0
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		connections++
+		conn, err := websocket.Accept(w, request, nil)
+		if err != nil {
+			t.Errorf("Accept() error = %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "done")
+		for i := 1; i <= 2; i++ {
+			if _, _, err := conn.Read(request.Context()); err != nil {
+				return
+			}
+			requests++
+			response := fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp-%d","output":[{"id":"msg-%d","type":"message","role":"assistant","content":[{"type":"output_text","text":"ok-%d"}]}]}}`, i, i, i)
+			_ = conn.Write(request.Context(), websocket.MessageText, []byte(response))
+		}
+	}))
+	defer server.Close()
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{Provider: &APIProvider{BaseURL: server.URL}, SupportsWebsockets: true})
+	for i := 1; i <= 2; i++ {
+		response, err := runner.RunWebSocket(context.Background(), &AgentRequest{Model: "gpt-test", Prompt: "hello", ThreadID: "thread-1", TurnID: "turn-1"})
+		if err != nil || response == nil || response.Message != fmt.Sprintf("ok-%d", i) {
+			t.Fatalf("request %d response=%#v err=%v", i, response, err)
+		}
+	}
+	if connections != 1 || requests != 2 {
+		t.Fatalf("connections=%d requests=%d", connections, requests)
+	}
+}
+
+func TestResponsesAgentRunnerRunWebSocketIsolatesTurns(t *testing.T) {
+	connections := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		connections++
+		connectionID := connections
+		conn, err := websocket.Accept(w, request, nil)
+		if err != nil {
+			t.Errorf("Accept() error = %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "done")
+		_, _, _ = conn.Read(request.Context())
+		response := fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp-%d","output":[{"id":"msg-%d","type":"message","role":"assistant","content":[{"type":"output_text","text":"connection-%d"}]}]}}`, connectionID, connectionID, connectionID)
+		_ = conn.Write(request.Context(), websocket.MessageText, []byte(response))
+	}))
+	defer server.Close()
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{Provider: &APIProvider{BaseURL: server.URL}, SupportsWebsockets: true})
+	for i, turnID := range []string{"turn-1", "turn-2"} {
+		response, err := runner.RunWebSocket(context.Background(), &AgentRequest{Model: "gpt-test", Prompt: "hello", ThreadID: "thread-1", TurnID: turnID})
+		if err != nil || response == nil || response.Message != fmt.Sprintf("connection-%d", i+1) {
+			t.Fatalf("turn %s response=%#v err=%v", turnID, response, err)
+		}
+	}
+	if connections != 2 {
+		t.Fatalf("connections=%d", connections)
+	}
+}
+
+func TestResponsesAgentRunnerRunWebSocketReconnectsClosedReusedConnection(t *testing.T) {
+	connections := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		connections++
+		connectionID := connections
+		conn, err := websocket.Accept(w, request, nil)
+		if err != nil {
+			t.Errorf("Accept() error = %v", err)
+			return
+		}
+		_, _, _ = conn.Read(request.Context())
+		response := fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp-%d","output":[{"id":"msg-%d","type":"message","role":"assistant","content":[{"type":"output_text","text":"ok-%d"}]}]}}`, connectionID, connectionID, connectionID)
+		_ = conn.Write(request.Context(), websocket.MessageText, []byte(response))
+		_ = conn.Close(websocket.StatusNormalClosure, "rotate")
+	}))
+	defer server.Close()
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{Provider: &APIProvider{BaseURL: server.URL}, SupportsWebsockets: true})
+	for i := 1; i <= 2; i++ {
+		response, err := runner.RunWebSocket(context.Background(), &AgentRequest{Model: "gpt-test", Prompt: "hello", ThreadID: "thread-1", TurnID: "turn-1"})
+		if err != nil || response == nil || response.Message != fmt.Sprintf("ok-%d", i) {
+			t.Fatalf("request %d response=%#v err=%v", i, response, err)
+		}
+	}
+	if connections != 2 {
+		t.Fatalf("connections=%d", connections)
+	}
+}
+
+func TestResponsesAgentRunnerWebSocketRetryExhaustionPermanentlyFallsBackToHTTP(t *testing.T) {
+	websocketConnections := 0
+	httpRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if strings.EqualFold(request.Header.Get("Upgrade"), "websocket") {
+			websocketConnections++
+			conn, err := websocket.Accept(w, request, nil)
+			if err != nil {
+				t.Errorf("Accept() error = %v", err)
+				return
+			}
+			_, _, _ = conn.Read(request.Context())
+			_ = conn.Close(websocket.StatusInternalError, "failed")
+			return
+		}
+		httpRequests++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"id":"http-%d","output_text":"fallback-%d","output":[]}`, httpRequests, httpRequests)))
+	}))
+	defer server.Close()
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{Provider: &APIProvider{BaseURL: server.URL}, SupportsWebsockets: true})
+	for i := 1; i <= 2; i++ {
+		response, err := runner.RunWebSocket(context.Background(), &AgentRequest{Model: "gpt-test", Prompt: "hello", ThreadID: "thread-1", TurnID: fmt.Sprintf("turn-%d", i)})
+		if err != nil || response == nil || response.Message != fmt.Sprintf("fallback-%d", i) {
+			t.Fatalf("request %d response=%#v err=%v", i, response, err)
+		}
+	}
+	prewarm, err := runner.Prewarm(context.Background(), &AgentRequest{Model: "gpt-test", ClientMetadata: map[string]string{"x-openai-subagent": "guardian"}})
+	if err != nil || prewarm != nil {
+		t.Fatalf("prewarm=%#v err=%v", prewarm, err)
+	}
+	if websocketConnections != 2 || httpRequests != 2 {
+		t.Fatalf("websocketConnections=%d httpRequests=%d", websocketConnections, httpRequests)
+	}
+}
+
+func TestResponsesAgentRunnerWebSocket426FallbackMatchesRust(t *testing.T) {
+	posts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if strings.EqualFold(request.Header.Get("Upgrade"), "websocket") {
+			http.Error(w, "upgrade required", http.StatusUpgradeRequired)
+			return
+		}
+		posts++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"http-fallback","output_text":"ok","output":[]}`))
+	}))
+	defer server.Close()
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{Provider: &APIProvider{BaseURL: server.URL}, SupportsWebsockets: true})
+	prewarm, err := runner.Prewarm(context.Background(), &AgentRequest{Model: "gpt-test"})
+	if err != nil || prewarm != nil || posts != 0 {
+		t.Fatalf("prewarm=%#v posts=%d err=%v", prewarm, posts, err)
+	}
+	response, err := runner.RunWebSocket(context.Background(), &AgentRequest{Model: "gpt-test", Prompt: "hello"})
+	if err != nil || response == nil || response.ResponseID != "http-fallback" || posts != 1 {
+		t.Fatalf("response=%#v posts=%d err=%v", response, posts, err)
+	}
+}
+
+func TestResponsesAgentRunnerWebSocketRefreshesAuthOnceAfter401(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		attempts++
+		if attempts == 1 {
+			if got := request.Header.Get("Authorization"); got != "Bearer old-token" {
+				t.Fatalf("first auth = %q", got)
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if got := request.Header.Get("Authorization"); got != "Bearer new-token" {
+			t.Fatalf("second auth = %q", got)
+		}
+		conn, err := websocket.Accept(w, request, nil)
+		if err != nil {
+			t.Errorf("Accept() error = %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "done")
+		_, _, _ = conn.Read(request.Context())
+		_ = conn.Write(request.Context(), websocket.MessageText, []byte(`{"type":"response.completed","response":{"id":"resp-refreshed","output":[{"id":"msg-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}}`))
+	}))
+	defer server.Close()
+	plan := "pro"
+	snapshot := auth.FromChatGPTAuthTokens("old-token", "account-old", &plan)
+	headers := BearerAuthHeaders("old-token", "account-old", false)
+	refreshCalls := 0
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider:           &APIProvider{BaseURL: server.URL},
+		SupportsWebsockets: true,
+		Auth:               &headers,
+		AuthSnapshot:       &snapshot,
+		ExternalAuthRefresh: func(ctx context.Context, request *ExternalAuthRefreshRequest) (*ExternalAuthRefreshResponse, error) {
+			refreshCalls++
+			return &ExternalAuthRefreshResponse{AccessToken: "new-token", ChatGPTAccountID: "account-new", ChatGPTPlanType: &plan}, nil
+		},
+	})
+	response, err := runner.RunWebSocket(context.Background(), &AgentRequest{Model: "gpt-test", Prompt: "hello"})
+	if err != nil || response == nil || response.ResponseID != "resp-refreshed" || response.Message != "ok" {
+		t.Fatalf("response=%#v err=%v", response, err)
+	}
+	if attempts != 2 || refreshCalls != 1 {
+		t.Fatalf("attempts=%d refreshCalls=%d", attempts, refreshCalls)
+	}
+}
+
+func TestResponsesAgentRunnerAddsAttestationHeaderWhenEnabled(t *testing.T) {
+	provider := codexapi.NewCountingAttestationProvider(" attest-token ")
+	var recordedAttestation string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recordedAttestation = r.Header.Get(codexapi.AttestationHeader)
+		_, _ = w.Write([]byte(`{"id":"resp-attest","model":"gpt-test","output_text":"ok","output":[]}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider:           &APIProvider{BaseURL: server.URL + "/v1"},
+		IncludeAttestation: true,
+	})
+	if _, err := runner.Run(context.Background(), &AgentRequest{
+		Prompt:              "hello",
+		Model:               "gpt-test",
+		ThreadID:            "thread-attest",
+		AttestationProvider: provider,
+	}); err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if recordedAttestation != "attest-token" {
+		t.Fatalf("attestation header = %q", recordedAttestation)
+	}
+	if provider.Calls() != 1 {
+		t.Fatalf("provider calls = %d", provider.Calls())
+	}
+}
+
+func TestResponsesAgentRunnerSkipsAttestationHeaderWhenDisabled(t *testing.T) {
+	provider := codexapi.NewCountingAttestationProvider("attest-token")
+	var recordedAttestation string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recordedAttestation = r.Header.Get(codexapi.AttestationHeader)
+		_, _ = w.Write([]byte(`{"id":"resp-no-attest","model":"gpt-test","output_text":"ok","output":[]}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{Provider: &APIProvider{BaseURL: server.URL + "/v1"}})
+	if _, err := runner.Run(context.Background(), &AgentRequest{
+		Prompt:              "hello",
+		Model:               "gpt-test",
+		ThreadID:            "thread-attest",
+		AttestationProvider: provider,
+	}); err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if recordedAttestation != "" {
+		t.Fatalf("attestation header = %q", recordedAttestation)
+	}
+	if provider.Calls() != 0 {
+		t.Fatalf("provider calls = %d", provider.Calls())
+	}
+}
+
+func TestResponsesAgentRunnerTurnStatePersistsWithinTurnAndResetsAfter(t *testing.T) {
+	attempts := 0
+	var recordedTurnStates []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		recordedTurnStates = append(recordedTurnStates, r.Header.Get(responsesCodexTurnStateHeader))
+		w.Header().Set("Content-Type", "application/json")
+		switch attempts {
+		case 1:
+			w.Header().Set(responsesCodexTurnStateHeader, "turn-state-1")
+		case 2:
+			w.Header().Set(responsesCodexTurnStateHeader, "turn-state-2")
+		}
+		_, _ = w.Write([]byte(`{
+			"id":"resp-1",
+			"model":"gpt-test",
+			"output":[{"id":"msg-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],
+			"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+		}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{BaseURL: server.URL + "/v1"},
+	})
+	if _, err := runner.Run(context.Background(), &AgentRequest{Prompt: "first", Model: "gpt-test", TurnID: "turn-1"}); err != nil {
+		t.Fatalf("first Run error = %v", err)
+	}
+	if _, err := runner.Run(context.Background(), &AgentRequest{Prompt: "same turn follow-up", Model: "gpt-test", TurnID: "turn-1"}); err != nil {
+		t.Fatalf("second Run error = %v", err)
+	}
+	if _, err := runner.Run(context.Background(), &AgentRequest{Prompt: "same turn second follow-up", Model: "gpt-test", TurnID: "turn-1"}); err != nil {
+		t.Fatalf("third Run error = %v", err)
+	}
+	if _, err := runner.Run(context.Background(), &AgentRequest{Prompt: "next turn", Model: "gpt-test", TurnID: "turn-2"}); err != nil {
+		t.Fatalf("fourth Run error = %v", err)
+	}
+	want := []string{"", "turn-state-1", "turn-state-1", ""}
+	if strings.Join(recordedTurnStates, ",") != strings.Join(want, ",") {
+		t.Fatalf("turn state headers = %#v, want %#v", recordedTurnStates, want)
+	}
+}
+
+func TestResponsesAgentRunnerStreamsTurnStatePersistsWithinTurnAndResetsAfter(t *testing.T) {
+	attempts := 0
+	var recordedTurnStates []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		recordedTurnStates = append(recordedTurnStates, r.Header.Get(responsesCodexTurnStateHeader))
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch attempts {
+		case 1:
+			w.Header().Set(responsesCodexTurnStateHeader, "turn-state-1")
+		case 2:
+			w.Header().Set(responsesCodexTurnStateHeader, "turn-state-2")
+		}
+		_, _ = w.Write([]byte(responsesSSE(
+			`{"type":"response.created","response":{"id":"resp-stream"}}`,
+			`{"type":"response.output_item.added","item":{"id":"msg-stream","type":"message","role":"assistant","content":[{"type":"output_text","text":""}]}}`,
+			`{"type":"response.output_text.delta","item_id":"msg-stream","delta":"done"}`,
+			`{"type":"response.output_item.done","item":{"id":"msg-stream","type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}`,
+			`{"type":"response.completed","response":{"id":"resp-stream","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+		)))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{BaseURL: server.URL + "/v1"},
+		Stream:   true,
+	})
+	if _, err := runner.Run(context.Background(), &AgentRequest{Prompt: "first", Model: "gpt-test", TurnID: "turn-1"}); err != nil {
+		t.Fatalf("first Run error = %v", err)
+	}
+	if _, err := runner.Run(context.Background(), &AgentRequest{Prompt: "same turn follow-up", Model: "gpt-test", TurnID: "turn-1"}); err != nil {
+		t.Fatalf("second Run error = %v", err)
+	}
+	if _, err := runner.Run(context.Background(), &AgentRequest{Prompt: "same turn second follow-up", Model: "gpt-test", TurnID: "turn-1"}); err != nil {
+		t.Fatalf("third Run error = %v", err)
+	}
+	if _, err := runner.Run(context.Background(), &AgentRequest{Prompt: "next turn", Model: "gpt-test", TurnID: "turn-2"}); err != nil {
+		t.Fatalf("fourth Run error = %v", err)
+	}
+	want := []string{"", "turn-state-1", "turn-state-1", ""}
+	if strings.Join(recordedTurnStates, ",") != strings.Join(want, ",") {
+		t.Fatalf("stream turn state headers = %#v, want %#v", recordedTurnStates, want)
+	}
+}
+
+func TestResponsesAgentRunnerCompressesCodexBackendOpenAIRequests(t *testing.T) {
+	var recordedEncoding string
+	var recordedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recordedEncoding = r.Header.Get("Content-Encoding")
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll request body error = %v", err)
+		}
+		decoder, err := zstd.NewReader(nil)
+		if err != nil {
+			t.Fatalf("NewReader error = %v", err)
+		}
+		defer decoder.Close()
+		decoded, err := decoder.DecodeAll(body, nil)
+		if err != nil {
+			t.Fatalf("DecodeAll request body error = %v", err)
+		}
+		if err := json.Unmarshal(decoded, &recordedBody); err != nil {
+			t.Fatalf("Unmarshal request body error = %v", err)
+		}
+		_, _ = w.Write([]byte(`{"id":"resp-1","model":"gpt-test","output_text":"ok","output":[]}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{
+			Name:              OpenAIProviderName,
+			BaseURL:           server.URL + "/v1",
+			RequestMaxRetries: 0,
+		},
+		AuthSnapshot: &auth.AuthDotJSON{
+			AuthMode: "chatgpt",
+			Tokens:   map[string]any{"access_token": "token"},
+		},
+		EnableRequestCompression: true,
+	})
+
+	if _, err := runner.Run(context.Background(), &AgentRequest{Model: "gpt-test", Prompt: "hello"}); err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if recordedEncoding != "zstd" {
+		t.Fatalf("Content-Encoding = %q, want zstd", recordedEncoding)
+	}
+	if recordedBody["model"] != "gpt-test" {
+		t.Fatalf("body = %#v", recordedBody)
+	}
+}
+
+func TestResponsesAgentRunnerDoesNotCompressAPIKeyRequests(t *testing.T) {
+	var recordedEncoding string
+	var recordedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recordedEncoding = r.Header.Get("Content-Encoding")
+		if err := json.NewDecoder(r.Body).Decode(&recordedBody); err != nil {
+			t.Fatalf("Decode request body error = %v", err)
+		}
+		_, _ = w.Write([]byte(`{"id":"resp-1","model":"gpt-test","output_text":"ok","output":[]}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{
+			Name:              OpenAIProviderName,
+			BaseURL:           server.URL + "/v1",
+			RequestMaxRetries: 0,
+		},
+		AuthSnapshot:             &auth.AuthDotJSON{AuthMode: "api-key", OpenAIAPIKey: "sk-test"},
+		EnableRequestCompression: true,
+	})
+
+	if _, err := runner.Run(context.Background(), &AgentRequest{Model: "gpt-test", Prompt: "hello"}); err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if recordedEncoding != "" {
+		t.Fatalf("Content-Encoding = %q, want empty", recordedEncoding)
+	}
+	if recordedBody["model"] != "gpt-test" {
+		t.Fatalf("body = %#v", recordedBody)
+	}
+}
+
+func TestResponsesAgentRunnerAddsHostedImageGenerationForCodexBackend(t *testing.T) {
+	var recordedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&recordedBody); err != nil {
+			t.Fatalf("Decode request body error = %v", err)
+		}
+		_, _ = w.Write([]byte(`{"id":"resp-1","model":"gpt-test","output_text":"ok","output":[]}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{Name: OpenAIProviderName, BaseURL: server.URL + "/v1"},
+		AuthSnapshot: &auth.AuthDotJSON{
+			AuthMode: "chatgpt",
+			Tokens:   map[string]any{"access_token": "token"},
+		},
+		ModelsManager: NewStaticModelsManager(ModelsResponse{Models: []ModelInfo{{
+			Slug:            "gpt-test",
+			InputModalities: []string{"text", "image"},
+		}}}),
+	})
+
+	if _, err := runner.Run(context.Background(), &AgentRequest{Model: "gpt-test", Prompt: "draw"}); err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	tools, ok := recordedBody["tools"].([]any)
+	if !ok {
+		t.Fatalf("tools = %#v", recordedBody["tools"])
+	}
+	if !hasResponseToolType(tools, "image_generation") {
+		t.Fatalf("tools missing image_generation: %#v", tools)
+	}
+}
+
+func TestResponsesAgentRunnerDoesNotAddHostedImageGenerationForFreePlan(t *testing.T) {
+	var recordedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&recordedBody); err != nil {
+			t.Fatalf("Decode request body error = %v", err)
+		}
+		_, _ = w.Write([]byte(`{"id":"resp-1","model":"gpt-test","output_text":"ok","output":[]}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{Name: OpenAIProviderName, BaseURL: server.URL + "/v1"},
+		AuthSnapshot: &auth.AuthDotJSON{
+			AuthMode: "chatgpt",
+			Tokens: map[string]any{
+				"access_token": "token",
+				"plan_type":    "free",
+			},
+		},
+		ModelsManager: NewStaticModelsManager(ModelsResponse{Models: []ModelInfo{{
+			Slug:            "gpt-test",
+			InputModalities: []string{"text", "image"},
+		}}}),
+	})
+
+	if _, err := runner.Run(context.Background(), &AgentRequest{Model: "gpt-test", Prompt: "draw"}); err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	tools, _ := recordedBody["tools"].([]any)
+	if hasResponseToolType(tools, "image_generation") {
+		t.Fatalf("free-plan tools should not include image_generation: %#v", tools)
+	}
+}
+
+func TestResponsesAgentRunnerAddsHostedImageGenerationForOpenAIAPIKey(t *testing.T) {
+	var recordedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&recordedBody); err != nil {
+			t.Fatalf("Decode request body error = %v", err)
+		}
+		_, _ = w.Write([]byte(`{"id":"resp-1","model":"gpt-test","output_text":"ok","output":[]}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider:     &APIProvider{Name: OpenAIProviderName, BaseURL: server.URL + "/v1"},
+		AuthSnapshot: &auth.AuthDotJSON{AuthMode: "api-key", OpenAIAPIKey: "sk-test"},
+		ModelsManager: NewStaticModelsManager(ModelsResponse{Models: []ModelInfo{{
+			Slug:            "gpt-test",
+			InputModalities: []string{"text", "image"},
+		}}}),
+	})
+
+	if _, err := runner.Run(context.Background(), &AgentRequest{Model: "gpt-test", Prompt: "draw"}); err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	tools, _ := recordedBody["tools"].([]any)
+	if !hasResponseToolType(tools, "image_generation") {
+		t.Fatalf("api key OpenAI tools missing image_generation: %#v", tools)
+	}
+}
+
+func TestResponsesAgentRunnerDoesNotAddHostedImageGenerationForResponsesLite(t *testing.T) {
+	var recordedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&recordedBody); err != nil {
+			t.Fatalf("Decode request body error = %v", err)
+		}
+		_, _ = w.Write([]byte(`{"id":"resp-1","model":"gpt-lite","output_text":"ok","output":[]}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{Name: OpenAIProviderName, BaseURL: server.URL + "/v1"},
+		AuthSnapshot: &auth.AuthDotJSON{
+			AuthMode: "chatgpt",
+			Tokens:   map[string]any{"access_token": "token"},
+		},
+		ModelsManager: NewStaticModelsManager(ModelsResponse{Models: []ModelInfo{{
+			Slug:             "gpt-lite",
+			InputModalities:  []string{"text", "image"},
+			UseResponsesLite: true,
+		}}}),
+	})
+
+	if _, err := runner.Run(context.Background(), &AgentRequest{
+		Model:  "gpt-lite",
+		Prompt: "draw",
+		Tools:  []any{map[string]any{"type": "function", "name": "echo"}},
+	}); err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if _, ok := recordedBody["tools"]; ok {
+		t.Fatalf("responses lite should not include top-level tools: %#v", recordedBody["tools"])
+	}
+	inputs, ok := recordedBody["input"].([]any)
+	if !ok || len(inputs) == 0 {
+		t.Fatalf("input = %#v", recordedBody["input"])
+	}
+	additionalTools, ok := inputs[0].(map[string]any)
+	if !ok || additionalTools["type"] != "additional_tools" {
+		t.Fatalf("additional_tools = %#v", inputs[0])
+	}
+	tools, ok := additionalTools["tools"].([]any)
+	if !ok {
+		t.Fatalf("additional_tools.tools = %#v", additionalTools["tools"])
+	}
+	if hasResponseToolType(tools, "image_generation") {
+		t.Fatalf("responses lite additional_tools should not include hosted image_generation: %#v", tools)
+	}
+}
+
+func TestResponsesAgentRunnerDoesNotAddHostedImageGenerationWhenStandaloneNamespacePresent(t *testing.T) {
+	var recordedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&recordedBody); err != nil {
+			t.Fatalf("Decode request body error = %v", err)
+		}
+		_, _ = w.Write([]byte(`{"id":"resp-1","model":"gpt-test","output_text":"ok","output":[]}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{Name: OpenAIProviderName, BaseURL: server.URL + "/v1"},
+		AuthSnapshot: &auth.AuthDotJSON{
+			AuthMode: "chatgpt",
+			Tokens:   map[string]any{"access_token": "token"},
+		},
+		ModelsManager: NewStaticModelsManager(ModelsResponse{Models: []ModelInfo{{
+			Slug:            "gpt-test",
+			InputModalities: []string{"text", "image"},
+		}}}),
+	})
+
+	standalone := map[string]any{
+		"type":        "namespace",
+		"name":        "image_gen",
+		"description": "Tools in the image_gen namespace.",
+		"tools": []any{map[string]any{
+			"type": "function",
+			"name": "imagegen",
+		}},
+	}
+	if _, err := runner.Run(context.Background(), &AgentRequest{
+		Model:  "gpt-test",
+		Prompt: "draw",
+		Tools:  []any{standalone},
+	}); err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	tools, ok := recordedBody["tools"].([]any)
+	if !ok {
+		t.Fatalf("tools = %#v", recordedBody["tools"])
+	}
+	if hasResponseToolType(tools, "image_generation") {
+		t.Fatalf("standalone image_gen should suppress hosted image_generation: %#v", tools)
+	}
+	if !hasResponseNamespaceFunction(tools, "image_gen", "imagegen") {
+		t.Fatalf("standalone namespace missing: %#v", tools)
+	}
+}
+
+func TestResponsesLitePrefixItemsUseStableDeterministicIDsLikeRust(t *testing.T) {
+	tools := []any{
+		map[string]any{"type": "function", "name": "echo", "strict": true},
+	}
+	instructions := "You are a helpful assistant."
+
+	first := responsesLiteInputItems([]any{map[string]any{"type": "message", "role": "user", "content": []any{}}}, cloneAnySlice(tools), instructions, "thread-abc")
+	second := responsesLiteInputItems([]any{map[string]any{"type": "message", "role": "user", "content": []any{}}}, cloneAnySlice(tools), instructions, "thread-abc")
+
+	// Same thread + same payload must produce identical prefix item IDs.
+	at1, ok := first[0].(map[string]any)
+	if !ok {
+		t.Fatalf("first item = %#v, want additional_tools map", first[0])
+	}
+	at2, ok := second[0].(map[string]any)
+	if !ok {
+		t.Fatalf("second item = %#v, want additional_tools map", second[0])
+	}
+	if at1["id"] != at2["id"] {
+		t.Fatalf("additional_tools id unstable: got %v then %v", at1["id"], at2["id"])
+	}
+	msg1, ok := first[1].(responsesInputMessage)
+	if !ok {
+		t.Fatalf("first message item = %#v, want responsesInputMessage", first[1])
+	}
+	msg2, ok := second[1].(responsesInputMessage)
+	if !ok {
+		t.Fatalf("second message item = %#v, want responsesInputMessage", second[1])
+	}
+	if msg1.ID != msg2.ID || msg1.ID == "" {
+		t.Fatalf("base-instruction message id unstable or empty: %q then %q", msg1.ID, msg2.ID)
+	}
+	if !strings.HasPrefix(msg1.ID, "msg_") || !strings.HasPrefix(at1["id"].(string), "at_") {
+		t.Fatalf("prefix item id suffixes missing: at=%v msg=%q", at1["id"], msg1.ID)
+	}
+
+	// Changing the thread must change the IDs.
+	third := responsesLiteInputItems([]any{map[string]any{"type": "message", "role": "user", "content": []any{}}}, cloneAnySlice(tools), instructions, "thread-xyz")
+	at3, ok := third[0].(map[string]any)
+	if !ok {
+		t.Fatalf("third item = %#v, want additional_tools map", third[0])
+	}
+	if at3["id"] == at1["id"] {
+		t.Fatalf("additional_tools id did not change across threads: %v", at1["id"])
+	}
+
+	// Changing the payload (tools) must change the additional_tools ID.
+	changedTools := responsesLiteInputItems([]any{map[string]any{"type": "message", "role": "user", "content": []any{}}}, []any{map[string]any{"type": "function", "name": "other"}}, instructions, "thread-abc")
+	at4, ok := changedTools[0].(map[string]any)
+	if !ok {
+		t.Fatalf("changed-tools item = %#v, want additional_tools map", changedTools[0])
+	}
+	if at4["id"] == at1["id"] {
+		t.Fatalf("additional_tools id did not change across payloads: %v", at1["id"])
+	}
+}
+
+func TestResponsesLiteBaseInstructionsMetadataLikeRust(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		providerName  string
+		kindsEnabled  bool
+		wantKindsSeen bool
+	}{
+		{name: "OpenAI feature enabled", providerName: OpenAIProviderName, kindsEnabled: true, wantKindsSeen: true},
+		{name: "OpenAI feature disabled", providerName: OpenAIProviderName, kindsEnabled: false},
+		{name: "non-OpenAI provider", providerName: "Azure OpenAI", kindsEnabled: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var recordedBody map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&recordedBody); err != nil {
+					t.Errorf("Decode request body error = %v", err)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{
+					"id":"resp-1",
+					"model":"gpt-lite",
+					"output":[{"id":"msg-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],
+					"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+				}`))
+			}))
+			defer server.Close()
+
+			enabled := test.kindsEnabled
+			runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+				Provider:                &APIProvider{Name: test.providerName, BaseURL: server.URL + "/v1"},
+				ContentItemKindsEnabled: &enabled,
+				ModelsManager: NewStaticModelsManager(ModelsResponse{Models: []ModelInfo{{
+					Slug:             "gpt-lite",
+					UseResponsesLite: true,
+				}}}),
+			})
+			if _, err := runner.Run(context.Background(), &AgentRequest{
+				Model:        "gpt-lite",
+				Prompt:       "hello",
+				Instructions: "test instructions",
+			}); err != nil {
+				t.Fatalf("Run error = %v", err)
+			}
+			inputs, ok := recordedBody["input"].([]any)
+			if !ok || len(inputs) < 2 {
+				t.Fatalf("input = %#v", recordedBody["input"])
+			}
+			message, ok := inputs[1].(map[string]any)
+			if !ok || message["role"] != "developer" {
+				t.Fatalf("base instructions = %#v", inputs[1])
+			}
+			content, ok := message["content"].([]any)
+			if !ok || len(content) != 1 {
+				t.Fatalf("base instruction content = %#v", message["content"])
+			}
+			block, ok := content[0].(map[string]any)
+			if !ok || block["type"] != "input_text" || block["text"] != "test instructions" {
+				t.Fatalf("base instruction block = %#v", content[0])
+			}
+			metadata, kindsSeen := message["internal_chat_message_metadata_passthrough"].(map[string]any)
+			if kindsSeen != test.wantKindsSeen {
+				t.Fatalf("metadata = %#v, want present=%v", message["internal_chat_message_metadata_passthrough"], test.wantKindsSeen)
+			}
+			if kindsSeen {
+				kinds, _ := metadata["content_item_kinds"].([]any)
+				if len(kinds) != 1 || kinds[0] != "model.base_instructions" {
+					t.Fatalf("content_item_kinds = %#v", metadata["content_item_kinds"])
+				}
+			}
+		})
+	}
+}
+
+func TestResponsesAgentRunnerParsesImageGenerationCall(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{
+			"id":"resp-image",
+			"model":"gpt-test",
+			"output":[{"id":"ig_123","type":"image_generation_call","status":"generating","revised_prompt":"A small blue square","result":"Zm9v"}]
+		}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{Name: OpenAIProviderName, BaseURL: server.URL + "/v1"},
+	})
+	response, err := runner.Run(context.Background(), &AgentRequest{Model: "gpt-test", Prompt: "draw"})
+	if err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if len(response.Items) != 1 {
+		t.Fatalf("items = %#v", response.Items)
+	}
+	item := response.Items[0]
+	if item.Type != "image_generation_call" || item.ID != "ig_123" || item.Status != "completed" || item.Text != "Zm9v" {
+		t.Fatalf("image item = %#v", item)
+	}
+	if item.Data["status"] != "completed" || item.Data["revised_prompt"] != "A small blue square" || item.Data["result"] != "Zm9v" {
+		t.Fatalf("image data = %#v", item.Data)
+	}
+}
+
+func TestParseResponsesStreamNormalizesImageGenerationCallWithResult(t *testing.T) {
+	var events []ResponsesStreamEvent
+	response, err := parseResponsesStream(context.Background(), strings.NewReader(responsesSSE(
+		`{"type":"response.created","response":{"id":"resp-image"}}`,
+		`{"type":"response.output_item.added","item":{"id":"ig_123","type":"image_generation_call","status":"generating"}}`,
+		`{"type":"response.output_item.done","item":{"id":"ig_123","type":"image_generation_call","status":"generating","revised_prompt":"A small blue square","result":"Zm9v"}}`,
+		`{"type":"response.completed","response":{"id":"resp-image","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+	)), &AgentRequest{Model: "gpt-test"}, OpenAIProviderName, func(event *ResponsesStreamEvent) {
+		events = append(events, *event)
+	})
+	if err != nil {
+		t.Fatalf("parseResponsesStream error = %v", err)
+	}
+	if len(response.Items) != 1 {
+		t.Fatalf("items = %#v", response.Items)
+	}
+	item := response.Items[0]
+	if item.Type != "image_generation_call" || item.Status != "completed" || item.Text != "Zm9v" {
+		t.Fatalf("image item = %#v", item)
+	}
+	var done *ResponsesStreamEvent
+	for i := range events {
+		if events[i].Kind == ResponsesStreamEventOutputDone {
+			done = &events[i]
+			break
+		}
+	}
+	if done == nil || done.Item == nil || done.Item.Status != "completed" || done.Item.Data["status"] != "completed" {
+		t.Fatalf("output done event = %#v", done)
+	}
+}
+
+func TestParseResponsesStreamRecordsImageGenerationFromCompletedOutput(t *testing.T) {
+	response, err := parseResponsesStream(context.Background(), strings.NewReader(responsesSSE(
+		`{"type":"response.created","response":{"id":"resp-image"}}`,
+		`{"type":"response.completed","response":{"id":"resp-image","output":[{"id":"ig_123","type":"image_generation_call","status":"generating","revised_prompt":"A small blue square","result":"Zm9v"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+	)), &AgentRequest{Model: "gpt-test"}, OpenAIProviderName, nil)
+	if err != nil {
+		t.Fatalf("parseResponsesStream error = %v", err)
+	}
+	if len(response.Items) != 1 {
+		t.Fatalf("items = %#v", response.Items)
+	}
+	item := response.Items[0]
+	if item.Type != "image_generation_call" || item.ID != "ig_123" || item.Status != "completed" || item.Text != "Zm9v" {
+		t.Fatalf("image item = %#v", item)
+	}
+	if item.Data["status"] != "completed" || item.Data["revised_prompt"] != "A small blue square" {
+		t.Fatalf("image data = %#v", item.Data)
+	}
+}
+
+func TestParseResponsesStreamDeduplicatesCompletedAssistantMessageWithStableID(t *testing.T) {
+	response, err := parseResponsesStream(context.Background(), strings.NewReader(responsesSSE(
+		`{"type":"response.created","response":{"id":"resp-1"}}`,
+		`{"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}`,
+		`{"type":"response.completed","response":{"id":"resp-1","output":[{"id":"msg_123","type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+	)), &AgentRequest{Model: "gpt-test"}, OpenAIProviderName, nil)
+	if err != nil {
+		t.Fatalf("parseResponsesStream error = %v", err)
+	}
+	if len(response.Items) != 1 {
+		t.Fatalf("items = %#v", response.Items)
+	}
+	item := response.Items[0]
+	if item.ID != "msg_123" || item.Type != "agent_message" || item.Text != "done" {
+		t.Fatalf("deduped item = %#v", item)
+	}
+}
+
+func TestParseResponsesStreamDeduplicatesCompletedAssistantMessageWhenSummaryOmitsID(t *testing.T) {
+	response, err := parseResponsesStream(context.Background(), strings.NewReader(responsesSSE(
+		`{"type":"response.created","response":{"id":"resp-1"}}`,
+		`{"type":"response.output_item.done","item":{"id":"msg_123","type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}`,
+		`{"type":"response.completed","response":{"id":"resp-1","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+	)), &AgentRequest{Model: "gpt-test"}, OpenAIProviderName, nil)
+	if err != nil {
+		t.Fatalf("parseResponsesStream error = %v", err)
+	}
+	if len(response.Items) != 1 {
+		t.Fatalf("items = %#v", response.Items)
+	}
+	item := response.Items[0]
+	if item.ID != "msg_123" || item.Type != "agent_message" || item.Text != "done" {
+		t.Fatalf("deduped item = %#v", item)
+	}
+}
+
+func TestParseResponsesStreamMergesToolCallsByCallIDAndPreservesNamespace(t *testing.T) {
+	response, err := parseResponsesStream(context.Background(), strings.NewReader(responsesSSE(
+		`{"type":"response.created","response":{"id":"resp-mcp"}}`,
+		`{"type":"response.output_item.done","item":{"id":"fc-complete","type":"function_call","call_id":"call-mcp","namespace":"mcp__geogebra","name":"geogebra_create_circle","arguments":"{\"radius\":3}"}}`,
+		`{"type":"response.completed","response":{"id":"resp-mcp","output":[{"id":"fc-summary","type":"function_call","call_id":"call-mcp","name":"geogebra_create_circle","arguments":"{\"radius\":3}"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+	)), &AgentRequest{Model: "gpt-test"}, OpenAIProviderName, nil)
+	if err != nil {
+		t.Fatalf("parseResponsesStream error = %v", err)
+	}
+	if len(response.Items) != 1 {
+		t.Fatalf("items = %#v", response.Items)
+	}
+	item := response.Items[0]
+	if item.ID != "fc-complete" || item.CallID != "call-mcp" || item.Namespace != "mcp__geogebra" || item.Name != "geogebra_create_circle" {
+		t.Fatalf("merged item = %#v", item)
+	}
+}
+
+func TestResponsesAgentRunnerReasoningUsesModelDefaultsAndLiteContext(t *testing.T) {
+	var recordedBody map[string]any
+	var recordedLiteHeader string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recordedLiteHeader = r.Header.Get(responsesLiteHeader)
+		if err := json.NewDecoder(r.Body).Decode(&recordedBody); err != nil {
+			t.Fatalf("Decode request body error = %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp-1",
+			"model":"gpt-lite",
+			"output":[{"id":"msg-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],
+			"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+		}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{Name: OpenAIProviderName, BaseURL: server.URL + "/v1"},
+		ModelsManager: NewStaticModelsManager(ModelsResponse{Models: []ModelInfo{{
+			Slug:                       "gpt-lite",
+			SupportsReasoningSummaries: true,
+			DefaultReasoningLevel:      "high",
+			DefaultReasoningSummary:    "auto",
+			UseResponsesLite:           true,
+		}}}),
+	})
+	_, err := runner.Run(context.Background(), &AgentRequest{
+		Prompt:       "hello",
+		Instructions: "test instructions",
+		InputItems: []any{map[string]any{
+			"type": "message",
+			"role": "user",
+			"content": []any{map[string]any{
+				"type":      "input_image",
+				"image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+				"detail":    "high",
+			}},
+		}},
+		Tools: []any{map[string]any{
+			"type": "function",
+			"name": "echo",
+		}},
+		Model:             "gpt-lite",
+		ParallelToolCalls: true,
+		ReasoningSummary:  "none",
+	})
+	if err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if recordedLiteHeader != "true" {
+		t.Fatalf("%s = %q", responsesLiteHeader, recordedLiteHeader)
+	}
+	if _, ok := recordedBody["instructions"]; ok {
+		t.Fatalf("instructions present = %#v", recordedBody["instructions"])
+	}
+	if _, ok := recordedBody["tools"]; ok {
+		t.Fatalf("tools present = %#v", recordedBody["tools"])
+	}
+	if recordedBody["parallel_tool_calls"] != false {
+		t.Fatalf("parallel_tool_calls = %#v", recordedBody["parallel_tool_calls"])
+	}
+	inputs, ok := recordedBody["input"].([]any)
+	if !ok || len(inputs) != 4 {
+		t.Fatalf("input = %#v", recordedBody["input"])
+	}
+	additionalTools, ok := inputs[0].(map[string]any)
+	if !ok || additionalTools["type"] != "additional_tools" || additionalTools["role"] != "developer" {
+		t.Fatalf("additional_tools = %#v", inputs[0])
+	}
+	if tools, ok := additionalTools["tools"].([]any); !ok || len(tools) != 1 {
+		t.Fatalf("additional_tools.tools = %#v", additionalTools["tools"])
+	}
+	developerMessage, ok := inputs[1].(map[string]any)
+	if !ok || developerMessage["role"] != "developer" {
+		t.Fatalf("developer message = %#v", inputs[1])
+	}
+	imageMessage, ok := inputs[2].(map[string]any)
+	if !ok {
+		t.Fatalf("image message = %#v", inputs[2])
+	}
+	content, ok := imageMessage["content"].([]any)
+	if !ok || len(content) != 1 {
+		t.Fatalf("image content = %#v", imageMessage["content"])
+	}
+	image, ok := content[0].(map[string]any)
+	if !ok || image["type"] != "input_image" || image["detail"] != nil {
+		t.Fatalf("lite image content = %#v", content[0])
+	}
+	reasoning, ok := recordedBody["reasoning"].(map[string]any)
+	if !ok || reasoning["effort"] != "high" || reasoning["context"] != "all_turns" {
+		t.Fatalf("reasoning = %#v", recordedBody["reasoning"])
+	}
+	if _, ok := reasoning["summary"]; ok {
+		t.Fatalf("reasoning summary present = %#v", reasoning)
+	}
+}
+
+func TestPrepareResponseInputImagesReencodesUnsupportedMime(t *testing.T) {
+	// A valid 1x1 PNG payload that view_image-style tools label
+	// application/octet-stream. Image preparation must re-encode the data URL
+	// with the canonical image/png mime (mirroring Rust format_to_mime) so the
+	// Responses API does not reject it as an unsupported image.
+	const pngPayload = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+	items := []any{map[string]any{
+		"type": "message",
+		"role": "user",
+		"content": []any{map[string]any{
+			"type":      "input_image",
+			"image_url": "data:application/octet-stream;base64," + pngPayload,
+			"detail":    "high",
+		}},
+	}}
+	out := prepareResponseInputImages(items)
+	content := out[0].(map[string]any)["content"].([]any)
+	block := content[0].(map[string]any)
+	if block["type"] != "input_image" {
+		t.Fatalf("block type = %#v, want input_image", block["type"])
+	}
+	url, _ := block["image_url"].(string)
+	if !strings.HasPrefix(url, "data:image/png;base64,") {
+		t.Fatalf("image_url = %q, want data:image/png;base64,...", url)
+	}
+}
+
+func TestPrepareResponseInputImagesReplacesUnprocessableWithPlaceholder(t *testing.T) {
+	items := []any{map[string]any{
+		"type": "message",
+		"role": "user",
+		"content": []any{map[string]any{
+			"type":      "input_image",
+			"image_url": "data:",
+			"detail":    "high",
+		}},
+	}}
+	out := prepareResponseInputImages(items)
+	content := out[0].(map[string]any)["content"].([]any)
+	block := content[0].(map[string]any)
+	if block["type"] != "input_text" {
+		t.Fatalf("block type = %#v, want input_text placeholder", block["type"])
+	}
+	if text, _ := block["text"].(string); !strings.Contains(text, "image content omitted") {
+		t.Fatalf("placeholder text = %q", text)
+	}
+	if _, ok := block["image_url"]; ok {
+		t.Fatal("placeholder block still carries image_url")
+	}
+}
+
+func TestPrepareResponseInputImagesTagsFailedImageKind(t *testing.T) {
+	items := []any{map[string]any{
+		"type": "message",
+		"role": "user",
+		"content": []any{map[string]any{
+			"type":      "input_image",
+			"image_url": "data:",
+			"detail":    "high",
+		}},
+		"internal_chat_message_metadata_passthrough": map[string]any{
+			"content_item_kinds": []any{"user.image"},
+		},
+	}}
+	out := prepareResponseInputImages(items)
+	msg := out[0].(map[string]any)
+	md := msg["internal_chat_message_metadata_passthrough"].(map[string]any)
+	kinds, _ := md["content_item_kinds"].([]any)
+	if len(kinds) != 1 || kinds[0] != "images.preparation_error" {
+		t.Fatalf("content_item_kinds = %#v, want images.preparation_error (Rust #40281)", kinds)
+	}
+}
+
+func TestPrepareResponseInputImagesLeavesNonImageItems(t *testing.T) {
+	items := []any{map[string]any{
+		"type": "message",
+		"role": "user",
+		"content": []any{map[string]any{
+			"type": "input_text",
+			"text": "hello",
+		}},
+	}}
+	out := prepareResponseInputImages(items)
+	if len(out) != 1 {
+		t.Fatalf("len(out) = %d, want 1", len(out))
+	}
+	content := out[0].(map[string]any)["content"].([]any)
+	if block := content[0].(map[string]any); block["type"] != "input_text" || block["text"] != "hello" {
+		t.Fatalf("block = %#v", block)
+	}
+}
+
+func TestResponsesAgentRunnerAppendsPromptAfterHistoryInputItems(t *testing.T) {
+	items := responsesInputItems(&AgentRequest{
+		Prompt: "new question",
+		InputItems: []any{map[string]any{
+			"type": "message",
+			"role": "assistant",
+			"content": []map[string]any{{
+				"type": "output_text",
+				"text": "old answer",
+			}},
+		}},
+	})
+
+	if len(items) != 2 {
+		t.Fatalf("items = %#v", items)
+	}
+	history := items[0].(map[string]any)
+	prompt := items[1].(responsesInputMessage)
+	if history["role"] != "assistant" || prompt.Role != "user" || prompt.Content[0].Text != "new question" {
+		t.Fatalf("items order = %#v", items)
+	}
+}
+
+func TestResponsesAgentRunnerBootstrapsAgentIdentity(t *testing.T) {
+	home := t.TempDir()
+	accessToken := fakeJWTModel(map[string]any{
+		"chatgpt_account_id": "account-123",
+		"chatgpt_user_id":    "user-123",
+		"chatgpt_plan_type":  "pro",
+	})
+	snapshot := auth.AuthDotJSON{
+		AuthMode: "chatgpt",
+		Tokens: map[string]any{
+			"access_token": accessToken,
+		},
+	}
+	if err := auth.NewStore(home).Save(snapshot); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	var responsesAuth string
+	var responsesAccountID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/agent/register":
+			if got := r.Header.Get("Authorization"); got != "Bearer "+accessToken {
+				t.Fatalf("register Authorization = %q", got)
+			}
+			writeJSONModel(t, w, map[string]string{"agent_runtime_id": "agent-runtime-1"})
+		case "/v1/agent/agent-runtime-1/task/register":
+			writeJSONModel(t, w, map[string]string{"task_id": "task-1"})
+		case "/v1/responses":
+			responsesAuth = r.Header.Get("Authorization")
+			responsesAccountID = r.Header.Get("ChatGPT-Account-ID")
+			writeJSONModel(t, w, map[string]any{"id": "resp-1", "output_text": "ok", "output": []any{}})
+		default:
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	bearer := BearerAuthHeaders(accessToken, "account-123", false)
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{
+			Name:              OpenAIProviderName,
+			BaseURL:           server.URL + "/v1",
+			RequestMaxRetries: 0,
+		},
+		Auth:         &bearer,
+		HTTPClient:   server.Client(),
+		CodexHome:    home,
+		AuthSnapshot: &snapshot,
+		AgentIdentity: &AgentIdentityOptions{
+			Enabled:        true,
+			AuthAPIBaseURL: server.URL,
+			SessionSource:  "cli",
+		},
+	})
+
+	response, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if response.Message != "ok" {
+		t.Fatalf("response = %#v", response)
+	}
+	if !strings.HasPrefix(responsesAuth, "AgentAssertion ") {
+		t.Fatalf("responses Authorization = %q", responsesAuth)
+	}
+	if responsesAccountID != "account-123" {
+		t.Fatalf("ChatGPT-Account-ID = %q", responsesAccountID)
+	}
+	if runner.AuthSnapshot == nil || runner.AuthSnapshot.Mode() != "agent-identity" {
+		t.Fatalf("runner auth snapshot = %#v", runner.AuthSnapshot)
+	}
+	if runner.AgentIdentityTelemetry == nil || runner.AgentIdentityTelemetry.AgentID != "agent-runtime-1" || runner.AgentIdentityTelemetry.TaskID != "task-1" {
+		t.Fatalf("AgentIdentityTelemetry = %#v", runner.AgentIdentityTelemetry)
+	}
+}
+
+func TestResponsesAgentRunnerSendsSignerPreparedBody(t *testing.T) {
+	var recordedBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll request body error = %v", err)
+		}
+		recordedBody = string(body)
+		_, _ = w.Write([]byte(`{"id":"resp-1","output_text":"ok","output":[]}`))
+	}))
+	defer server.Close()
+
+	authHeaders := AuthHeaders{
+		SignRequest: func(_ context.Context, request *http.Request, _ []byte) (*SignedRequest, error) {
+			body := []byte(`{"model":"signed-body"}`)
+			request.Header.Set("X-Signed-Body", "true")
+			return &SignedRequest{Body: body}, nil
+		},
+	}
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{
+			Name:              OpenAIProviderName,
+			BaseURL:           server.URL + "/v1",
+			RequestMaxRetries: 0,
+		},
+		Auth: &authHeaders,
+	})
+
+	if _, err := runner.Run(context.Background(), &AgentRequest{Model: "gpt-test", Prompt: "hello"}); err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if recordedBody != `{"model":"signed-body"}` {
+		t.Fatalf("body = %q", recordedBody)
+	}
+}
+
+func fakeJWTModel(payload map[string]any) string {
+	header, _ := json.Marshal(map[string]any{"alg": "none"})
+	body, _ := json.Marshal(payload)
+	return base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(body) + "."
+}
+
+func writeJSONModel(t *testing.T, w http.ResponseWriter, value any) {
+	t.Helper()
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		t.Fatalf("Encode() error = %v", err)
+	}
+}
+
+func TestResponsesAgentRunnerSendsOriginatorHeader(t *testing.T) {
+	var recordedOriginator string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recordedOriginator = r.Header.Get("originator")
+		_, _ = w.Write([]byte(`{"id":"resp-1","output_text":"ok","output":[]}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{
+			Name:              OpenAIProviderName,
+			BaseURL:           server.URL + "/v1",
+			RequestMaxRetries: 0,
+		},
+	})
+
+	if _, err := runner.Run(context.Background(), &AgentRequest{Model: "gpt-test", Prompt: "hello", Originator: "codex_vscode"}); err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if recordedOriginator != "codex_vscode" {
+		t.Fatalf("originator = %q", recordedOriginator)
+	}
+}
+
+func TestResponsesAgentRunnerRoutingHintUsesCodexBackendAuth(t *testing.T) {
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider:     &APIProvider{Name: OpenAIProviderName, BaseURL: "https://example.test/v1"},
+		AuthSnapshot: &auth.AuthDotJSON{AuthMode: "chatgpt"},
+	})
+	request, err := runner.newResponsesHTTPRequest(context.Background(), &AgentRequest{}, &responsesAgentRequest{
+		Model: "gpt-test", ServiceTier: "fast",
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := request.Header.Get(codexapi.ClientCodexRoutingHintHeader); got != "model=gpt-test;tier=fast" {
+		t.Fatalf("routing hint = %q", got)
+	}
+
+	runner.ProviderUsesOwnCredentials = true
+	request, err = runner.newResponsesHTTPRequest(context.Background(), &AgentRequest{}, &responsesAgentRequest{Model: "gpt-test"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := request.Header.Get(codexapi.ClientCodexRoutingHintHeader); got != "" {
+		t.Fatalf("provider-credential routing hint = %q, want empty", got)
+	}
+	runner.ProviderUsesOwnCredentials = false
+	runner.AuthSnapshot = &auth.AuthDotJSON{AuthMode: "api-key", OpenAIAPIKey: "sk-test"}
+	request, err = runner.newResponsesHTTPRequest(context.Background(), &AgentRequest{}, &responsesAgentRequest{Model: "gpt-test"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := request.Header.Get(codexapi.ClientCodexRoutingHintHeader); got != "" {
+		t.Fatalf("API-key routing hint = %q, want empty", got)
+	}
+}
+
+// Mirrors Rust #45736: Guardian review inference uses the standard /responses
+// route and identifies itself with `x-codex-guardian: reviewer` when the request
+// model is the provider's preferred review model, the auth uses the Codex
+// backend, and the provider supports the backend routes. `free_guardian` no
+// longer gates the decision.
+func TestResponsesAgentRunnerGuardianRoutingLikeRust(t *testing.T) {
+	makeRunner := func(authMode string, baseURL string) *ResponsesAgentRunner {
+		return NewResponsesAgentRunner(&ResponsesAgentOptions{
+			Provider:     &APIProvider{Name: OpenAIProviderName, BaseURL: baseURL},
+			AuthSnapshot: &auth.AuthDotJSON{AuthMode: authMode},
+		})
+	}
+	const backendBaseURL = "https://example.test/backend-api/codex"
+
+	// A preferred-model review over Codex backend auth carries the reviewer
+	// header, drops the routing hint and the service tier, and stays on
+	// /responses.
+	runner := makeRunner("chatgpt", backendBaseURL)
+	request, err := runner.newResponsesHTTPRequest(context.Background(), &AgentRequest{
+		TaskKind:   AgentTaskReview,
+		Originator: "guardian",
+		Model:      DefaultApprovalReviewPreferredModel,
+	}, &responsesAgentRequest{Model: DefaultApprovalReviewPreferredModel, ServiceTier: "priority"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(request.URL.Path, "/responses") {
+		t.Fatalf("review path = %q, want /responses", request.URL.Path)
+	}
+	if got := request.Header.Get(GuardianHeaderName); got != GuardianHeaderReviewer {
+		t.Fatalf("guardian header = %q, want %q", got, GuardianHeaderReviewer)
+	}
+	if got := request.Header.Get(codexapi.ClientCodexRoutingHintHeader); got != "" {
+		t.Fatalf("guardian routing hint = %q, want empty", got)
+	}
+	body, err := io.ReadAll(request.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "service_tier") {
+		t.Fatalf("guardian review body kept a service tier: %s", body)
+	}
+	if strings.Contains(string(body), codexapi.GuardianCreditsRequestedKey) {
+		t.Fatalf("guardian review body requested Guardian credits: %s", body)
+	}
+
+	// A review with a different (overridden) model is unmarked: the header,
+	// hint suppression and tier clearing are all scoped to the preferred model.
+	request, err = runner.newResponsesHTTPRequest(context.Background(), &AgentRequest{
+		TaskKind: AgentTaskReview,
+		Model:    "gpt-review-override",
+	}, &responsesAgentRequest{Model: "gpt-review-override"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := request.Header.Get(GuardianHeaderName); got != "" {
+		t.Fatalf("overridden review guardian header = %q, want empty", got)
+	}
+	if got := request.Header.Get(codexapi.ClientCodexRoutingHintHeader); got != "model=gpt-review-override" {
+		t.Fatalf("overridden review routing hint = %q", got)
+	}
+
+	// An ordinary request has no guardian header and keeps its routing hint.
+	request, err = runner.newResponsesHTTPRequest(context.Background(), &AgentRequest{}, &responsesAgentRequest{Model: "gpt-test"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := request.Header.Get(GuardianHeaderName); got != "" {
+		t.Fatalf("ordinary guardian header = %q, want empty", got)
+	}
+	if got := request.Header.Get(codexapi.ClientCodexRoutingHintHeader); got != "model=gpt-test" {
+		t.Fatalf("ordinary routing hint = %q, want %q", got, "model=gpt-test")
+	}
+	ordinaryBody, err := io.ReadAll(request.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(ordinaryBody), `"`+codexapi.GuardianCreditsRequestedKey+`":"true"`) {
+		t.Fatalf("ordinary request did not request Guardian credits: %s", ordinaryBody)
+	}
+
+	// API-key auth does not use the Codex backend, so the review is unmarked.
+	apiKeyRunner := makeRunner("api-key", backendBaseURL)
+	request, err = apiKeyRunner.newResponsesHTTPRequest(context.Background(), &AgentRequest{
+		TaskKind: AgentTaskReview,
+		Model:    DefaultApprovalReviewPreferredModel,
+	}, &responsesAgentRequest{Model: DefaultApprovalReviewPreferredModel}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := request.Header.Get(GuardianHeaderName); got != "" {
+		t.Fatalf("api-key guardian header = %q, want empty", got)
+	}
+
+	// A provider without the backend routes is unmarked as well.
+	plainRunner := makeRunner("chatgpt", "https://example.test/v1")
+	request, err = plainRunner.newResponsesHTTPRequest(context.Background(), &AgentRequest{
+		TaskKind: AgentTaskReview,
+		Model:    DefaultApprovalReviewPreferredModel,
+	}, &responsesAgentRequest{Model: DefaultApprovalReviewPreferredModel}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := request.Header.Get(GuardianHeaderName); got != "" {
+		t.Fatalf("plain-provider guardian header = %q, want empty", got)
+	}
+}
+
+func TestResponsesAgentRunnerSendsStoreAndMetadataFieldsWithoutHTTPPreviousResponseID(t *testing.T) {
+	var recordedBody map[string]any
+	var recordedHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recordedHeaders = r.Header.Clone()
+		if err := json.NewDecoder(r.Body).Decode(&recordedBody); err != nil {
+			t.Fatalf("Decode request body error = %v", err)
+		}
+		_, _ = w.Write([]byte(`{"id":"resp-next","model":"gpt-test","output_text":"ok"}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{BaseURL: server.URL + "/v1"},
+		ModelsManager: NewStaticModelsManager(ModelsResponse{Models: []ModelInfo{{
+			Slug:         "gpt-test",
+			ServiceTiers: []string{"priority"},
+		}}}),
+	})
+	_, err := runner.Run(context.Background(), &AgentRequest{
+		Prompt:             "hello",
+		Model:              "gpt-test",
+		Store:              true,
+		PreviousResponseID: "resp-prev",
+		ServiceTier:        "priority",
+		PromptCacheKey:     "cache-key",
+		ClientMetadata: map[string]string{
+			"thread_id":             "thread-1",
+			"x-codex-window-id":     "thread-1:1",
+			"x-codex-turn-metadata": `{"thread_id":"thread-1","workspace_kind":"git"}`,
+			"workspace_kind":        "git",
+			"x-openai-subagent":     "review",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if recordedBody["store"] != true || recordedBody["service_tier"] != "priority" || recordedBody["prompt_cache_key"] != "cache-key" {
+		t.Fatalf("body = %#v", recordedBody)
+	}
+	if _, ok := recordedBody["previous_response_id"]; ok {
+		t.Fatalf("HTTP Responses request unexpectedly included previous_response_id: %#v", recordedBody)
+	}
+	metadata, ok := recordedBody["client_metadata"].(map[string]any)
+	if !ok || metadata["thread_id"] != "thread-1" {
+		t.Fatalf("client_metadata = %#v", recordedBody["client_metadata"])
+	}
+	if recordedHeaders.Get("x-codex-window-id") != "thread-1:1" ||
+		recordedHeaders.Get("x-codex-turn-metadata") != `{"thread_id":"thread-1","workspace_kind":"git"}` ||
+		recordedHeaders.Get("x-openai-subagent") != "review" {
+		t.Fatalf("compatibility metadata headers = %#v", recordedHeaders)
+	}
+	if recordedHeaders.Get("workspace_kind") != "" {
+		t.Fatalf("extra metadata should not be sent as compatibility header: %#v", recordedHeaders)
+	}
+}
+
+func TestResponsesAgentRunnerKeepsCodeModeNamesInClientMetadataButOmitsThemFromHeader(t *testing.T) {
+	var recordedBody map[string]any
+	var recordedHeader string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recordedHeader = r.Header.Get(codexapi.ClientCodexTurnMetadataHeader)
+		if err := json.NewDecoder(r.Body).Decode(&recordedBody); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"id":"resp-next","model":"gpt-test","output_text":"ok"}`))
+	}))
+	defer server.Close()
+	turnMetadata := `{"thread_id":"thread-1","tool_namespaces_info":{"functions":{"name":"functions","functions":{"view_image":{"name":"view_image","direct":true,"deferred":false,"source":{"kind":"harness"}}}}}}`
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{Provider: &APIProvider{BaseURL: server.URL + "/v1"}})
+	if _, err := runner.Run(context.Background(), &AgentRequest{
+		Prompt: "hello", Model: "gpt-test",
+		ClientMetadata: map[string]string{codexapi.ClientCodexTurnMetadataHeader: turnMetadata},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clientMetadata := recordedBody["client_metadata"].(map[string]any)
+	if clientMetadata[codexapi.ClientCodexTurnMetadataHeader] != turnMetadata {
+		t.Fatalf("canonical client metadata = %#v", clientMetadata)
+	}
+	if strings.Contains(recordedHeader, codexapi.ToolNamespacesInfoKey) || strings.Contains(recordedHeader, codexapi.CodeModeToolNamesKey) || !strings.Contains(recordedHeader, `"thread_id":"thread-1"`) {
+		t.Fatalf("compatibility header = %q", recordedHeader)
+	}
+}
+
+func TestResponsesAgentRunnerPreparesInputItemIDsLikeRust(t *testing.T) {
+	cases := []struct {
+		name           string
+		store          bool
+		itemIDsEnabled bool
+		inputID        string
+		wantID         bool
+	}{
+		{name: "default strips legacy id", inputID: "legacy-id"},
+		{name: "default keeps responses prefixed id", inputID: "msg_server", wantID: true},
+		{name: "item ids enabled keeps legacy id", inputID: "legacy-id", itemIDsEnabled: true, wantID: true},
+		{name: "store keeps legacy id", inputID: "legacy-id", store: true, wantID: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var recordedBody map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&recordedBody); err != nil {
+					t.Fatalf("Decode request body error = %v", err)
+				}
+				_, _ = w.Write([]byte(`{"id":"resp-next","model":"gpt-test","output_text":"ok"}`))
+			}))
+			defer server.Close()
+
+			runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+				Provider: &APIProvider{BaseURL: server.URL + "/v1"},
+			})
+			_, err := runner.Run(context.Background(), &AgentRequest{
+				Prompt:         "hello",
+				Model:          "gpt-test",
+				Store:          tc.store,
+				ItemIDsEnabled: tc.itemIDsEnabled,
+				InputItems: []any{&AgentItem{
+					ID:   tc.inputID,
+					Type: "agent_message",
+					Text: "old",
+				}},
+			})
+			if err != nil {
+				t.Fatalf("Run error = %v", err)
+			}
+			inputs, ok := recordedBody["input"].([]any)
+			if !ok || len(inputs) == 0 {
+				t.Fatalf("input = %#v", recordedBody["input"])
+			}
+			var legacyItem map[string]any
+			for _, raw := range inputs {
+				item, _ := raw.(map[string]any)
+				content, _ := item["content"].([]any)
+				if len(content) != 1 {
+					continue
+				}
+				part, _ := content[0].(map[string]any)
+				if part["text"] == "old" {
+					legacyItem = item
+					break
+				}
+			}
+			if legacyItem == nil {
+				t.Fatalf("legacy item not found in input = %#v", recordedBody["input"])
+			}
+			_, hasID := legacyItem["id"]
+			if hasID != tc.wantID {
+				t.Fatalf("input id present = %v, want %v; input=%#v", hasID, tc.wantID, legacyItem)
+			}
+		})
+	}
+}
+
+func TestResponsesAgentRunnerUsesRequestInstructions(t *testing.T) {
+	var recordedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&recordedBody); err != nil {
+			t.Fatalf("Decode request body error = %v", err)
+		}
+		_, _ = w.Write([]byte(`{"id":"resp-instructions","model":"gpt-test","output_text":"ok"}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{BaseURL: server.URL + "/v1"},
+	})
+	_, err := runner.Run(context.Background(), &AgentRequest{
+		Prompt:       "hello",
+		Model:        "gpt-test",
+		Instructions: "project instructions",
+	})
+	if err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if raw, exists := recordedBody["instructions"]; exists && raw != nil && raw != "" {
+		t.Fatalf("top-level instructions = %#v, want omitted", raw)
+	}
+	inputs, ok := recordedBody["input"].([]any)
+	if !ok || len(inputs) == 0 {
+		t.Fatalf("input = %#v", recordedBody["input"])
+	}
+	message, ok := inputs[0].(map[string]any)
+	if !ok || message["type"] != "message" || message["role"] != "developer" {
+		t.Fatalf("instruction input = %#v", inputs[0])
+	}
+	content, _ := message["content"].([]any)
+	if len(content) != 1 {
+		t.Fatalf("instruction content = %#v", message["content"])
+	}
+	part, _ := content[0].(map[string]any)
+	if part["type"] != "input_text" || part["text"] != "project instructions" {
+		t.Fatalf("instruction part = %#v", part)
+	}
+}
+
+func TestResponsesAgentRunnerSendsOutputSchemaTextFormat(t *testing.T) {
+	var recordedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&recordedBody); err != nil {
+			t.Fatalf("Decode request body error = %v", err)
+		}
+		_, _ = w.Write([]byte(`{"id":"resp-schema","model":"gpt-test","output_text":"ok"}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{BaseURL: server.URL + "/v1"},
+	})
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"answer": map[string]any{"type": "string"},
+		},
+		"required":             []any{"answer"},
+		"additionalProperties": false,
+	}
+	_, err := runner.Run(context.Background(), &AgentRequest{
+		Prompt:       "hello",
+		Model:        "gpt-test",
+		OutputSchema: schema,
+	})
+	if err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	text, ok := recordedBody["text"].(map[string]any)
+	if !ok {
+		t.Fatalf("text = %#v", recordedBody["text"])
+	}
+	format, ok := text["format"].(map[string]any)
+	if !ok {
+		t.Fatalf("text.format = %#v", text["format"])
+	}
+	if format["name"] != "codex_output_schema" || format["type"] != "json_schema" || format["strict"] != true {
+		t.Fatalf("format = %#v", format)
+	}
+	schemaBody, ok := format["schema"].(map[string]any)
+	if !ok || schemaBody["type"] != "object" || schemaBody["additionalProperties"] != false {
+		t.Fatalf("schema = %#v", format["schema"])
+	}
+}
+
+func TestResponsesAgentRunnerUsesOutputTextFallback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"resp-fallback","model":"gpt-test","output_text":"plain text"}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{BaseURL: server.URL + "/v1"},
+	})
+	response, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"})
+	if err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if response.Message != "plain text" || len(response.Items) != 1 || response.Items[0].ID != "resp-fallback" {
+		t.Fatalf("response = %#v", response)
+	}
+}
+
+func TestResponsesAgentRunnerKeepsToolCallItems(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp-tools",
+			"model":"gpt-test",
+			"output":[
+				{"id":"call-1","type":"function_call","name":"echo","call_id":"call-1","arguments":"{\"text\":\"hi\"}"},
+				{"id":"search-1","type":"tool_search_call","call_id":"search-1","execution":"client","arguments":{"query":"calendar"}}
+			],
+			"usage":{"input_tokens":1}
+		}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{BaseURL: server.URL + "/v1"},
+	})
+	response, err := runner.Run(context.Background(), &AgentRequest{Prompt: "call tools", Model: "gpt-test"})
+	if err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if response.Message != "" || len(response.Items) != 2 {
+		t.Fatalf("response = %#v", response)
+	}
+	if response.Items[0].Type != "function_call" || response.Items[0].Name != "echo" || response.Items[0].Arguments != `{"text":"hi"}` {
+		t.Fatalf("function item = %#v", response.Items[0])
+	}
+	if response.Items[1].Type != "tool_search_call" || response.Items[1].Search["query"] != "calendar" {
+		t.Fatalf("search item = %#v", response.Items[1])
+	}
+}
+
+// Mirrors Rust's `CodexErrorDetails::UsageLimitReached` handling in
+// core/src/session/turn.rs: a 429 usage-limit error carries the response's
+// rate-limit headers, so the session refreshes its snapshot even though the
+// request failed. A different 429 kind reports no rate limits.
+func TestResponsesAgentRunnerUsageLimitErrorReportsRateLimitsLikeRust(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		body      string
+		wantEvent bool
+	}{
+		{
+			name:      "usage limit",
+			body:      `{"error":{"type":"usage_limit_reached","message":"usage limit reached","plan_type":"pro","limit_window_minutes":300}}`,
+			wantEvent: true,
+		},
+		{
+			name:      "other 429",
+			body:      `{"error":{"type":"insufficient_quota","message":"limit reached"}}`,
+			wantEvent: false,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("x-codex-primary-used-percent", "100.0")
+				w.Header().Set("x-codex-primary-window-minutes", "300")
+				w.Header().Set("x-codex-primary-reset-at", "1735689720")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(testCase.body))
+			}))
+			defer server.Close()
+
+			var events []ResponsesStreamEvent
+			runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+				Provider: &APIProvider{BaseURL: server.URL},
+				StreamHandler: func(event *ResponsesStreamEvent) {
+					if event != nil {
+						events = append(events, *event)
+					}
+				},
+			})
+			if _, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"}); err == nil {
+				t.Fatal("Run() accepted a 429 response")
+			}
+			rateLimits := eventsByKind(events, ResponsesStreamEventRateLimits)
+			if !testCase.wantEvent {
+				if len(rateLimits) != 0 {
+					t.Fatalf("unrelated 429 reported rate limits: %#v", rateLimits)
+				}
+				return
+			}
+			if len(rateLimits) != 1 || rateLimits[0].RateLimit == nil || rateLimits[0].RateLimit.Primary == nil {
+				t.Fatalf("rate limit events = %#v", rateLimits)
+			}
+			primary := rateLimits[0].RateLimit.Primary
+			if primary.UsedPercent != 100 ||
+				primary.WindowDurationMins == nil || *primary.WindowDurationMins != 300 ||
+				primary.ResetsAt == nil || *primary.ResetsAt != 1735689720 {
+				t.Fatalf("primary window = %#v", primary)
+			}
+		})
+	}
+}
+
+// Mirrors Rust's wrapped-WebSocket usage-limit mapping: an `error` event carrying
+// a numeric status, a `usage_limit_reached` type and `x-codex-*` headers is a
+// usage-limit failure whose rate-limit headers refresh the session's snapshot,
+// exactly like the HTTP path.
+func TestResponsesAgentRunnerRunWebSocketUsageLimitReportsRateLimitsLikeRust(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		conn, err := websocket.Accept(w, request, nil)
+		if err != nil {
+			t.Errorf("Accept() error = %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "done")
+		_, _, _ = conn.Read(request.Context())
+		event := `{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"pro","limit_window_minutes":300},` +
+			`"headers":{"x-codex-primary-used-percent":"100.0","x-codex-primary-window-minutes":"300","x-codex-primary-reset-at":"1735689720"}}`
+		_ = conn.Write(request.Context(), websocket.MessageText, []byte(event))
+	}))
+	defer server.Close()
+
+	var events []ResponsesStreamEvent
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider:           &APIProvider{BaseURL: server.URL},
+		SupportsWebsockets: true,
+		StreamHandler: func(event *ResponsesStreamEvent) {
+			if event != nil {
+				events = append(events, *event)
+			}
+		},
+	})
+	_, err := runner.RunWebSocket(context.Background(), &AgentRequest{Model: "gpt-test", Prompt: "usage limit"})
+	var apiErr *codexapi.APIError
+	if !errors.As(err, &apiErr) || apiErr.Kind != codexapi.ErrorRateLimit {
+		t.Fatalf("websocket usage limit error = %v", err)
+	}
+	if apiErr.UsageLimitWindowMinutes == nil || *apiErr.UsageLimitWindowMinutes != 300 {
+		t.Fatalf("usage limit window = %v, want 300", apiErr.UsageLimitWindowMinutes)
+	}
+	rateLimits := eventsByKind(events, ResponsesStreamEventRateLimits)
+	if len(rateLimits) != 1 || rateLimits[0].RateLimit == nil || rateLimits[0].RateLimit.Primary == nil {
+		t.Fatalf("rate limit events = %#v", rateLimits)
+	}
+	primary := rateLimits[0].RateLimit.Primary
+	if primary.UsedPercent != 100 ||
+		primary.WindowDurationMins == nil || *primary.WindowDurationMins != 300 ||
+		primary.ResetsAt == nil || *primary.ResetsAt != 1735689720 {
+		t.Fatalf("primary window = %#v", primary)
+	}
+}
+
+// Mirrors Rust's WebSocket turn-state propagation: `connect_websocket` records
+// the handshake response's `x-codex-turn-state`, and `ResponseEvent::turn_state`
+// records the one a `response.metadata` event carries in its JSON headers. Both
+// fill the session's turn state once, and the next dial in the turn sends it.
+func TestResponsesAgentRunnerRunWebSocketTurnStateMatchesRust(t *testing.T) {
+	t.Run("handshake header", func(t *testing.T) {
+		var handshakes []string
+		dials := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			dials++
+			handshakes = append(handshakes, request.Header.Get(responsesCodexTurnStateHeader))
+			if dials == 1 {
+				// The handshake teaches the client the turn state, then the stream
+				// ends before any event so the client redials.
+				w.Header().Set(responsesCodexTurnStateHeader, "ws-handshake-1")
+				conn, err := websocket.Accept(w, request, nil)
+				if err != nil {
+					t.Errorf("Accept() error = %v", err)
+					return
+				}
+				_ = conn.Close(websocket.StatusAbnormalClosure, "drop")
+				return
+			}
+			serveWebSocketTurnStateResponse(t, w, request, `{"x-codex-turn-state":"ws-event-ignored"}`)
+		}))
+		defer server.Close()
+
+		runner := NewResponsesAgentRunner(&ResponsesAgentOptions{Provider: &APIProvider{BaseURL: server.URL}, SupportsWebsockets: true})
+		if _, err := runner.RunWebSocket(context.Background(), &AgentRequest{Model: "gpt-test", Prompt: "turn state", TurnID: "turn-1"}); err != nil {
+			t.Fatalf("RunWebSocket() error = %v", err)
+		}
+		if len(handshakes) != 2 || handshakes[0] != "" || handshakes[1] != "ws-handshake-1" {
+			t.Fatalf("handshake turn states = %#v, want the handshake's state on the redial", handshakes)
+		}
+	})
+
+	t.Run("metadata event header", func(t *testing.T) {
+		var handshakes []string
+		dials := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			dials++
+			handshakes = append(handshakes, request.Header.Get(responsesCodexTurnStateHeader))
+			if dials == 1 {
+				serveWebSocketTurnStateResponse(t, w, request, `{"x-codex-turn-state":"ws-event-2"}`)
+				return
+			}
+			serveWebSocketTurnStateResponse(t, w, request, "")
+		}))
+		defer server.Close()
+
+		runner := NewResponsesAgentRunner(&ResponsesAgentOptions{Provider: &APIProvider{BaseURL: server.URL}, SupportsWebsockets: true})
+		request := &AgentRequest{Model: "gpt-test", Prompt: "turn state", TurnID: "turn-1"}
+		if _, err := runner.RunWebSocket(context.Background(), request); err != nil {
+			t.Fatalf("first RunWebSocket() error = %v", err)
+		}
+		if _, err := runner.RunWebSocket(context.Background(), request); err != nil {
+			t.Fatalf("second RunWebSocket() error = %v", err)
+		}
+		if len(handshakes) != 2 || handshakes[0] != "" || handshakes[1] != "ws-event-2" {
+			t.Fatalf("handshake turn states = %#v, want the metadata event's state on the redial", handshakes)
+		}
+	})
+}
+
+// serveWebSocketTurnStateResponse completes one WebSocket turn, optionally
+// carrying the turn-state header on a response.metadata event, and closes the
+// connection so the next request in the turn redials.
+func serveWebSocketTurnStateResponse(t *testing.T, w http.ResponseWriter, request *http.Request, metadataHeaders string) {
+	t.Helper()
+	conn, err := websocket.Accept(w, request, nil)
+	if err != nil {
+		t.Errorf("Accept() error = %v", err)
+		return
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "done")
+	_, _, _ = conn.Read(request.Context())
+	events := []string{}
+	if metadataHeaders != "" {
+		events = append(events, `{"type":"response.metadata","headers":`+metadataHeaders+`}`)
+	}
+	events = append(events,
+		`{"type":"response.output_text.delta","delta":"ok"}`,
+		`{"type":"response.completed","response":{"id":"resp-ws-turn-state","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+	)
+	for _, event := range events {
+		_ = conn.Write(request.Context(), websocket.MessageText, []byte(event))
+	}
+}
+func TestResponsesAgentRunnerRetriesTransientHTTPError(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`temporarily unavailable`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-retry","model":"gpt-test","output_text":"ok"}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{BaseURL: server.URL + "/v1", RequestMaxRetries: 1},
+	})
+	response, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"})
+	if err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if attempts != 2 || response.Message != "ok" {
+		t.Fatalf("attempts = %d response = %#v", attempts, response)
+	}
+}
+
+func TestResponsesAgentRunnerDoesNotRetryTooManyRequests(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Retry-After", "0")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limited"}}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{BaseURL: server.URL + "/v1", RequestMaxRetries: 3},
+	})
+	_, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"})
+	if err == nil {
+		t.Fatal("Run returned nil error, want 429 failure")
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+	if !strings.Contains(err.Error(), "rate limited") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestResponsesAgentRunnerRefreshesCommandAuthAfterUnauthorized(t *testing.T) {
+	authConfig := commandAuthForTest("second-token")
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts == 1 {
+			if got := r.Header.Get("Authorization"); got != "Bearer first-token" {
+				t.Fatalf("first auth = %q", got)
+			}
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer second-token" {
+			t.Fatalf("second auth = %q", got)
+		}
+		_, _ = w.Write([]byte(`{"id":"resp-auth","model":"gpt-test","output_text":"ok"}`))
+	}))
+	defer server.Close()
+
+	initialAuth := BearerAuthHeaders("first-token", "", false)
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{BaseURL: server.URL + "/v1", Auth: authConfig, RequestMaxRetries: 1},
+		Auth:     &initialAuth,
+	})
+	response, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"})
+	if err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if attempts != 2 || response.Message != "ok" {
+		t.Fatalf("attempts = %d response = %#v", attempts, response)
+	}
+}
+
+// TestResponsesAgentRunnerWebsocketKeepsExplicitCookieHeaderLikeRust mirrors
+// Rust #46506: the shared ChatGPT cookie header is only added when the handshake
+// does not already carry an explicit Cookie header.
+func TestResponsesAgentRunnerWebsocketKeepsExplicitCookieHeaderLikeRust(t *testing.T) {
+	recorded := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		select {
+		case recorded <- request.Header.Get("Cookie"):
+		default:
+		}
+		conn, err := websocket.Accept(w, request, nil)
+		if err != nil {
+			t.Errorf("Accept() error = %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "")
+		if _, _, err := conn.Read(request.Context()); err != nil {
+			return
+		}
+		response := `{"type":"response.completed","response":{"id":"resp-cookie","output":[{"id":"msg-cookie","type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}}`
+		_ = conn.Write(request.Context(), websocket.MessageText, []byte(response))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider:           &APIProvider{BaseURL: server.URL, Headers: http.Header{"Cookie": {"explicit=1"}}},
+		SupportsWebsockets: true,
+	})
+	response, err := runner.RunWebSocket(context.Background(), &AgentRequest{
+		Model: "gpt-test", Prompt: "hello", ThreadID: "thread-cookie", TurnID: "turn-cookie",
+	})
+	if err != nil || response == nil {
+		t.Fatalf("RunWebSocket response=%#v err=%v", response, err)
+	}
+	select {
+	case got := <-recorded:
+		if got != "explicit=1" {
+			t.Fatalf("handshake Cookie = %q, want the explicit header", got)
+		}
+	default:
+		t.Fatal("the websocket handshake was not recorded")
+	}
+}
+
+// Each websocket request send reports its record: the duration and outcome, and
+// whether the request reused an existing connection (Rust's
+// SessionTelemetry::record_websocket_request with the session's connection_reused).
+func TestResponsesAgentRunnerRecordsWebsocketRequestsLikeRust(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		conn, err := websocket.Accept(w, request, nil)
+		if err != nil {
+			t.Errorf("Accept() error = %v", err)
+			return
+		}
+		for index := 1; index <= 2; index++ {
+			if _, _, err := conn.Read(request.Context()); err != nil {
+				return
+			}
+			response := fmt.Sprintf(`{"type":"response.completed","response":{"id":"resp-%d","output":[{"id":"msg-%d","type":"message","role":"assistant","content":[{"type":"output_text","text":"ok-%d"}]}]}}`, index, index, index)
+			if err := conn.Write(request.Context(), websocket.MessageText, []byte(response)); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	sink := &recordingTelemetrySink{}
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{Provider: &APIProvider{BaseURL: server.URL}, SupportsWebsockets: true})
+	runner.Telemetry = sink
+	runner.AgentIdentityTelemetry = &codexapi.AgentIdentityTelemetry{AgentID: "agent-1", TaskID: "task-1"}
+	for index := 1; index <= 2; index++ {
+		response, err := runner.RunWebSocket(context.Background(), &AgentRequest{
+			// The websocket session is keyed by thread and turn, so both requests
+			// share one connection.
+			Model: "gpt-test", Prompt: "hello", ThreadID: "thread-1", TurnID: "turn-1",
+		})
+		if err != nil || response == nil {
+			t.Fatalf("request %d response=%#v err=%v", index, response, err)
+		}
+	}
+	if len(sink.websocketRequests) != 2 {
+		t.Fatalf("records = %#v", sink.websocketRequests)
+	}
+	first := sink.websocketRequests[0]
+	if first.ErrorMessage != "" || first.ConnectionReused {
+		t.Fatalf("first record = %#v", first)
+	}
+	if first.AgentID != "agent-1" || first.TaskID != "task-1" {
+		t.Fatalf("first record = %#v", first)
+	}
+	second := sink.websocketRequests[1]
+	if !second.ConnectionReused || second.ErrorMessage != "" {
+		t.Fatalf("second record = %#v", second)
+	}
+	// Only the request that dialed reports a handshake attempt.
+	if len(sink.websocketConnects) != 1 {
+		t.Fatalf("connect records = %#v", sink.websocketConnects)
+	}
+	connect := sink.websocketConnects[0]
+	if connect.ErrorMessage != "" || connect.Status != nil {
+		t.Fatalf("connect record = %#v", connect)
+	}
+	if connect.Endpoint != "/responses" || connect.ConnectionReused || connect.RetryAfterUnauthorized {
+		t.Fatalf("connect record = %#v", connect)
+	}
+	if connect.AgentID != "agent-1" || connect.TaskID != "task-1" {
+		t.Fatalf("connect record = %#v", connect)
+	}
+}
+
+// A failed handshake reports the HTTP status and the response's request id and
+// cf-ray headers (Rust's record_websocket_connect).
+func TestResponsesAgentRunnerRecordsWebsocketConnectFailureLikeRust(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("x-request-id", "req-ws-401")
+		w.Header().Set("cf-ray", "ray-ws-401")
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	sink := &recordingTelemetrySink{}
+	initialAuth := BearerAuthHeaders("token", "", false)
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{BaseURL: server.URL}, Auth: &initialAuth, SupportsWebsockets: true,
+	})
+	runner.Telemetry = sink
+	if _, err := runner.RunWebSocket(context.Background(), &AgentRequest{Model: "gpt-test", Prompt: "hello", ThreadID: "thread-1", TurnID: "turn-1"}); err == nil {
+		t.Fatal("RunWebSocket() error = nil")
+	}
+	// No recovery step is available for a plain bearer runner, so the handshake
+	// fails once and the recovery reports that it never ran (Rust's
+	// has_next() == false path).
+	if len(sink.websocketConnects) != 1 {
+		t.Fatalf("connect records = %#v", sink.websocketConnects)
+	}
+	record := sink.websocketConnects[0]
+	if record.Status == nil || *record.Status != http.StatusUnauthorized {
+		t.Fatalf("connect record = %#v", record)
+	}
+	if record.ErrorMessage == "" {
+		t.Fatalf("connect record = %#v", record)
+	}
+	if record.RequestID != "req-ws-401" || record.CFRay != "ray-ws-401" {
+		t.Fatalf("connect record = %#v", record)
+	}
+	if record.Endpoint != "/responses" || !record.AuthHeaderAttached {
+		t.Fatalf("connect record = %#v", record)
+	}
+	if record.RetryAfterUnauthorized {
+		t.Fatalf("first connect record = %#v", record)
+	}
+	if len(sink.authRecoveries) != 1 {
+		t.Fatalf("recovery records = %#v", sink.authRecoveries)
+	}
+	if recovery := sink.authRecoveries[0]; recovery.Outcome != auth.AuthRecoveryOutcomeNotRun ||
+		recovery.RequestID != "req-ws-401" || recovery.CFRay != "ray-ws-401" {
+		t.Fatalf("recovery record = %#v", recovery)
+	}
+}
+
+// A websocket handshake keeps retrying while the recovery plan has steps, and
+// each handshake attempt reports the recovery that produced it (Rust's
+// handle_unauthorized loop plus PendingUnauthorizedRetry on the connect record).
+func TestResponsesAgentRunnerWebsocketHandshakeFollowsRecoveryPlan(t *testing.T) {
+	home := t.TempDir()
+	initialSnapshot := &auth.AuthDotJSON{
+		AuthMode: "chatgpt",
+		Tokens: map[string]any{
+			"access_token":  "old-access-token",
+			"refresh_token": "refresh-token",
+			"account_id":    "account-1",
+		},
+	}
+	if err := auth.NewStore(home).Save(*initialSnapshot); err != nil {
+		t.Fatalf("Save auth returned error: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/responses":
+			w.Header().Set("x-request-id", "req-ws-401")
+			w.Header().Set("cf-ray", "ray-ws-401")
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/oauth/token":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"new-access-token","refresh_token":"new-refresh-token"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	sink := &recordingTelemetrySink{}
+	initialAuth := BearerAuthHeaders("old-access-token", "account-1", false)
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider:           &APIProvider{BaseURL: server.URL},
+		Auth:               &initialAuth,
+		SupportsWebsockets: true,
+		CodexHome:          home,
+		AuthSnapshot:       initialSnapshot,
+		AuthIssuer:         server.URL,
+	})
+	runner.Telemetry = sink
+	if _, err := runner.RunWebSocket(context.Background(), &AgentRequest{Model: "gpt-test", Prompt: "hello", ThreadID: "thread-1", TurnID: "turn-1"}); err == nil {
+		t.Fatal("RunWebSocket() error = nil")
+	}
+	if len(sink.websocketConnects) != 3 {
+		t.Fatalf("connect records = %#v", sink.websocketConnects)
+	}
+	if first := sink.websocketConnects[0]; first.RetryAfterUnauthorized || first.RecoveryMode != "" {
+		t.Fatalf("first connect record = %#v", first)
+	}
+	if second := sink.websocketConnects[1]; !second.RetryAfterUnauthorized ||
+		second.RecoveryMode != "managed" || second.RecoveryPhase != "reload" {
+		t.Fatalf("second connect record = %#v", second)
+	}
+	if third := sink.websocketConnects[2]; !third.RetryAfterUnauthorized ||
+		third.RecoveryMode != "managed" || third.RecoveryPhase != "refresh_token" {
+		t.Fatalf("third connect record = %#v", third)
+	}
+	if len(sink.authRecoveries) != 3 {
+		t.Fatalf("recovery records = %#v", sink.authRecoveries)
+	}
+	if reload := sink.authRecoveries[0]; reload.Step != "reload" || reload.Outcome != auth.AuthRecoveryOutcomeSucceeded {
+		t.Fatalf("reload record = %#v", reload)
+	}
+	if refresh := sink.authRecoveries[1]; refresh.Step != "refresh_token" || refresh.Outcome != auth.AuthRecoveryOutcomeSucceeded {
+		t.Fatalf("refresh record = %#v", refresh)
+	}
+	// The plan is exhausted on the next handshake, so the last record reports
+	// recovery_not_run at the cursor's step (Rust's has_next() == false path).
+	if exhausted := sink.authRecoveries[2]; exhausted.Step != "done" ||
+		exhausted.Outcome != auth.AuthRecoveryOutcomeNotRun || exhausted.RecoveryReason != "recovery_exhausted" {
+		t.Fatalf("exhausted record = %#v", exhausted)
+	}
+}
+
+// Every HTTP attempt reports its api-request record: the attempt number, the
+// status, the provider-relative endpoint, the auth header the provider attached,
+// the response's request id / cf-ray / auth-error headers, and whether the
+// attempt followed a 401 recovery (Rust's RequestTelemetry::on_request).
+func TestResponsesAgentRunnerRecordsAPIAttemptsLikeRust(t *testing.T) {
+	home := t.TempDir()
+	managedAuth := &auth.AuthDotJSON{
+		AuthMode: "chatgpt",
+		Tokens: map[string]any{
+			"access_token":  "token",
+			"refresh_token": "refresh-token",
+			"account_id":    "account-1",
+		},
+	}
+	if err := auth.NewStore(home).Save(*managedAuth); err != nil {
+		t.Fatalf("Save auth returned error: %v", err)
+	}
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.Header().Set("x-request-id", "req-401")
+			w.Header().Set("cf-ray", "ray-401")
+			w.Header().Set("x-openai-authorization-error", "missing_authorization_header")
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"resp-auth","model":"gpt-test","output_text":"ok"}`))
+	}))
+	defer server.Close()
+
+	sink := &recordingTelemetrySink{}
+	initialAuth := BearerAuthHeaders("token", "account-1", false)
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider:     &APIProvider{BaseURL: server.URL + "/v1", RequestMaxRetries: 1},
+		Auth:         &initialAuth,
+		CodexHome:    home,
+		AuthSnapshot: managedAuth,
+	})
+	runner.Telemetry = sink
+	runner.AgentIdentityTelemetry = &codexapi.AgentIdentityTelemetry{AgentID: "agent-1", TaskID: "task-1"}
+	if _, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"}); err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if len(sink.apiRequests) != 2 {
+		t.Fatalf("records = %#v", sink.apiRequests)
+	}
+	first := sink.apiRequests[0]
+	if first.Attempt != 0 || first.Status == nil || *first.Status != http.StatusUnauthorized {
+		t.Fatalf("first record = %#v", first)
+	}
+	if first.Endpoint != "/responses" || !first.AuthHeaderAttached || first.AuthHeaderName != "authorization" {
+		t.Fatalf("first record = %#v", first)
+	}
+	if first.RequestID != "req-401" || first.CFRay != "ray-401" ||
+		first.AuthError != "missing_authorization_header" {
+		t.Fatalf("first record = %#v", first)
+	}
+	if first.RetryAfterUnauthorized || first.ErrorMessage != "" {
+		t.Fatalf("first record = %#v", first)
+	}
+	if first.AgentID != "agent-1" || first.TaskID != "task-1" {
+		t.Fatalf("first record = %#v", first)
+	}
+
+	second := sink.apiRequests[1]
+	if second.Attempt != 1 || !second.RetryAfterUnauthorized {
+		t.Fatalf("second record = %#v", second)
+	}
+	if second.Status == nil || *second.Status != http.StatusOK || second.Endpoint != "/responses" {
+		t.Fatalf("second record = %#v", second)
+	}
+}
+
+// A managed ChatGPT recovery reports its plan position and outcome, and the
+// retrying attempt reports the recovery that produced it (Rust's
+// record_auth_recovery plus PendingUnauthorizedRetry on the next api_request).
+func TestResponsesAgentRunnerReportsManagedAuthRecoveryLikeRust(t *testing.T) {
+	home := t.TempDir()
+	initialSnapshot := &auth.AuthDotJSON{
+		AuthMode: "chatgpt",
+		Tokens: map[string]any{
+			"access_token":  "old-access-token",
+			"refresh_token": "refresh-token",
+			"account_id":    "account-1",
+		},
+	}
+	if err := auth.NewStore(home).Save(*initialSnapshot); err != nil {
+		t.Fatalf("Save auth returned error: %v", err)
+	}
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/responses":
+			attempts++
+			// Rust reports the no-change reload on the first 401 and the token
+			// refresh on the next one, so the server rejects both.
+			if attempts <= 2 {
+				w.Header().Set("Retry-After", "0")
+				w.Header().Set("x-request-id", "req-401")
+				w.Header().Set("cf-ray", "ray-401")
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			_, _ = w.Write([]byte(`{"id":"resp-auth","model":"gpt-test","output_text":"ok"}`))
+		case "/oauth/token":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"new-access-token","refresh_token":"new-refresh-token"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	sink := &recordingTelemetrySink{}
+	initialAuth := BearerAuthHeaders("old-access-token", "account-1", false)
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider:     &APIProvider{BaseURL: server.URL + "/v1", RequestMaxRetries: 1},
+		Auth:         &initialAuth,
+		HTTPClient:   server.Client(),
+		CodexHome:    home,
+		AuthSnapshot: initialSnapshot,
+		AuthIssuer:   server.URL,
+	})
+	runner.Telemetry = sink
+	if _, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"}); err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	// The managed plan reloads the stored auth first; nothing changed on disk, so
+	// the plan continues to the token refresh (Rust reports the reload on the
+	// first 401 and the refresh on the next one).
+	if len(sink.authRecoveries) != 2 {
+		t.Fatalf("recovery records = %#v", sink.authRecoveries)
+	}
+	reload := sink.authRecoveries[0]
+	if reload.Mode != "managed" || reload.Step != "reload" ||
+		reload.Outcome != auth.AuthRecoveryOutcomeSucceeded {
+		t.Fatalf("reload record = %#v", reload)
+	}
+	if reload.AuthStateChanged == nil || *reload.AuthStateChanged {
+		t.Fatalf("reload record = %#v", reload)
+	}
+	recovery := sink.authRecoveries[1]
+	if recovery.Mode != "managed" || recovery.Step != "refresh_token" ||
+		recovery.Outcome != auth.AuthRecoveryOutcomeSucceeded {
+		t.Fatalf("recovery record = %#v", recovery)
+	}
+	if recovery.RequestID != "req-401" || recovery.CFRay != "ray-401" {
+		t.Fatalf("recovery record = %#v", recovery)
+	}
+	if recovery.AuthStateChanged == nil || !*recovery.AuthStateChanged {
+		t.Fatalf("recovery record = %#v", recovery)
+	}
+	if len(sink.apiRequests) != 3 {
+		t.Fatalf("api records = %#v", sink.apiRequests)
+	}
+	retry := sink.apiRequests[2]
+	if !retry.RetryAfterUnauthorized || retry.RecoveryMode != "managed" || retry.RecoveryPhase != "refresh_token" {
+		t.Fatalf("retry record = %#v", retry)
+	}
+}
+
+// A managed recovery adopts the stored auth when another process refreshed it:
+// the reload step reports the change, the retry uses the reloaded token, and the
+// pending retry names the reload (Rust's first-401 behavior).
+func TestResponsesAgentRunnerReloadsChangedStoredAuthLikeRust(t *testing.T) {
+	home := t.TempDir()
+	cached := &auth.AuthDotJSON{
+		AuthMode: "chatgpt",
+		Tokens: map[string]any{
+			"access_token":  "cached-token",
+			"refresh_token": "refresh-token",
+			"account_id":    "account-1",
+		},
+	}
+	if err := auth.NewStore(home).Save(auth.AuthDotJSON{
+		AuthMode: "chatgpt",
+		Tokens: map[string]any{
+			"access_token":  "stored-token",
+			"refresh_token": "refresh-token",
+			"account_id":    "account-1",
+		},
+	}); err != nil {
+		t.Fatalf("Save auth returned error: %v", err)
+	}
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		switch attempts {
+		case 1:
+			if got := r.Header.Get("Authorization"); got != "Bearer cached-token" {
+				t.Fatalf("first auth = %q", got)
+			}
+			w.Header().Set("Retry-After", "0")
+			w.Header().Set("x-request-id", "req-401")
+			w.WriteHeader(http.StatusUnauthorized)
+		default:
+			if got := r.Header.Get("Authorization"); got != "Bearer stored-token" {
+				t.Fatalf("retry auth = %q", got)
+			}
+			_, _ = w.Write([]byte(`{"id":"resp-reload","model":"gpt-test","output_text":"ok"}`))
+		}
+	}))
+	defer server.Close()
+
+	sink := &recordingTelemetrySink{}
+	initialAuth := BearerAuthHeaders("cached-token", "account-1", false)
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider:     &APIProvider{BaseURL: server.URL + "/v1", RequestMaxRetries: 1},
+		Auth:         &initialAuth,
+		HTTPClient:   server.Client(),
+		CodexHome:    home,
+		AuthSnapshot: cached,
+		AuthIssuer:   server.URL,
+	})
+	runner.Telemetry = sink
+	response, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"})
+	if err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if response == nil || response.Message != "ok" {
+		t.Fatalf("response = %#v", response)
+	}
+	// The reload changed the auth, so the plan stops there; Rust reports the same
+	// single record on the first 401.
+	if len(sink.authRecoveries) != 1 {
+		t.Fatalf("recovery records = %#v", sink.authRecoveries)
+	}
+	reload := sink.authRecoveries[0]
+	if reload.Mode != "managed" || reload.Step != "reload" ||
+		reload.Outcome != auth.AuthRecoveryOutcomeSucceeded {
+		t.Fatalf("reload record = %#v", reload)
+	}
+	if reload.AuthStateChanged == nil || !*reload.AuthStateChanged {
+		t.Fatalf("reload record = %#v", reload)
+	}
+	if reload.RequestID != "req-401" {
+		t.Fatalf("reload record = %#v", reload)
+	}
+	retry := sink.apiRequests[len(sink.apiRequests)-1]
+	if !retry.RetryAfterUnauthorized || retry.RecoveryMode != "managed" || retry.RecoveryPhase != "reload" {
+		t.Fatalf("retry record = %#v", retry)
+	}
+}
+
+// A permanent refresh failure reports the permanent outcome.
+func TestResponsesAgentRunnerReportsPermanentAuthRecoveryFailureLikeRust(t *testing.T) {
+	home := t.TempDir()
+	initialSnapshot := &auth.AuthDotJSON{
+		AuthMode: "chatgpt",
+		Tokens: map[string]any{
+			"access_token":  "old-access-token",
+			"refresh_token": "refresh-token",
+			"account_id":    "account-1",
+		},
+	}
+	if err := auth.NewStore(home).Save(*initialSnapshot); err != nil {
+		t.Fatalf("Save auth returned error: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/responses":
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/oauth/token":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"invalid_grant","error_description":"token expired"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	sink := &recordingTelemetrySink{}
+	initialAuth := BearerAuthHeaders("old-access-token", "account-1", false)
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider:     &APIProvider{BaseURL: server.URL + "/v1", RequestMaxRetries: 1},
+		Auth:         &initialAuth,
+		HTTPClient:   server.Client(),
+		CodexHome:    home,
+		AuthSnapshot: initialSnapshot,
+		AuthIssuer:   server.URL,
+	})
+	runner.Telemetry = sink
+	_, _ = runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"})
+	if len(sink.authRecoveries) != 2 {
+		t.Fatalf("recovery records = %#v", sink.authRecoveries)
+	}
+	if reload := sink.authRecoveries[0]; reload.Step != "reload" ||
+		reload.AuthStateChanged == nil || *reload.AuthStateChanged {
+		t.Fatalf("reload record = %#v", reload)
+	}
+	recovery := sink.authRecoveries[1]
+	if recovery.Mode != "managed" || recovery.Step != "refresh_token" ||
+		recovery.Outcome != auth.AuthRecoveryOutcomeFailedPermanent {
+		t.Fatalf("recovery record = %#v", recovery)
+	}
+	if recovery.AuthStateChanged != nil {
+		t.Fatalf("recovery record = %#v", recovery)
+	}
+}
+
+func TestResponsesAgentRunnerRefreshesChatGPTAuthAfterUnauthorized(t *testing.T) {
+	home := t.TempDir()
+	initialSnapshot := &auth.AuthDotJSON{
+		AuthMode: "chatgpt",
+		Tokens: map[string]any{
+			"access_token":  "old-access-token",
+			"refresh_token": "refresh-token",
+			"account_id":    "account-1",
+		},
+	}
+	if err := auth.NewStore(home).Save(*initialSnapshot); err != nil {
+		t.Fatalf("Save auth returned error: %v", err)
+	}
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/responses":
+			attempts++
+			// The no-change reload retries with the stored token first; the
+			// token refresh runs on the 401 that follows (Rust's plan cursor).
+			if attempts <= 2 {
+				if got := r.Header.Get("Authorization"); got != "Bearer old-access-token" {
+					t.Fatalf("first auth = %q", got)
+				}
+				w.Header().Set("Retry-After", "0")
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			if got := r.Header.Get("Authorization"); got != "Bearer new-access-token" {
+				t.Fatalf("second auth = %q", got)
+			}
+			if got := r.Header.Get("ChatGPT-Account-ID"); got != "account-1" {
+				t.Fatalf("account id = %q", got)
+			}
+			_, _ = w.Write([]byte(`{"id":"resp-auth","model":"gpt-test","output_text":"ok"}`))
+		case "/oauth/token":
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("Decode refresh body error = %v", err)
+			}
+			if body["refresh_token"] != "refresh-token" {
+				t.Fatalf("refresh body = %#v", body)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"new-access-token","refresh_token":"new-refresh-token"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	initialAuth := BearerAuthHeaders("old-access-token", "account-1", false)
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider:     &APIProvider{BaseURL: server.URL + "/v1", RequestMaxRetries: 1},
+		Auth:         &initialAuth,
+		HTTPClient:   server.Client(),
+		CodexHome:    home,
+		AuthSnapshot: initialSnapshot,
+		AuthIssuer:   server.URL,
+	})
+	response, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"})
+	if err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if attempts != 3 || response.Message != "ok" {
+		t.Fatalf("attempts = %d response = %#v", attempts, response)
+	}
+	loaded, err := auth.NewStore(home).Load()
+	if err != nil {
+		t.Fatalf("Load auth returned error: %v", err)
+	}
+	if loaded == nil || loaded.Tokens["access_token"] != "new-access-token" || loaded.Tokens["refresh_token"] != "new-refresh-token" {
+		t.Fatalf("loaded auth = %#v", loaded)
+	}
+}
+
+func TestResponsesAgentRunnerRefreshesExternalChatGPTAuthAfterUnauthorized(t *testing.T) {
+	plan := "pro"
+	initialSnapshot := auth.FromChatGPTAuthTokens("old-external-token", "account-old", &plan)
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts == 1 {
+			if got := r.Header.Get("Authorization"); got != "Bearer old-external-token" {
+				t.Fatalf("first auth = %q", got)
+			}
+			if got := r.Header.Get("ChatGPT-Account-ID"); got != "account-old" {
+				t.Fatalf("first account id = %q", got)
+			}
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer new-external-token" {
+			t.Fatalf("second auth = %q", got)
+		}
+		if got := r.Header.Get("ChatGPT-Account-ID"); got != "account-new" {
+			t.Fatalf("second account id = %q", got)
+		}
+		_, _ = w.Write([]byte(`{"id":"resp-auth","model":"gpt-test","output_text":"ok"}`))
+	}))
+	defer server.Close()
+
+	refreshCalls := 0
+	initialAuth := BearerAuthHeaders("old-external-token", "account-old", false)
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider:     &APIProvider{BaseURL: server.URL + "/v1", RequestMaxRetries: 1},
+		Auth:         &initialAuth,
+		HTTPClient:   server.Client(),
+		AuthSnapshot: &initialSnapshot,
+		ExternalAuthRefresh: func(ctx context.Context, request *ExternalAuthRefreshRequest) (*ExternalAuthRefreshResponse, error) {
+			refreshCalls++
+			if request == nil || request.Reason != ExternalAuthRefreshUnauthorized || request.PreviousAccountID != "account-old" {
+				t.Fatalf("refresh request = %#v", request)
+			}
+			return &ExternalAuthRefreshResponse{AccessToken: "new-external-token", ChatGPTAccountID: "account-new", ChatGPTPlanType: &plan}, nil
+		},
+	})
+	response, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"})
+	if err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if attempts != 2 || refreshCalls != 1 || response.Message != "ok" {
+		t.Fatalf("attempts=%d refreshCalls=%d response=%#v", attempts, refreshCalls, response)
+	}
+	if runner.AuthSnapshot == nil || runner.AuthSnapshot.Mode() != "chatgptAuthTokens" || runner.AuthSnapshot.Tokens["account_id"] != "account-new" {
+		t.Fatalf("auth snapshot = %#v", runner.AuthSnapshot)
+	}
+}
+
+func TestResponsesAgentRunnerCachesCommandAuthUntilRefreshInterval(t *testing.T) {
+	var authorizations []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorizations = append(authorizations, r.Header.Get("Authorization"))
+		_, _ = w.Write([]byte(`{"id":"resp-command-auth","model":"gpt-test","output_text":"ok"}`))
+	}))
+	defer server.Close()
+
+	authConfig := commandAuthSequenceForTest(t, []string{"first-token", "second-token"})
+	authConfig.RefreshIntervalMS = 60_000
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{BaseURL: server.URL + "/v1", Auth: authConfig},
+	})
+	for i := 0; i < 2; i++ {
+		if _, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"}); err != nil {
+			t.Fatalf("Run %d error = %v", i+1, err)
+		}
+	}
+	if strings.Join(authorizations, ",") != "Bearer first-token,Bearer first-token" {
+		t.Fatalf("authorizations = %#v", authorizations)
+	}
+}
+
+func TestResponsesAgentRunnerRefreshesStaleCommandAuthBeforeRequest(t *testing.T) {
+	var authorizations []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorizations = append(authorizations, r.Header.Get("Authorization"))
+		_, _ = w.Write([]byte(`{"id":"resp-command-auth","model":"gpt-test","output_text":"ok"}`))
+	}))
+	defer server.Close()
+
+	authConfig := commandAuthSequenceForTest(t, []string{"first-token", "second-token"})
+	authConfig.RefreshIntervalMS = 1
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{BaseURL: server.URL + "/v1", Auth: authConfig},
+	})
+	if _, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"}); err != nil {
+		t.Fatalf("first Run error = %v", err)
+	}
+	runner.providerAuthFetchedAt = time.Now().Add(-time.Second)
+	if _, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"}); err != nil {
+		t.Fatalf("second Run error = %v", err)
+	}
+	if strings.Join(authorizations, ",") != "Bearer first-token,Bearer second-token" {
+		t.Fatalf("authorizations = %#v", authorizations)
+	}
+}
+
+func commandAuthForTest(token string) *ProviderAuthInfo {
+	if runtime.GOOS == "windows" {
+		return &ProviderAuthInfo{
+			Command:   "cmd",
+			Args:      []string{"/D", "/Q", "/C", "echo " + token},
+			TimeoutMS: 5000,
+		}
+	}
+	return &ProviderAuthInfo{
+		Command:   "sh",
+		Args:      []string{"-c", "printf '%s\n' " + shellSingleQuote(token)},
+		TimeoutMS: 5000,
+	}
+}
+
+func shellSingleQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func commandAuthSequenceForTest(t *testing.T, tokens []string) *ProviderAuthInfo {
+	t.Helper()
+	if len(tokens) == 0 {
+		t.Fatal("tokens must not be empty")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "tokens.txt"), []byte(strings.Join(tokens, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile tokens returned error: %v", err)
+	}
+	if runtime.GOOS == "windows" {
+		script := filepath.Join(dir, "print-token.ps1")
+		body := `$dir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$indexPath = Join-Path $dir 'index.txt'
+$i = 0
+if (Test-Path -LiteralPath $indexPath) {
+  $raw = Get-Content -LiteralPath $indexPath -Raw
+  if ($raw.Trim().Length -gt 0) { $i = [int]$raw.Trim() }
+}
+$tokens = @(Get-Content -LiteralPath (Join-Path $dir 'tokens.txt'))
+if ($i -ge $tokens.Length) { $i = $tokens.Length - 1 }
+Write-Output $tokens[$i]
+Set-Content -LiteralPath $indexPath -Value ($i + 1)
+`
+		if err := os.WriteFile(script, []byte(body), 0o600); err != nil {
+			t.Fatalf("WriteFile script returned error: %v", err)
+		}
+		return &ProviderAuthInfo{
+			Command:   "powershell",
+			Args:      []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script},
+			TimeoutMS: 5000,
+		}
+	}
+	script := filepath.Join(dir, "print-token.sh")
+	body := `#!/bin/sh
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+idx=$(cat "$dir/index.txt" 2>/dev/null || echo 0)
+token=$(sed -n "$((idx + 1))p" "$dir/tokens.txt")
+if [ -z "$token" ]; then
+  token=$(tail -n 1 "$dir/tokens.txt")
+fi
+printf '%s\n' "$token"
+printf '%s\n' "$((idx + 1))" > "$dir/index.txt"
+`
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("WriteFile script returned error: %v", err)
+	}
+	return &ProviderAuthInfo{
+		Command:   script,
+		TimeoutMS: 5000,
+	}
+}
+
+func TestResponsesAgentRunnerStreamsResponsesSSE(t *testing.T) {
+	var recordedAccept string
+	var recordedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recordedAccept = r.Header.Get("Accept")
+		if err := json.NewDecoder(r.Body).Decode(&recordedBody); err != nil {
+			t.Fatalf("Decode request body error = %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("x-request-id", "req-1")
+		w.Header().Set("openai-model", "gpt-stream-header")
+		w.Header().Set("x-codex-turn-state", "turn-state-1")
+		w.Header().Set("x-models-etag", `"models-etag-1"`)
+		w.Header().Set("x-reasoning-included", "true")
+		w.Header().Set("x-codex-primary-used-percent", "12.5")
+		w.Header().Set("x-codex-primary-window-minutes", "60")
+		w.Header().Set("x-codex-primary-reset-at", "1704069000")
+		w.Header().Set("x-codex-secondary-primary-used-percent", "80")
+		w.Header().Set("x-codex-secondary-limit-name", "gpt-secondary")
+		_, _ = w.Write([]byte(responsesSSE(
+			`{"type":"response.metadata","headers":{"openai-model":"gpt-metadata"}}`,
+			`{"type":"response.metadata","metadata":{"model_reroute":{"from_model":"gpt-old","to_model":"gpt-new","reason":"high_risk_cyber_activity"},"model_verification":{"verifications":["trusted_access_for_cyber"]},"turn_moderation_metadata":{"flagged":true}}}`,
+			`{"type":"response.metadata","metadata":{"type":"safety_buffering","use_cases":["cyber"],"reasons":["review"],"show_buffering_ui":true,"faster_model":"gpt-fast"}}`,
+			`{"type":"response.created","response":{"id":"resp-1"}}`,
+			`{"type":"responsesapi.websocket_timing","timing_metrics":{"responses_duration_excl_engine_and_client_tool_time_ms":120,"engine_iapi_ttft_total_ms":310,"engine_service_ttft_total_ms":340}}`,
+			`{"type":"response.output_item.added","item":{"id":"msg-1","type":"message","role":"assistant","content":[{"type":"output_text","text":""}]}}`,
+			`{"type":"response.output_text.delta","delta":"hello "}`,
+			`{"type":"response.output_text.delta","delta":"world"}`,
+			`{"type":"response.output_item.done","item":{"id":"msg-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello world"}]}}`,
+			`{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call-1","name":"echo","arguments":"{\"text\":\"hi\"}"}}`,
+			`{"type":"response.completed","response":{"id":"resp-1","usage":{"input_tokens":4,"output_tokens":2,"input_tokens_details":{"cached_tokens":1},"output_tokens_details":{"reasoning_tokens":1},"total_tokens":6}}}`,
+		)))
+	}))
+	defer server.Close()
+
+	var events []ResponsesStreamEvent
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{BaseURL: server.URL + "/v1"},
+		Stream:   true,
+		StreamHandler: func(event *ResponsesStreamEvent) {
+			events = append(events, *event)
+		},
+	})
+	response, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test", PreviousResponseID: "resp-prev"})
+	if err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if recordedAccept != "text/event-stream" || recordedBody["stream"] != true {
+		t.Fatalf("stream request accept=%q body=%#v", recordedAccept, recordedBody)
+	}
+	if _, ok := recordedBody["previous_response_id"]; ok {
+		t.Fatalf("SSE Responses request unexpectedly included previous_response_id: %#v", recordedBody)
+	}
+	if response.Message != "hello world" || len(response.Items) != 2 {
+		t.Fatalf("response = %#v", response)
+	}
+	if response.ResponseID != "resp-1" {
+		t.Fatalf("response id = %q", response.ResponseID)
+	}
+	if response.Items[1].Type != "function_call" || response.Items[1].CallID != "call-1" || response.Items[1].Arguments != `{"text":"hi"}` {
+		t.Fatalf("function item = %#v", response.Items[1])
+	}
+	if response.Usage.InputTokens != 4 || response.Usage.CachedInputTokens != 1 || response.Usage.OutputTokens != 2 || response.Usage.ReasoningOutputTokens != 1 || response.Usage.TotalTokens != 6 {
+		t.Fatalf("usage = %#v", response.Usage)
+	}
+	if response.TimingMetrics["engine_iapi_ttft_total_ms"] != float64(310) || response.TimingMetrics["engine_service_ttft_total_ms"] != float64(340) {
+		t.Fatalf("timing metrics = %#v", response.TimingMetrics)
+	}
+	if len(events) != 18 {
+		t.Fatalf("events = %#v", events)
+	}
+	if events[0].Kind != ResponsesStreamEventHeaders || events[0].RequestID != "req-1" || events[0].Model != "gpt-stream-header" || events[0].TurnState != "turn-state-1" || events[0].ModelsETag != "" {
+		t.Fatalf("headers event = %#v", events[0])
+	}
+	if events[0].Headers["x-request-id"] != "req-1" || events[0].Headers["openai-model"] != "gpt-stream-header" {
+		t.Fatalf("headers map = %#v", events[0].Headers)
+	}
+	serverModels := eventsByKind(events, ResponsesStreamEventServerModel)
+	if len(serverModels) != 2 || serverModels[0].Model != "gpt-stream-header" || serverModels[1].Model != "gpt-metadata" {
+		t.Fatalf("server model events = %#v", serverModels)
+	}
+	if reroute := firstEventByKind(events, ResponsesStreamEventModelReroute); reroute == nil || reroute.Reroute == nil || reroute.Reroute.FromModel != "gpt-old" || reroute.Reroute.ToModel != "gpt-new" {
+		t.Fatalf("reroute event = %#v", reroute)
+	}
+	if verification := firstEventByKind(events, ResponsesStreamEventModelVerify); verification == nil || verification.Verification == nil || len(verification.Verification.Verifications) != 1 || verification.Verification.Verifications[0] != "trusted_access_for_cyber" {
+		t.Fatalf("verification event = %#v", verification)
+	}
+	if moderation := firstEventByKind(events, ResponsesStreamEventModeration); moderation == nil || moderation.ModerationMetadata == nil {
+		t.Fatalf("moderation event = %#v", moderation)
+	}
+	if buffering := firstEventByKind(events, ResponsesStreamEventSafetyBuffer); buffering == nil || buffering.SafetyBuffering == nil || !buffering.SafetyBuffering.ShowBufferingUI || buffering.SafetyBuffering.FasterModel == nil || *buffering.SafetyBuffering.FasterModel != "gpt-fast" {
+		t.Fatalf("safety buffering event = %#v", buffering)
+	}
+	rateLimits := eventsByKind(events, ResponsesStreamEventRateLimits)
+	if len(rateLimits) != 2 {
+		t.Fatalf("rate limit events = %#v", rateLimits)
+	}
+	if rateLimits[0].RateLimit == nil || rateLimits[0].RateLimit.LimitID != "codex" || rateLimits[0].RateLimit.Primary == nil || rateLimits[0].RateLimit.Primary.UsedPercent != 12.5 {
+		t.Fatalf("default rate limit = %#v", rateLimits[0])
+	}
+	if rateLimits[1].RateLimit == nil || rateLimits[1].RateLimit.LimitID != "codex_secondary" || rateLimits[1].RateLimit.LimitName != "gpt-secondary" || rateLimits[1].RateLimit.Primary == nil || rateLimits[1].RateLimit.Primary.UsedPercent != 80 {
+		t.Fatalf("secondary rate limit = %#v", rateLimits[1])
+	}
+	reasoning := firstEventByKind(events, ResponsesStreamEventReasoning)
+	if reasoning == nil || reasoning.Reasoning == nil || !*reasoning.Reasoning {
+		t.Fatalf("reasoning event = %#v", reasoning)
+	}
+	timing := firstEventByKind(events, ResponsesStreamEventTimingMetrics)
+	if timing == nil || timing.TimingMetrics["responses_duration_excl_engine_and_client_tool_time_ms"] != float64(120) {
+		t.Fatalf("timing event = %#v", timing)
+	}
+	firstDelta := firstEventByKind(events, ResponsesStreamEventOutputText)
+	if firstDelta == nil || firstDelta.Delta != "hello " {
+		t.Fatalf("first delta event = %#v", firstDelta)
+	}
+	outputAdded := firstEventByKind(events, ResponsesStreamEventOutputAdded)
+	if outputAdded == nil || outputAdded.ResponseID != "resp-1" {
+		t.Fatalf("output added event = %#v", outputAdded)
+	}
+	if events[len(events)-1].Kind != ResponsesStreamEventCompleted || events[len(events)-1].ResponseID != "resp-1" {
+		t.Fatalf("completed event = %#v", events[len(events)-1])
+	}
+}
+
+func TestParseResponsesStreamAccumulatesFunctionCallArgumentDeltas(t *testing.T) {
+	var events []ResponsesStreamEvent
+	response, err := parseResponsesStream(
+		context.Background(),
+		strings.NewReader(responsesSSE(
+			`{"type":"response.created","response":{"id":"resp-1"}}`,
+			`{"type":"response.output_item.added","item":{"id":"fc-1","type":"function_call","call_id":"call-1","name":"exec_command","arguments":""}}`,
+			`{"type":"response.function_call_arguments.delta","item_id":"fc-1","call_id":"call-1","delta":"{\"cmd\":\""}`,
+			`{"type":"response.function_call_arguments.delta","item_id":"fc-1","call_id":"call-1","delta":"pwd\"}"}`,
+			`{"type":"response.output_item.done","item":{"id":"fc-1","type":"function_call","call_id":"call-1","name":"exec_command","arguments":""}}`,
+			`{"type":"response.completed","response":{"id":"resp-1","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+		)),
+		&AgentRequest{Prompt: "inspect", Model: "gpt-test"},
+		"openai",
+		func(event *ResponsesStreamEvent) {
+			events = append(events, *event)
+		},
+	)
+	if err != nil {
+		t.Fatalf("parseResponsesStream() error = %v", err)
+	}
+	if len(response.Items) != 1 {
+		t.Fatalf("items = %#v", response.Items)
+	}
+	item := response.Items[0]
+	if item.Type != "function_call" || item.Name != "exec_command" || item.CallID != "call-1" || item.Arguments != `{"cmd":"pwd"}` {
+		t.Fatalf("function call item = %#v", item)
+	}
+	toolDeltas := eventsByKind(events, ResponsesStreamEventToolInputDelta)
+	if len(toolDeltas) != 2 || toolDeltas[0].ItemID != "fc-1" || toolDeltas[0].CallID != "call-1" {
+		t.Fatalf("tool delta events = %#v", toolDeltas)
+	}
+	done := firstEventByKind(events, ResponsesStreamEventOutputDone)
+	if done == nil || done.Item == nil || done.Item.Arguments != `{"cmd":"pwd"}` {
+		t.Fatalf("done event = %#v", done)
+	}
+}
+
+func TestResponsesAgentRunnerStreamsRetryAndIdleTimeout(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.(http.Flusher).Flush()
+		time.Sleep(20 * time.Millisecond)
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{
+			BaseURL:           server.URL + "/v1",
+			RequestMaxRetries: 1,
+			StreamMaxRetries:  1,
+			StreamIdleTimeout: 5 * time.Millisecond,
+		},
+		Stream: true,
+	})
+	_, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"})
+	if err == nil || !strings.Contains(err.Error(), "idle timeout") {
+		t.Fatalf("Run error = %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want request retry plus one dropped-stream retry", attempts)
+	}
+}
+
+func TestResponsesAgentRunnerRetriesDroppedSSEStreamLikeRust(t *testing.T) {
+	var attempts atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := attempts.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if attempt == 1 {
+			_, _ = w.Write([]byte(responsesSSE(`{"type":"response.created","response":{"id":"resp-dropped"}}`)))
+			return
+		}
+		_, _ = w.Write([]byte(responsesSSE(
+			`{"type":"response.output_item.done","item":{"id":"msg-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"recovered"}]}}`,
+			`{"type":"response.completed","response":{"id":"resp-recovered","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`,
+		)))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{
+			BaseURL:          server.URL + "/v1",
+			StreamMaxRetries: 1,
+		},
+		Stream: true,
+	})
+	response, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if attempts.Load() != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts.Load())
+	}
+	if response.ResponseID != "resp-recovered" || response.Message != "recovered" {
+		t.Fatalf("response = %#v", response)
+	}
+}
+
+func TestResponsesAgentRunnerRetriesTemporaryResponseFailedLikeRust(t *testing.T) {
+	var attempts atomic.Int64
+	var retryEvents []*ResponsesStreamEvent
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := attempts.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if attempt == 1 {
+			_, _ = w.Write([]byte(responsesSSE(
+				`{"type":"response.failed","response":{"id":"resp-1","error":{"code":"upstream_unavailable","message":"Upstream service temporarily unavailable"}}}`,
+			)))
+			return
+		}
+		_, _ = w.Write([]byte(responsesSSE(
+			`{"type":"response.output_item.done","item":{"id":"msg-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"recovered"}]}}`,
+			`{"type":"response.completed","response":{"id":"resp-2"}}`,
+		)))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{
+			BaseURL:          server.URL + "/v1",
+			StreamMaxRetries: 2,
+		},
+		Stream: true,
+		StreamHandler: func(event *ResponsesStreamEvent) {
+			if event.Kind == ResponsesStreamEventRetrying {
+				retryEvents = append(retryEvents, event)
+			}
+		},
+	})
+	response, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"})
+	if err != nil || response == nil || response.Message != "recovered" {
+		t.Fatalf("response=%#v error=%v", response, err)
+	}
+	if attempts.Load() != 2 || len(retryEvents) != 1 || retryEvents[0].RetryAttempt != 1 {
+		t.Fatalf("attempts=%d retryEvents=%#v", attempts.Load(), retryEvents)
+	}
+}
+
+func TestResponsesAgentRunnerDoesNotRetryFatalResponseFailedLikeRust(t *testing.T) {
+	for _, code := range []string{"context_length_exceeded", "insufficient_quota", "usage_not_included", "cyber_policy", "misalignment_policy_violation", "invalid_prompt", "bio_policy"} {
+		t.Run(code, func(t *testing.T) {
+			var attempts atomic.Int64
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				attempts.Add(1)
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte(responsesSSE(fmt.Sprintf(
+					`{"type":"response.failed","response":{"id":"resp-1","error":{"code":%q,"message":"fatal"}}}`,
+					code,
+				))))
+			}))
+			defer server.Close()
+			runner := NewResponsesAgentRunner(&ResponsesAgentOptions{Provider: &APIProvider{BaseURL: server.URL + "/v1", StreamMaxRetries: 2}, Stream: true})
+			if _, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"}); err == nil {
+				t.Fatal("Run() error = nil")
+			}
+			if attempts.Load() != 1 {
+				t.Fatalf("attempts = %d, want 1", attempts.Load())
+			}
+		})
+	}
+}
+
+func TestMisalignmentPolicyViolationErrorsAreTypedAndNonRetryableLikeRust(t *testing.T) {
+	err := responseFailedError([]byte(`{"type":"response.failed","response":{"error":{"code":"misalignment_policy_violation","message":"This request violated the misalignment policy."}}}`))
+	var apiErr *codexapi.APIError
+	if !errors.As(err, &apiErr) || apiErr.Kind != codexapi.ErrorMisalignmentPolicyViolation {
+		t.Fatalf("streamed error = %#v", err)
+	}
+	if apiErr.Message != "This request violated the misalignment policy." {
+		t.Fatalf("message = %q", apiErr.Message)
+	}
+
+	blank := responseFailedError([]byte(`{"type":"response.failed","response":{"error":{"code":"misalignment_policy_violation","message":"   "}}}`))
+	if !errors.As(blank, &apiErr) || apiErr.Message != "This request was blocked due to a misalignment policy violation." {
+		t.Fatalf("blank streamed error = %#v", blank)
+	}
+
+	// HTTP 400 with the misalignment code is also typed and not retried.
+	httpErr := responsesHTTPError("openai", http.StatusBadRequest, http.Header{}, []byte(`{"error":{"code":"misalignment_policy_violation","message":"blocked"}}`))
+	if !errors.As(httpErr, &apiErr) || apiErr.Kind != codexapi.ErrorMisalignmentPolicyViolation || apiErr.Status != http.StatusBadRequest {
+		t.Fatalf("http error = %#v", httpErr)
+	}
+	if apiErr.Message != "blocked" {
+		t.Fatalf("http message = %q", apiErr.Message)
+	}
+}
+
+// TestBioPolicyErrorsAreTypedAcrossStreamAndHTTPLikeRust mirrors Rust #46306:
+// bio-policy failures are typed on both the streaming and HTTP 400 paths, keep
+// the server message, and fall back to the biological-risk text when it is
+// missing or blank. The wrapped-WebSocket shape (`type`/`status` alongside
+// `error`) is classified the same way.
+func TestBioPolicyErrorsAreTypedAcrossStreamAndHTTPLikeRust(t *testing.T) {
+	strPtr := func(value string) *string { return &value }
+	cases := []struct {
+		name        string
+		message     *string
+		wantMessage string
+	}{
+		{name: "message", message: strPtr("This request was blocked by bio policy."), wantMessage: "This request was blocked by bio policy."},
+		{name: "missing", wantMessage: BioPolicyFallbackMessage},
+		{name: "empty", message: strPtr(""), wantMessage: BioPolicyFallbackMessage},
+		{name: "blank", message: strPtr("  "), wantMessage: BioPolicyFallbackMessage},
+	}
+	for _, wrapped := range []bool{false, true} {
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				body := map[string]any{"error": map[string]any{"code": "bio_policy"}}
+				if tc.message != nil {
+					body["error"].(map[string]any)["message"] = *tc.message
+				}
+				if wrapped {
+					body["type"] = "error"
+					body["status"] = http.StatusBadRequest
+				}
+				raw, err := json.Marshal(body)
+				if err != nil {
+					t.Fatalf("Marshal: %v", err)
+				}
+				httpErr := responsesHTTPError("openai", http.StatusBadRequest, http.Header{}, raw)
+				var apiErr *codexapi.APIError
+				if !errors.As(httpErr, &apiErr) || apiErr.Kind != codexapi.ErrorBioPolicy {
+					t.Fatalf("http error = %#v", httpErr)
+				}
+				if apiErr.Message != tc.wantMessage {
+					t.Fatalf("http message = %q, want %q", apiErr.Message, tc.wantMessage)
+				}
+			})
+		}
+	}
+
+	// The same classification applies to cyber-policy refusals on HTTP 400.
+	httpErr := responsesHTTPError("openai", http.StatusBadRequest, http.Header{}, []byte(`{"error":{"code":"cyber_policy","message":""}}`))
+	var apiErr *codexapi.APIError
+	if !errors.As(httpErr, &apiErr) || apiErr.Kind != codexapi.ErrorCyberPolicy || apiErr.Message != CyberPolicyFallbackMessage {
+		t.Fatalf("cyber policy http error = %#v", httpErr)
+	}
+}
+
+func TestResponseFailedRateLimitRetryDelayLikeRust(t *testing.T) {
+	err := responseFailedError([]byte(`{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"Please try again in 11.054s."}}}`))
+	if delay, ok := codexapi.RetryDelayInfo(err); !ok || delay != 11054*time.Millisecond {
+		t.Fatalf("retry delay = %v, %t", delay, ok)
+	}
+}
+
+func TestResponsesAgentRunnerReportsResponseIncompleteReason(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(responsesSSE(
+			`{"type":"response.incomplete","response":{"id":"resp-1","incomplete_details":{"reason":"max_output_tokens"}}}`,
+		)))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{BaseURL: server.URL + "/v1", StreamMaxRetries: 0},
+		Stream:   true,
+	})
+	_, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"})
+	if err == nil || err.Error() != "Incomplete response returned, reason: max_output_tokens" {
+		t.Fatalf("Run() error = %v", err)
+	}
+}
+
+func TestResponsesAgentRunnerReportsUnknownResponseIncompleteReason(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(responsesSSE(
+			`{"type":"response.incomplete","response":{"id":"resp-1","incomplete_details":null}}`,
+		)))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{BaseURL: server.URL + "/v1", StreamMaxRetries: 0},
+		Stream:   true,
+	})
+	_, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"})
+	if err == nil || err.Error() != "Incomplete response returned, reason: unknown" {
+		t.Fatalf("Run() error = %v", err)
+	}
+}
+
+func TestResponsesAgentRunnerStreamsResponseFailed(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(responsesSSE(
+			`{"type":"response.failed","response":{"id":"resp-1","error":{"code":"context_length_exceeded","message":"too much context"}}}`,
+		)))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{BaseURL: server.URL + "/v1"},
+		Stream:   true,
+	})
+	_, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"})
+	// Rust's CodexErrorDetails::ContextWindowExceeded copy is the user-facing
+	// message for this failure.
+	if err == nil || !strings.Contains(err.Error(), "Codex ran out of room in the model's context window.") {
+		t.Fatalf("Run error = %v", err)
+	}
+	var apiErr *codexapi.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("Run error type = %T, want APIError", err)
+	}
+	if apiErr.Kind != codexapi.ErrorContextWindowExceeded || apiErr.Status != http.StatusBadRequest {
+		t.Fatalf("APIError = %#v, want context window exceeded bad request", apiErr)
+	}
+}
+
+func TestResponsesAgentRunnerReturnsAPIErrorMessage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("x-request-id", "req-error")
+		w.Header().Set("cf-ray", "ray-error")
+		w.Header().Set("x-openai-authorization-error", "identity denied")
+		w.Header().Set("x-error-json", base64.StdEncoding.EncodeToString([]byte(`{"error":{"code":"identity_denied"}}`)))
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"bad prompt","type":"invalid_request_error"}}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{BaseURL: server.URL + "/v1"},
+	})
+	_, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"})
+	if err == nil || !strings.Contains(err.Error(), "bad prompt") {
+		t.Fatalf("Run error = %v", err)
+	}
+	var apiErr *ResponsesAPIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("Run error type = %T", err)
+	}
+	if apiErr.RequestID != "req-error" || apiErr.CFRay != "ray-error" || apiErr.AuthorizationError != "identity denied" || apiErr.AuthorizationErrorCode != "identity_denied" {
+		t.Fatalf("debug context = %#v", apiErr)
+	}
+	if !strings.Contains(err.Error(), "request id: req-error") || !strings.Contains(err.Error(), "cf-ray: ray-error") {
+		t.Fatalf("error string = %v", err)
+	}
+}
+
+func TestResponsesAgentRunnerMapsBedrockExpiredSignature(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("x-request-id", "req-bedrock")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("Signature expired: 20260609T133205Z is now earlier than 20260614T062525Z"))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{Name: AmazonBedrockProviderName, BaseURL: server.URL + "/openai/v1"},
+	})
+	_, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: AmazonBedrockGPT55ModelID})
+	if err == nil {
+		t.Fatal("Run returned nil error, want API error")
+	}
+	var apiErr *ResponsesAPIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("Run error type = %T", err)
+	}
+	if apiErr.Message != bedrockExpiredSignatureMessage {
+		t.Fatalf("message = %q", apiErr.Message)
+	}
+	if !strings.Contains(err.Error(), "Refresh your AWS credentials and retry") || !strings.Contains(err.Error(), "request id: req-bedrock") {
+		t.Fatalf("error string = %v", err)
+	}
+}
+
+func TestResponsesAgentRunnerKeepsGenericBedrockUnauthorized(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("The security token included in the request is invalid"))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{Name: AmazonBedrockProviderName, BaseURL: server.URL + "/openai/v1"},
+	})
+	_, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: AmazonBedrockGPT55ModelID})
+	if err == nil || !strings.Contains(err.Error(), "The security token included in the request is invalid") {
+		t.Fatalf("Run error = %v", err)
+	}
+	if strings.Contains(err.Error(), "Refresh your AWS credentials") {
+		t.Fatalf("error string = %v", err)
+	}
+}
+
+func hasResponseToolType(tools []any, toolType string) bool {
+	for _, tool := range tools {
+		item, ok := tool.(map[string]any)
+		if !ok {
+			continue
+		}
+		if item["type"] == toolType {
+			return true
+		}
+	}
+	return false
+}
+
+func hasResponseNamespaceFunction(tools []any, namespace string, name string) bool {
+	for _, tool := range tools {
+		item, ok := tool.(map[string]any)
+		if !ok || item["type"] != "namespace" || item["name"] != namespace {
+			continue
+		}
+		switch children := item["tools"].(type) {
+		case []map[string]any:
+			for _, child := range children {
+				if child["name"] == name {
+					return true
+				}
+			}
+		case []any:
+			for _, childValue := range children {
+				child, ok := childValue.(map[string]any)
+				if ok && child["name"] == name {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func responsesSSE(payloads ...string) string {
+	var builder strings.Builder
+	for _, payload := range payloads {
+		eventType := responseSSEType(payload)
+		if eventType != "" {
+			builder.WriteString("event: ")
+			builder.WriteString(eventType)
+			builder.WriteByte('\n')
+		}
+		builder.WriteString("data: ")
+		builder.WriteString(payload)
+		builder.WriteString("\n\n")
+	}
+	return builder.String()
+}
+
+func responseSSEType(payload string) string {
+	var value map[string]any
+	if err := json.Unmarshal([]byte(payload), &value); err != nil {
+		return ""
+	}
+	eventType, _ := value["type"].(string)
+	return eventType
+}
+
+func eventsByKind(events []ResponsesStreamEvent, kind ResponsesStreamEventKind) []ResponsesStreamEvent {
+	out := []ResponsesStreamEvent{}
+	for _, event := range events {
+		if event.Kind == kind {
+			out = append(out, event)
+		}
+	}
+	return out
+}
+
+func firstEventByKind(events []ResponsesStreamEvent, kind ResponsesStreamEventKind) *ResponsesStreamEvent {
+	for i := range events {
+		if events[i].Kind == kind {
+			return &events[i]
+		}
+	}
+	return nil
+}
+
+func TestResponsesInputItemsStripEncryptedFunctionArgsForNonOpenAIProviders(t *testing.T) {
+	marker := []string{}
+	request := &AgentRequest{InputItems: []any{
+		&AgentItem{Type: "function_call", Name: "spawn_agent", EncryptedFunctionArgs: &marker},
+		map[string]any{"type": "function_call", "name": "send_message", "encrypted_function_args": []any{}},
+	}}
+	openAI := responsesInputItemsForProvider(request, OpenAIProviderName)
+	if openAI[0].(*AgentItem).EncryptedFunctionArgs == nil {
+		t.Fatal("OpenAI input lost encrypted function marker")
+	}
+	nonOpenAI := responsesInputItemsForProvider(request, "ollama")
+	if nonOpenAI[0].(*AgentItem).EncryptedFunctionArgs != nil {
+		t.Fatalf("non-OpenAI AgentItem marker = %#v", nonOpenAI[0])
+	}
+	if _, ok := nonOpenAI[1].(map[string]any)["encrypted_function_args"]; ok {
+		t.Fatalf("non-OpenAI map marker = %#v", nonOpenAI[1])
+	}
+}
+
+func TestAddMemoryGenerationHeaderForConsolidationAgentLikeRust(t *testing.T) {
+	headers := http.Header{}
+	addMemoryGenerationHeader(headers, map[string]string{
+		codexapi.ClientOpenAISubagentHeader: "memory_consolidation",
+	})
+	if got := headers.Get(codexapi.ClientOpenAIMemgenRequestHeader); got != "true" {
+		t.Fatalf("memory generation header = %q, want true", got)
+	}
+
+	ordinary := http.Header{}
+	addMemoryGenerationHeader(ordinary, map[string]string{
+		codexapi.ClientOpenAISubagentHeader: "review",
+	})
+	if got := ordinary.Get(codexapi.ClientOpenAIMemgenRequestHeader); got != "" {
+		t.Fatalf("ordinary subagent memory generation header = %q, want empty", got)
+	}
+}
+
+func TestResponsesAgentRunnerRefreshWorkloadIdentityAfterUnauthorizedLikeRust(t *testing.T) {
+	// Mirrors Rust refresh_external_auth (login/src/auth/manager.rs): when the
+	// process selected workload identity, a downstream 401 re-exchanges the
+	// workload token preserving the previously authenticated account instead
+	// of falling through to OAuth refresh.
+	runner := &ResponsesAgentRunner{
+		AuthSnapshot: &auth.AuthDotJSON{
+			Tokens: map[string]any{"access_token": "old", "account_id": "account-one"},
+		},
+		WorkloadIdentityRefresh: func(ctx context.Context, previousAccountID string) (*auth.AuthDotJSON, error) {
+			if previousAccountID != "account-one" {
+				t.Fatalf("previous account id = %q, want account-one", previousAccountID)
+			}
+			return &auth.AuthDotJSON{
+				Tokens: map[string]any{"access_token": "new-workload", "account_id": "account-one"},
+			}, nil
+		},
+	}
+	if err := runner.refreshWorkloadIdentityAuth(context.Background()); err != nil {
+		t.Fatalf("refreshWorkloadIdentityAuth: %v", err)
+	}
+	if got := stringFromAny(runner.AuthSnapshot.Tokens, "access_token"); got != "new-workload" {
+		t.Fatalf("access token after refresh = %q, want new-workload", got)
+	}
+	if runner.Auth == nil {
+		t.Fatal("auth headers not updated after workload identity refresh")
+	}
+}
+
+func TestResponsesAgentRunnerWorkloadIdentityRefreshFallsThroughWhenNotSelected(t *testing.T) {
+	// Without a configured workload identity, the refresh falls through to the
+	// next recovery step instead of erroring the whole recovery.
+	runner := &ResponsesAgentRunner{AuthSnapshot: &auth.AuthDotJSON{}}
+	err := runner.refreshWorkloadIdentityAuth(context.Background())
+	if err == nil {
+		t.Fatal("expected workload identity refresh to report unavailability")
+	}
+}
+
+func TestResponsesAgentRunnerAppliesManagedResidencyHeaderLikeRust(t *testing.T) {
+	provider := &APIProvider{
+		Name:    OpenAIProviderName,
+		BaseURL: "https://example.invalid/v1",
+		// A provider-configured residency header must be overridden by the
+		// managed enforce_residency requirement (#39645).
+		Headers: http.Header{ResidencyHeaderName: []string{"provider-value"}},
+	}
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider:      provider,
+		ModelsManager: NewStaticModelsManager(ModelsResponse{}),
+		ProviderID:    OpenAIProviderID,
+	})
+	runner.Residency = "us"
+	req, err := runner.newResponsesHTTPRequest(context.Background(), &AgentRequest{Model: "gpt-test"}, &responsesAgentRequest{}, "application/json")
+	if err != nil {
+		t.Fatalf("newResponsesHTTPRequest() error = %v", err)
+	}
+	if got := req.Header.Get(ResidencyHeaderName); got != "us" {
+		t.Fatalf("residency header = %q, want managed value us", got)
+	}
+}
+
+func TestRefreshBedrockAWSCredentialsRunsCommandOnceAndReloads(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell helper not needed; command path is cross-platform")
+	}
+	helper := `
+if [ "$1" = "refresh" ]; then
+  touch "$CODEX_TEST_REFRESH_MARKER"
+  exit 0
+fi
+exit 1
+`
+	marker := filepath.Join(t.TempDir(), "refreshed")
+	script := filepath.Join(t.TempDir(), "aws-refresh.sh")
+	if err := os.WriteFile(script, []byte(helper), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_TEST_REFRESH_MARKER", marker)
+	runner := &ResponsesAgentRunner{
+		Provider: &APIProvider{Name: AmazonBedrockProviderName},
+		AWS: &ProviderAWSAuthInfo{
+			Region: "us-east-1",
+			AuthRefresh: &ProviderAuthRefreshInfo{
+				Command: script,
+				Args:    []string{"refresh"},
+			},
+		},
+	}
+	if err := runner.refreshBedrockAWSCredentials(context.Background()); err != nil {
+		t.Fatalf("refresh error = %v", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("refresh command did not run: %v", err)
+	}
+	if runner.Auth == nil || runner.Auth.SignRequest == nil {
+		t.Fatalf("signer not reloaded after refresh: %#v", runner.Auth)
+	}
+}
+
+func TestRefreshBedrockAWSCredentialsSkipsWhenNotConfigured(t *testing.T) {
+	runner := &ResponsesAgentRunner{Provider: &APIProvider{Name: OpenAIProviderName}}
+	if err := runner.refreshBedrockAWSCredentials(context.Background()); err == nil {
+		t.Fatal("refresh should be skipped when not configured")
+	}
+}
+
+func TestRefreshBedrockAWSCredentialsBoundsProviderRecoveryPerRequest(t *testing.T) {
+	// Rust #39274: at most one provider-owned recovery attempt per request.
+	if runtime.GOOS == "windows" {
+		t.Skip("shell helper path is unix-only")
+	}
+	script := filepath.Join(t.TempDir(), "aws-refresh.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := &ResponsesAgentRunner{
+		Provider: &APIProvider{Name: AmazonBedrockProviderName},
+		AWS: &ProviderAWSAuthInfo{
+			Region: "us-east-1",
+			AuthRefresh: &ProviderAuthRefreshInfo{
+				Command: script,
+			},
+		},
+	}
+	if err := runner.refreshBedrockAWSCredentials(context.Background()); err != nil {
+		t.Fatalf("first refresh error = %v", err)
+	}
+	if err := runner.refreshBedrockAWSCredentials(context.Background()); err == nil {
+		t.Fatal("second provider-owned recovery should be rejected within the request")
+	}
+}
+func TestResponsesAgentRunnerContentItemKindsGate(t *testing.T) {
+	newItem := func() map[string]any {
+		return map[string]any{
+			"type": "message",
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "input_text", "text": "hi"},
+			},
+			"internal_chat_message_metadata_passthrough": map[string]any{
+				"content_item_kinds": []any{"user.text"},
+				"turn_id":            "turn-1",
+			},
+		}
+	}
+	hasKinds := func(item any) bool {
+		m, ok := item.(map[string]any)
+		if !ok {
+			return false
+		}
+		md, ok := m["internal_chat_message_metadata_passthrough"].(map[string]any)
+		if !ok {
+			return false
+		}
+		_, present := md["content_item_kinds"]
+		return present
+	}
+
+	// A nil gate means the feature default (enabled): content kinds preserved.
+	runner := &ResponsesAgentRunner{}
+	if got := runner.gateContentItemKinds([]any{newItem()}); !hasKinds(got[0]) {
+		t.Fatalf("enabled gate stripped content_item_kinds: %#v", got[0])
+	}
+
+	// An explicit disabled gate clears content_item_kinds from the request item.
+	disabled := false
+	runnerDisabled := &ResponsesAgentRunner{ContentItemKindsEnabled: &disabled}
+	got := runnerDisabled.gateContentItemKinds([]any{newItem()})[0].(map[string]any)
+	if hasKinds(got) {
+		t.Fatalf("disabled gate did not strip content_item_kinds: %#v", got)
+	}
+	metadata, _ := got["internal_chat_message_metadata_passthrough"].(map[string]any)
+	if metadata["turn_id"] != "turn-1" {
+		t.Fatalf("disabled gate removed unrelated metadata: %#v", got)
+	}
+
+	// Matching Rust's default-value cleanup: metadata containing only the
+	// classification disappears instead of leaving an empty object on the wire.
+	onlyKinds := newItem()
+	delete(onlyKinds["internal_chat_message_metadata_passthrough"].(map[string]any), "turn_id")
+	cleaned := runnerDisabled.gateContentItemKinds([]any{onlyKinds})[0].(map[string]any)
+	if _, present := cleaned["internal_chat_message_metadata_passthrough"]; present {
+		t.Fatalf("disabled gate left empty metadata: %#v", cleaned)
+	}
+}
+
+func TestResponsesReasoningParamPersistentTranslatesToDisabled(t *testing.T) {
+	request := &AgentRequest{ReasoningEffort: "persistent"}
+	info := &ModelInfo{SupportsReasoningSummaries: true, DefaultReasoningSummary: "none"}
+	r := responsesReasoningParam(request, info)
+	if r == nil || r.Effort != "disabled" {
+		t.Fatalf("reasoning effort = %#v, want disabled (Rust #40799)", r)
+	}
+}
+
+// TestResponsesReasoningEffortWireTypeLikeRust pins Rust #47590
+// (codex-rs/codex-api/src/common.rs serialize_reasoning_effort): the reasoning
+// effort is a JSON string for named levels, but a custom value that parses as
+// an unsigned integer must be sent as a JSON number. Only the wire type of the
+// effort field changes; the summary and context fields keep their order and
+// omitempty behavior.
+func TestResponsesReasoningEffortWireTypeLikeRust(t *testing.T) {
+	cases := []struct {
+		name   string
+		effort string
+		want   string
+	}{
+		{"named level", "high", `{"effort":"high"}`},
+		{"named level none", "none", `{"effort":"none"}`},
+		{"named level disabled", "disabled", `{"effort":"disabled"}`},
+		{"named level ultra", "ultra", `{"effort":"ultra"}`},
+		{"custom number", "64", `{"effort":64}`},
+		{"custom zero", "0", `{"effort":0}`},
+		{"custom plus sign", "+7", `{"effort":7}`},
+		{"custom leading zeros", "007", `{"effort":7}`},
+		{"custom u64 maximum", "18446744073709551615", `{"effort":18446744073709551615}`},
+		{"custom negative", "-1", `{"effort":"-1"}`},
+		{"custom beyond u64", "18446744073709551616", `{"effort":"18446744073709551616"}`},
+		{"custom plus only", "+", `{"effort":"+"}`},
+		{"custom non-numeric", "experimental", `{"effort":"experimental"}`},
+	}
+	for _, testCase := range cases {
+		body, err := json.Marshal(responsesReasoning{Effort: testCase.effort})
+		if err != nil {
+			t.Fatalf("%s: json.Marshal error = %v", testCase.name, err)
+		}
+		if string(body) != testCase.want {
+			t.Fatalf("%s: reasoning body = %s, want %s", testCase.name, body, testCase.want)
+		}
+	}
+
+	// The production path must reach the wire with the numeric form: a custom
+	// effort supplied through AgentRequest survives ResolveReasoningEffort
+	// unchanged and is embedded as a number inside the Responses request.
+	number := responsesReasoningParam(
+		&AgentRequest{ReasoningEffort: "64"},
+		&ModelInfo{SupportsReasoningSummaries: true, DefaultReasoningSummary: "none"},
+	)
+	if number == nil || number.Effort != "64" {
+		t.Fatalf("reasoning effort = %#v, want the custom value 64", number)
+	}
+	requestBody, err := json.Marshal(&responsesAgentRequest{Model: "gpt-5.5", Reasoning: number})
+	if err != nil {
+		t.Fatalf("json.Marshal request error = %v", err)
+	}
+	if !strings.Contains(string(requestBody), `"reasoning":{"effort":64}`) {
+		t.Fatalf("request body = %s, want a numeric reasoning effort", requestBody)
+	}
+
+	// Named levels and the other reasoning fields are untouched.
+	full, err := json.Marshal(responsesReasoning{Effort: "high", Summary: "detailed", Context: "all_turns"})
+	if err != nil {
+		t.Fatalf("json.Marshal full reasoning error = %v", err)
+	}
+	if string(full) != `{"effort":"high","summary":"detailed","context":"all_turns"}` {
+		t.Fatalf("full reasoning body = %s", full)
+	}
+}
+
+// TestResponsesAgentRunnerResetAuthOwnedCaches covers Rust #44489: a new
+// credential owner must not reuse the previous owner's websocket connection or
+// per-turn routing state.
+func TestResponsesAgentRunnerResetAuthOwnedCaches(t *testing.T) {
+	runner := &ResponsesAgentRunner{
+		websocketSessions: &responsesWebsocketSessionCache{
+			sessions: map[string]*responsesWebsocketSession{
+				"thread:t:turn:u": {conn: nil},
+			},
+		},
+		turnState: &responsesTurnStateCache{turnID: "turn-1", value: "route-1"},
+	}
+	runner.ResetAuthOwnedCaches()
+	if len(runner.websocketSessions.sessions) != 0 {
+		t.Fatalf("cached websocket sessions = %d, want 0 after auth ownership change", len(runner.websocketSessions.sessions))
+	}
+	if runner.turnState.turnID != "" || runner.turnState.value != "" {
+		t.Fatalf("turn state = %q/%q, want cleared after auth ownership change", runner.turnState.turnID, runner.turnState.value)
+	}
+}
+
+// TestResponsesInputItemsDropUnsupportedConfigurationUpdatesLikeRust covers
+// Rust #46530: when the effective model does not accept reasoning-effort
+// update items, saved configuration_update items are removed from the request
+// copy while other input items are preserved.
+func TestResponsesInputItemsDropUnsupportedConfigurationUpdatesLikeRust(t *testing.T) {
+	update := map[string]any{"type": "configuration_update", "reasoning": map[string]any{"effort": "high"}}
+	message := map[string]any{"type": "message", "role": "user", "content": []any{}}
+	request := &AgentRequest{
+		Prompt:                     "hello",
+		InputItems:                 []any{message, update},
+		PostPromptInputItems:       []any{update},
+		DropReasoningEffortUpdates: true,
+	}
+	items := responsesInputItems(request)
+	for _, item := range items {
+		if payload, ok := item.(map[string]any); ok {
+			if itemType, _ := payload["type"].(string); itemType == "configuration_update" {
+				t.Fatalf("configuration_update survived the unsupported-model filter: %#v", items)
+			}
+		}
+	}
+	if len(items) != 2 {
+		t.Fatalf("filtered input item count = %d, want 2 (history message + prompt)", len(items))
+	}
+
+	// The same input is left intact when the model supports updates.
+	unfiltered := responsesInputItems(&AgentRequest{
+		Prompt:               "hello",
+		InputItems:           []any{message, update},
+		PostPromptInputItems: []any{update},
+	})
+	if len(unfiltered) != 4 {
+		t.Fatalf("unfiltered input item count = %d, want 4", len(unfiltered))
+	}
+}
+
+// Mirrors Rust #48508: an interrupted incomplete response completes the stream
+// with `end_turn: false`, preserving token usage so the turn can continue, while
+// every other incomplete reason stays an error.
+func TestInterruptedIncompleteCompletesWithEndTurnFalseLikeRust(t *testing.T) {
+	var events []ResponsesStreamEvent
+	response, err := parseResponsesStream(context.Background(), strings.NewReader(responsesSSE(
+		`{"type":"response.created","response":{"id":"resp-1"}}`,
+		`{"type":"response.output_item.done","item":{"id":"rs-1","type":"reasoning","summary":["partial thought"]}}`,
+		`{"type":"response.incomplete","response":{"id":"resp-1","incomplete_details":{"reason":"interrupted"},"end_turn":true,"usage":{"input_tokens":11,"output_tokens":5,"total_tokens":16}}}`,
+	)), &AgentRequest{Model: "gpt-test"}, OpenAIProviderName, func(event *ResponsesStreamEvent) {
+		events = append(events, *event)
+	})
+	if err != nil {
+		t.Fatalf("parseResponsesStream() error = %v", err)
+	}
+	if response.ResponseID != "resp-1" || response.Usage.TotalTokens != 16 {
+		t.Fatalf("response = %#v", response)
+	}
+	completed := events[len(events)-1]
+	if completed.Kind != ResponsesStreamEventCompleted || completed.RawType != "response.incomplete" {
+		t.Fatalf("completed event = %#v", completed)
+	}
+	if completed.EndTurn == nil || *completed.EndTurn {
+		t.Fatalf("EndTurn = %v, want false", completed.EndTurn)
+	}
+	if completed.Usage == nil || completed.Usage.TotalTokens != 16 {
+		t.Fatalf("completed usage = %#v, want the interrupted response's usage", completed.Usage)
+	}
+
+	// A different incomplete reason still fails.
+	if _, err := parseResponsesStream(context.Background(), strings.NewReader(responsesSSE(
+		`{"type":"response.incomplete","response":{"id":"resp-2","incomplete_details":{"reason":"max_output_tokens"}}}`,
+	)), &AgentRequest{Model: "gpt-test"}, OpenAIProviderName, nil); err == nil || err.Error() != "Incomplete response returned, reason: max_output_tokens" {
+		t.Fatalf("non-interrupted incomplete error = %v", err)
+	}
+}
+
+// TestWindowHasToolDeclarationsLikeRust covers Rust
+// `ContextManager::has_tool_declarations` (#51480): a context window declares
+// its tools when its history carries the harness-authored `additional_tools`
+// item. Rollout-loaded raw JSON, decoded maps and typed agent items must all be
+// recognized, and ordinary conversation items must not count.
+func TestWindowHasToolDeclarationsLikeRust(t *testing.T) {
+	cases := []struct {
+		name  string
+		items []any
+		want  bool
+	}{
+		{
+			name:  "empty window",
+			items: nil,
+			want:  false,
+		},
+		{
+			name: "conversation without declarations",
+			items: []any{
+				map[string]any{"type": "message", "role": "user", "content": "hi"},
+				map[string]any{"type": "function_call", "name": "shell"},
+			},
+			want: false,
+		},
+		{
+			name: "decoded additional_tools item",
+			items: []any{
+				map[string]any{"type": "additional_tools", "role": "developer", "tools": []any{}},
+				map[string]any{"type": "message", "role": "user", "content": "hi"},
+			},
+			want: true,
+		},
+		{
+			name: "raw rollout json item",
+			items: []any{
+				json.RawMessage(`{"id":"at_1","type":"additional_tools","role":"developer","tools":[]}`),
+			},
+			want: true,
+		},
+		{
+			name: "typed agent item",
+			items: []any{
+				&AgentItem{ID: "at_1", Type: "additional_tools"},
+			},
+			want: true,
+		},
+		{
+			name: "nil item ignored",
+			items: []any{
+				nil,
+				&AgentItem{ID: "at_1"},
+			},
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		if got := WindowHasToolDeclarations(tc.items); got != tc.want {
+			t.Fatalf("%s: WindowHasToolDeclarations = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestResponsesLiteReusesRecordedToolDeclarationsLikeRust covers Rust #51480's
+// "legacy resume"/existing-window half for the Go runner: a responses-lite
+// window whose history already holds its declarations must send those recorded
+// items verbatim instead of rebuilding and prepending a second copy, so the tool
+// declarations and base instructions keep their position inside the window.
+func TestResponsesLiteReusesRecordedToolDeclarationsLikeRust(t *testing.T) {
+	var recordedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&recordedBody); err != nil {
+			t.Fatalf("Decode request body error = %v", err)
+		}
+		_, _ = w.Write([]byte(`{"id":"resp-1","model":"gpt-lite","output_text":"ok","output":[]}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{Name: OpenAIProviderName, BaseURL: server.URL + "/v1"},
+		AuthSnapshot: &auth.AuthDotJSON{
+			AuthMode: "chatgpt",
+			Tokens:   map[string]any{"access_token": "token"},
+		},
+		ModelsManager: NewStaticModelsManager(ModelsResponse{Models: []ModelInfo{{
+			Slug:             "gpt-lite",
+			InputModalities:  []string{"text", "image"},
+			UseResponsesLite: true,
+		}}}),
+	})
+
+	recordedDeclarations := map[string]any{
+		"id":    "at_recorded",
+		"type":  "additional_tools",
+		"role":  "developer",
+		"tools": []any{map[string]any{"type": "function", "name": "echo"}},
+	}
+	recordedInstructions := map[string]any{
+		"id":   "msg_recorded",
+		"type": "message",
+		"role": "developer",
+		"content": []any{
+			map[string]any{"type": "input_text", "text": "You are a helpful assistant."},
+		},
+	}
+	history := []any{
+		recordedDeclarations,
+		recordedInstructions,
+		map[string]any{"type": "message", "role": "user", "content": "hello"},
+	}
+
+	if _, err := runner.Run(context.Background(), &AgentRequest{
+		Model:      "gpt-lite",
+		Prompt:     "again",
+		InputItems: history,
+		Tools:      []any{map[string]any{"type": "function", "name": "echo"}},
+	}); err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	if _, ok := recordedBody["tools"]; ok {
+		t.Fatalf("responses lite should not include top-level tools: %#v", recordedBody["tools"])
+	}
+	if instructions, ok := recordedBody["instructions"].(string); ok && strings.TrimSpace(instructions) != "" {
+		t.Fatalf("responses lite should keep base instructions in the window: %#v", instructions)
+	}
+	inputs, ok := recordedBody["input"].([]any)
+	if !ok || len(inputs) == 0 {
+		t.Fatalf("input = %#v", recordedBody["input"])
+	}
+	declarationCount := 0
+	declarationIndex := -1
+	for i, raw := range inputs {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if item["type"] == "additional_tools" {
+			declarationCount++
+			declarationIndex = i
+			if item["id"] != "at_recorded" {
+				t.Fatalf("rebuilt declaration replaced the recorded one: %#v", item)
+			}
+		}
+	}
+	if declarationCount != 1 {
+		t.Fatalf("recorded declarations should appear exactly once, got %d: %#v", declarationCount, inputs)
+	}
+	// The recorded declarations stay ahead of the conversation, as the window
+	// recorded them, and are not moved to a rebuilt prefix position.
+	if declarationIndex != 0 {
+		t.Fatalf("recorded declarations moved to index %d: %#v", declarationIndex, inputs)
+	}
+	first, _ := inputs[0].(map[string]any)
+	if first["type"] != "additional_tools" {
+		t.Fatalf("first input item = %#v", inputs[0])
+	}
+	second, ok := inputs[1].(map[string]any)
+	if !ok || second["id"] != "msg_recorded" {
+		t.Fatalf("recorded base instructions lost: %#v", inputs[1])
+	}
+}
+
+// TestResponsesLiteBuildsDeclarationsForWindowWithoutThemLikeRust guards the
+// other half of the #51480 decision: a responses-lite window that has not
+// declared its tools yet still gets the rebuilt `additional_tools` /
+// base-instruction prefix for this request.
+func TestResponsesLiteBuildsDeclarationsForWindowWithoutThemLikeRust(t *testing.T) {
+	var recordedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&recordedBody); err != nil {
+			t.Fatalf("Decode request body error = %v", err)
+		}
+		_, _ = w.Write([]byte(`{"id":"resp-1","model":"gpt-lite","output_text":"ok","output":[]}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{Name: OpenAIProviderName, BaseURL: server.URL + "/v1"},
+		AuthSnapshot: &auth.AuthDotJSON{
+			AuthMode: "chatgpt",
+			Tokens:   map[string]any{"access_token": "token"},
+		},
+		ModelsManager: NewStaticModelsManager(ModelsResponse{Models: []ModelInfo{{
+			Slug:             "gpt-lite",
+			InputModalities:  []string{"text", "image"},
+			UseResponsesLite: true,
+		}}}),
+	})
+
+	if _, err := runner.Run(context.Background(), &AgentRequest{
+		Model:        "gpt-lite",
+		Prompt:       "hello",
+		InputItems:   []any{map[string]any{"type": "message", "role": "user", "content": "first"}},
+		Instructions: "You are a helpful assistant.",
+		Tools:        []any{map[string]any{"type": "function", "name": "echo"}},
+	}); err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	inputs, ok := recordedBody["input"].([]any)
+	if !ok || len(inputs) < 2 {
+		t.Fatalf("input = %#v", recordedBody["input"])
+	}
+	additionalTools, ok := inputs[0].(map[string]any)
+	if !ok || additionalTools["type"] != "additional_tools" {
+		t.Fatalf("additional_tools = %#v", inputs[0])
+	}
+	id, _ := additionalTools["id"].(string)
+	if !strings.HasPrefix(id, "at_") {
+		t.Fatalf("rebuilt additional_tools id = %q, want deterministic at_ id", id)
+	}
+	if _, ok := recordedBody["tools"]; ok {
+		t.Fatalf("responses lite should not include top-level tools: %#v", recordedBody["tools"])
+	}
+}
+
+// TestResponsesLiteWebSocketReusesRecordedDeclarationsLikeRust mirrors Rust
+// #51480's WebSocket startup-prewarm coverage: a responses-lite window that has
+// already recorded its tool declarations replays them from history over the
+// websocket transport and omits the rebuilt `instructions` / `tools` fields,
+// exactly like the HTTP runner.
+func TestResponsesLiteWebSocketReusesRecordedDeclarationsLikeRust(t *testing.T) {
+	var received map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		conn, err := websocket.Accept(w, request, nil)
+		if err != nil {
+			t.Errorf("Accept() error = %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "done")
+		_, data, _ := conn.Read(request.Context())
+		_ = json.Unmarshal(data, &received)
+		_ = conn.Write(request.Context(), websocket.MessageText, []byte(`{"type":"response.output_text.delta","delta":"ok"}`))
+		_ = conn.Write(request.Context(), websocket.MessageText, []byte(`{"type":"response.completed","response":{"id":"ws-lite-1"}}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider:           &APIProvider{Name: OpenAIProviderName, BaseURL: server.URL + "/v1"},
+		SupportsWebsockets: true,
+		ModelsManager: NewStaticModelsManager(ModelsResponse{Models: []ModelInfo{{
+			Slug:             "gpt-lite",
+			InputModalities:  []string{"text", "image"},
+			UseResponsesLite: true,
+		}}}),
+	})
+
+	history := []any{
+		map[string]any{
+			"id":    "at_recorded",
+			"type":  "additional_tools",
+			"role":  "developer",
+			"tools": []any{map[string]any{"type": "function", "name": "echo"}},
+		},
+		map[string]any{
+			"id":   "msg_recorded",
+			"type": "message",
+			"role": "developer",
+			"content": []any{
+				map[string]any{"type": "input_text", "text": "You are a helpful assistant."},
+			},
+		},
+		map[string]any{"type": "message", "role": "user", "content": "hello"},
+	}
+	if _, err := runner.RunWebSocket(context.Background(), &AgentRequest{
+		Model:        "gpt-lite",
+		Prompt:       "again",
+		Instructions: "You are a helpful assistant.",
+		InputItems:   history,
+		Tools:        []any{map[string]any{"type": "function", "name": "echo"}},
+	}); err != nil {
+		t.Fatalf("RunWebSocket error = %v", err)
+	}
+	if tools, ok := received["tools"]; ok && tools != nil {
+		t.Fatalf("responses lite websocket should not include top-level tools: %#v", tools)
+	}
+	if instructions, ok := received["instructions"].(string); ok && strings.TrimSpace(instructions) != "" {
+		t.Fatalf("responses lite websocket should keep declarations in the window: %#v", instructions)
+	}
+	inputs, ok := received["input"].([]any)
+	if !ok || len(inputs) == 0 {
+		t.Fatalf("input = %#v", received["input"])
+	}
+	first, _ := inputs[0].(map[string]any)
+	if first["type"] != "additional_tools" || first["id"] != "at_recorded" {
+		t.Fatalf("recorded declarations lost over websocket: %#v", inputs[0])
+	}
+	declarationCount := 0
+	for _, raw := range inputs {
+		if item, ok := raw.(map[string]any); ok && item["type"] == "additional_tools" {
+			declarationCount++
+		}
+	}
+	if declarationCount != 1 {
+		t.Fatalf("recorded declarations should appear exactly once, got %d", declarationCount)
+	}
+}
+
+// responsesBodyPrefix returns the first limit bytes of a serialized request body
+// for failure messages.
+func responsesBodyPrefix(body string, limit int) string {
+	if len(body) <= limit {
+		return body
+	}
+	return body[:limit] + "..."
+}
+
+// assertResponsesRoutingFieldsPrecedeInput checks the Rust #49675 contract: a
+// gateway must be able to route a Responses request from a partially read body,
+// so the routing fields appear before the potentially multi-megabyte input.
+func assertResponsesRoutingFieldsPrecedeInput(t *testing.T, body string, fields ...string) {
+	t.Helper()
+	inputPosition := strings.Index(body, `"input"`)
+	if inputPosition < 0 {
+		t.Fatalf("request body has no input field: %q", responsesBodyPrefix(body, 200))
+	}
+	for _, field := range fields {
+		position := strings.Index(body, `"`+field+`"`)
+		if position < 0 {
+			t.Fatalf("request body has no %q field: %q", field, responsesBodyPrefix(body, 200))
+		}
+		if position > inputPosition {
+			t.Fatalf("%q at byte %d must precede input at byte %d: %q", field, position, inputPosition, responsesBodyPrefix(body, 200))
+		}
+	}
+}
+
+// TestResponsesAgentRunnerWebSocketSendsRoutingFieldsBeforeInputLikeRust mirrors
+// Rust #49675's websocket coverage: the response.create message serializes
+// `model`, `stream` and `service_tier` ahead of the input. The Go payload is
+// assembled as a map, which encoding/json would otherwise emit in lexical key
+// order (putting `model` fourth, after `input`).
+func TestResponsesAgentRunnerWebSocketSendsRoutingFieldsBeforeInputLikeRust(t *testing.T) {
+	for _, useLite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("lite=%t", useLite), func(t *testing.T) {
+			var received []byte
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				conn, err := websocket.Accept(w, request, nil)
+				if err != nil {
+					t.Errorf("Accept() error = %v", err)
+					return
+				}
+				defer conn.Close(websocket.StatusNormalClosure, "done")
+				conn.SetReadLimit(8 << 20)
+				_, data, err := conn.Read(request.Context())
+				if err != nil {
+					t.Errorf("Read() error = %v", err)
+					return
+				}
+				received = data
+				_ = conn.Write(request.Context(), websocket.MessageText, []byte(`{"type":"response.completed","response":{"id":"ws-routing-1","output":[{"id":"msg-routing","type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}}`))
+			}))
+			defer server.Close()
+
+			slug := "gpt-test"
+			if useLite {
+				slug = "gpt-test-lite"
+			}
+			runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+				Provider:           &APIProvider{Name: OpenAIProviderName, BaseURL: server.URL + "/v1"},
+				SupportsWebsockets: true,
+				ModelsManager: NewStaticModelsManager(ModelsResponse{Models: []ModelInfo{{
+					Slug:             slug,
+					InputModalities:  []string{"text", "image"},
+					ServiceTiers:     []string{"priority"},
+					UseResponsesLite: useLite,
+				}}}),
+			})
+			largeInput := strings.Repeat("x", 2*1024*1024)
+			if _, err := runner.RunWebSocket(context.Background(), &AgentRequest{
+				Model:       slug,
+				Prompt:      largeInput,
+				ServiceTier: "priority",
+			}); err != nil {
+				t.Fatalf("RunWebSocket error = %v", err)
+			}
+			if len(received) == 0 {
+				t.Fatal("no websocket request message recorded")
+			}
+			body := string(received)
+			if !strings.HasPrefix(body, `{"type":"response.create","model":"`+slug+`","stream":true,"service_tier":"priority"`) {
+				t.Fatalf("websocket routing prefix = %q", responsesBodyPrefix(body, 200))
+			}
+			assertResponsesRoutingFieldsPrecedeInput(t, body, "model", "stream", "service_tier")
+			if len(received) <= 2*1024*1024 {
+				t.Fatalf("websocket message = %d bytes, want the large input to be present", len(received))
+			}
+			var parsed map[string]any
+			if err := json.Unmarshal(received, &parsed); err != nil {
+				t.Fatalf("Unmarshal() error = %v", err)
+			}
+			if parsed["type"] != "response.create" || parsed["model"] != slug || parsed["stream"] != true || parsed["service_tier"] != "priority" {
+				t.Fatalf("websocket payload = %#v", map[string]any{
+					"type": parsed["type"], "model": parsed["model"], "stream": parsed["stream"], "service_tier": parsed["service_tier"],
+				})
+			}
+		})
+	}
+}
+
+// TestResponsesAgentRunnerHTTPSendsRoutingFieldsBeforeLargeInputLikeRust mirrors
+// Rust #49675's HTTP coverage: the /responses body serializes `model`, `stream`
+// and `service_tier` ahead of a 2 MiB input, for both the standard and the
+// responses-lite request shapes, and keeps the field values and the omission of
+// an unset service_tier.
+func TestResponsesAgentRunnerHTTPSendsRoutingFieldsBeforeLargeInputLikeRust(t *testing.T) {
+	for _, useLite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("lite=%t", useLite), func(t *testing.T) {
+			var recorded []byte
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Errorf("ReadAll() error = %v", err)
+					return
+				}
+				recorded = body
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"id":"resp-routing","model":"gpt-test","output":[{"id":"msg-routing","type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`))
+			}))
+			defer server.Close()
+
+			slug := "gpt-test"
+			if useLite {
+				slug = "gpt-test-lite"
+			}
+			runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+				Provider: &APIProvider{Name: OpenAIProviderName, BaseURL: server.URL + "/v1"},
+				ModelsManager: NewStaticModelsManager(ModelsResponse{Models: []ModelInfo{{
+					Slug:             slug,
+					InputModalities:  []string{"text", "image"},
+					ServiceTiers:     []string{"priority"},
+					UseResponsesLite: useLite,
+				}}}),
+			})
+			largeInput := strings.Repeat("x", 2*1024*1024)
+			if _, err := runner.Run(context.Background(), &AgentRequest{
+				Model:       slug,
+				Prompt:      largeInput,
+				ServiceTier: "priority",
+			}); err != nil {
+				t.Fatalf("Run error = %v", err)
+			}
+			if len(recorded) == 0 {
+				t.Fatal("no HTTP request body recorded")
+			}
+			body := string(recorded)
+			if !strings.HasPrefix(body, `{"model":"`+slug+`","stream":false,"service_tier":"priority"`) {
+				t.Fatalf("HTTP routing prefix = %q", responsesBodyPrefix(body, 200))
+			}
+			assertResponsesRoutingFieldsPrecedeInput(t, body, "model", "stream", "service_tier")
+			if len(recorded) <= 2*1024*1024 {
+				t.Fatalf("HTTP body = %d bytes, want the large input to be present", len(recorded))
+			}
+			var parsed map[string]any
+			if err := json.Unmarshal(recorded, &parsed); err != nil {
+				t.Fatalf("Unmarshal() error = %v", err)
+			}
+			if parsed["model"] != slug || parsed["stream"] != false || parsed["service_tier"] != "priority" {
+				t.Fatalf("HTTP payload = %#v", map[string]any{"model": parsed["model"], "stream": parsed["stream"], "service_tier": parsed["service_tier"]})
+			}
+		})
+	}
+}
+
+// TestResponsesAgentRunnerHTTPSendsRoutingFieldsBeforeOmittedServiceTierLikeRust
+// covers Rust #49675's "Preserve ... omission of unset service_tier" half: an
+// unset tier stays absent from the body while the routing fields still precede
+// the input.
+func TestResponsesAgentRunnerHTTPSendsRoutingFieldsBeforeOmittedServiceTierLikeRust(t *testing.T) {
+	var recorded []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll() error = %v", err)
+			return
+		}
+		recorded = body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-routing","model":"gpt-test","output":[{"id":"msg-routing","type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{Name: OpenAIProviderName, BaseURL: server.URL + "/v1"},
+		ModelsManager: NewStaticModelsManager(ModelsResponse{Models: []ModelInfo{{
+			Slug:         "gpt-test",
+			ServiceTiers: []string{"priority"},
+		}}}),
+	})
+	largeInput := strings.Repeat("x", 2*1024*1024)
+	if _, err := runner.Run(context.Background(), &AgentRequest{Model: "gpt-test", Prompt: largeInput}); err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+	body := string(recorded)
+	if !strings.HasPrefix(body, `{"model":"gpt-test","stream":false`) {
+		t.Fatalf("HTTP routing prefix = %q", responsesBodyPrefix(body, 200))
+	}
+	if strings.Contains(body, "service_tier") {
+		t.Fatalf("unset service_tier should be omitted: %q", responsesBodyPrefix(body, 200))
+	}
+	assertResponsesRoutingFieldsPrecedeInput(t, body, "model", "stream")
+}

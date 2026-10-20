@@ -1,0 +1,1248 @@
+package mcp
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"sort"
+	"strings"
+
+	"codex_core/jsonschema"
+	"codex_core/tool"
+	"codex_core/utils"
+)
+
+const (
+	LegacyMCPToolNamePrefix = "mcp__"
+	MCPToolNameDelimiter    = "__"
+	openAIFileHookInputKey  = "_codex_openai_file_arguments"
+	// ConfirmationPoliciesMetaKey mirrors Rust protocol::mcp::
+	// CONFIRMATION_POLICIES_META_KEY; host-supplied confirmation-policy
+	// documents forwarded to Node REPL-backed actor calls (#41072).
+	ConfirmationPoliciesMetaKey = "openai/confirmation_policies"
+	// BrowserConnectorID identifies the host-owned Browser connector whose
+	// tools run through the computer-use policy path (Rust #47647).
+	BrowserConnectorID = "connector_openai_browser"
+	// maxSerializedMCPToolBytes mirrors Rust MAX_SERIALIZED_MCP_TOOL_BYTES:
+	// the cap above which Agent Plugin v1 tools degrade to an accept-anything
+	// object schema (responses_api.rs).
+	maxSerializedMCPToolBytes = 8_000
+)
+
+// ActorConfirmationPolicies carries the issuing model's Browser Use and native
+// Computer Use confirmation-policy Markdown (Rust
+// protocol::openai_models::ConfirmationPolicies, #41072), forwarded verbatim in
+// the openai/confirmation_policies request metadata for node_repl/cua_repl
+// actor calls.
+type ActorConfirmationPolicies struct {
+	BrowserUse  string
+	ComputerUse string
+}
+
+// IsNodeReplBackedServer mirrors Rust protocol::mcp::is_node_repl_backed_server:
+// whether a raw MCP server name identifies a Node REPL-backed actor server.
+func IsNodeReplBackedServer(server string) bool {
+	return server == "node_repl" || server == "cua_repl"
+}
+
+// IsNodeReplBackedConnector reports whether a server or host-registered
+// connector is backed by the Node REPL computer-use policy path. Connector IDs
+// must come from registered tool metadata, not tool arguments.
+func IsNodeReplBackedConnector(server string, connectorID string) bool {
+	server = strings.TrimSpace(server)
+	return IsNodeReplBackedServer(server) ||
+		(IsCodexAppsMCPServerName(server) && strings.TrimSpace(connectorID) == BrowserConnectorID)
+}
+
+// McpCallSource is the identity of one completed MCP tools/call, reported to the
+// thread's cumulative attribution recorder (Rust
+// `codex_protocol::mcp::McpAttributionSource` as built by
+// `core/src/mcp_tool_call.rs`). ConnectorID is set only for a host-owned apps
+// server; the first turn is the originating turn id.
+type McpCallSource struct {
+	ConnectorID *string
+	PluginID    *string
+	ServerName  string
+	ToolName    string
+	FirstTurnID string
+}
+
+func mustMarshalJSON(value any) []byte {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
+type ToolExecutorOptions struct {
+	Service       *MCPService
+	ServerName    string
+	ServerOrigin  string
+	ToolInfo      *MCPToolInfo
+	ToolName      tool.ToolName
+	ConnectorID   string
+	ConnectorName string
+	// ConnectorDescription is the connector's own description, forwarded to the
+	// Guardian review (Rust McpToolApprovalMetadata::connector_description).
+	ConnectorDescription string
+	// PluginID is the plugin that contributed the owning server, when any; it is
+	// reported on the tool-call item metadata (Rust #45805's plugin_id).
+	PluginID    string
+	Model       string
+	Parallel    bool
+	ThreadID    string
+	TurnID      string
+	RequestMeta map[string]any
+	// TurnMetadata supplies the turn-metadata document this call reports to the
+	// MCP server (Rust build_mcp_tool_call_request_meta's
+	// x-codex-turn-metadata entry). Nil omits the entry; the callback is invoked
+	// per call so live turn state (the user-input flag) is current.
+	TurnMetadata func() map[string]any
+	// TurnRootTurnID supplies the issuing turn's root turn id for host-owned
+	// Apps calls (Rust #51421). Nil or empty omits the field.
+	TurnRootTurnID func() string
+	// ToolInputSchemaMaxBytes bounds best-effort compaction of this server's
+	// model-visible input schema (Rust #47936).
+	ToolInputSchemaMaxBytes int
+	// CodeModeInputSchemaMaxBytes is the rendering budget for the generated
+	// Code Mode input type. Zero uses the 16,000-byte default.
+	CodeModeInputSchemaMaxBytes int
+	// HostOwnedApps marks the captured host-owned codex_apps registration
+	// (Rust #51421). Only it receives the turn's root turn id; user-configured
+	// and extension-owned Apps servers omit it.
+	HostOwnedApps                 bool
+	Binding                       *Binding
+	OpenAIFileRewriter            *OpenAIFileRewriter
+	OpenAIFileInputOptionalFields map[string][]string
+	// AgentPlugin marks tools contributed by Agent Plugins v1 servers, which
+	// get Rust's oversized-schema fallback in Spec (mirrors
+	// agent_plugin_mcp_tool_to_responses_api_tool).
+	AgentPlugin bool
+	// ConfirmationPolicies carries the issuing model's confirmation-policy
+	// Markdown (#41072), forwarded verbatim in the openai/confirmation_policies
+	// request metadata for node_repl/cua_repl actor calls. Nil still attaches an
+	// empty object (clearing startup defaults).
+	ConfirmationPolicies *ActorConfirmationPolicies
+	// SuppressActorConfirmationPolicies omits the confirmation-policies metadata
+	// entirely (Guardian review sessions), mirroring Rust's basic-session gate.
+	SuppressActorConfirmationPolicies bool
+	// AuthElicitation enables the Codex Apps connector URL elicitation flow for
+	// this turn (Rust maybe_request_codex_apps_auth_elicitation). The caller
+	// gates it on the auth_elicitation feature and the approval policy.
+	AuthElicitation *AuthElicitationOptions
+	// ToolApproval enables the custom-MCP-server tool approval policy for this
+	// turn (Rust mcp_tool_call.rs maybe_request_mcp_tool_approval). Nil disables
+	// the gate.
+	ToolApproval *ToolApprovalOptions
+	// CaptureResultMetadata exposes the raw MCP result `_meta` for the internal
+	// executed-tool-call record (Rust #46010's `result_metadata_capture_allowed`).
+	// The caller gates it on session analytics being enabled and the server being
+	// a host-owned apps server; the record itself is written by the tool
+	// dispatcher.
+	CaptureResultMetadata bool
+	// SessionID and WindowID are the turn's session identity and conversation
+	// window identity (`{thread_id}:{window_number}`); every MCP request reports
+	// them as `sessionId` and `windowId` in `_meta` (Rust #45409). They default
+	// to an omitted key, which mirrors a call outside a session window.
+	SessionID string
+	WindowID  string
+	// ConnectorAuthFailureObserver reports a Codex Apps call whose raw result is a
+	// trusted connector authentication failure, before any callback or
+	// model-facing rewrite can change it (Rust #45716's classification). Nil
+	// leaves the report off.
+	ConnectorAuthFailureObserver func(callID string)
+	// MCPSourceObserver receives every completed tools/call so the thread can
+	// accumulate its cumulative MCP attribution (Rust `record_mcp_source`). Nil
+	// leaves the report off.
+	MCPSourceObserver func(source McpCallSource)
+}
+
+// AuthElicitationOptions carries the turn-scoped hooks the Codex Apps auth
+// elicitation flow needs. Request asks the client to complete a URL
+// elicitation, RefreshCodexApps re-lists the Codex Apps catalog after the user
+// accepts, and InstallURL resolves the connector install URL.
+type AuthElicitationOptions struct {
+	Request          func(ctx context.Context, request *MCPElicitationRequest) (*MCPElicitationResponse, error)
+	RefreshCodexApps func(ctx context.Context) error
+	InstallURL       func(connectorName string, connectorID string) string
+}
+
+// MCPToolTurnMetadataMetaKey carries the turn-metadata document an MCP call
+// reports (Rust build_mcp_tool_call_request_meta's X_CODEX_TURN_METADATA_HEADER
+// entry).
+const MCPToolTurnMetadataMetaKey = "x-codex-turn-metadata"
+
+type ToolExecutor struct {
+	service                       *MCPService
+	serverName                    string
+	serverOrigin                  string
+	toolInfo                      MCPToolInfo
+	toolName                      tool.ToolName
+	connectorID                   string
+	connectorName                 string
+	connectorDescription          string
+	pluginID                      string
+	model                         string
+	parallel                      bool
+	readOnlyHint                  *bool
+	threadID                      string
+	turnID                        string
+	sessionID                     string
+	windowID                      string
+	requestMeta                   map[string]any
+	turnMetadata                  func() map[string]any
+	turnRootTurnID                func() string
+	hostOwnedApps                 bool
+	binding                       *Binding
+	openAIFileRewriter            *OpenAIFileRewriter
+	openAIFileInputOptionalFields map[string][]string
+	agentPlugin                   bool
+	confirmationPolicies          *ActorConfirmationPolicies
+	suppressActorPolicies         bool
+	authElicitation               *AuthElicitationOptions
+	toolApproval                  *ToolApprovalOptions
+	captureResultMetadata         bool
+	connectorAuthFailureObserver  func(callID string)
+	mcpSourceObserver             func(source McpCallSource)
+	toolInputSchemaMaxBytes       int
+	codeModeInputSchemaMaxBytes   int
+}
+
+func NewToolExecutor(options *ToolExecutorOptions) *ToolExecutor {
+	executor := &ToolExecutor{service: NewMCPService(nil)}
+	if options == nil {
+		return executor
+	}
+	if options.Service != nil {
+		executor.service = options.Service
+	}
+	executor.serverName = strings.TrimSpace(options.ServerName)
+	executor.serverOrigin = strings.TrimSpace(options.ServerOrigin)
+	if options.ToolInfo != nil {
+		executor.toolInfo = *options.ToolInfo
+	}
+	if options.ToolName.Key() != "" {
+		executor.toolName = options.ToolName
+	} else if executor.serverName != "" && executor.toolInfo.Name != "" {
+		executor.toolName = tool.NamespacedName(executor.serverName, executor.toolInfo.Name)
+	}
+	executor.readOnlyHint = mcpToolReadOnlyHint(executor.toolInfo.Annotations)
+	executor.parallel = options.Parallel || (executor.readOnlyHint != nil && *executor.readOnlyHint)
+	executor.threadID = strings.TrimSpace(options.ThreadID)
+	executor.turnID = strings.TrimSpace(options.TurnID)
+	executor.sessionID = strings.TrimSpace(options.SessionID)
+	executor.windowID = strings.TrimSpace(options.WindowID)
+	executor.requestMeta = cloneAnyMap(options.RequestMeta)
+	executor.turnMetadata = options.TurnMetadata
+	executor.turnRootTurnID = options.TurnRootTurnID
+	executor.toolInputSchemaMaxBytes = options.ToolInputSchemaMaxBytes
+	executor.codeModeInputSchemaMaxBytes = options.CodeModeInputSchemaMaxBytes
+	executor.hostOwnedApps = options.HostOwnedApps
+	executor.binding = options.Binding
+	executor.connectorID = strings.TrimSpace(options.ConnectorID)
+	executor.connectorName = strings.TrimSpace(options.ConnectorName)
+	executor.connectorDescription = strings.TrimSpace(options.ConnectorDescription)
+	executor.pluginID = strings.TrimSpace(options.PluginID)
+	executor.model = strings.TrimSpace(options.Model)
+	executor.openAIFileRewriter = options.OpenAIFileRewriter
+	executor.openAIFileInputOptionalFields = cloneOpenAIFileOptionalFields(options.OpenAIFileInputOptionalFields)
+	executor.agentPlugin = options.AgentPlugin
+	executor.confirmationPolicies = options.ConfirmationPolicies
+	executor.suppressActorPolicies = options.SuppressActorConfirmationPolicies
+	executor.authElicitation = options.AuthElicitation
+	executor.toolApproval = options.ToolApproval
+	executor.captureResultMetadata = options.CaptureResultMetadata
+	executor.connectorAuthFailureObserver = options.ConnectorAuthFailureObserver
+	executor.mcpSourceObserver = options.MCPSourceObserver
+	return executor
+}
+
+func RegisterToolExecutor(registry *tool.Registry, options *ToolExecutorOptions) error {
+	if registry == nil {
+		return fmt.Errorf("%w: registry is nil", tool.ErrToolInvalidCall)
+	}
+	return registry.Register(NewToolExecutor(options))
+}
+
+func RegisterToolExecutors(registry *tool.Registry, service *MCPService, tools []RuntimeToolInfo) error {
+	tools = NormalizeRuntimeToolsForModel(tools)
+	for i := range tools {
+		info := runtimeToolInfoToMCPToolInfo(&tools[i])
+		if err := RegisterToolExecutor(registry, &ToolExecutorOptions{
+			Service:                       service,
+			ServerName:                    tools[i].ServerName,
+			ServerOrigin:                  tools[i].ServerOrigin,
+			ToolInfo:                      info,
+			ToolName:                      tool.NamespacedName(tools[i].CallableNamespace, tools[i].CallableName),
+			ConnectorID:                   tools[i].ConnectorID,
+			ConnectorName:                 tools[i].ConnectorName,
+			ConnectorDescription:          tools[i].ConnectorDescription,
+			OpenAIFileInputOptionalFields: tools[i].OpenAIFileInputOptionalFields,
+			AgentPlugin:                   tools[i].AgentPlugin,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *ToolExecutor) TelemetryTags(_ *tool.Invocation) map[string]string {
+	if e == nil {
+		return nil
+	}
+	tags := map[string]string{"mcp_server": e.resolvedServerName()}
+	if e.serverOrigin != "" {
+		tags["mcp_server_origin"] = e.serverOrigin
+	}
+	return tags
+}
+
+// MCPConnectorInfo reports the connector this call targets, when the tool carries
+// one (Rust's McpToolCallSpanFields connector_id/connector_name, which the call
+// span and the codex.mcp.call metrics report).
+func (e *ToolExecutor) MCPConnectorInfo(*tool.Invocation) (string, string) {
+	if e == nil {
+		return "", ""
+	}
+	return strings.TrimSpace(e.connectorID), strings.TrimSpace(e.connectorName)
+}
+
+// MCPServerName reports the MCP server that owns this tool, or "" for a
+// non-MCP executor (Rust ToolRuntime::mcp_server_name).
+func (e *ToolExecutor) MCPServerName() string {
+	if e == nil {
+		return ""
+	}
+	return e.resolvedServerName()
+}
+
+func (e *ToolExecutor) Spec() tool.Spec {
+	name := e.resolvedToolName()
+	parameters := jsonschema.NormalizeWithBudget(cloneAnyMap(e.toolInfo.InputSchema), e.toolInputSchemaMaxBytes)
+	// Mirrors Rust agent_plugin_mcp_tool_to_responses_api_tool: Agent Plugins
+	// v1 tools that still exceed the serialized-size cap after normalization
+	// degrade to an accept-anything object schema instead of reaching the
+	// model oversized.
+	if e.agentPlugin && len(mustMarshalJSON(parameters)) > maxSerializedMCPToolBytes {
+		parameters = map[string]any{"type": "object", "additionalProperties": true}
+	}
+	return tool.Spec{
+		Name:        name,
+		Description: firstNonEmptyMCP(e.toolInfo.Description, e.toolInfo.Title),
+		// Mirrors Rust mcp_tool_to_responses_api_tool: the model-visible
+		// parameters go through the JsonSchema subset policy (sanitize, prune
+		// unreachable $defs, drop non-subset fields, compact oversized
+		// schemas); the raw schema stays on the executor for calls.
+		InputSchema:         parameters,
+		InputSchemaMaxBytes: maxIntMCP(tool.DefaultCodeModeInputSchemaMaxBytes, e.codeModeInputSchemaMaxBytes),
+		Search:              e.searchInfo(),
+		Parallel:            e.parallel,
+		ReadOnlyHint:        cloneBoolPtrMCP(e.readOnlyHint),
+	}
+}
+
+func maxIntMCP(left, right int) int {
+	if right > left {
+		return right
+	}
+	return left
+}
+
+func (e *ToolExecutor) Execute(ctx context.Context, invocation *tool.Invocation) (*tool.Output, error) {
+	if invocation == nil || invocation.Payload.Kind != tool.PayloadFunction {
+		return nil, tool.RespondToModel("mcp handler received unsupported payload")
+	}
+	arguments := mcpHookToolInput(invocation.Payload.Arguments)
+	releaseInvocation := e.service.RegisterToolInvocation(e.resolvedServerName(), invocation.CallID, MCPInvocationMetadata{
+		ServerName:           e.resolvedServerName(),
+		ToolName:             e.resolvedRemoteToolName(),
+		ConnectorID:          e.connectorID,
+		ConnectorName:        e.connectorName,
+		ConnectorDescription: e.connectorDescription,
+		ToolTitle:            e.toolInfo.Title,
+		ToolDescription:      e.toolInfo.Description,
+		Arguments:            cloneMCPInvocationArguments(arguments),
+		ThreadID:             e.threadID,
+		TurnID:               e.turnID,
+	})
+	defer releaseInvocation()
+	rewrittenArguments := any(nil)
+	if e.openAIFileRewriter != nil && len(e.openAIFileInputOptionalFields) > 0 {
+		rewritten, err := e.openAIFileRewriter.RewriteArgumentsWithOptionalFields(ctx, arguments, e.openAIFileInputOptionalFields, e.hostedFileUploadContext())
+		if err != nil {
+			return nil, tool.RespondToModel(err.Error())
+		}
+		arguments = rewritten
+		rewrittenArguments = rewritten
+	}
+	meta := e.requestMetaForCall(invocation.CallID)
+	// Rust #40728: a server whose published permission authority is unavailable
+	// must be rejected instead of running with another owner's authority.
+	if err := e.ensureServerPermissionAuthority(); err != nil {
+		return nil, err
+	}
+	// Rust #42054: resolve the Apps account selector before approval or
+	// execution so a required link_id cannot be bypassed by omitting it.
+	linkID := ""
+	if IsCodexAppsMCPServerName(e.resolvedServerName()) {
+		resolved, err := resolveMCPToolAccount(&e.toolInfo, arguments)
+		if err != nil {
+			return nil, tool.RespondToModel(err.Error())
+		}
+		linkID = resolved
+	}
+	// Rust mcp_tool_call.rs maybe_request_mcp_tool_approval: a custom MCP server
+	// can require the user to approve a call before it runs.
+	if denied, err := e.approveToolCallIfNeeded(ctx, invocation.CallID, arguments); err != nil || denied != nil {
+		return denied, err
+	}
+	callParams := &MCPToolCallParams{
+		Context:    ctx,
+		ServerName: e.resolvedServerName(),
+		ToolName:   e.resolvedRemoteToolName(),
+		Arguments:  arguments,
+		ThreadID:   e.threadID,
+		TurnID:     e.turnID,
+		ItemID:     invocation.CallID,
+		CallID:     invocation.CallID,
+		Meta:       meta,
+		// Rust #45409: the request reports the session and the originating
+		// window, plus the Responses item that requested the call. A nested Code
+		// Mode call carries its cell's retained window, which outlives a later
+		// wait or compaction.
+		SessionID:    e.sessionID,
+		WindowID:     e.originWindowID(invocation),
+		OriginItemID: invocationOriginItemID(invocation),
+	}
+	var response *MCPToolCallResponse
+	var err error
+	if e.binding != nil {
+		response, err = e.binding.CallTool(callParams)
+	} else {
+		response, err = e.mcpService().CallTool(callParams)
+	}
+	// Rust `mcp_tool_call.rs`: direct and Code Mode calls share this boundary, and
+	// an approved call that reached the server is attributed even when it
+	// returned an error, because the error may contain peer data.
+	e.recordMcpAttribution()
+	if err != nil {
+		if output, ok := mcpAuthenticationChallengeToolOutput(err); ok {
+			return output, nil
+		}
+		return nil, err
+	}
+	// Rust maybe_request_codex_apps_auth_elicitation: a Codex Apps tool call that
+	// failed because the connector needs authentication can prompt the client to
+	// authorize it; on acceptance the model receives a completed result to retry.
+	// Rust #45716: the trusted connector auth-failure classification is captured
+	// from the raw result first, before the elicitation can rewrite it.
+	if e.connectorAuthFailureObserver != nil && e.resolvedServerName() == RuntimeCodexAppsMCPServerName &&
+		IsConnectorAuthFailureFromToolResult(response, strings.TrimSpace(e.connectorID)) {
+		e.connectorAuthFailureObserver(invocation.CallID)
+	}
+	response = e.maybeRequestCodexAppsAuthElicitation(ctx, invocation.CallID, response)
+	// Rust #41421: carry the effective per-tool output budget so tool output,
+	// post-tool hook responses, and resumed sessions share the same truncation
+	// limit. Resolve the configured per-tool limit and truncate the response
+	// text before it reaches the model.
+	if limit := e.resolvedOutputTokenLimit(); limit > 0 {
+		truncateMCPResponseToOutputTokenLimit(response, limit)
+	}
+	// Rust #40737: MCP results become typed function-call output content items.
+	// Encrypted content and unstructured content stay as content items, while
+	// structured content is serialized to text.
+	body, contentItems, useContentItems := mcpFunctionCallOutput(response)
+	data := mcpToolResponseData(response)
+	if useContentItems {
+		data["content_items"] = contentItems
+	}
+	data["server"] = e.resolvedServerName()
+	data["tool"] = e.resolvedRemoteToolName()
+	if e.readOnlyHint != nil {
+		data["read_only_hint"] = *e.readOnlyHint
+	}
+	// Rust #45805: carry the invoked descriptor's widget presentation so clients
+	// can render MCP apps without waiting for the catalog, and the trusted Codex
+	// Apps connector/link/action identity that only the codex_apps server may
+	// contribute.
+	ApplyMCPAppOutputMetadata(data, e.resolvedServerName(), e.toolInfo.Meta, e.connectorID, e.connectorName, e.pluginID, linkID)
+	if rewrittenArguments != nil {
+		data[openAIFileHookInputKey] = rewrittenArguments
+	}
+	return &tool.Output{
+		Success:            !mcpToolCallIsError(response),
+		Body:               body,
+		Data:               data,
+		LogPreview:         mcpLogPreview(body),
+		ToolResultMetadata: e.capturedResultMetadata(response),
+	}, nil
+}
+
+// capturedResultMetadata mirrors Rust #46010: the raw MCP result `_meta` is
+// exposed for the internal executed-tool-call record only when the caller
+// allowed the capture (session analytics enabled and a host-owned apps call).
+func (e *ToolExecutor) capturedResultMetadata(response *MCPToolCallResponse) any {
+	if e == nil || !e.captureResultMetadata || response == nil {
+		return nil
+	}
+	return response.Meta
+}
+
+// invocationOriginItemID reports the Responses item that requested the call, the
+// value Rust reports as `_meta.itemId` (with_mcp_tool_call_ids_meta). A nested
+// Code Mode call inherits its cell's origin because the delegate clones the
+// parent invocation's context.
+func invocationOriginItemID(invocation *tool.Invocation) string {
+	if invocation == nil || invocation.Context == nil {
+		return ""
+	}
+	itemID, _ := invocation.Context[tool.OriginItemIDContextKey].(string)
+	return strings.TrimSpace(itemID)
+}
+
+// originWindowID reports the window the call's origin belongs to: a nested Code
+// Mode call carries its cell's retained window, otherwise the turn's window
+// applies (Rust #45409 keeps the retained cell window across waits).
+func (e *ToolExecutor) originWindowID(invocation *tool.Invocation) string {
+	if invocation != nil && invocation.Context != nil {
+		if windowID, ok := invocation.Context[tool.OriginWindowIDContextKey].(string); ok {
+			if trimmed := strings.TrimSpace(windowID); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	if e == nil {
+		return ""
+	}
+	return e.windowID
+}
+
+// maybeRequestCodexAppsAuthElicitation mirrors Rust's
+// maybe_request_codex_apps_auth_elicitation: for a Codex Apps tool call whose
+// result carries a connector auth failure, ask the client to complete the
+// connector's URL elicitation and, when the user accepts, refresh the Codex Apps
+// catalog and return a completed result telling the model to retry.
+func (e *ToolExecutor) maybeRequestCodexAppsAuthElicitation(ctx context.Context, callID string, result *MCPToolCallResponse) *MCPToolCallResponse {
+	if e == nil || e.authElicitation == nil || result == nil {
+		return result
+	}
+	if e.resolvedServerName() != RuntimeCodexAppsMCPServerName {
+		return result
+	}
+	connectorID := strings.TrimSpace(e.connectorID)
+	if connectorID == "" {
+		return result
+	}
+	connectorName := strings.TrimSpace(e.connectorName)
+	if connectorName == "" {
+		connectorName = connectorID
+	}
+	installURL := ""
+	if e.authElicitation.InstallURL != nil {
+		installURL = e.authElicitation.InstallURL(connectorName, connectorID)
+	}
+	plan := BuildAuthElicitationPlan(callID, result, connectorID, connectorName, installURL)
+	if plan == nil || plan.Elicitation == nil {
+		return result
+	}
+	if e.authElicitation.Request == nil {
+		return result
+	}
+	elicitationRequest := &MCPElicitationRequest{
+		ServerName:    RuntimeCodexAppsMCPServerName,
+		ThreadID:      e.threadID,
+		TurnID:        e.turnID,
+		Method:        "elicitation/create",
+		Message:       plan.Elicitation.Message,
+		URL:           plan.Elicitation.URL,
+		ElicitationID: plan.Elicitation.ElicitationID,
+		Meta:          plan.Elicitation.Meta,
+	}
+	response, err := e.authElicitation.Request(ctx, elicitationRequest)
+	if err != nil {
+		// Rust #46066: a failed request (for example a subagent's handoff) keeps
+		// the connector's diagnostic and adds the recovery guidance instead of
+		// dropping the original result.
+		return AuthElicitationFailureResult(plan.AuthFailure, result, err)
+	}
+	if response == nil || response.Action != MCPElicitationActionAccept {
+		return result
+	}
+	if e.authElicitation.RefreshCodexApps != nil {
+		_ = e.authElicitation.RefreshCodexApps(ctx)
+	}
+	return AuthElicitationCompletedResult(plan.AuthFailure, result.Meta)
+}
+
+// mcpAuthenticationChallengeToolOutput converts a 401 Unauthorized MCP
+// response carrying WWW-Authenticate headers into a model-visible tool error
+// with the combined challenge preserved under `mcp/www_authenticate` (Rust
+// #42552). It returns false for other errors so normal handling is unchanged.
+func mcpAuthenticationChallengeToolOutput(err error) (*tool.Output, bool) {
+	// Rust #43947: a local expired credential that could not be refreshed uses
+	// the same reconnect signal as a server-rejected call, with a fixed
+	// challenge so token-endpoint and transport details stay hidden.
+	var authRequired *mcpAuthenticationRequiredError
+	if errors.As(err, &authRequired) {
+		message := authRequired.Error()
+		return &tool.Output{
+			Success:    false,
+			Body:       message,
+			Error:      message,
+			LogPreview: mcpLogPreview(message),
+			Data: map[string]any{
+				"mcp/www_authenticate": `Bearer error="invalid_token"`,
+			},
+		}, true
+	}
+	var statusErr *mcpHTTPStatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusUnauthorized || len(statusErr.WWWAuthenticate) == 0 {
+		return nil, false
+	}
+	message := statusErr.Error()
+	return &tool.Output{
+		Success:    false,
+		Body:       message,
+		Error:      message,
+		LogPreview: mcpLogPreview(message),
+		Data: map[string]any{
+			"mcp/www_authenticate": statusErr.CombinedWWWAuthenticate(),
+		},
+	}, true
+}
+
+// resolvedOutputTokenLimit returns the configured per-tool output token limit
+// for this server/tool, resolved from the MCP service server config (Rust
+// #41421 PreparedMcpCall::output_token_limit). 0 means no per-tool limit.
+func (e *ToolExecutor) resolvedOutputTokenLimit() int {
+	if e == nil || e.service == nil {
+		return 0
+	}
+	limit := e.service.ConfiguredToolOutputLimit(e.resolvedServerName(), e.resolvedRemoteToolName())
+	if limit == nil || *limit <= 0 {
+		return 0
+	}
+	return *limit
+}
+
+// truncateMCPResponseToOutputTokenLimit truncates the text content of an MCP
+// tool response to the given output token budget, preserving non-text content
+// items (Rust #41421). It strips the text from over-budget content items so the
+// model does not observe an unbounded tool result.
+func truncateMCPResponseToOutputTokenLimit(response *MCPToolCallResponse, limit int) {
+	if response == nil || limit <= 0 {
+		return
+	}
+	totalTokens := 0
+	for i := range response.Content {
+		totalTokens += utils.ApproxTokenCount(response.Content[i].Text)
+	}
+	if totalTokens <= limit {
+		return
+	}
+	remaining := limit
+	for i := range response.Content {
+		tokens := utils.ApproxTokenCount(response.Content[i].Text)
+		if tokens <= remaining {
+			remaining -= tokens
+			continue
+		}
+		response.Content[i].Text = utils.TruncateText(response.Content[i].Text, utils.TokensPolicy(remaining))
+		remaining = 0
+	}
+}
+
+func (e *ToolExecutor) WaitUntilReady(ctx context.Context, invocation *tool.Invocation) error {
+	threadID := e.threadID
+	if invocation != nil && invocation.Context != nil {
+		if value, ok := invocation.Context["thread_id"].(string); ok && strings.TrimSpace(value) != "" {
+			threadID = strings.TrimSpace(value)
+		}
+	}
+	return e.mcpService().WaitForServerStartup(ctx, e.resolvedServerName(), threadID)
+}
+
+func (e *ToolExecutor) requestMetaForCall(callID ...string) any {
+	if e == nil {
+		return nil
+	}
+	requestMeta := cloneAnyMap(e.requestMeta)
+	if requestMeta == nil {
+		requestMeta = map[string]any{}
+	}
+	if e.threadID != "" {
+		requestMeta["thread_id"] = e.threadID
+	}
+	// Rust build_mcp_tool_call_request_meta: every MCP tool call reports the
+	// turn metadata document so the server can attribute the call.
+	if e.turnMetadata != nil {
+		if document := e.turnMetadata(); len(document) > 0 {
+			requestMeta[MCPToolTurnMetadataMetaKey] = document
+		}
+	}
+	if IsCodexAppsMCPServerName(e.resolvedServerName()) {
+		appsMeta, _ := requestMeta["_codex_apps"].(map[string]any)
+		appsMeta = cloneAnyMap(appsMeta)
+		if appsMeta == nil {
+			appsMeta = map[string]any{}
+		}
+		if len(callID) > 0 && strings.TrimSpace(callID[0]) != "" {
+			appsMeta["call_id"] = strings.TrimSpace(callID[0])
+		}
+		// Rust #51421: Core lineage is trusted, so any tool-supplied root turn id
+		// is dropped; only the host-owned Apps registration receives the issuing
+		// turn's root turn id.
+		delete(appsMeta, "root_turn_id")
+		if e.hostOwnedApps && e.turnRootTurnID != nil {
+			if root := strings.TrimSpace(e.turnRootTurnID()); root != "" {
+				appsMeta["root_turn_id"] = root
+			}
+		}
+		requestMeta["_codex_apps"] = appsMeta
+	}
+	if IsNodeReplBackedConnector(e.resolvedServerName(), e.connectorID) && !e.suppressActorPolicies {
+		requestMeta[ConfirmationPoliciesMetaKey] = e.actorConfirmationPoliciesMeta()
+	}
+	if len(requestMeta) == 0 {
+		return nil
+	}
+	return requestMeta
+}
+
+// actorConfirmationPoliciesMeta builds the openai/confirmation_policies value for
+// an eligible actor call. It is always a (possibly empty) object so runtimes
+// can clear startup defaults; text is forwarded verbatim.
+func (e *ToolExecutor) actorConfirmationPoliciesMeta() map[string]any {
+	policies := map[string]any{}
+	if e == nil || e.confirmationPolicies == nil {
+		return policies
+	}
+	if e.confirmationPolicies.BrowserUse != "" {
+		policies["browser_use"] = e.confirmationPolicies.BrowserUse
+	}
+	if e.confirmationPolicies.ComputerUse != "" {
+		policies["computer_use"] = e.confirmationPolicies.ComputerUse
+	}
+	return policies
+}
+
+func (e *ToolExecutor) PreToolUsePayload(invocation *tool.Invocation) (*tool.PreToolUsePayload, bool) {
+	if invocation == nil || invocation.Payload.Kind != tool.PayloadFunction {
+		return nil, false
+	}
+	return &tool.PreToolUsePayload{
+		ToolName:  e.hookToolName(),
+		ToolInput: mcpHookToolInput(invocation.Payload.Arguments),
+		McpTool:   e.mcpToolContext(),
+	}, true
+}
+
+// mcpToolContext captures the model-visible MCP tool details and its source
+// classification for tool lifecycle extensions (Rust McpToolContext, #40976).
+// The executable client is never exposed.
+func (e *ToolExecutor) mcpToolContext() *tool.McpToolContext {
+	if e == nil {
+		return nil
+	}
+	ctx := &tool.McpToolContext{
+		ServerName: strings.TrimSpace(e.serverName),
+		ToolName:   strings.TrimSpace(e.toolInfo.Name),
+		Connector:  strings.TrimSpace(e.connectorID),
+		Source:     tool.McpToolSourceOther,
+	}
+	if ctx.Connector != "" {
+		ctx.Source = tool.McpToolSourceConnector
+	} else if e.agentPlugin {
+		ctx.Source = tool.McpToolSourcePlugin
+	} else if e.serverName != "" {
+		ctx.Source = tool.McpToolSourceConfig
+	}
+	return ctx
+}
+
+func (e *ToolExecutor) PostToolUsePayload(invocation *tool.Invocation, output *tool.Output) (*tool.PostToolUsePayload, bool) {
+	if invocation == nil || output == nil || invocation.Payload.Kind != tool.PayloadFunction {
+		return nil, false
+	}
+	response := any(output.Data)
+	if value, ok := output.Data["hook_response"]; ok {
+		response = value
+	}
+	toolInput := mcpHookToolInput(invocation.Payload.Arguments)
+	if value, ok := output.Data[openAIFileHookInputKey]; ok {
+		toolInput = value
+	}
+	return &tool.PostToolUsePayload{
+		ToolName:     e.hookToolName(),
+		ToolUseID:    firstNonEmptyMCP(output.CallID, invocation.CallID),
+		ToolInput:    toolInput,
+		ToolResponse: response,
+	}, true
+}
+
+func (e *ToolExecutor) WithUpdatedHookInput(invocation *tool.Invocation, updatedInput any) (*tool.Invocation, error) {
+	if invocation == nil || invocation.Payload.Kind != tool.PayloadFunction {
+		name := e.resolvedToolName()
+		return nil, tool.RespondToModel(fmt.Sprintf("tool %s does not support hook input rewriting for this payload", name.Key()))
+	}
+	data, err := json.Marshal(updatedInput)
+	if err != nil {
+		return nil, tool.RespondToModel(fmt.Sprintf("failed to serialize rewritten MCP arguments: %v", err))
+	}
+	updated := *invocation
+	updated.Payload.Arguments = string(data)
+	return &updated, nil
+}
+
+func (e *ToolExecutor) resolvedToolName() tool.ToolName {
+	if e == nil {
+		return tool.ToolName{}
+	}
+	if e.toolName.Key() != "" {
+		return e.toolName
+	}
+	if e.serverName != "" && e.toolInfo.Name != "" {
+		return tool.NamespacedName(e.serverName, e.toolInfo.Name)
+	}
+	return tool.ToolName{}
+}
+
+func (e *ToolExecutor) resolvedServerName() string {
+	if e == nil {
+		return ""
+	}
+	if e.serverName != "" {
+		return e.serverName
+	}
+	return e.resolvedToolName().Namespace
+}
+
+func (e *ToolExecutor) resolvedRemoteToolName() string {
+	if e == nil {
+		return ""
+	}
+	if strings.TrimSpace(e.toolInfo.Name) != "" {
+		return strings.TrimSpace(e.toolInfo.Name)
+	}
+	return e.resolvedToolName().Name
+}
+
+// recordMcpAttribution reports a completed tools/call to the thread's cumulative
+// MCP attribution recorder (Rust `ExecutedToolCalls::record_mcp_source`).
+func (e *ToolExecutor) recordMcpAttribution() {
+	if e == nil || e.mcpSourceObserver == nil {
+		return
+	}
+	e.mcpSourceObserver(e.mcpCallSource())
+}
+
+// mcpCallSource mirrors Rust's `McpAttributionSource` construction in
+// `core/src/mcp_tool_call.rs`: the connector id is reported only for a
+// host-owned apps server, the plugin id when a plugin contributed the server,
+// and the first turn is the originating turn id.
+func (e *ToolExecutor) mcpCallSource() McpCallSource {
+	source := McpCallSource{
+		ServerName:  e.resolvedServerName(),
+		ToolName:    e.resolvedRemoteToolName(),
+		FirstTurnID: e.turnID,
+	}
+	if e.connectorID != "" && IsCodexAppsMCPServerName(source.ServerName) {
+		connectorID := e.connectorID
+		source.ConnectorID = &connectorID
+	}
+	if e.pluginID != "" {
+		pluginID := e.pluginID
+		source.PluginID = &pluginID
+	}
+	return source
+}
+
+func (e *ToolExecutor) mcpService() *MCPService {
+	if e == nil || e.service == nil {
+		return NewMCPService(nil)
+	}
+	return e.service
+}
+
+// ensureServerPermissionAuthority mirrors Rust PreparedMcpCall::new returning
+// None when the server's published permission authority is unavailable
+// (#40728): the call is rejected rather than inheriting another owner's
+// authority. Runtimes that never published authority keep the legacy behavior.
+func (e *ToolExecutor) ensureServerPermissionAuthority() error {
+	service := e.mcpService()
+	if service == nil || !service.HasPublishedPermissionAuthority() {
+		return nil
+	}
+	server := e.resolvedServerName()
+	if _, ok := service.PermissionProfileForServer(server); ok {
+		return nil
+	}
+	return fmt.Errorf("%w: MCP server %q has no published permission authority", ErrInvalidMCPRequest, server)
+}
+
+func (e *ToolExecutor) hookToolName() *tool.HookToolName {
+	return &tool.HookToolName{Name: EnsureMCPHookToolName(JoinToolName(e.resolvedToolName()))}
+}
+
+func (e *ToolExecutor) searchInfo() *tool.SearchInfo {
+	text := strings.Join(e.searchTextParts(), " ")
+	sourceName := e.resolvedServerName()
+	if sourceName == "" {
+		sourceName = "MCP"
+	}
+	return &tool.SearchInfo{
+		Text: text,
+		Source: &tool.SearchSourceInfo{
+			Name: sourceName,
+		},
+	}
+}
+
+func (e *ToolExecutor) searchTextParts() []string {
+	name := e.resolvedToolName()
+	parts := []string{
+		name.Key(),
+		JoinToolName(name),
+		e.resolvedRemoteToolName(),
+		e.resolvedServerName(),
+		e.toolInfo.Title,
+		e.toolInfo.Description,
+	}
+	if e.toolInfo.InputSchema != nil {
+		if properties, ok := e.toolInfo.InputSchema["properties"].(map[string]any); ok {
+			names := make([]string, 0, len(properties))
+			for name := range properties {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			parts = append(parts, names...)
+		} else if encoded, err := json.Marshal(e.toolInfo.InputSchema); err == nil {
+			parts = append(parts, string(encoded))
+		}
+	}
+	return nonEmptyStrings(parts)
+}
+
+func JoinToolName(name tool.ToolName) string {
+	if name.Namespace == "" {
+		return name.Name
+	}
+	namespace := strings.TrimRight(name.Namespace, "_")
+	toolName := strings.TrimLeft(name.Name, "_")
+	return namespace + MCPToolNameDelimiter + toolName
+}
+
+func EnsureMCPHookToolName(name string) string {
+	if strings.HasPrefix(name, LegacyMCPToolNamePrefix) {
+		return name
+	}
+	return LegacyMCPToolNamePrefix + name
+}
+
+func MCPToolResponseText(response *MCPToolCallResponse) string {
+	if response == nil {
+		return ""
+	}
+	var parts []string
+	for _, content := range response.Content {
+		if strings.TrimSpace(content.Text) != "" {
+			parts = append(parts, content.Text)
+		}
+	}
+	if len(parts) > 0 {
+		return strings.Join(parts, "\n")
+	}
+	encoded, err := json.Marshal(mcpToolResponseData(response))
+	if err != nil {
+		return ""
+	}
+	return string(encoded)
+}
+
+// mcpFunctionCallOutput mirrors Rust CallToolResult::as_function_call_output_payload
+// (#40737): a single encrypted content item forces content items, otherwise a
+// non-null structured result is serialized to text, and everything else becomes
+// typed content items.
+func mcpFunctionCallOutput(response *MCPToolCallResponse) (body string, contentItems []any, useContentItems bool) {
+	contentItems = mcpToolModelContentItems(response)
+	for _, item := range contentItems {
+		if entry, ok := item.(map[string]any); ok && entry["type"] == "encrypted_content" {
+			return MCPToolResponseText(response), contentItems, true
+		}
+	}
+	if response != nil && response.StructuredContent != nil {
+		encoded, err := json.Marshal(response.StructuredContent)
+		if err != nil {
+			return err.Error(), nil, false
+		}
+		return string(encoded), nil, false
+	}
+	return MCPToolResponseText(response), contentItems, true
+}
+
+// MCP content metadata keys mirror Rust CODEX_ENCRYPTED_CONTENT_META_KEY /
+// CODEX_IMAGE_DETAIL_META_KEY.
+const (
+	mcpEncryptedContentMetaKey = "codex/encryptedContent"
+	mcpImageDetailMetaKey      = "codex/imageDetail"
+)
+
+// mcpToolModelContentItems mirrors Rust convert_mcp_content_to_items: text,
+// image, and audio become typed items; unknown or malformed content is
+// preserved as serialized text so no result is silently dropped.
+func mcpToolModelContentItems(response *MCPToolCallResponse) []any {
+	if response == nil {
+		return []any{}
+	}
+	items := make([]any, 0, len(response.Content))
+	for i := range response.Content {
+		items = append(items, mcpContentToModelItem(response.Content[i].Map()))
+	}
+	return items
+}
+
+func mcpContentToModelItem(content map[string]any) any {
+	contentType, _ := content["type"].(string)
+	switch contentType {
+	case "text":
+		text, ok := content["text"].(string)
+		if !ok {
+			return mcpUnknownContentItem(content)
+		}
+		if meta, ok := content["_meta"].(map[string]any); ok {
+			if encrypted, _ := meta[mcpEncryptedContentMetaKey].(bool); encrypted {
+				return map[string]any{"type": "encrypted_content", "encrypted_content": text}
+			}
+		}
+		return map[string]any{"type": "input_text", "text": text}
+	case "image":
+		data, ok := content["data"].(string)
+		if !ok {
+			return mcpUnknownContentItem(content)
+		}
+		return map[string]any{
+			"type":      "input_image",
+			"image_url": mcpContentDataURL(data, mcpContentMimeType(content)),
+			"detail":    mcpContentImageDetail(content),
+		}
+	case "audio":
+		data, ok := content["data"].(string)
+		if !ok {
+			return mcpUnknownContentItem(content)
+		}
+		return map[string]any{
+			"type":      "input_audio",
+			"audio_url": mcpContentDataURL(data, mcpContentMimeType(content)),
+		}
+	default:
+		return mcpUnknownContentItem(content)
+	}
+}
+
+// mcpContentDataURL builds a data URL when the payload is not already one.
+func mcpContentDataURL(data string, mimeType string) string {
+	if strings.HasPrefix(data, "data:") {
+		return data
+	}
+	if strings.TrimSpace(mimeType) == "" {
+		mimeType = "application/octet-stream"
+	}
+	return "data:" + mimeType + ";base64," + data
+}
+
+func mcpContentMimeType(content map[string]any) string {
+	if value, ok := content["mimeType"].(string); ok && strings.TrimSpace(value) != "" {
+		return value
+	}
+	if value, ok := content["mime_type"].(string); ok && strings.TrimSpace(value) != "" {
+		return value
+	}
+	return ""
+}
+
+// mcpContentImageDetail mirrors Rust's default image detail (`high`) and its
+// `codex/imageDetail` override.
+func mcpContentImageDetail(content map[string]any) string {
+	meta, _ := content["_meta"].(map[string]any)
+	detail, _ := meta[mcpImageDetailMetaKey].(string)
+	switch detail {
+	case "auto", "low", "high", "original":
+		return detail
+	default:
+		return "high"
+	}
+}
+
+func mcpUnknownContentItem(content map[string]any) any {
+	encoded, err := json.Marshal(content)
+	if err != nil {
+		return map[string]any{"type": "input_text", "text": "<content>"}
+	}
+	return map[string]any{"type": "input_text", "text": string(encoded)}
+}
+
+func mcpHookToolInput(rawArguments string) any {
+	if strings.TrimSpace(rawArguments) == "" {
+		return map[string]any{}
+	}
+	var value any
+	if err := json.Unmarshal([]byte(rawArguments), &value); err != nil {
+		return rawArguments
+	}
+	return value
+}
+
+func mcpToolResponseData(response *MCPToolCallResponse) map[string]any {
+	data := map[string]any{"mcpToolCall": true}
+	if response == nil {
+		return data
+	}
+	content := make([]map[string]any, 0, len(response.Content))
+	for _, item := range response.Content {
+		content = append(content, item.Map())
+	}
+	data["content"] = content
+	if response.StructuredContent != nil {
+		data["structuredContent"] = response.StructuredContent
+	}
+	if response.Meta != nil {
+		data["_meta"] = response.Meta
+	}
+	if response.IsError != nil {
+		data["isError"] = *response.IsError
+	}
+	data["hook_response"] = cloneMCPHookResponse(data)
+	return data
+}
+
+func mcpToolCallIsError(response *MCPToolCallResponse) bool {
+	return response != nil && response.IsError != nil && *response.IsError
+}
+
+func cloneMCPHookResponse(data map[string]any) map[string]any {
+	out := map[string]any{}
+	for key, value := range data {
+		if key == "hook_response" || key == "isError" {
+			continue
+		}
+		out[key] = value
+	}
+	return out
+}
+
+func runtimeToolInfoToMCPToolInfo(info *RuntimeToolInfo) *MCPToolInfo {
+	if info == nil {
+		return &MCPToolInfo{}
+	}
+	return &MCPToolInfo{
+		Name:        info.Tool.Name,
+		Title:       info.Tool.Title,
+		Description: info.Tool.Description,
+		InputSchema: cloneAnyMap(info.Tool.InputSchema),
+		Annotations: info.Tool.Annotations,
+		Meta:        cloneJSONValue(info.Meta),
+	}
+}
+
+// hostedFileUploadContext mirrors Rust's hosted-upload derivation in
+// mcp_tool_call.rs (#38101): for Codex Apps MCP tools with both a connector ID
+// and an action name (from the _codex_apps resource_uri), the OpenAI file
+// upload is annotated with connector/action/model.
+func (e *ToolExecutor) hostedFileUploadContext() *HostedFileUploadContext {
+	if e == nil || !IsCodexAppsMCPServerName(e.resolvedServerName()) {
+		return nil
+	}
+	connectorID := strings.TrimSpace(e.connectorID)
+	actionName := mcpToolCallActionName(e.toolInfo.Meta)
+	model := strings.TrimSpace(e.model)
+	if connectorID == "" || actionName == "" || model == "" {
+		return nil
+	}
+	return &HostedFileUploadContext{
+		ConnectorID: connectorID,
+		ActionName:  actionName,
+		Model:       model,
+	}
+}
+
+// mcpToolCallActionName derives the hosted-app action name from the tool's
+// _codex_apps metadata: the last path segment of the resource_uri (Rust
+// MCP_TOOL_RESOURCE_URI_META_KEY = "resource_uri").
+func mcpToolCallActionName(meta any) string {
+	base := metadataMap(meta)
+	if base == nil {
+		return ""
+	}
+	for _, key := range []string{"_codex_apps", "codex_apps", "codexApps"} {
+		nested := metadataMap(base[key])
+		if nested == nil {
+			continue
+		}
+		raw, ok := nested["resource_uri"]
+		if !ok {
+			continue
+		}
+		uri, ok := raw.(string)
+		if !ok {
+			continue
+		}
+		uri = strings.Trim(uri, "/")
+		if index := strings.LastIndex(uri, "/"); index >= 0 {
+			uri = uri[index+1:]
+		}
+		uri = strings.TrimSpace(uri)
+		if uri != "" {
+			return uri
+		}
+	}
+	return ""
+}
+
+func mcpToolReadOnlyHint(annotations any) *bool {
+	encoded, err := json.Marshal(annotations)
+	if err != nil {
+		return nil
+	}
+	var raw struct {
+		ReadOnlyHint *bool `json:"readOnlyHint"`
+	}
+	if err := json.Unmarshal(encoded, &raw); err != nil {
+		return nil
+	}
+	return cloneBoolPtrMCP(raw.ReadOnlyHint)
+}
+
+func cloneBoolPtrMCP(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func nonEmptyStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func mcpLogPreview(body string) string {
+	body = strings.TrimSpace(body)
+	if len(body) <= 200 {
+		return body
+	}
+	return body[:200]
+}
+
+var _ tool.Executor = (*ToolExecutor)(nil)
+var _ tool.PreToolUsePayloadProvider = (*ToolExecutor)(nil)
+var _ tool.PostToolUsePayloadProvider = (*ToolExecutor)(nil)
+var _ tool.HookInputUpdater = (*ToolExecutor)(nil)

@@ -1,0 +1,373 @@
+package eventmap
+
+import (
+	"encoding/base64"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+)
+
+func TestContextualDeveloperContent(t *testing.T) {
+	content := []ContentItem{{Kind: ContentInputText, Text: "<token_budget>\nleft"}}
+	if !IsContextualDevMessageContent(content) {
+		t.Fatalf("IsContextualDevMessageContent() = false")
+	}
+	if HasNonContextualDevMessageContent(content) {
+		t.Fatalf("HasNonContextualDevMessageContent() = true")
+	}
+	mixed := append(content, ContentItem{Kind: ContentInputText, Text: "real instructions"})
+	if !HasNonContextualDevMessageContent(mixed) {
+		t.Fatalf("HasNonContextualDevMessageContent(mixed) = false")
+	}
+}
+
+func TestParseUserMessageSkipsImageLabels(t *testing.T) {
+	item := &ResponseItem{
+		Kind: ResponseMessage,
+		Role: "user",
+		Content: []ContentItem{
+			{Kind: ContentInputText, Text: `<image name="one">`},
+			{Kind: ContentInputImage, ImageURL: "data:image/png;base64,abc", Detail: "high"},
+			{Kind: ContentInputText, Text: `</image>`},
+			{Kind: ContentInputText, Text: "please inspect"},
+		},
+	}
+	got, ok := ParseTurnItem(item)
+	if !ok || got.Kind != TurnUserMessage {
+		t.Fatalf("ParseTurnItem() = %#v/%v", got, ok)
+	}
+	want := []UserInput{
+		{Kind: UserInputImage, ImageURL: "data:image/png;base64,abc", Detail: "high"},
+		{Kind: UserInputText, Text: "please inspect"},
+	}
+	if !reflect.DeepEqual(got.UserContent, want) {
+		t.Fatalf("UserContent = %#v, want %#v", got.UserContent, want)
+	}
+}
+
+func TestParseAssistantReasoningWebSearchAndImage(t *testing.T) {
+	assistant, ok := ParseTurnItem(&ResponseItem{
+		Kind:    ResponseMessage,
+		Role:    "assistant",
+		ID:      "a1",
+		Phase:   "final",
+		Content: []ContentItem{{Kind: ContentOutputText, Text: "hello"}},
+	})
+	if !ok || assistant.Kind != TurnAgentMessage || assistant.AgentText != "hello" || assistant.Phase != "final" {
+		t.Fatalf("assistant = %#v/%v", assistant, ok)
+	}
+	reasoning, ok := ParseTurnItem(&ResponseItem{Kind: ResponseReasoning, ID: "r1", Summary: []string{"s"}, RawContent: []string{"raw"}})
+	if !ok || reasoning.Kind != TurnReasoning || reasoning.Summary[0] != "s" || reasoning.RawContent[0] != "raw" {
+		t.Fatalf("reasoning = %#v/%v", reasoning, ok)
+	}
+	search, ok := ParseTurnItem(&ResponseItem{Kind: ResponseWebSearchCall, ID: "w1", WebSearchAction: "search: golang"})
+	if !ok || search.Kind != TurnWebSearch || search.Query != "golang" {
+		t.Fatalf("search = %#v/%v", search, ok)
+	}
+	image, ok := ParseTurnItem(&ResponseItem{Kind: ResponseImageGeneration, ID: "i1", ImageStatus: "completed", ImageResult: "abc"})
+	if !ok || image.Kind != TurnImageGeneration || image.Status != "completed" {
+		t.Fatalf("image = %#v/%v", image, ok)
+	}
+}
+
+func TestContextualUserAndHookPrompt(t *testing.T) {
+	// Mirrors Rust's CONTEXTUAL_USER_FRAGMENT_MATCHERS: every injected user
+	// fragment is hidden runtime context.
+	contextual := []string{
+		"<user_instructions>follow</user_instructions>",
+		"  <environment_context>\n<cwd>/repo</cwd>\n</environment_context>  ",
+		"<agent_message_board_notification>board</agent_message_board_notification>",
+		"<skills_instructions>skills</skills_instructions>",
+		"<user_shell_command><command>ls</command></user_shell_command>",
+		"<turn_aborted>interrupted</turn_aborted>",
+		"<subagent_notification>agent done</subagent_notification>",
+		"<recommended_plugins>plugins</recommended_plugins>",
+		"<external_calendar>{\"a\":1}</external_calendar>",
+		"<codex_internal_context source=\"goal\">\nbody\n</codex_internal_context>",
+		"<goal_context>legacy goal</goal_context>",
+		"Warning: The maximum number of unified exec processes you can keep open is 5",
+		"Warning: Your account was flagged for potentially high-risk cyber activity",
+		"Warning: apply_patch was requested via exec_command. Use the apply_patch tool instead of exec_command.",
+	}
+	for _, text := range contextual {
+		if !IsContextualUserMessageContent([]ContentItem{{Kind: ContentInputText, Text: text}}) {
+			t.Fatalf("IsContextualUserMessageContent(%q) = false, want true", text)
+		}
+	}
+	// A developer-role fragment, plain text and a partially marked message are
+	// not contextual user content.
+	for _, text := range []string{
+		"<current_time>now</current_time>",
+		"<current_time_reminder>It is now.</current_time_reminder>",
+		"hello",
+		"<user_instructions>unclosed",
+		"<codex_internal_context source=\"Bad\">body</codex_internal_context>",
+		"Warning: apply_patch was requested via exec_command.",
+	} {
+		if IsContextualUserMessageContent([]ContentItem{{Kind: ContentInputText, Text: text}}) {
+			t.Fatalf("IsContextualUserMessageContent(%q) = true, want false", text)
+		}
+	}
+	// Rust's `parse_hook_prompt_fragment` requires a parseable element with a
+	// non-empty run id, so the tagged form is a hook prompt...
+	hook, ok := ParseTurnItem(&ResponseItem{Kind: ResponseMessage, Role: "user", ID: "h1", Content: []ContentItem{{Kind: ContentInputText, Text: `<hook_prompt hook_run_id="run-1">hi</hook_prompt>`}}})
+	if !ok || hook.Kind != TurnHookPrompt {
+		t.Fatalf("hook = %#v/%v", hook, ok)
+	}
+	// ...while an attribute-less tag is an ordinary user message.
+	plain, ok := ParseTurnItem(&ResponseItem{Kind: ResponseMessage, Role: "user", ID: "h2", Content: []ContentItem{{Kind: ContentInputText, Text: "<hook_prompt>hi</hook_prompt>"}}})
+	if !ok || plain.Kind != TurnUserMessage {
+		t.Fatalf("attribute-less hook tag = %#v/%v, want a user message", plain, ok)
+	}
+	if IsContextualUserMessageContent([]ContentItem{{Kind: ContentInputText, Text: `<hook_prompt hook_run_id="run-1">hi</hook_prompt>`}}) != true {
+		t.Fatal("a hook prompt is contextual context")
+	}
+	if IsContextualUserMessageContent([]ContentItem{{Kind: ContentInputText, Text: "<hook_prompt>hi</hook_prompt>"}}) {
+		t.Fatal("an attribute-less hook tag is not contextual context")
+	}
+}
+
+func TestRawAssistantOutputTextFromItem(t *testing.T) {
+	text, ok := RawAssistantOutputTextFromItem(&ResponseItem{
+		Kind: ResponseMessage,
+		Role: "assistant",
+		Content: []ContentItem{
+			{Kind: ContentOutputText, Text: "a"},
+			{Kind: ContentInputText, Text: "ignored"},
+			{Kind: ContentOutputText, Text: "b"},
+		},
+	})
+	if !ok || text != "ab" {
+		t.Fatalf("RawAssistantOutputTextFromItem() = %q/%v", text, ok)
+	}
+}
+
+// TestMemoryCitationBodies mirrors Rust
+// codex_utils_stream_parser::citation::strip_citations collecting citation
+// bodies, including the auto-close at EOF behavior.
+func TestMemoryCitationBodies(t *testing.T) {
+	text := "before <oai-mem-citation>first</oai-mem-citation> middle " +
+		"<oai-mem-citation>second</oai-mem-citation> after"
+	if got := MemoryCitationBodies(text); !reflect.DeepEqual(got, []string{"first", "second"}) {
+		t.Fatalf("MemoryCitationBodies() = %#v", got)
+	}
+	if got := MemoryCitationBodies("visible <oai-mem-citation>unterminated"); !reflect.DeepEqual(got, []string{"unterminated"}) {
+		t.Fatalf("unterminated MemoryCitationBodies() = %#v", got)
+	}
+	if got := MemoryCitationBodies("partial <oai-mem-"); got != nil {
+		t.Fatalf("partial MemoryCitationBodies() = %#v", got)
+	}
+	if got := MemoryCitationBodies("no citations here"); got != nil {
+		t.Fatalf("MemoryCitationBodies() = %#v", got)
+	}
+}
+
+func TestImageGenerationArtifactPathAndSave(t *testing.T) {
+	home := t.TempDir()
+	result := base64.StdEncoding.EncodeToString([]byte("png"))
+	path, err := SaveImageGenerationResult(home, "session/1", "call:1", result)
+	if err != nil {
+		t.Fatalf("SaveImageGenerationResult() error = %v", err)
+	}
+	if filepath.Base(path) != "call_1.png" || !strings.Contains(path, "session_1") {
+		t.Fatalf("path = %q", path)
+	}
+	bytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(bytes) != "png" {
+		t.Fatalf("saved bytes = %q", bytes)
+	}
+}
+
+func TestStripHiddenAssistantMarkup(t *testing.T) {
+	got := StripHiddenAssistantMarkup("hello【cite】<proposed_plan>secret</proposed_plan> world", true)
+	if got != "hello world" {
+		t.Fatalf("StripHiddenAssistantMarkup() = %q", got)
+	}
+}
+
+func TestStripHiddenAssistantMarkupRemovesRustMemoryAndWebCitations(t *testing.T) {
+	text := "昆明\uE200cite\uE202turn0forecast0\uE201 21°C\uE000cite\uE002turn7forecast0\uE001 and <oai-mem-citation>memory</oai-mem-citation>done"
+	if got := StripHiddenAssistantMarkup(text, false); got != "昆明 21°C and done" {
+		t.Fatalf("StripHiddenAssistantMarkup() = %q", got)
+	}
+}
+
+func TestStripHiddenAssistantMarkupHidesUnterminatedCitations(t *testing.T) {
+	text := "visible\uE200cite\uE202turn0forecast0"
+	if got := StripHiddenAssistantMarkup(text, false); got != "visible" {
+		t.Fatalf("StripHiddenAssistantMarkup() = %q", got)
+	}
+}
+
+// Mirrors Rust's CONTEXTUAL_DEVELOPER_PREFIXES: every rollback-trimmable
+// developer fragment is recognized case-insensitively after leading whitespace.
+func TestContextualDeveloperPrefixesLikeRust(t *testing.T) {
+	prefixes := []string{
+		"<permissions instructions>",
+		"Approved command prefix saved:",
+		"<model_switch>",
+		"<managed_developer_instructions>",
+		"<persistent_mode>",
+		"<apps_instructions>",
+		"<collaboration_mode>",
+		"<multi_agent_role>",
+		"<multi_agent_mode>",
+		"<environments_instructions>",
+		"<git_attribution>",
+		"<plugins_instructions>",
+		"<realtime_conversation>",
+		"<skills_instructions>",
+		"<tools>",
+		"<personality_spec>",
+		"<token_budget>",
+		"<context_window>",
+		"<context_window_guidance>",
+		"<rollout_budget>",
+	}
+	for _, prefix := range prefixes {
+		content := []ContentItem{{Kind: ContentInputText, Text: prefix + "\nbody"}}
+		if !IsContextualDevMessageContent(content) {
+			t.Fatalf("IsContextualDevMessageContent(%q) = false", prefix)
+		}
+		if HasNonContextualDevMessageContent(content) {
+			t.Fatalf("HasNonContextualDevMessageContent(%q) = true", prefix)
+		}
+	}
+	if !IsContextualDevMessageContent([]ContentItem{{Kind: ContentInputText, Text: "  <TOOLS>body"}}) {
+		t.Fatal("leading whitespace and case must be ignored")
+	}
+	for _, text := range []string{"real instructions", "<unknown_tag>body", ""} {
+		if IsContextualDevMessageContent([]ContentItem{{Kind: ContentInputText, Text: text}}) {
+			t.Fatalf("IsContextualDevMessageContent(%q) = true, want false", text)
+		}
+	}
+}
+
+// Rust `user_input_parts` (core/src/event_mapping.rs:100): the media wrapper
+// labels are not user text, so they are skipped while every other part keeps its
+// original index. Image and audio labels are handled the same way.
+func TestUserInputPartIndicesSkipMediaLabelsLikeRust(t *testing.T) {
+	message := []ContentItem{
+		{Kind: ContentInputText, Text: "<image name=\"one\" path=\"/tmp/one.png\">"},
+		{Kind: ContentInputImage, ImageURL: "data:image/png;base64,AAAA"},
+		{Kind: ContentInputText, Text: "</image>"},
+		{Kind: ContentInputText, Text: "look"},
+		{Kind: ContentInputText, Text: "<audio>"},
+		{Kind: ContentInputAudio},
+		{Kind: ContentInputText, Text: "</audio>"},
+	}
+	got := UserInputPartIndices(message)
+	want := []int{1, 3, 5}
+	if len(got) != len(want) {
+		t.Fatalf("indices = %#v, want %#v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("indices = %#v, want %#v", got, want)
+		}
+	}
+
+	// A label that is not beside its media is ordinary user text.
+	if got := UserInputPartIndices([]ContentItem{{Kind: ContentInputText, Text: "<audio>"}, {Kind: ContentInputText, Text: "x"}}); len(got) != 2 {
+		t.Fatalf("indices = %#v, want both parts", got)
+	}
+}
+
+// rustUserInputPartIndices transcribes Rust's `user_input_parts`
+// (core/src/event_mapping.rs:100-126) with the media label predicates from
+// protocol/src/models.rs:1823-1873, including that Rust matches the raw text and
+// never trims it. It is the oracle the Go implementation is compared against.
+func rustUserInputPartIndices(message []ContentItem) []int {
+	localOpen := func(text string, prefix string) bool {
+		rest, ok := strings.CutPrefix(text, prefix)
+		return ok && strings.HasSuffix(rest, ">")
+	}
+	indices := make([]int, 0, len(message))
+	for index := range message {
+		item := message[index]
+		if item.Kind != ContentInputText {
+			indices = append(indices, index)
+			continue
+		}
+		isImageLabel := ((localOpen(item.Text, "<image name=") || item.Text == "<image>") &&
+			index+1 < len(message) && message[index+1].Kind == ContentInputImage) ||
+			(index > 0 && item.Text == "</image>" && message[index-1].Kind == ContentInputImage)
+		isAudioLabel := ((localOpen(item.Text, "<audio name=") || item.Text == "<audio>") &&
+			index+1 < len(message) && message[index+1].Kind == ContentInputAudio) ||
+			(index > 0 && item.Text == "</audio>" && message[index-1].Kind == ContentInputAudio)
+		if !isImageLabel && !isAudioLabel {
+			indices = append(indices, index)
+		}
+	}
+	return indices
+}
+
+// Mirrors Rust's `user_input_parts` (core/src/event_mapping.rs:100) for the
+// media label accept sets: only the exact `<image>` / `<audio>` / closing tags
+// and the `<image name=` / `<audio name=` local variants (prefix plus a `>`
+// suffix) are label text, and the raw text is matched without trimming
+// (protocol/src/models.rs:1823-1873). Every case where the earlier Go
+// `HasPrefix` accept set was wider than Rust must now agree with the oracle.
+func TestUserInputPartIndicesMatchRustMediaLabels(t *testing.T) {
+	image := ContentItem{Kind: ContentInputImage, ImageURL: "data:image/png;base64,AAAA"}
+	audio := ContentItem{Kind: ContentInputAudio}
+	text := func(value string) ContentItem { return ContentItem{Kind: ContentInputText, Text: value} }
+	for _, tc := range []struct {
+		name    string
+		message []ContentItem
+		want    []int
+	}{
+		{"local image open + image", []ContentItem{text(`<image name=[Image #1] path="/tmp/a.png">`), image}, []int{1}},
+		{"bare image open + image", []ContentItem{text("<image>"), image}, []int{1}},
+		{"image + close", []ContentItem{image, text("</image>")}, []int{0}},
+		{"audio open + audio", []ContentItem{text("<audio>"), audio}, []int{1}},
+		{"local audio open + audio", []ContentItem{text(`<audio name=[Audio #1] path="/tmp/a.wav">`), audio}, []int{1}},
+		{"audio + close", []ContentItem{audio, text("</audio>")}, []int{0}},
+		{"image prefixed tag", []ContentItem{text("<imagefoo>"), image}, []int{0, 1}},
+		{"unprefixed local image tag", []ContentItem{text("<local_image>"), image}, []int{0, 1}},
+		{"leading space image tag", []ContentItem{text(" <image>"), image}, []int{0, 1}},
+		{"audio prefixed tag", []ContentItem{text("<audiofoo>"), audio}, []int{0, 1}},
+		{"unprefixed local audio tag", []ContentItem{text("<local_audio>"), audio}, []int{0, 1}},
+		{"unprefixed local image close", []ContentItem{image, text("</local_image>")}, []int{0, 1}},
+		{"unprefixed local audio close", []ContentItem{audio, text("</local_audio>")}, []int{0, 1}},
+		{"image label without suffix", []ContentItem{text(`<image name=[Image #1] path="/tmp/a.png"`), image}, []int{0, 1}},
+		{"audio label without suffix", []ContentItem{text(`<audio name=[Audio #1] path="/tmp/a.wav"`), audio}, []int{0, 1}},
+		{"empty label + image", []ContentItem{text(""), image}, []int{0, 1}},
+		{"duplicate label before image", []ContentItem{text("<image>"), text("<image>"), image}, []int{0, 2}},
+		{"image label without media", []ContentItem{text("<image>"), text("x")}, []int{0, 1}},
+		{"paired image and audio labels", []ContentItem{
+			text(`<image name=[Image #1] path="/tmp/a.png">`), image, text("</image>"),
+			text(`<audio name=[Audio #1] path="/tmp/a.wav">`), audio, text("</audio>"),
+			text("keep me"),
+		}, []int{1, 4, 6}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := rustUserInputPartIndices(tc.message); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("oracle = %#v, want %#v", got, tc.want)
+			}
+			if got := UserInputPartIndices(tc.message); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("UserInputPartIndices = %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+
+	// The six tag spellings Rust itself produces stay equivalent.
+	for _, tc := range []struct {
+		label string
+		media ContentItem
+	}{
+		{`<image name=[Image #1] path="/tmp/a.png">`, image},
+		{"<image>", image},
+		{`<audio name=[Audio #1] path="/tmp/a.wav">`, audio},
+		{"<audio>", audio},
+	} {
+		if got := UserInputPartIndices([]ContentItem{text(tc.label), tc.media}); !reflect.DeepEqual(got, []int{1}) {
+			t.Fatalf("label %q = %#v, want [1]", tc.label, got)
+		}
+	}
+}

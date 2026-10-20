@@ -1,0 +1,742 @@
+package mcp
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+
+	"codex_core/keyring"
+)
+
+var oauthFallbackMu sync.Mutex
+
+const (
+	mcpOAuthFallbackFilename = ".credentials.json"
+	mcpOAuthServerType       = "http"
+	mcpOAuthRefreshSkew      = 30 * time.Second
+	// mcpOAuthKeyringService mirrors Rust's `KEYRING_SERVICE`; the account is the
+	// computed store key for the server.
+	mcpOAuthKeyringService = "Codex MCP Credentials"
+	// mcpOAuthEnterpriseServerPrefix marks enterprise (EMA) credentials, whose
+	// store key also covers the Codex home (Rust `ema-idp:`).
+	mcpOAuthEnterpriseServerPrefix = "ema-idp:"
+)
+
+type OAuthTokenSet struct {
+	ServerName   string `json:"server_name"`
+	ServerURL    string `json:"server_url"`
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret,omitempty"`
+	Issuer       string `json:"issuer,omitempty"`
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	// IDToken is the OIDC identity assertion returned by an enterprise IdP
+	// login (Rust #43844 keeps the full token response including `id_token`).
+	IDToken         string   `json:"id_token,omitempty"`
+	Scopes          []string `json:"scopes,omitempty"`
+	ExpiresAtMillis *int64   `json:"expires_at,omitempty"`
+}
+
+type OAuthStore struct {
+	CodexHome string
+	// Mode is the configured credential store mode (Rust
+	// OAuthCredentialsStoreMode); an empty value means auto.
+	Mode OAuthCredentialsStoreMode
+	// Keyring overrides the platform keyring backend (tests); nil uses the OS
+	// keyring.
+	Keyring keyring.Store
+}
+
+func (s *OAuthStore) keyringStore() keyring.Store {
+	if s != nil && s.Keyring != nil {
+		return s.Keyring
+	}
+	return keyring.New()
+}
+
+type oauthFallbackEntry struct {
+	ServerName      string   `json:"server_name"`
+	ServerURL       string   `json:"server_url"`
+	ClientID        string   `json:"client_id"`
+	ClientSecret    *string  `json:"client_secret,omitempty"`
+	Issuer          string   `json:"issuer,omitempty"`
+	AccessToken     string   `json:"access_token"`
+	ExpiresAtMillis *int64   `json:"expires_at,omitempty"`
+	RefreshToken    *string  `json:"refresh_token,omitempty"`
+	IDToken         *string  `json:"id_token,omitempty"`
+	Scopes          []string `json:"scopes,omitempty"`
+	ExecutorOwned   bool     `json:"executor_owned,omitempty"`
+}
+
+func NewOAuthStore(codexHome string) *OAuthStore {
+	return NewOAuthStoreWithMode(codexHome, OAuthCredentialsStoreAuto)
+}
+
+// NewOAuthStoreWithMode builds a store for an explicit mode.
+func NewOAuthStoreWithMode(codexHome string, mode OAuthCredentialsStoreMode) *OAuthStore {
+	if _, ok := ParseOAuthCredentialsStoreMode(string(mode)); !ok {
+		mode = OAuthCredentialsStoreAuto
+	}
+	return &OAuthStore{CodexHome: codexHome, Mode: mode}
+}
+
+// effectiveMode resolves the store for this instance. Rust resolves the store
+// once per client lifetime ("once an MCP client loads credentials from one
+// store, that client keeps the resolved store"), so auto is resolved on every
+// call from the fixed availability of the platform: without a keyring backend
+// auto always means the credentials file.
+func (s *OAuthStore) effectiveMode() OAuthCredentialsStoreMode {
+	if s == nil {
+		return OAuthCredentialsStoreAuto
+	}
+	mode := s.configuredMode()
+	if mode == OAuthCredentialsStoreAuto && MCPOAuthKeyringAvailable {
+		return OAuthCredentialsStoreKeyring
+	}
+	if mode == OAuthCredentialsStoreAuto {
+		return OAuthCredentialsStoreFile
+	}
+	return mode
+}
+
+// configuredMode is the normalized mode as configured, before auto resolves to
+// a concrete store. It decides whether a save may fall back to the file.
+func (s *OAuthStore) configuredMode() OAuthCredentialsStoreMode {
+	if s == nil {
+		return OAuthCredentialsStoreAuto
+	}
+	mode, ok := ParseOAuthCredentialsStoreMode(string(s.Mode))
+	if !ok {
+		return OAuthCredentialsStoreAuto
+	}
+	return mode
+}
+
+// keyringUnavailable reports the Rust "keyring when available, otherwise fail"
+// outcome for the keyring mode.
+func (s *OAuthStore) keyringUnavailable() error {
+	if s == nil || s.effectiveMode() != OAuthCredentialsStoreKeyring {
+		return nil
+	}
+	if MCPOAuthKeyringAvailable {
+		return nil
+	}
+	return errors.New(MCPOAuthKeyringUnavailableError)
+}
+
+// KeyringUnavailable reports whether this store cannot persist credentials
+// because keyring storage was required but is unavailable.
+func (s *OAuthStore) KeyringUnavailable() bool {
+	return s != nil && s.effectiveMode() == OAuthCredentialsStoreKeyring && !MCPOAuthKeyringAvailable
+}
+
+func (s *OAuthStore) Load(serverName string, serverURL string) (tokens *OAuthTokenSet, err error) {
+	if s == nil {
+		return nil, errors.New("MCP OAuth store is nil")
+	}
+	attempt := newOAuthStorageAttempt(s.configuredMode(), "load")
+	actualStore := string(s.effectiveMode())
+	secureOutcome := "not_attempted"
+	secureError := "none"
+	defer func() {
+		attempt.finish(actualStore, oauthStorageOutcome(tokens, err), secureOutcome, secureError)
+	}()
+	if err := s.keyringUnavailable(); err != nil {
+		secureOutcome = "error"
+		secureError = classifyOAuthStorageError(err)
+		return nil, err
+	}
+	mode := s.effectiveMode()
+	configured := s.configuredMode()
+	if mode == OAuthCredentialsStoreFile {
+		actualStore = "file"
+		return s.loadFromFile(serverName, serverURL)
+	}
+	tokens, err = s.loadFromKeyring(serverName, serverURL)
+	if err != nil {
+		secureOutcome = "error"
+		secureError = classifyOAuthStorageError(err)
+		if configured == OAuthCredentialsStoreKeyring {
+			return nil, fmt.Errorf("failed to load OAuth tokens from keyring: %w", err)
+		}
+		// Auto falls back to the credentials file on a keyring error.
+		actualStore = "file"
+		tokens, err = s.loadFromFile(serverName, serverURL)
+		return tokens, err
+	}
+	if tokens != nil {
+		secureOutcome = "success"
+		return tokens, nil
+	}
+	secureOutcome = "not_found"
+	// Keyring mode reads only the keyring; auto falls back to the file.
+	if configured == OAuthCredentialsStoreKeyring {
+		return nil, nil
+	}
+	actualStore = "file"
+	return s.loadFromFile(serverName, serverURL)
+}
+
+// loadFromKeyring reads the direct-keyring entry for the server
+// (Rust load_oauth_tokens_from_direct_keyring).
+func (s *OAuthStore) loadFromKeyring(serverName string, serverURL string) (*OAuthTokenSet, error) {
+	key, err := computeMCPOAuthStoreKey(s.CodexHome, serverName, serverURL)
+	if err != nil {
+		return nil, err
+	}
+	serialized, err := s.keyringStore().Load(mcpOAuthKeyringService, key)
+	if errors.Is(err, keyring.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var entry oauthFallbackEntry
+	if err := json.Unmarshal([]byte(serialized), &entry); err != nil {
+		return nil, fmt.Errorf("failed to deserialize OAuth tokens from keyring: %w", err)
+	}
+	return oauthTokenSetFromFallbackEntry(&entry), nil
+}
+
+func (s *OAuthStore) loadFromFile(serverName string, serverURL string) (*OAuthTokenSet, error) {
+	oauthFallbackMu.Lock()
+	defer oauthFallbackMu.Unlock()
+	file, err := s.readFallbackFile()
+	if err != nil || len(file) == 0 {
+		return nil, err
+	}
+	key, err := computeMCPOAuthStoreKey(s.CodexHome, serverName, serverURL)
+	if err != nil {
+		return nil, err
+	}
+	localServerName := strings.TrimPrefix(serverName, "local:")
+	for storedKey, entry := range file {
+		if entry == nil {
+			continue
+		}
+		matches := false
+		if strings.HasPrefix(serverName, "executor:") {
+			matches = storedKey == key && entry.ExecutorOwned && entry.ServerName == serverName && entry.ServerURL == serverURL
+		} else if !entry.ExecutorOwned {
+			matches = entry.ServerURL == serverURL && (entry.ServerName == localServerName || (storedKey == key && entry.ServerName == serverName))
+		}
+		if matches {
+			return oauthTokenSetFromFallbackEntry(entry), nil
+		}
+	}
+	return nil, nil
+}
+
+func (s *OAuthStore) Save(tokens *OAuthTokenSet) (err error) {
+	if s == nil {
+		return errors.New("MCP OAuth store is nil")
+	}
+	attempt := newOAuthStorageAttempt(s.configuredMode(), "save")
+	actualStore := string(s.effectiveMode())
+	secureOutcome := "not_attempted"
+	secureError := "none"
+	defer func() {
+		attempt.finish(actualStore, oauthStorageSaveOutcome(err), secureOutcome, secureError)
+	}()
+	if err := s.keyringUnavailable(); err != nil {
+		secureOutcome = "error"
+		secureError = classifyOAuthStorageError(err)
+		return err
+	}
+	if tokens == nil {
+		return errors.New("MCP OAuth tokens are required")
+	}
+	if strings.TrimSpace(tokens.ServerName) == "" || strings.TrimSpace(tokens.ServerURL) == "" {
+		return errors.New("MCP OAuth server name and URL are required")
+	}
+	if strings.TrimSpace(tokens.ClientID) == "" {
+		return errors.New("MCP OAuth client ID is required")
+	}
+	if strings.TrimSpace(tokens.AccessToken) == "" {
+		return errors.New("MCP OAuth access token is required")
+	}
+	// Serialize credential mutations across processes (Rust save_oauth_tokens
+	// acquires the credential lock before persisting).
+	lock, err := acquireMCPOAuthCredentialLockForServer(s.CodexHome, tokens.ServerName, tokens.ServerURL)
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+	configured := s.configuredMode()
+	if s.effectiveMode() == OAuthCredentialsStoreFile {
+		actualStore = "file"
+		return s.saveWithLockHeld(tokens)
+	}
+	if err := s.saveToKeyring(tokens); err != nil {
+		secureOutcome = "error"
+		secureError = classifyOAuthStorageError(err)
+		if configured == OAuthCredentialsStoreKeyring {
+			return err
+		}
+		// Auto falls back to the credentials file (Rust
+		// save_oauth_tokens_with_keyring_with_fallback_to_file).
+		actualStore = "file"
+		return s.saveWithLockHeld(tokens)
+	}
+	secureOutcome = "success"
+	// Best-effort legacy cleanup; a failure must not fail the save.
+	_, _ = s.deleteWithLockHeld(tokens.ServerName, tokens.ServerURL)
+	return nil
+}
+
+// saveToKeyring persists tokens in the direct keyring
+// (Rust save_oauth_tokens_to_direct_keyring).
+func (s *OAuthStore) saveToKeyring(tokens *OAuthTokenSet) error {
+	key, err := computeMCPOAuthStoreKey(s.CodexHome, tokens.ServerName, tokens.ServerURL)
+	if err != nil {
+		return err
+	}
+	serialized, err := json.Marshal(oauthFallbackEntryFromTokenSet(tokens))
+	if err != nil {
+		return fmt.Errorf("failed to serialize OAuth tokens: %w", err)
+	}
+	if err := s.keyringStore().Save(mcpOAuthKeyringService, key, string(serialized)); err != nil {
+		return fmt.Errorf("failed to write OAuth tokens to keyring: %w", err)
+	}
+	return nil
+}
+
+// saveWithLockHeld persists tokens while the caller retains the matching
+// credential lock. Mirrors Rust save_oauth_tokens_with_lock_held.
+func (s *OAuthStore) saveWithLockHeld(tokens *OAuthTokenSet) error {
+	oauthFallbackMu.Lock()
+	defer oauthFallbackMu.Unlock()
+	file, err := s.readFallbackFile()
+	if err != nil {
+		return err
+	}
+	if file == nil {
+		file = map[string]*oauthFallbackEntry{}
+	}
+	key, err := computeMCPOAuthStoreKey(s.CodexHome, tokens.ServerName, tokens.ServerURL)
+	if err != nil {
+		return err
+	}
+	if existing := file[key]; strings.HasPrefix(tokens.ServerName, "executor:") && existing != nil && !existing.ExecutorOwned {
+		return errors.New("executor OAuth credential key conflicts with a host-owned credential")
+	}
+	file[key] = oauthFallbackEntryFromTokenSet(tokens)
+	return s.writeFallbackFile(file)
+}
+
+// retireRefreshTokenWithLockHeld removes only the refresh token of the
+// credential the caller observed, while the caller retains the matching
+// credential lock. Mirrors Rust's `retire_refresh_token_if_matches` (#54079,
+// oauth/resolved_store.rs:201-300): the access token and the credential record
+// stay, so a still-valid access token keeps working, and a credential a
+// concurrent login replaced is left untouched because the stored snapshot no
+// longer matches.
+//
+// Direct-keyring credentials can be shared across Codex homes, where the
+// credential lock does not reach; as in Rust (oauth/credential_store.rs:345-356)
+// those are retired only for the current runtime, leaving the durable entry for
+// a real login to replace.
+func (s *OAuthStore) retireRefreshTokenWithLockHeld(serverName string, serverURL string, expected *OAuthTokenSet) (bool, error) {
+	if s == nil || expected == nil {
+		return false, nil
+	}
+	if err := s.keyringUnavailable(); err != nil {
+		return false, err
+	}
+	current, err := s.Load(serverName, serverURL)
+	if err != nil {
+		return false, err
+	}
+	if !sameStoredMCPOAuthCredential(current, expected) {
+		return false, nil
+	}
+	if s.effectiveMode() != OAuthCredentialsStoreFile {
+		return true, nil
+	}
+	retired := *expected
+	retired.RefreshToken = ""
+	if err := s.saveWithLockHeld(&retired); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// sameStoredMCPOAuthCredential reports whether two stored credentials are the
+// same snapshot. Rust compares the whole credential after clearing only
+// `expires_in` (`normalized_oauth_credentials`, oauth.rs:338-344), so every
+// field except the absolute expiry identifies the credential here too.
+func sameStoredMCPOAuthCredential(current *OAuthTokenSet, expected *OAuthTokenSet) bool {
+	if current == nil || expected == nil {
+		return false
+	}
+	return current.ServerName == expected.ServerName &&
+		current.ServerURL == expected.ServerURL &&
+		current.ClientID == expected.ClientID &&
+		current.ClientSecret == expected.ClientSecret &&
+		strings.TrimSpace(current.Issuer) == strings.TrimSpace(expected.Issuer) &&
+		current.AccessToken == expected.AccessToken &&
+		current.RefreshToken == expected.RefreshToken &&
+		current.IDToken == expected.IDToken &&
+		sameMCPOAuthScopes(current.Scopes, expected.Scopes)
+}
+
+func sameMCPOAuthScopes(current []string, expected []string) bool {
+	if len(current) != len(expected) {
+		return false
+	}
+	for index := range current {
+		if current[index] != expected[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *OAuthStore) Delete(serverName string, serverURL string) (removed bool, err error) {
+	if s == nil {
+		return false, errors.New("MCP OAuth store is nil")
+	}
+	attempt := newOAuthStorageAttempt(s.configuredMode(), "delete")
+	actualStore := "multiple"
+	if s.effectiveMode() == OAuthCredentialsStoreFile {
+		actualStore = "file"
+	}
+	secureOutcome := "not_attempted"
+	secureError := "none"
+	defer func() {
+		attempt.finish(actualStore, oauthStorageDeleteOutcome(removed, err), secureOutcome, secureError)
+	}()
+	if err := s.keyringUnavailable(); err != nil {
+		secureOutcome = "error"
+		secureError = classifyOAuthStorageError(err)
+		return false, err
+	}
+	// Serialize credential mutations across processes (Rust delete_oauth_tokens
+	// acquires the credential lock before deleting).
+	lock, err := acquireMCPOAuthCredentialLockForServer(s.CodexHome, serverName, serverURL)
+	if err != nil {
+		return false, err
+	}
+	defer lock.Release()
+	mode := s.effectiveMode()
+	keyringRemoved := false
+	if removed, keyringErr := s.deleteKeyringEntry(serverName, serverURL); keyringErr != nil {
+		secureOutcome = "error"
+		secureError = classifyOAuthStorageError(keyringErr)
+		// Rust swallows a keyring delete failure in file mode but propagates it
+		// for auto/keyring.
+		if mode != OAuthCredentialsStoreFile {
+			return false, fmt.Errorf("failed to delete OAuth tokens from keyring: %w", keyringErr)
+		}
+	} else {
+		keyringRemoved = removed
+		if keyringRemoved {
+			secureOutcome = "success"
+		} else {
+			secureOutcome = "not_found"
+		}
+	}
+	fileRemoved, err := s.deleteWithLockHeld(serverName, serverURL)
+	if err != nil {
+		return false, err
+	}
+	return keyringRemoved || fileRemoved, nil
+}
+
+// deleteKeyringEntry removes the direct-keyring entry for the server
+// (Rust delete_oauth_tokens_from_direct_keyring).
+func (s *OAuthStore) deleteKeyringEntry(serverName string, serverURL string) (bool, error) {
+	key, err := computeMCPOAuthStoreKey(s.CodexHome, serverName, serverURL)
+	if err != nil {
+		return false, err
+	}
+	return s.keyringStore().Delete(mcpOAuthKeyringService, key)
+}
+
+// deleteWithLockHeld removes the fallback-file tokens while the caller retains
+// the matching credential lock. Mirrors Rust delete_oauth_tokens_from_file.
+func (s *OAuthStore) deleteWithLockHeld(serverName string, serverURL string) (bool, error) {
+	oauthFallbackMu.Lock()
+	defer oauthFallbackMu.Unlock()
+	file, err := s.readFallbackFile()
+	if err != nil || len(file) == 0 {
+		return false, err
+	}
+	key, err := computeMCPOAuthStoreKey(s.CodexHome, serverName, serverURL)
+	if err != nil {
+		return false, err
+	}
+	removed := false
+	localServerName := strings.TrimPrefix(serverName, "local:")
+	for entryKey, entry := range file {
+		if entry == nil {
+			continue
+		}
+		matches := false
+		if strings.HasPrefix(serverName, "executor:") {
+			if entryKey == key && !entry.ExecutorOwned {
+				return false, errors.New("executor OAuth credential key conflicts with a host-owned credential")
+			}
+			matches = entryKey == key && entry.ExecutorOwned && entry.ServerName == serverName && entry.ServerURL == serverURL
+		} else if !entry.ExecutorOwned {
+			matches = entry.ServerURL == serverURL && (entry.ServerName == localServerName || (entryKey == key && entry.ServerName == serverName))
+		}
+		if matches {
+			delete(file, entryKey)
+			removed = true
+		}
+	}
+	if !removed {
+		return false, nil
+	}
+	return true, s.writeFallbackFile(file)
+}
+
+func (s *OAuthStore) AuthStatus(serverName string, config *ServerConfig) (MCPAuthStatus, error) {
+	if config == nil || strings.TrimSpace(config.URL) == "" {
+		return MCPAuthUnsupported, nil
+	}
+	if strings.TrimSpace(config.BearerTokenEnvVar) != "" {
+		return MCPAuthBearerToken, nil
+	}
+	credentialName := config.OAuthCredentialName(serverName)
+	tokens, err := s.Load(credentialName, config.URL)
+	if err != nil {
+		return MCPAuthUnsupported, err
+	}
+	if tokens == nil {
+		if strings.TrimSpace(config.OAuthClientID) != "" || strings.TrimSpace(config.OAuthResource) != "" {
+			return MCPAuthNotLoggedIn, nil
+		}
+		return MCPAuthUnsupported, nil
+	}
+	if tokens.Usable(time.Now()) {
+		return MCPAuthOAuth, nil
+	}
+	return MCPAuthNotLoggedIn, nil
+}
+
+func (t *OAuthTokenSet) Usable(now time.Time) bool {
+	if t == nil || strings.TrimSpace(t.ClientID) == "" {
+		return false
+	}
+	if !tokenNeedsRefresh(t.ExpiresAtMillis, now) {
+		return strings.TrimSpace(t.AccessToken) != ""
+	}
+	return strings.TrimSpace(t.RefreshToken) != ""
+}
+
+func (t *OAuthTokenSet) AccessTokenForRequest(now time.Time) string {
+	if t == nil || strings.TrimSpace(t.AccessToken) == "" {
+		return ""
+	}
+	if tokenNeedsRefresh(t.ExpiresAtMillis, now) {
+		return ""
+	}
+	return strings.TrimSpace(t.AccessToken)
+}
+
+func (s *OAuthStore) path() string {
+	return filepath.Join(s.CodexHome, mcpOAuthFallbackFilename)
+}
+
+func (s *OAuthStore) readFallbackFile() (map[string]*oauthFallbackEntry, error) {
+	data, err := os.ReadFile(s.path())
+	if errors.Is(err, os.ErrNotExist) {
+		return map[string]*oauthFallbackEntry{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	file := map[string]*oauthFallbackEntry{}
+	if err := json.Unmarshal(data, &file); err != nil {
+		return nil, err
+	}
+	return file, nil
+}
+
+func (s *OAuthStore) writeFallbackFile(file map[string]*oauthFallbackEntry) error {
+	path := s.path()
+	if len(file) == 0 {
+		err := os.Remove(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	data, err := json.Marshal(file)
+	if err != nil {
+		return err
+	}
+	return writeMCPOAuthFallbackFile(path, data)
+}
+
+// writeMCPOAuthFallbackFile mirrors Rust #39611: the fallback file contains
+// OAuth credentials, so it must be private from the moment it is created and
+// writes must never follow links to another path.
+func writeMCPOAuthFallbackFile(path string, data []byte) error {
+	if strings.TrimSpace(path) == "" {
+		return errors.New("MCP OAuth fallback path is empty")
+	}
+	info, err := os.Lstat(path)
+	switch {
+	case err == nil:
+		// Existing path: reject symlinks and other non-regular files
+		// (Windows reparse points surface as os.ModeSymlink here too).
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fmt.Errorf("MCP OAuth fallback path %s is not a regular file", path)
+		}
+	case errors.Is(err, os.ErrNotExist):
+		info = nil
+	default:
+		return err
+	}
+	flags := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	file, err := os.OpenFile(path, flags, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if _, err := file.Write(data); err != nil {
+		return err
+	}
+	// Restore private permissions even when the file already existed with
+	// looser modes (Unix).
+	if runtime.GOOS != "windows" {
+		if err := file.Chmod(0o600); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func oauthTokenSetFromFallbackEntry(entry *oauthFallbackEntry) *OAuthTokenSet {
+	if entry == nil {
+		return nil
+	}
+	tokens := &OAuthTokenSet{
+		ServerName:      entry.ServerName,
+		ServerURL:       entry.ServerURL,
+		ClientID:        entry.ClientID,
+		Issuer:          strings.TrimSpace(entry.Issuer),
+		AccessToken:     entry.AccessToken,
+		Scopes:          append([]string(nil), entry.Scopes...),
+		ExpiresAtMillis: cloneInt64Pointer(entry.ExpiresAtMillis),
+	}
+	if entry.ClientSecret != nil {
+		tokens.ClientSecret = strings.TrimSpace(*entry.ClientSecret)
+	}
+	if entry.RefreshToken != nil {
+		tokens.RefreshToken = *entry.RefreshToken
+	}
+	if entry.IDToken != nil {
+		tokens.IDToken = *entry.IDToken
+	}
+	return tokens
+}
+
+func oauthFallbackEntryFromTokenSet(tokens *OAuthTokenSet) *oauthFallbackEntry {
+	entry := &oauthFallbackEntry{
+		ServerName:      strings.TrimSpace(tokens.ServerName),
+		ServerURL:       strings.TrimSpace(tokens.ServerURL),
+		ClientID:        strings.TrimSpace(tokens.ClientID),
+		Issuer:          strings.TrimSpace(tokens.Issuer),
+		AccessToken:     strings.TrimSpace(tokens.AccessToken),
+		Scopes:          append([]string(nil), tokens.Scopes...),
+		ExpiresAtMillis: cloneInt64Pointer(tokens.ExpiresAtMillis),
+		ExecutorOwned:   strings.HasPrefix(strings.TrimSpace(tokens.ServerName), "executor:"),
+	}
+	if refresh := strings.TrimSpace(tokens.RefreshToken); refresh != "" {
+		entry.RefreshToken = &refresh
+	}
+	if idToken := strings.TrimSpace(tokens.IDToken); idToken != "" {
+		entry.IDToken = &idToken
+	}
+	if secret := strings.TrimSpace(tokens.ClientSecret); secret != "" {
+		entry.ClientSecret = &secret
+	}
+	return entry
+}
+
+// computeMCPOAuthStoreKey mirrors Rust's `compute_store_key`: the readable name,
+// a separator ("." for executor-owned servers), and the first 16 hex digits of
+// the SHA-256 of the credential payload. Enterprise credentials add the
+// canonical Codex home to the hashed payload because the OS keyring is shared
+// across homes.
+func computeMCPOAuthStoreKey(codexHome string, serverName string, serverURL string) (string, error) {
+	serverName = strings.TrimSpace(serverName)
+	serverURL = strings.TrimSpace(serverURL)
+	if serverName == "" || serverURL == "" {
+		return "", fmt.Errorf("MCP OAuth server name and URL are required")
+	}
+	executorOwned := strings.HasPrefix(serverName, "executor:")
+	enterpriseOwned := strings.HasPrefix(serverName, mcpOAuthEnterpriseServerPrefix)
+	serverName = strings.TrimPrefix(serverName, "local:")
+	payload := map[string]any{
+		"type":    mcpOAuthServerType,
+		"url":     serverURL,
+		"headers": map[string]string{},
+	}
+	if enterpriseOwned {
+		canonical, err := canonicalMCPOAuthCodexHome(codexHome)
+		if err != nil {
+			return "", err
+		}
+		payload["codex_home"] = canonical
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(encoded)
+	separator := "|"
+	if executorOwned {
+		separator = ":"
+	}
+	return serverName + separator + hex.EncodeToString(sum[:])[:16], nil
+}
+
+// canonicalMCPOAuthCodexHome mirrors Rust's use of find_codex_home +
+// create_dir_all + canonicalize for the enterprise store key.
+func canonicalMCPOAuthCodexHome(codexHome string) (string, error) {
+	codexHome = strings.TrimSpace(codexHome)
+	if codexHome == "" {
+		return "", errors.New("MCP OAuth enterprise credentials require CODEX_HOME")
+	}
+	if err := os.MkdirAll(codexHome, 0o700); err != nil {
+		return "", err
+	}
+	if canonical, err := filepath.EvalSymlinks(codexHome); err == nil {
+		if absolute, absErr := filepath.Abs(canonical); absErr == nil {
+			return absolute, nil
+		}
+	}
+	return filepath.Abs(codexHome)
+}
+
+func tokenNeedsRefresh(expiresAtMillis *int64, now time.Time) bool {
+	if expiresAtMillis == nil {
+		return false
+	}
+	expiresAt := time.UnixMilli(*expiresAtMillis)
+	return !now.Add(mcpOAuthRefreshSkew).Before(expiresAt)
+}
+
+func cloneInt64Pointer(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}

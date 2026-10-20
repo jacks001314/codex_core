@@ -1,0 +1,229 @@
+package execpolicy
+
+import (
+	"runtime"
+	"testing"
+)
+
+func TestEnvPolicyFromShellEnvironmentPolicy(t *testing.T) {
+	table := map[string]any{
+		"inherit":      "core",
+		"exclude":      []any{"SECRET_*"},
+		"include_only": []any{"PATH"},
+		"set":          map[string]any{"CODEX_KEPT": "yes"},
+	}
+	policy := EnvPolicyFromShellEnvironmentPolicy(table, "/repo")
+	if policy.Inherit != "core" || policy.CWD != "/repo" {
+		t.Fatalf("policy = %#v", policy)
+	}
+	if len(policy.Exclude) != 1 || policy.Exclude[0].Value != "SECRET_*" || policy.Exclude[0].Mode != EnvPatternWildcard {
+		t.Fatalf("exclude = %#v", policy.Exclude)
+	}
+	if len(policy.IncludeOnly) != 1 || policy.IncludeOnly[0].Value != "PATH" || policy.IncludeOnly[0].Mode != EnvPatternLiteral {
+		t.Fatalf("include_only = %#v", policy.IncludeOnly)
+	}
+	if policy.Set["CODEX_KEPT"] != "yes" {
+		t.Fatalf("set = %#v", policy.Set)
+	}
+
+	// The filters table wins over the legacy exclude/include_only lists.
+	filters := EnvPolicyFromShellEnvironmentPolicy(map[string]any{
+		"filters":      map[string]any{"KEEP_*": "include", "DROP_*": "exclude"},
+		"exclude":      []any{"LEGACY_EXCLUDE_*"},
+		"include_only": []any{"LEGACY_INCLUDE_*"},
+	}, "")
+	if len(filters.IncludeOnly) != 1 || filters.IncludeOnly[0].Value != "KEEP_*" {
+		t.Fatalf("filters include_only = %#v", filters.IncludeOnly)
+	}
+	if len(filters.Exclude) != 1 || filters.Exclude[0].Value != "DROP_*" {
+		t.Fatalf("filters exclude = %#v", filters.Exclude)
+	}
+
+	// Empty/nil table yields the default policy (inherit all, default
+	// excludes ignored), matching Rust's Default.
+	def := EnvPolicyFromShellEnvironmentPolicy(nil, "")
+	if def.Inherit != "all" || def.IgnoreDefaultExcludes != nil || len(def.Exclude) != 0 {
+		t.Fatalf("default policy = %#v", def)
+	}
+}
+
+func TestEnvPolicyFromShellEnvironmentPolicyFiltersInheritedEnv(t *testing.T) {
+	policy := EnvPolicyFromShellEnvironmentPolicy(map[string]any{
+		"inherit": "core",
+		"set":     map[string]any{"CODEX_KEPT": "yes"},
+	}, "/repo")
+	threadID := "thread-1"
+	env := CreateEnv(policy, &threadID, map[string]string{
+		"PATH":         "/bin",
+		"RANDOM_VAR":   "y",
+		"SECRET_TOKEN": "x",
+	})
+	if env["PATH"] != "/bin" {
+		t.Fatalf("core var PATH lost: %#v", env)
+	}
+	if env["RANDOM_VAR"] != "" || env["SECRET_TOKEN"] != "" {
+		t.Fatalf("non-core vars leaked: %#v", env)
+	}
+	if env["CODEX_KEPT"] != "yes" {
+		t.Fatalf("set var missing: %#v", env)
+	}
+	if env[ThreadIDEnvVar] != "thread-1" {
+		t.Fatalf("thread id = %q", env[ThreadIDEnvVar])
+	}
+}
+
+func TestCreateEnvInheritExcludeSetAndThreadID(t *testing.T) {
+	threadID := "thread-1"
+	env := CreateEnv(&EnvPolicy{
+		InheritAll: true,
+		Exclude:    []EnvVariablePattern{{Mode: EnvPatternPrefix, Value: "SECRET_"}},
+		Set:        map[string]string{"CODEX_HOME": "$CWD/.gcode", "PATH": "/custom$PATH_SEP$PATH"},
+		CWD:        "/repo",
+	}, &threadID, map[string]string{
+		"PATH":       "/usr/bin",
+		"SECRET_KEY": "redacted",
+	})
+	if env["SECRET_KEY"] != "" {
+		t.Fatalf("SECRET_KEY inherited, env=%+v", env)
+	}
+	if env["CODEX_HOME"] != "/repo/.gcode" {
+		t.Fatalf("CODEX_HOME = %q", env["CODEX_HOME"])
+	}
+	if env[ThreadIDEnvVar] != "thread-1" {
+		t.Fatalf("thread id env = %q", env[ThreadIDEnvVar])
+	}
+}
+
+func TestInjectSessionID(t *testing.T) {
+	env := map[string]string{"PATH": "/bin", "codex_session_id": "stale"}
+	sessionID := "session-1"
+	InjectSessionID(env, &sessionID)
+	if env[SessionIDEnvVar] != "session-1" {
+		t.Fatalf("CODEX_SESSION_ID = %q", env[SessionIDEnvVar])
+	}
+	if _, ok := env["codex_session_id"]; ok {
+		t.Fatalf("stale case-variant CODEX_SESSION_ID was not removed: %#v", env)
+	}
+	InjectSessionID(env, nil)
+	if _, ok := env[SessionIDEnvVar]; ok {
+		t.Fatalf("CODEX_SESSION_ID should be removed when session id is nil: %#v", env)
+	}
+}
+
+func TestCreateEnvIncludeOnly(t *testing.T) {
+	env := CreateEnv(&EnvPolicy{
+		IncludeOnly: []EnvVariablePattern{{Mode: EnvPatternLiteral, Value: "PATH"}},
+	}, nil, map[string]string{"PATH": "/bin", "HOME": "/home/me"})
+	wantLen := 1
+	if runtime.GOOS == "windows" {
+		wantLen = 2
+		if env["PATHEXT"] != ".COM;.EXE;.BAT;.CMD" {
+			t.Fatalf("PATHEXT = %q", env["PATHEXT"])
+		}
+	}
+	if len(env) != wantLen || env["PATH"] != "/bin" {
+		t.Fatalf("env = %+v, want only PATH", env)
+	}
+}
+
+func TestCreateEnvCoreAndDefaultExcludes(t *testing.T) {
+	ignoreDefaultExcludes := false
+	env := CreateEnv(&EnvPolicy{
+		Inherit:               "core",
+		IgnoreDefaultExcludes: &ignoreDefaultExcludes,
+		Set:                   map[string]string{"CODEX_PUBLIC": "ok"},
+	}, nil, map[string]string{
+		"PATH":       "/bin",
+		"HOME":       "/home/me",
+		"API_KEY":    "secret",
+		"CUSTOM_VAR": "ignored",
+	})
+	if env["PATH"] != "/bin" {
+		t.Fatalf("core env missing PATH: %+v", env)
+	}
+	if runtime.GOOS != "windows" && env["HOME"] != "/home/me" {
+		t.Fatalf("core env missing HOME: %+v", env)
+	}
+	if _, ok := env["API_KEY"]; ok {
+		t.Fatalf("API_KEY inherited despite default excludes: %+v", env)
+	}
+	if _, ok := env["CUSTOM_VAR"]; ok {
+		t.Fatalf("CUSTOM_VAR inherited despite core mode: %+v", env)
+	}
+	if env["CODEX_PUBLIC"] != "ok" {
+		t.Fatalf("set env missing: %+v", env)
+	}
+}
+
+func TestCreateEnvWindowsCorePreservesCaseVariantWINDIR(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("windows core environment allowlist")
+	}
+	ignoreDefaultExcludes := false
+	env := CreateEnv(&EnvPolicy{
+		Inherit:               "core",
+		IgnoreDefaultExcludes: &ignoreDefaultExcludes,
+	}, nil, map[string]string{
+		"PATH":       `C:\Windows\System32`,
+		"SystemRoot": `C:\Windows`,
+		"WinDir":     `C:\Windows`,
+		"Custom":     "drop",
+	})
+	if env["WinDir"] != `C:\Windows` {
+		t.Fatalf("case-variant WinDir not preserved: %+v", env)
+	}
+	if env["SystemRoot"] != `C:\Windows` {
+		t.Fatalf("SystemRoot not preserved: %+v", env)
+	}
+	if _, ok := env["Custom"]; ok {
+		t.Fatalf("Custom inherited despite core mode: %+v", env)
+	}
+}
+
+func TestCreateEnvAppliesIncludeOnlyAfterSet(t *testing.T) {
+	env := CreateEnv(&EnvPolicy{
+		Inherit:     "all",
+		Set:         map[string]string{"KEEP_SET": "set", "DROP_SET": "set"},
+		IncludeOnly: []EnvVariablePattern{{Mode: EnvPatternWildcard, Value: "KEEP*"}},
+	}, nil, map[string]string{"KEEP_BASE": "base", "DROP_BASE": "base"})
+	if env["KEEP_BASE"] != "base" || env["KEEP_SET"] != "set" {
+		t.Fatalf("keep vars missing: %+v", env)
+	}
+	if _, ok := env["DROP_BASE"]; ok {
+		t.Fatalf("DROP_BASE survived include_only: %+v", env)
+	}
+	if _, ok := env["DROP_SET"]; ok {
+		t.Fatalf("DROP_SET survived include_only: %+v", env)
+	}
+}
+
+func TestInjectPermissionProfile(t *testing.T) {
+	env := map[string]string{PermissionProfileEnvVar: "old"}
+	profile := "full-access"
+	InjectPermissionProfile(env, &profile)
+	if env[PermissionProfileEnvVar] != "full-access" {
+		t.Fatalf("profile env = %q", env[PermissionProfileEnvVar])
+	}
+	InjectPermissionProfile(env, nil)
+	if _, ok := env[PermissionProfileEnvVar]; ok {
+		t.Fatalf("profile env still present: %+v", env)
+	}
+}
+
+func TestVariablePatternMatches(t *testing.T) {
+	cases := []struct {
+		pattern EnvVariablePattern
+		key     string
+		want    bool
+	}{
+		{EnvVariablePattern{Mode: EnvPatternLiteral, Value: "PATH"}, "PATH", true},
+		{EnvVariablePattern{Mode: EnvPatternPrefix, Value: "AWS_"}, "AWS_REGION", true},
+		{EnvVariablePattern{Mode: EnvPatternSuffix, Value: "_TOKEN"}, "API_TOKEN", true},
+		{EnvVariablePattern{Mode: EnvPatternContains, Value: "PROXY"}, "HTTPS_PROXY", true},
+	}
+	for i := range cases {
+		if got := cases[i].pattern.Matches(cases[i].key); got != cases[i].want {
+			t.Fatalf("case %d Matches() = %v, want %v", i, got, cases[i].want)
+		}
+	}
+}

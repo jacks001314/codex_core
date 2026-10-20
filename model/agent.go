@@ -1,0 +1,672 @@
+package model
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+
+	"codex_core/codexapi"
+	"codex_core/protocol"
+	"codex_core/sandbox"
+)
+
+var ErrInvalidAgentRequest = errors.New("invalid agent request")
+
+type AgentTaskKind string
+
+const (
+	AgentTaskRegular AgentTaskKind = "regular"
+	AgentTaskReview  AgentTaskKind = "review"
+)
+
+type AgentRequest struct {
+	Prompt       string
+	Instructions string
+	InputItems   []any
+	// PostPromptInputItems are appended to the model input after the prompt's
+	// user message (and after InputItems when there is no prompt). Rust #43110
+	// records trusted reasoning-effort configuration updates after accepted
+	// input so they follow the user message in the request.
+	PostPromptInputItems []any
+	Tools                []any
+	Model                string
+	ProviderID           string
+	// Endpoint selects the Responses-compatible backend route. The zero value
+	// is the standard /responses route; Guardian callers may opt into /guardian.
+	Endpoint ResponsesEndpoint
+	TaskKind AgentTaskKind
+	ThreadID string
+	// SessionID is the session (rollout) identity that Rust passes to
+	// ResponsesOptions::session_id. Go keeps one rollout per thread, so an
+	// empty value falls back to ThreadID (see addSessionIdentityHeaders).
+	SessionID          string
+	TurnID             string
+	Originator         string
+	Store              bool
+	PreviousResponseID string
+	ParallelToolCalls  bool
+	ReasoningEffort    string
+	ReasoningSummary   string
+	// DropReasoningEffortUpdates mirrors Rust ModelClient's request-time filter
+	// (#46530): when reasoning-effort updates are unsupported for the effective
+	// model or provider, saved configuration_update items are removed from the
+	// request copy only (persisted history is unchanged).
+	DropReasoningEffortUpdates   bool
+	ConcurrentReasoningSummaries bool
+	ModelVerbosity               string
+	IncludeTimingMetrics         bool
+	BetaFeaturesHeader           string
+	ItemIDsEnabled               bool
+	ServiceTier                  string
+	PromptCacheKey               string
+	// Ephemeral mirrors Rust's `turn_context.config.ephemeral`: the thread
+	// intentionally skips durable persistence, so every attachment upload made
+	// while preparing this request carries that intent (Rust #51517).
+	Ephemeral bool
+	// CyberAccessProgram is the turn's selected cyber access program (core
+	// snake_case, empty when the turn selected none). It reaches the request body
+	// only for a ChatGPT-authenticated account (Rust #44893 / for_auth).
+	CyberAccessProgram string
+	ClientMetadata     map[string]string
+	// Trace is the W3C trace context of the request that started this turn
+	// (Rust's `request_trace`): the websocket payload carries it so the model
+	// call stays inside the caller's trace.
+	Trace                        *protocol.W3CTraceContext
+	AttestationProvider          codexapi.AttestationProvider
+	OutputSchema                 any
+	StreamHandler                ResponsesStreamHandler
+	DisableHostedImageGeneration bool
+	PermissionProfile            *sandbox.PermissionProfile
+	// OnConversationItem, when non-nil, receives conversation items that a
+	// sampling request records in live history while it is running. Rust #49119
+	// records the content-filter guidance with `sess.record_conversation_items`
+	// before the retry is issued, so the retried request carries it; Go's retry
+	// loop owns the request body, so the item is appended to the attempt input
+	// here and handed to the caller for recording.
+	OnConversationItem func(item any)
+	// OnWireInputBounded, when non-nil, receives the original and bounded wire
+	// copies when the outgoing-message soft cap changed executed-tool-call
+	// metadata. Rust uses the same hook to invalidate a Code Mode cell's
+	// completeness after the wire copy loses calls or arguments (#47957).
+	OnWireInputBounded func(original, bounded []any)
+	// Preempt, when non-nil, carries the sampling request's preemption signal
+	// (Rust #48141's `StepContext::preempt`): closing it interrupts request
+	// setup, the response stream and the retry backoff so the queued user input
+	// reaches the model without waiting for the unfinished response. A
+	// preempted request returns a response with Preempted set and no output.
+	Preempt <-chan struct{}
+}
+
+type AgentUsage struct {
+	InputTokens           int64
+	CachedInputTokens     int64
+	CacheWriteInputTokens int64
+	OutputTokens          int64
+	ReasoningOutputTokens int64
+	TotalTokens           int64
+
+	// CodexRolloutBudgetUnits is the provider-reported number of units
+	// consumed from the shared rollout budget. It is an internal-only value
+	// parsed from the completed Responses API usage and must not be serialized
+	// into protocol, JSON schema, or TypeScript representations (mirrors Rust
+	// TokenUsage.codex_rollout_budget_units with skip_serializing/skip).
+	CodexRolloutBudgetUnits json.Number `json:"-"`
+}
+
+type AgentItem struct {
+	ID                    string
+	Type                  string
+	Text                  string
+	Name                  string
+	Namespace             string
+	CallID                string
+	Arguments             string
+	EncryptedFunctionArgs *[]string `json:"encrypted_function_args,omitempty"`
+	Input                 string
+	Status                string
+	Execution             string
+	Search                map[string]any
+	Data                  map[string]any
+
+	// Locally observed metadata is intentionally private so JSON input cannot
+	// forge warehouse-only executed-tool records.
+	executedToolCalls []ExecutedToolCall
+	// cellID associates the recorded tool calls with the originating Code Mode
+	// cell shared across its exec and wait outputs (Rust #41058). Input cannot
+	// forge this field.
+	cellID string
+	// toolCallsComplete reports whether the host retained the cell's complete
+	// ordered call inventory. Arguments may be truncated independently.
+	toolCallsComplete *bool
+}
+
+func (i *AgentItem) MarshalJSON() ([]byte, error) {
+	if i == nil {
+		return []byte("null"), nil
+	}
+	switch i.Type {
+	case "function_call":
+		return marshalAgentItemWithExecutedToolCalls(i, struct {
+			ID                    string    `json:"id,omitempty"`
+			Type                  string    `json:"type"`
+			Status                string    `json:"status,omitempty"`
+			EncryptedContent      *string   `json:"encrypted_content,omitempty"`
+			Name                  string    `json:"name"`
+			Namespace             string    `json:"namespace,omitempty"`
+			Arguments             string    `json:"arguments"`
+			EncryptedFunctionArgs *[]string `json:"encrypted_function_args,omitempty"`
+			CallID                string    `json:"call_id"`
+		}{
+			ID:                    i.ID,
+			Type:                  i.Type,
+			Status:                firstAgentItemValue(i.Status, stringValueFromAgentItemMap(i.Data, "status")),
+			EncryptedContent:      agentItemEncryptedContent(i.Data),
+			Name:                  i.Name,
+			Namespace:             i.Namespace,
+			Arguments:             i.Arguments,
+			EncryptedFunctionArgs: cloneAgentStringSlicePtr(i.EncryptedFunctionArgs),
+			CallID:                firstAgentItemValue(i.CallID, i.ID),
+		})
+	case "custom_tool_call":
+		return marshalAgentItemWithExecutedToolCalls(i, struct {
+			ID               string  `json:"id,omitempty"`
+			Type             string  `json:"type"`
+			Status           string  `json:"status,omitempty"`
+			EncryptedContent *string `json:"encrypted_content,omitempty"`
+			CallID           string  `json:"call_id"`
+			Name             string  `json:"name"`
+			Namespace        string  `json:"namespace,omitempty"`
+			Input            string  `json:"input"`
+		}{
+			ID:               i.ID,
+			Type:             i.Type,
+			Status:           i.Status,
+			EncryptedContent: agentItemEncryptedContent(i.Data),
+			CallID:           firstAgentItemValue(i.CallID, i.ID),
+			Name:             i.Name,
+			Namespace:        i.Namespace,
+			Input:            i.Input,
+		})
+	case "tool_search_call":
+		return marshalAgentItemWithExecutedToolCalls(i, struct {
+			ID               string  `json:"id,omitempty"`
+			Type             string  `json:"type"`
+			CallID           *string `json:"call_id"`
+			Status           string  `json:"status,omitempty"`
+			EncryptedContent *string `json:"encrypted_content,omitempty"`
+			Execution        string  `json:"execution"`
+			Arguments        any     `json:"arguments"`
+		}{
+			ID:               i.ID,
+			Type:             i.Type,
+			CallID:           optionalAgentItemString(firstAgentItemValue(i.CallID, i.ID)),
+			Status:           i.Status,
+			EncryptedContent: agentItemEncryptedContent(i.Data),
+			Execution:        firstAgentItemValue(i.Execution, "client"),
+			Arguments:        agentItemSearchArguments(i),
+		})
+	case "web_search_call":
+		return marshalAgentItemWithExecutedToolCalls(i, struct {
+			ID               string         `json:"id,omitempty"`
+			Type             string         `json:"type"`
+			Status           string         `json:"status,omitempty"`
+			EncryptedContent *string        `json:"encrypted_content,omitempty"`
+			Action           map[string]any `json:"action,omitempty"`
+		}{
+			ID:               i.ID,
+			Type:             i.Type,
+			Status:           i.Status,
+			EncryptedContent: agentItemEncryptedContent(i.Data),
+			Action:           cloneAgentItemMap(i.Search),
+		})
+	case "reasoning":
+		return marshalAgentItemWithExecutedToolCalls(i, struct {
+			ID               string                          `json:"id,omitempty"`
+			Type             string                          `json:"type"`
+			Summary          []responsesReasoningSummary     `json:"summary"`
+			Content          []responsesReasoningTextContent `json:"content,omitempty"`
+			EncryptedContent *string                         `json:"encrypted_content"`
+		}{
+			ID:               i.ID,
+			Type:             "reasoning",
+			Summary:          agentReasoningSummary(i.Data),
+			Content:          agentReasoningContent(i.Data),
+			EncryptedContent: agentReasoningEncryptedContent(i.Data),
+		})
+	case "image_generation_call":
+		return marshalAgentItemWithExecutedToolCalls(i, struct {
+			ID               string  `json:"id,omitempty"`
+			Type             string  `json:"type"`
+			Status           string  `json:"status"`
+			EncryptedContent *string `json:"encrypted_content,omitempty"`
+			RevisedPrompt    string  `json:"revised_prompt,omitempty"`
+			Result           string  `json:"result"`
+		}{
+			ID:               i.ID,
+			Type:             "image_generation_call",
+			Status:           firstAgentItemValue(i.Status, stringValueFromAgentItemMap(i.Data, "status")),
+			EncryptedContent: agentItemEncryptedContent(i.Data),
+			RevisedPrompt:    stringValueFromAgentItemMap(i.Data, "revised_prompt", "revisedPrompt"),
+			Result:           firstAgentItemValue(stringValueFromAgentItemMap(i.Data, "result"), i.Text),
+		})
+	case "", "agent_message":
+		phase := stringValueFromAgentItemMap(i.Data, "phase", "messagePhase", "message_phase")
+		return marshalAgentItemWithExecutedToolCalls(i, struct {
+			ID               string                       `json:"id,omitempty"`
+			Type             string                       `json:"type"`
+			Role             string                       `json:"role"`
+			Phase            string                       `json:"phase,omitempty"`
+			Status           string                       `json:"status,omitempty"`
+			EncryptedContent *string                      `json:"encrypted_content,omitempty"`
+			Content          []responsesAgentContentBlock `json:"content"`
+		}{
+			ID:               i.ID,
+			Type:             "message",
+			Role:             "assistant",
+			Phase:            phase,
+			Status:           firstAgentItemValue(i.Status, stringValueFromAgentItemMap(i.Data, "status")),
+			EncryptedContent: agentItemEncryptedContent(i.Data),
+			Content:          agentMessageContentBlocks(i),
+		})
+	default:
+		return marshalAgentItemWithExecutedToolCalls(i, struct {
+			ID   string `json:"id,omitempty"`
+			Type string `json:"type"`
+			Text string `json:"text,omitempty"`
+		}{ID: i.ID, Type: i.Type, Text: i.Text})
+	}
+}
+
+func cloneAgentStringSlicePtr(value *[]string) *[]string {
+	if value == nil {
+		return nil
+	}
+	cloned := append([]string{}, (*value)...)
+	return &cloned
+}
+
+func agentItemEncryptedContent(data map[string]any) *string {
+	for _, key := range []string{"encrypted_content", "encryptedContent"} {
+		if value, ok := data[key].(string); ok {
+			return &value
+		}
+	}
+	return nil
+}
+
+func agentMessageContentBlocks(item *AgentItem) []responsesAgentContentBlock {
+	if item != nil {
+		if blocks, ok := item.Data["outputContent"].([]responsesAgentContentBlock); ok {
+			return append([]responsesAgentContentBlock(nil), blocks...)
+		}
+		if raw, ok := item.Data["outputContent"]; ok {
+			switch values := raw.(type) {
+			case []any:
+				encoded, err := json.Marshal(values)
+				if err == nil {
+					var blocks []responsesAgentContentBlock
+					if json.Unmarshal(encoded, &blocks) == nil {
+						return blocks
+					}
+				}
+			}
+		}
+	}
+	text := ""
+	if item != nil {
+		text = item.Text
+	}
+	return []responsesAgentContentBlock{{Type: "output_text", Text: text}}
+}
+
+func marshalAgentItemWithExecutedToolCalls(item *AgentItem, value any) ([]byte, error) {
+	encoded, err := json.Marshal(value)
+	if err != nil || item == nil {
+		return encoded, err
+	}
+	// Rust #46081: a completeness marker always carries an explicit call list,
+	// using [] for an empty inventory.
+	if len(item.executedToolCalls) == 0 && item.cellID == "" && item.toolCallsComplete == nil {
+		return encoded, err
+	}
+	var object map[string]any
+	if err := json.Unmarshal(encoded, &object); err != nil {
+		return nil, err
+	}
+	calls := item.executedToolCalls
+	if calls == nil {
+		calls = []ExecutedToolCall{}
+	}
+	metadata := map[string]any{executedToolCallsField: calls}
+	if item.cellID != "" {
+		metadata["cell_id"] = item.cellID
+	}
+	if item.toolCallsComplete != nil {
+		metadata["tool_calls_complete"] = *item.toolCallsComplete
+	}
+	object[internalChatMessageMetadataPassthroughField] = metadata
+	return json.Marshal(object)
+}
+
+// SetExecutedToolCallCell associates the recorded tool calls with the Code
+// Mode cell shared across its exec and wait outputs (Rust #41058).
+func (i *AgentItem) SetExecutedToolCallCell(cellID string) {
+	if i != nil {
+		i.cellID = strings.TrimSpace(cellID)
+	}
+}
+
+// SetExecutedToolCallsComplete marks whether the host retained the cell's
+// complete ordered call inventory. Arguments may be truncated independently
+// (Rust #51892).
+func (i *AgentItem) SetExecutedToolCallsComplete(complete bool) {
+	if i != nil {
+		value := complete
+		i.toolCallsComplete = &value
+	}
+}
+
+// ClearExecutedToolCallsComplete discards a completion claim when the host
+// cannot retain the cell's full evidence (Rust's
+// `ResponseItem::clear_tool_calls_complete`).
+func (i *AgentItem) ClearExecutedToolCallsComplete() {
+	if i != nil {
+		i.toolCallsComplete = nil
+	}
+}
+
+type responsesReasoningSummary struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type responsesReasoningTextContent struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type AgentResponse struct {
+	ResponseID        string
+	Message           string
+	Items             []AgentItem
+	Usage             AgentUsage
+	Model             string
+	ProviderID        string
+	RequestID         string
+	ServerModel       string
+	TurnState         string
+	ModelsETag        string
+	Headers           map[string]string
+	RateLimits        []ResponsesRateLimitSnapshot
+	ReasoningIncluded *bool
+	TimingMetrics     map[string]any
+	// Preempted reports that the sampling request was interrupted by new user
+	// input before it produced a response (Rust #48141's
+	// `SamplingRequestResult { needs_follow_up: true }` for a signaled step). The
+	// turn continues with the queued input instead of treating the step as a
+	// failure.
+	Preempted bool
+}
+
+func AgentResponseMetadata(response *AgentResponse) map[string]any {
+	metadata := map[string]any{}
+	if response == nil {
+		return metadata
+	}
+	if strings.TrimSpace(response.Model) != "" {
+		metadata["model"] = response.Model
+	}
+	if strings.TrimSpace(response.ProviderID) != "" {
+		metadata["providerId"] = response.ProviderID
+		metadata["provider_id"] = response.ProviderID
+	}
+	if strings.TrimSpace(response.ResponseID) != "" {
+		metadata["responseId"] = response.ResponseID
+		metadata["response_id"] = response.ResponseID
+	}
+	if strings.TrimSpace(response.RequestID) != "" {
+		metadata["requestId"] = response.RequestID
+		metadata["request_id"] = response.RequestID
+	}
+	if strings.TrimSpace(response.ServerModel) != "" {
+		metadata["serverModel"] = response.ServerModel
+		metadata["server_model"] = response.ServerModel
+	}
+	if strings.TrimSpace(response.TurnState) != "" {
+		metadata["turnState"] = response.TurnState
+		metadata["turn_state"] = response.TurnState
+	}
+	if strings.TrimSpace(response.ModelsETag) != "" {
+		metadata["modelsETag"] = response.ModelsETag
+		metadata["models_etag"] = response.ModelsETag
+	}
+	if len(response.Headers) > 0 {
+		headers := cloneStringMap(response.Headers)
+		metadata["responseHeaders"] = headers
+		metadata["response_headers"] = cloneStringMap(headers)
+	}
+	if len(response.RateLimits) > 0 {
+		rateLimits := append([]ResponsesRateLimitSnapshot(nil), response.RateLimits...)
+		metadata["rateLimits"] = rateLimits
+		metadata["rate_limits"] = append([]ResponsesRateLimitSnapshot(nil), rateLimits...)
+	}
+	if response.ReasoningIncluded != nil {
+		metadata["reasoningIncluded"] = *response.ReasoningIncluded
+		metadata["reasoning_included"] = *response.ReasoningIncluded
+	}
+	if len(response.TimingMetrics) > 0 {
+		metadata["timingMetrics"] = cloneMapAny(response.TimingMetrics)
+		metadata["timing_metrics"] = cloneMapAny(response.TimingMetrics)
+	}
+	return metadata
+}
+
+type AgentRunner interface {
+	Run(ctx context.Context, request *AgentRequest) (*AgentResponse, error)
+}
+
+type UnavailableAgentRunner struct{ Err error }
+
+func (r *UnavailableAgentRunner) Run(ctx context.Context, request *AgentRequest) (*AgentResponse, error) {
+	if ctx != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if r != nil && r.Err != nil {
+		return nil, r.Err
+	}
+	return nil, errors.New("model-backed agent is unavailable")
+}
+
+type LocalAgentRunner struct{}
+
+func NewLocalAgentRunner() *LocalAgentRunner {
+	return &LocalAgentRunner{}
+}
+
+func (r *LocalAgentRunner) Run(ctx context.Context, request *AgentRequest) (*AgentResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if request == nil {
+		return nil, ErrInvalidAgentRequest
+	}
+	prompt := strings.TrimSpace(request.Prompt)
+	if prompt == "" {
+		return nil, errors.New("prompt is required")
+	}
+	message := LocalAgentMessage(prompt)
+	itemID := "agent-message-1"
+	responseID := "resp-local"
+	if request.TurnID != "" {
+		itemID = "agent-message-" + strings.TrimPrefix(request.TurnID, "turn-")
+		responseID = "resp-" + request.TurnID
+	}
+	inputTokens := estimateTokens(prompt)
+	outputTokens := estimateTokens(message)
+	return &AgentResponse{
+		ResponseID: responseID,
+		Message:    message,
+		Items: []AgentItem{{
+			ID:   itemID,
+			Type: "agent_message",
+			Text: message,
+		}},
+		Usage: AgentUsage{
+			InputTokens:  inputTokens,
+			OutputTokens: outputTokens,
+			TotalTokens:  inputTokens + outputTokens,
+		},
+		Model:      request.Model,
+		ProviderID: request.ProviderID,
+	}, nil
+}
+
+func AgentUsageTotalTokens(usage AgentUsage) int64 {
+	if usage.TotalTokens != 0 {
+		return usage.TotalTokens
+	}
+	return usage.InputTokens + usage.OutputTokens
+}
+
+func LocalAgentMessage(prompt string) string {
+	firstLine := strings.TrimSpace(prompt)
+	if idx := strings.IndexByte(firstLine, '\n'); idx >= 0 {
+		firstLine = strings.TrimSpace(firstLine[:idx])
+	}
+	if firstLine == "" {
+		firstLine = "prompt"
+	}
+	return "Go Codex exec stub received: " + firstLine
+}
+
+func estimateTokens(value string) int64 {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	return int64(len(strings.Fields(value)))
+}
+
+func firstAgentItemValue(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func optionalAgentItemString(value string) *string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+func stringValueFromAgentItemMap(values map[string]any, keys ...string) string {
+	if values == nil {
+		return ""
+	}
+	for _, key := range keys {
+		value, ok := values[key]
+		if !ok {
+			continue
+		}
+		switch typed := value.(type) {
+		case string:
+			if strings.TrimSpace(typed) != "" {
+				return strings.TrimSpace(typed)
+			}
+		}
+	}
+	return ""
+}
+
+func cloneAgentItemMap(values map[string]any) map[string]any {
+	if values == nil {
+		return nil
+	}
+	out := make(map[string]any, len(values))
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
+}
+
+func agentItemSearchArguments(item *AgentItem) map[string]any {
+	if item == nil {
+		return nil
+	}
+	if item.Search != nil {
+		return cloneAgentItemMap(item.Search)
+	}
+	if strings.TrimSpace(item.Arguments) == "" {
+		return nil
+	}
+	var out map[string]any
+	if err := json.Unmarshal([]byte(item.Arguments), &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+func agentReasoningSummary(data map[string]any) []responsesReasoningSummary {
+	values := agentStringSliceFromData(data, "summary")
+	out := make([]responsesReasoningSummary, 0, len(values))
+	for _, value := range values {
+		out = append(out, responsesReasoningSummary{Type: "summary_text", Text: value})
+	}
+	if out == nil {
+		return []responsesReasoningSummary{}
+	}
+	return out
+}
+
+func agentReasoningContent(data map[string]any) []responsesReasoningTextContent {
+	values := agentStringSliceFromData(data, "reasoningContent", "content")
+	out := make([]responsesReasoningTextContent, 0, len(values))
+	for _, value := range values {
+		out = append(out, responsesReasoningTextContent{Type: "reasoning_text", Text: value})
+	}
+	return out
+}
+
+func agentReasoningEncryptedContent(data map[string]any) *string {
+	for _, key := range []string{"encrypted_content", "encryptedContent"} {
+		if value, ok := data[key].(string); ok {
+			return &value
+		}
+	}
+	return nil
+}
+
+func agentStringSliceFromData(data map[string]any, keys ...string) []string {
+	for _, key := range keys {
+		value, ok := data[key]
+		if !ok {
+			continue
+		}
+		switch typed := value.(type) {
+		case []string:
+			return append([]string(nil), typed...)
+		case []any:
+			out := make([]string, 0, len(typed))
+			for _, item := range typed {
+				if text, ok := item.(string); ok {
+					out = append(out, text)
+				}
+			}
+			return out
+		case string:
+			if strings.TrimSpace(typed) != "" {
+				return []string{typed}
+			}
+		}
+	}
+	return nil
+}

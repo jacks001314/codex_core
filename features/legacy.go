@@ -1,0 +1,246 @@
+package features
+
+import (
+	"sort"
+	"strings"
+)
+
+type LegacyFeatureUsage struct {
+	Alias   string
+	Feature string
+}
+
+type LegacyFeatureNotice struct {
+	Summary string
+	Details string
+}
+
+var legacyFeatureAliases = map[string]string{
+	"connectors":                          "apps",
+	"enable_experimental_windows_sandbox": "experimental_windows_sandbox",
+	"experimental_use_unified_exec_tool":  "unified_exec",
+	"request_permissions":                 "exec_permission_approvals",
+	"web_search":                          "web_search_request",
+	"collab":                              "multi_agent",
+	"memory_tool":                         "memories",
+	"telepathy":                           "chronicle",
+	"codex_hooks":                         "hooks",
+	"imagegenext":                         "image_generation",
+}
+
+var ignoredFeatureKeys = map[string]bool{
+	"tui_app_server": true,
+	// Rust #54175 (features/src/lib.rs `apply_map`): the retired
+	// `worktrees` / `realtime_conversation` toggles are skipped alongside
+	// `tui_app_server`, so a config override cannot bring back either one.
+	"worktrees":                          true,
+	"realtime_conversation":              true,
+	"undo":                               true,
+	"js_repl":                            true,
+	"js_repl_tools_only":                 true,
+	"remote_control":                     true,
+	"apply_patch_freeform":               true,
+	"tool_search":                        true,
+	"tool_search_always_defer_mcp_tools": true,
+	"apps_mcp_path_override":             true,
+	"image_detail_original":              true,
+	"resize_all_images":                  true,
+	"item_ids":                           true,
+	"plugin_hooks":                       true,
+	// Rust apply_map skips the remote-compaction toggle; the beta header
+	// advertises the key unconditionally instead.
+	remoteCompactionV2Key:             true,
+	"skill_env_var_dependency_prompt": true,
+	"terminal_resize_reflow":          true,
+}
+
+// CanonicalKey returns the canonical feature key for a canonical key or accepted
+// legacy alias.
+func CanonicalKey(key string) (string, bool) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "", false
+	}
+	if _, ok := byKey()[key]; ok {
+		return key, true
+	}
+	canonical, ok := legacyFeatureAliases[key]
+	return canonical, ok
+}
+
+// RetiredRequirementKey reports whether a managed `features` requirement names
+// one of the retired compatibility flags whose availability no longer depends on
+// the feature system (Rust #54175). Such requirements are ignored with a
+// startup warning.
+func RetiredRequirementKey(key string) bool {
+	switch strings.TrimSpace(key) {
+	case "worktrees", "realtime_conversation":
+		return true
+	default:
+		return false
+	}
+}
+
+// RequirementKey mirrors Rust's canonical_feature_for_key / feature_for_key
+// lookup used when a managed `features` requirement table is parsed: it reports
+// the canonical key and whether the given key was a legacy alias. Unknown keys
+// report ok = false.
+func RequirementKey(key string) (canonical string, legacy bool, ok bool) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "", false, false
+	}
+	if _, ok := byKey()[key]; ok {
+		return key, false, true
+	}
+	canonical, ok = legacyFeatureAliases[key]
+	return canonical, true, ok
+}
+
+func ResolveSettings(raw map[string]any) (map[string]bool, []LegacyFeatureUsage) {
+	settings := map[string]bool{}
+	if len(raw) == 0 {
+		return settings, nil
+	}
+	usages := map[string]LegacyFeatureUsage{}
+	keys := make([]string, 0, len(raw))
+	for key := range raw {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		enabled, ok := featureEnabledValue(raw[key])
+		if !ok {
+			continue
+		}
+		if alias, canonical, ok := forcedLegacyUsageForKey(key); ok {
+			recordLegacyUsage(usages, alias, canonical)
+		}
+		if ignoredFeatureKeys[key] {
+			continue
+		}
+		canonical, ok := CanonicalKey(key)
+		if !ok {
+			continue
+		}
+		if key != canonical {
+			recordLegacyUsage(usages, key, canonical)
+			if rawCanonical, canonicalPresent := raw[canonical]; canonicalPresent {
+				if _, ok := featureEnabledValue(rawCanonical); ok {
+					continue
+				}
+			}
+		}
+		settings[canonical] = enabled
+	}
+	normalizeSettings(settings)
+	return settings, sortedLegacyUsages(usages)
+}
+
+func featureEnabledValue(value any) (bool, bool) {
+	switch typed := value.(type) {
+	case bool:
+		return typed, true
+	case map[string]any:
+		enabled, ok := typed["enabled"].(bool)
+		return enabled, ok
+	default:
+		return false, false
+	}
+}
+
+func forcedLegacyUsageForKey(key string) (string, string, bool) {
+	switch key {
+	case "web_search_request":
+		return "features.web_search_request", "web_search_request", true
+	case "web_search_cached":
+		return "features.web_search_cached", "web_search_cached", true
+	case "use_legacy_landlock":
+		return "features.use_legacy_landlock", "use_legacy_landlock", true
+	default:
+		return "", "", false
+	}
+}
+
+func recordLegacyUsage(usages map[string]LegacyFeatureUsage, alias string, canonical string) {
+	if alias == "" || canonical == "" {
+		return
+	}
+	key := alias + "\x00" + canonical
+	usages[key] = LegacyFeatureUsage{Alias: alias, Feature: canonical}
+}
+
+func sortedLegacyUsages(usages map[string]LegacyFeatureUsage) []LegacyFeatureUsage {
+	if len(usages) == 0 {
+		return nil
+	}
+	out := make([]LegacyFeatureUsage, 0, len(usages))
+	for _, usage := range usages {
+		out = append(out, usage)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Alias == out[j].Alias {
+			return out[i].Feature < out[j].Feature
+		}
+		return out[i].Alias < out[j].Alias
+	})
+	return out
+}
+
+func NoticeForLegacyFeatureUsage(usage LegacyFeatureUsage) LegacyFeatureNotice {
+	alias := strings.TrimSpace(usage.Alias)
+	canonical := strings.TrimSpace(usage.Feature)
+	switch canonical {
+	case "web_search_request", "web_search_cached":
+		label := alias
+		switch alias {
+		case "web_search":
+			label = "[features].web_search"
+		case "features.web_search_request", "web_search_request":
+			label = "[features].web_search_request"
+		case "features.web_search_cached", "web_search_cached":
+			label = "[features].web_search_cached"
+		}
+		return LegacyFeatureNotice{
+			Summary: "`" + label + "` is deprecated because web search is enabled by default.",
+			Details: "Set `web_search` to `\"live\"`, `\"indexed\"`, `\"cached\"`, or `\"disabled\"` at the top level (or under a profile) in config.toml if you want to override it.",
+		}
+	case "use_legacy_landlock":
+		label := alias
+		if alias == "features.use_legacy_landlock" || alias == "use_legacy_landlock" {
+			label = "[features].use_legacy_landlock"
+		}
+		return LegacyFeatureNotice{
+			Summary: "`" + label + "` is deprecated and will be removed soon.",
+			Details: "Remove this setting to stop opting into the legacy Linux sandbox behavior.",
+		}
+	default:
+		label := alias
+		if !strings.Contains(alias, ".") && !strings.HasPrefix(alias, "[") {
+			label = "[features]." + alias
+		}
+		notice := LegacyFeatureNotice{
+			Summary: "`" + label + "` is deprecated. Use `[features]." + canonical + "` instead.",
+		}
+		if alias != canonical {
+			notice.Details = "Enable it with `--enable " + canonical + "` or `[features]." + canonical + "` in config.toml. See https://developers.openai.com/codex/config-basic#feature-flags for details."
+		}
+		return notice
+	}
+}
+
+func (n LegacyFeatureNotice) Message() string {
+	if strings.TrimSpace(n.Details) == "" {
+		return n.Summary
+	}
+	return n.Summary + " (" + n.Details + ")"
+}
+
+func normalizeSettings(settings map[string]bool) {
+	if settings["enable_fanout"] {
+		settings["multi_agent"] = true
+	}
+	if settings["code_mode_only"] {
+		settings["code_mode"] = true
+	}
+}

@@ -1,0 +1,198 @@
+package tool
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"codex_core/sandbox"
+)
+
+const RequestPermissionsToolName = "request_permissions"
+
+// Rust #50962: request_permissions requires a usable primary environment and
+// reports this legacy message while `stable_environment_tools` is off.
+const requestPermissionsUnavailableMessage = "request_permissions requires a primary environment"
+
+// RequestPermissionsDecision is the Guardian-reviewed outcome for a
+// request_permissions call (Rust #38701).
+type RequestPermissionsDecision struct {
+	Approved bool
+	Reason   string
+	// Permissions is the host-approved subset of the requested profile.
+	Permissions *sandbox.AdditionalPermissionProfile
+	// Scope is "turn" or "session"; an empty value is treated as turn-scoped.
+	Scope            string
+	StrictAutoReview bool
+}
+
+// RequestPermissionsReviewer reviews a request_permissions call through the
+// shared Guardian approval path. environmentID is the call's own environment
+// when it named one (Rust `RequestPermissionsEnvironmentArgs::environment_id`).
+type RequestPermissionsReviewer func(ctx context.Context, threadID, turnID, callID, environmentID, reason string, permissions map[string]any) (RequestPermissionsDecision, error)
+
+// RequestPermissionsExecutor implements the request_permissions tool: the
+// requested permission profile is routed through the shared Guardian approval
+// path and the resulting decision drives the tool output.
+type RequestPermissionsExecutor struct {
+	Reviewer RequestPermissionsReviewer
+	// EnvironmentCheck carries the turn readiness facts (Rust #50962) so the
+	// call resolves the selected environment before review.
+	EnvironmentCheck *UnifiedExecEnvironmentCheck
+	// EnvironmentFileSystems resolves the turn's usable executors so the call
+	// targets a real selected environment (Rust #20647 `78421face0`: the review
+	// records `turn_environment.selection()`), not just a readiness count.
+	EnvironmentFileSystems EnvironmentFileSystemProvider
+}
+
+func (e *RequestPermissionsExecutor) Spec() Spec {
+	return Spec{
+		Name:        PlainName(RequestPermissionsToolName),
+		Description: "Request additional filesystem or network permissions from the user and wait for the client to grant a subset of the requested permission profile. Use environment_id to target a specific attached environment; omit it to use the primary environment. Relative filesystem paths resolve against the selected environment cwd. Granted permissions apply automatically to later shell-like commands in the current turn, or for the rest of the session if the client approves them at session scope.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"reason": map[string]any{"type": "string", "description": "Why the additional permissions are needed."},
+				"environment_id": map[string]any{
+					"type":        "string",
+					"description": "Environment id from <environment_context>. Omit to use the primary environment.",
+				},
+				"permissions": map[string]any{
+					"type":        "object",
+					"description": "Requested permission profile (fileSystem/network).",
+				},
+			},
+			"required": []string{"permissions"},
+		},
+	}
+}
+
+func (e *RequestPermissionsExecutor) Execute(ctx context.Context, invocation *Invocation) (*Output, error) {
+	if invocation == nil || invocation.Payload.Kind != PayloadFunction {
+		return nil, RespondToModel("request_permissions received an unsupported payload")
+	}
+	if e == nil || e.Reviewer == nil {
+		return nil, RespondToModel("request_permissions review is not configured")
+	}
+	var args struct {
+		Reason             string         `json:"reason"`
+		EnvironmentID      *string        `json:"environment_id"`
+		EnvironmentIDCamel *string        `json:"environmentId"`
+		Permissions        map[string]any `json:"permissions"`
+	}
+	if err := invocation.DecodeArguments(&args); err != nil {
+		return nil, RespondToModel("request_permissions arguments are invalid: " + err.Error())
+	}
+	// Rust #20647/#25858: resolve the call's environment against the turn's real
+	// executors (`turn_environments()` is ready-only), then hand the resolved
+	// environment's id to the review path
+	// (`session.request_permissions_for_environment(selection)`).
+	resolvedEnvironmentID, err := resolveToolEnvironmentID(e.EnvironmentCheck, e.EnvironmentFileSystems, requestPermissionsEnvironmentID(args), requestPermissionsUnavailableMessage)
+	if err != nil {
+		return nil, RespondToModel(err.Error())
+	}
+	if len(args.Permissions) == 0 {
+		return nil, RespondToModel("request_permissions requires a permissions object")
+	}
+	threadID := strings.TrimSpace(invocationContextString(invocation, "thread_id"))
+	turnID := strings.TrimSpace(invocationContextString(invocation, "turn_id"))
+	decision, err := e.Reviewer(ctx, threadID, turnID, invocation.CallID, resolvedEnvironmentID, strings.TrimSpace(args.Reason), cloneRequestPermissions(args.Permissions))
+	if err != nil {
+		return nil, err
+	}
+	if !decision.Approved {
+		reason := strings.TrimSpace(decision.Reason)
+		if reason == "" {
+			reason = "The requested permissions were denied by review."
+		}
+		return nil, RespondToModel(reason)
+	}
+	granted := decision.Permissions
+	if granted == nil {
+		encoded, err := json.Marshal(args.Permissions)
+		if err != nil {
+			return nil, RespondToModel("request_permissions response could not be encoded")
+		}
+		var fallback sandbox.AdditionalPermissionProfile
+		if err := json.Unmarshal(encoded, &fallback); err != nil {
+			return nil, RespondToModel("request_permissions response could not be decoded")
+		}
+		granted = &fallback
+	}
+	scope := strings.TrimSpace(decision.Scope)
+	if scope == "" {
+		scope = "turn"
+	}
+	response := map[string]any{
+		"permissions":      granted,
+		"scope":            scope,
+		"strictAutoReview": decision.StrictAutoReview,
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		return nil, RespondToModel("request_permissions response could not be encoded")
+	}
+	return &Output{Success: true, Body: string(encoded), Data: response}, nil
+}
+
+// requestPermissionsEnvironmentID reads the call's own environment selector, which is
+// an advisory id until ResolveToolEnvironment validates it (Rust
+// `RequestPermissionsEnvironmentArgs::environment_id`).
+func requestPermissionsEnvironmentID(args struct {
+	Reason             string         `json:"reason"`
+	EnvironmentID      *string        `json:"environment_id"`
+	EnvironmentIDCamel *string        `json:"environmentId"`
+	Permissions        map[string]any `json:"permissions"`
+}) string {
+	if args.EnvironmentID != nil {
+		return strings.TrimSpace(*args.EnvironmentID)
+	}
+	if args.EnvironmentIDCamel != nil {
+		return strings.TrimSpace(*args.EnvironmentIDCamel)
+	}
+	return ""
+}
+
+func invocationContextString(invocation *Invocation, key string) string {
+	if invocation == nil || invocation.Context == nil {
+		return ""
+	}
+	value, _ := invocation.Context[key].(string)
+	return value
+}
+
+func cloneRequestPermissions(values map[string]any) map[string]any {
+	out := make(map[string]any, len(values))
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
+}
+
+var _ Executor = (*RequestPermissionsExecutor)(nil)
+
+// RegisterRequestPermissionsTool registers the request_permissions executor
+// with the given reviewer, replacing any previous registration.
+func RegisterRequestPermissionsTool(registry *Registry, reviewer RequestPermissionsReviewer) error {
+	return RegisterRequestPermissionsToolWithOptions(registry, reviewer, nil)
+}
+
+// RegisterRequestPermissionsToolWithOptions registers request_permissions with
+// the turn readiness facts so an explicit environment_id is resolved through
+// ResolveToolEnvironment (Rust #50962).
+func RegisterRequestPermissionsToolWithOptions(registry *Registry, reviewer RequestPermissionsReviewer, environmentCheck *UnifiedExecEnvironmentCheck) error {
+	return RegisterRequestPermissionsToolWithFileSystems(registry, reviewer, environmentCheck, nil)
+}
+
+// RegisterRequestPermissionsToolWithFileSystems registers request_permissions
+// with the turn's environment filesystems, so an explicit selector or the
+// implicit primary resolves against the turn's usable executors (Rust #20647
+// `78421face0`; Rust #25858 `e29071e4c9` adds the environment id to
+// request_permissions).
+func RegisterRequestPermissionsToolWithFileSystems(registry *Registry, reviewer RequestPermissionsReviewer, environmentCheck *UnifiedExecEnvironmentCheck, environmentFileSystems EnvironmentFileSystemProvider) error {
+	if registry == nil {
+		return fmt.Errorf("registry is nil")
+	}
+	return registry.Register(&RequestPermissionsExecutor{Reviewer: reviewer, EnvironmentCheck: environmentCheck, EnvironmentFileSystems: environmentFileSystems})
+}

@@ -1,0 +1,769 @@
+package mcp
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"math/rand"
+
+	"codex_core/utils"
+
+	"github.com/google/uuid"
+)
+
+const (
+	DefaultOpenAIFileUploadLimitBytes int64 = 512 * 1024 * 1024
+	defaultOpenAIFileBaseURL                = "https://chatgpt.com/backend-api"
+	defaultOpenAIFileRequestTimeout         = 60 * time.Second
+	// Rust #47122/#47393: the blob PUT gets its own 5-minute allowance, retried
+	// within a single deadline across attempts.
+	defaultOpenAIFileBlobUploadTimeout        = 5 * time.Minute
+	maxOpenAIFileBlobUploadAttempts           = 5
+	openAIFileBlobRetryBaseDelay              = 125 * time.Millisecond
+	defaultOpenAIFileFinalizeTimeout          = 30 * time.Second
+	defaultOpenAIFileFinalizeRetryDelay       = 250 * time.Millisecond
+	maxOpenAIFileResponseBytes          int64 = 1024 * 1024
+)
+
+type OpenAIFileHTTPDoer interface {
+	Do(*http.Request) (*http.Response, error)
+}
+
+type OpenAIFileAuth struct {
+	ChatGPTBackend bool
+	BaseURL        string
+	Headers        http.Header
+	ApplyRequest   func(*http.Request, []byte) error
+}
+
+func OpenAIFileAuthFromRuntimeAuth(runtimeAuth *RuntimeAuth, baseURL string) *OpenAIFileAuth {
+	if runtimeAuth == nil || !runtimeAuth.UsesCodexBackend {
+		return nil
+	}
+	headers := http.Header{}
+	if runtimeAuth.ApplyHTTPRequest == nil {
+		for name, value := range runtimeAuth.HTTPHeaders {
+			if strings.TrimSpace(name) != "" {
+				headers.Set(name, value)
+			}
+		}
+	}
+	return &OpenAIFileAuth{
+		ChatGPTBackend: true,
+		BaseURL:        strings.TrimSpace(baseURL),
+		Headers:        headers,
+		ApplyRequest:   runtimeAuth.ApplyHTTPRequest,
+	}
+}
+
+type OpenAIUploadedFile struct {
+	DownloadURL   string `json:"download_url,omitempty"`
+	FileID        string `json:"file_id"`
+	MimeType      string `json:"mime_type,omitempty"`
+	FileName      string `json:"file_name"`
+	URI           string `json:"uri,omitempty"`
+	FileSizeBytes int64  `json:"file_size_bytes"`
+}
+
+type OpenAIFileUploadRequest struct {
+	Path          string
+	FileName      string
+	FileSizeBytes int64
+	Open          func(context.Context) (io.ReadCloser, error)
+	// HostedContext carries the hosted-app connector/action/model identity for
+	// Codex Apps tool calls. When set, the file creation request includes
+	// codex_connector_id/codex_action_name/codex_model (Rust #38101).
+	HostedContext *HostedFileUploadContext
+}
+
+// HostedFileUploadContext mirrors Rust codex_api::HostedFileUploadContext: the
+// hosted-app context attached to OpenAI file uploads made from Codex Apps MCP
+// tool calls.
+type HostedFileUploadContext struct {
+	ConnectorID string
+	ActionName  string
+	Model       string
+}
+
+type OpenAIFileUploader interface {
+	UploadOpenAIFile(ctx context.Context, request OpenAIFileUploadRequest) (*OpenAIUploadedFile, error)
+}
+
+type OpenAIFileMetadata struct {
+	IsFile bool
+	Size   int64
+}
+
+type OpenAIFileSystem interface {
+	Metadata(ctx context.Context, pathURI string) (*OpenAIFileMetadata, error)
+	Open(ctx context.Context, pathURI string) (io.ReadCloser, error)
+}
+
+type localOpenAIFileSystem struct{}
+
+func (localOpenAIFileSystem) Metadata(_ context.Context, pathURI string) (*OpenAIFileMetadata, error) {
+	path, err := openAIFileHostPath(pathURI)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	return &OpenAIFileMetadata{IsFile: info.Mode().IsRegular(), Size: info.Size()}, nil
+}
+
+func (localOpenAIFileSystem) Open(_ context.Context, pathURI string) (io.ReadCloser, error) {
+	path, err := openAIFileHostPath(pathURI)
+	if err != nil {
+		return nil, err
+	}
+	return os.Open(path)
+}
+
+func openAIFileHostPath(pathURI string) (string, error) {
+	parsed, err := utils.Parse(pathURI)
+	if err != nil {
+		return "", err
+	}
+	return parsed.HostNativePath()
+}
+
+type LocalOpenAIFileUploader struct {
+	BaseURL        string
+	Auth           *OpenAIFileAuth
+	HTTPClient     OpenAIFileHTTPDoer
+	RequestTimeout time.Duration
+	// BlobUploadTimeout bounds the whole blob upload, retries and backoff
+	// included (Rust OPENAI_FILE_BLOB_UPLOAD_TIMEOUT).
+	BlobUploadTimeout time.Duration
+	FinalizeTimeout   time.Duration
+	FinalizeInterval  time.Duration
+}
+
+func (u *LocalOpenAIFileUploader) UploadOpenAIFile(ctx context.Context, request OpenAIFileUploadRequest) (*OpenAIUploadedFile, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if u == nil || u.Auth == nil || !u.Auth.ChatGPTBackend {
+		return nil, fmt.Errorf("ChatGPT auth is required to upload files for Codex Apps tools")
+	}
+	if request.FileSizeBytes > DefaultOpenAIFileUploadLimitBytes {
+		return nil, fmt.Errorf("file `%s` is too large: %d bytes exceeds the limit of %d bytes", request.FileName, request.FileSizeBytes, DefaultOpenAIFileUploadLimitBytes)
+	}
+	baseURL := strings.TrimRight(firstNonEmptyMCP(strings.TrimSpace(u.BaseURL), strings.TrimSpace(u.Auth.BaseURL), defaultOpenAIFileBaseURL), "/")
+	createURL := baseURL + "/files"
+	createBody := map[string]any{
+		"file_name": request.FileName,
+		"file_size": request.FileSizeBytes,
+		"use_case":  "codex",
+	}
+	if request.HostedContext != nil {
+		createBody["codex_connector_id"] = request.HostedContext.ConnectorID
+		createBody["codex_action_name"] = request.HostedContext.ActionName
+		createBody["codex_model"] = request.HostedContext.Model
+	}
+	var created struct {
+		FileID             string `json:"file_id"`
+		UploadURL          string `json:"upload_url"`
+		PDFC2PAReservation bool   `json:"pdf_c2pa_reservation"`
+	}
+	if err := u.authorizedJSON(ctx, http.MethodPost, createURL, createBody, &created); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(created.FileID) == "" || strings.TrimSpace(created.UploadURL) == "" {
+		return nil, fmt.Errorf("failed to decode OpenAI file response from %s: missing file_id or upload_url", createURL)
+	}
+
+	if err := u.uploadBlob(ctx, created.UploadURL, request); err != nil {
+		return nil, err
+	}
+
+	finalizeURL := baseURL + "/files/" + url.PathEscape(created.FileID) + "/uploaded"
+	deadline := time.Now().Add(u.finalizeTimeout())
+	// Rust #39807: when the server reserves a PDF C2PA create, the original
+	// creation payload is echoed back on finalization; older servers expect an
+	// empty payload.
+	finalizePayload := map[string]any{}
+	if created.PDFC2PAReservation {
+		finalizePayload["pdf_c2pa_create_request"] = createBody
+	}
+	for {
+		var finalized struct {
+			Status       string `json:"status"`
+			DownloadURL  string `json:"download_url"`
+			FileName     string `json:"file_name"`
+			MimeType     string `json:"mime_type"`
+			ErrorMessage string `json:"error_message"`
+			// file_size_bytes is optional for older servers; fall back to the
+			// local size when absent (Rust #38101).
+			FileSizeBytes *int64 `json:"file_size_bytes"`
+		}
+		if err := u.authorizedJSON(ctx, http.MethodPost, finalizeURL, finalizePayload, &finalized); err != nil {
+			return nil, err
+		}
+		switch finalized.Status {
+		case "success":
+			if strings.TrimSpace(finalized.DownloadURL) == "" {
+				return nil, fmt.Errorf("OpenAI file upload failed for %s: missing download_url", created.FileID)
+			}
+			fileName := strings.TrimSpace(finalized.FileName)
+			if fileName == "" {
+				fileName = request.FileName
+			}
+			fileSizeBytes := request.FileSizeBytes
+			if finalized.FileSizeBytes != nil {
+				fileSizeBytes = *finalized.FileSizeBytes
+			}
+			return &OpenAIUploadedFile{
+				DownloadURL:   finalized.DownloadURL,
+				FileID:        created.FileID,
+				MimeType:      finalized.MimeType,
+				FileName:      fileName,
+				URI:           "sediment://" + created.FileID,
+				FileSizeBytes: fileSizeBytes,
+			}, nil
+		case "retry":
+			if !time.Now().Before(deadline) {
+				return nil, fmt.Errorf("OpenAI file upload is not ready for %s", created.FileID)
+			}
+			timer := time.NewTimer(u.finalizeInterval())
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
+		default:
+			message := strings.TrimSpace(finalized.ErrorMessage)
+			if message == "" {
+				message = "upload finalization returned an error"
+			}
+			return nil, fmt.Errorf("OpenAI file upload failed for %s: %s", created.FileID, message)
+		}
+	}
+}
+
+func (u *LocalOpenAIFileUploader) authorizedJSON(ctx context.Context, method string, endpoint string, payload any, out any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to encode OpenAI file request for %s: %w", endpoint, err)
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, u.requestTimeout())
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestCtx, method, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to build OpenAI file request for %s: %w", endpoint, err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	for name, values := range u.Auth.Headers {
+		for _, value := range values {
+			request.Header.Add(name, value)
+		}
+	}
+	if u.Auth.ApplyRequest != nil {
+		if err := u.Auth.ApplyRequest(request, body); err != nil {
+			return fmt.Errorf("failed to authorize OpenAI file request for %s: %w", endpoint, err)
+		}
+	}
+	response, err := u.httpClient().Do(request)
+	if err != nil {
+		return fmt.Errorf("OpenAI file request to %s failed: %w", endpoint, err)
+	}
+	defer response.Body.Close()
+	responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, maxOpenAIFileResponseBytes))
+	if readErr != nil {
+		return fmt.Errorf("failed to read OpenAI file response from %s: %w", endpoint, readErr)
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("OpenAI file request to %s failed with status %s: %s", endpoint, response.Status, strings.TrimSpace(string(responseBody)))
+	}
+	if err := json.Unmarshal(responseBody, out); err != nil {
+		return fmt.Errorf("failed to decode OpenAI file response from %s: %w", endpoint, err)
+	}
+	return nil
+}
+
+func (u *LocalOpenAIFileUploader) uploadBlob(ctx context.Context, uploadURL string, request OpenAIFileUploadRequest) error {
+	host := openAIFileUploadHost(uploadURL)
+	started := time.Now()
+	// Rust #47393/#47926: opening the stream, every attempt, and the backoff
+	// share one deadline, and each attempt uses a fresh client request ID. The
+	// transient gateway statuses (502/503/504) and transport failures recover
+	// on retry; other failures are terminal.
+	deadline := started.Add(u.blobUploadTimeout())
+	var lastErr error
+	for attempt := uint64(1); attempt <= maxOpenAIFileBlobUploadAttempts; attempt++ {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			if lastErr != nil {
+				return lastErr
+			}
+			return fmt.Errorf("OpenAI file blob upload failed after %dms (timeout, host=%s)", time.Since(started).Milliseconds(), host)
+		}
+		requestID := uuid.NewString()
+		attemptErr, retryable, serverDelay, hasServerDelay := u.uploadBlobAttempt(ctx, uploadURL, request, requestID, host, started, deadline)
+		if attemptErr == nil {
+			return nil
+		}
+		lastErr = attemptErr
+		delay := serverDelay
+		if !hasServerDelay {
+			delay = openAIFileBlobBackoff(openAIFileBlobRetryBaseDelay, attempt)
+		}
+		if !retryable || attempt >= maxOpenAIFileBlobUploadAttempts || delay >= time.Until(deadline) {
+			return attemptErr
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		}
+	}
+	return lastErr
+}
+
+// uploadBlobAttempt performs one blob PUT and reports whether it is retryable
+// together with any server-advised retry delay.
+func (u *LocalOpenAIFileUploader) uploadBlobAttempt(
+	ctx context.Context,
+	uploadURL string,
+	request OpenAIFileUploadRequest,
+	requestID string,
+	host string,
+	started time.Time,
+	deadline time.Time,
+) (error, bool, time.Duration, bool) {
+	attemptCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	var contents io.ReadCloser
+	var err error
+	if request.Open != nil {
+		contents, err = request.Open(attemptCtx)
+	} else {
+		contents, err = os.Open(request.Path)
+	}
+	if err != nil {
+		// A read failure cannot recover by retrying the same request (Rust's
+		// `_ => (false, "read")` arm).
+		return fmt.Errorf("OpenAI file blob upload failed after %dms (read, host=%s, azure_client_request_id=%s)", time.Since(started).Milliseconds(), host, requestID), false, 0, false
+	}
+	defer contents.Close()
+	uploadRequest, err := http.NewRequestWithContext(attemptCtx, http.MethodPut, uploadURL, contents)
+	if err != nil {
+		return fmt.Errorf("OpenAI file blob upload failed after %dms (request, host=%s, azure_client_request_id=%s)", time.Since(started).Milliseconds(), host, requestID), false, 0, false
+	}
+	uploadRequest.ContentLength = request.FileSizeBytes
+	uploadRequest.Header.Set("Content-Length", fmt.Sprintf("%d", request.FileSizeBytes))
+	uploadRequest.Header.Set("x-ms-blob-type", "BlockBlob")
+	uploadRequest.Header.Set("x-ms-client-request-id", requestID)
+	response, err := u.httpClient().Do(uploadRequest)
+	if err != nil {
+		kind := openAIFileUploadErrorKind(err)
+		retryable := kind != "other" && ctx.Err() == nil
+		return fmt.Errorf("OpenAI file blob upload failed after %dms (%s, host=%s, azure_client_request_id=%s)", time.Since(started).Milliseconds(), kind, host, requestID), retryable, 0, false
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		statusErr := fmt.Errorf(
+			"OpenAI file blob upload to %s failed with status %d (azure_client_request_id=%s, azure_request_id=%s, azure_error_code=%s)",
+			host,
+			response.StatusCode,
+			requestID,
+			openAIFileResponseHeader(response, "x-ms-request-id"),
+			openAIFileResponseHeader(response, "x-ms-error-code"),
+		)
+		switch response.StatusCode {
+		case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			delay, ok := openAIFileBlobRetryAfter(response.Header)
+			return statusErr, true, delay, ok
+		default:
+			// 403/409/500 and every other status stay terminal (Rust #47926).
+			return statusErr, false, 0, false
+		}
+	}
+	return nil, false, 0, false
+}
+
+// openAIFileBlobRetryAfter mirrors Rust's blob_retry_after: the Azure
+// millisecond hint wins, then the standard Retry-After seconds value.
+func openAIFileBlobRetryAfter(headers http.Header) (time.Duration, bool) {
+	if headers == nil {
+		return 0, false
+	}
+	if raw := strings.TrimSpace(headers.Get("x-ms-retry-after-ms")); raw != "" {
+		if milliseconds, err := strconv.ParseInt(raw, 10, 64); err == nil && milliseconds >= 0 {
+			return time.Duration(milliseconds) * time.Millisecond, true
+		}
+	}
+	if raw := strings.TrimSpace(headers.Get("Retry-After")); raw != "" {
+		if seconds, err := strconv.ParseInt(raw, 10, 64); err == nil && seconds >= 0 {
+			return time.Duration(seconds) * time.Second, true
+		}
+	}
+	return 0, false
+}
+
+// openAIFileBlobBackoff mirrors Rust's codex_client::backoff: base * 2^(attempt-1)
+// with a 0.9..1.1 jitter.
+func openAIFileBlobBackoff(base time.Duration, attempt uint64) time.Duration {
+	if attempt == 0 {
+		return base
+	}
+	raw := float64(base.Milliseconds()) * float64(uint64(1)<<(attempt-1))
+	return time.Duration(raw * (0.9 + rand.Float64()*0.2) * float64(time.Millisecond))
+}
+
+func (u *LocalOpenAIFileUploader) httpClient() OpenAIFileHTTPDoer {
+	if u != nil && u.HTTPClient != nil {
+		return u.HTTPClient
+	}
+	return http.DefaultClient
+}
+
+func (u *LocalOpenAIFileUploader) requestTimeout() time.Duration {
+	if u != nil && u.RequestTimeout > 0 {
+		return u.RequestTimeout
+	}
+	return defaultOpenAIFileRequestTimeout
+}
+
+// blobUploadTimeout is the whole blob-upload deadline shared by every attempt
+// (Rust OPENAI_FILE_BLOB_UPLOAD_TIMEOUT, #47122).
+func (u *LocalOpenAIFileUploader) blobUploadTimeout() time.Duration {
+	if u != nil && u.BlobUploadTimeout > 0 {
+		return u.BlobUploadTimeout
+	}
+	return defaultOpenAIFileBlobUploadTimeout
+}
+
+func (u *LocalOpenAIFileUploader) finalizeTimeout() time.Duration {
+	if u != nil && u.FinalizeTimeout > 0 {
+		return u.FinalizeTimeout
+	}
+	return defaultOpenAIFileFinalizeTimeout
+}
+
+func (u *LocalOpenAIFileUploader) finalizeInterval() time.Duration {
+	if u != nil && u.FinalizeInterval > 0 {
+		return u.FinalizeInterval
+	}
+	return defaultOpenAIFileFinalizeRetryDelay
+}
+
+func openAIFileUploadHost(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err == nil && strings.TrimSpace(parsed.Hostname()) != "" {
+		return parsed.Hostname()
+	}
+	return "unknown-host"
+}
+
+func openAIFileUploadErrorKind(err error) string {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return "connect"
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return "request"
+	}
+	return "other"
+}
+
+func openAIFileResponseHeader(response *http.Response, name string) string {
+	if response != nil {
+		if value := strings.TrimSpace(response.Header.Get(name)); value != "" {
+			return value
+		}
+	}
+	return "missing"
+}
+
+type OpenAIFileRewriterOptions struct {
+	CWD              string
+	Auth             *OpenAIFileAuth
+	Uploader         OpenAIFileUploader
+	FileSystem       OpenAIFileSystem
+	HTTPClient       OpenAIFileHTTPDoer
+	UploadLimitBytes int64
+	ReadPolicy       func(pathURI string) error
+	GrantedReadPaths []string
+}
+
+type OpenAIFileRewriter struct {
+	CWD              string
+	Auth             *OpenAIFileAuth
+	Uploader         OpenAIFileUploader
+	FileSystem       OpenAIFileSystem
+	UploadLimitBytes int64
+	ReadPolicy       func(pathURI string) error
+	GrantedReadPaths []string
+}
+
+func NewOpenAIFileRewriter(cwd string, auth *OpenAIFileAuth, uploader OpenAIFileUploader) *OpenAIFileRewriter {
+	return NewOpenAIFileRewriterWithOptions(OpenAIFileRewriterOptions{CWD: cwd, Auth: auth, Uploader: uploader})
+}
+
+func NewOpenAIFileRewriterWithOptions(options OpenAIFileRewriterOptions) *OpenAIFileRewriter {
+	uploader := options.Uploader
+	if uploader == nil {
+		uploader = &LocalOpenAIFileUploader{Auth: options.Auth, HTTPClient: options.HTTPClient}
+	}
+	limit := options.UploadLimitBytes
+	if limit <= 0 {
+		limit = DefaultOpenAIFileUploadLimitBytes
+	}
+	return &OpenAIFileRewriter{
+		CWD:              options.CWD,
+		Auth:             options.Auth,
+		Uploader:         uploader,
+		FileSystem:       options.FileSystem,
+		UploadLimitBytes: limit,
+		ReadPolicy:       options.ReadPolicy,
+		GrantedReadPaths: append([]string(nil), options.GrantedReadPaths...),
+	}
+}
+
+func (r *OpenAIFileRewriter) RewriteArguments(ctx context.Context, arguments any, openAIFileInputParams []string) (any, error) {
+	optionalFields := make(map[string][]string, len(openAIFileInputParams))
+	for _, fieldName := range openAIFileInputParams {
+		if strings.TrimSpace(fieldName) != "" {
+			optionalFields[fieldName] = nil
+		}
+	}
+	return r.RewriteArgumentsWithOptionalFields(ctx, arguments, optionalFields, nil)
+}
+
+func (r *OpenAIFileRewriter) RewriteArgumentsWithOptionalFields(ctx context.Context, arguments any, openAIFileInputOptionalFields map[string][]string, hosted *HostedFileUploadContext) (any, error) {
+	if len(openAIFileInputOptionalFields) == 0 || arguments == nil {
+		return arguments, nil
+	}
+	object, ok := arguments.(map[string]any)
+	if !ok {
+		return arguments, nil
+	}
+	rewritten := cloneOpenAIFileMap(object)
+	changed := false
+	for fieldName, optionalFields := range openAIFileInputOptionalFields {
+		value, exists := object[fieldName]
+		if !exists {
+			continue
+		}
+		uploaded, ok, err := r.rewriteValue(ctx, fieldName, value, optionalFields, hosted)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			rewritten[fieldName] = uploaded
+			changed = true
+		}
+	}
+	if !changed {
+		return arguments, nil
+	}
+	return rewritten, nil
+}
+
+func (r *OpenAIFileRewriter) rewriteValue(ctx context.Context, fieldName string, value any, optionalFields []string, hosted *HostedFileUploadContext) (any, bool, error) {
+	switch typed := value.(type) {
+	case string:
+		uploaded, err := r.buildUploadedValue(ctx, fieldName, -1, typed, optionalFields, hosted)
+		return uploaded, true, err
+	case []string:
+		values := make([]any, 0, len(typed))
+		for index, item := range typed {
+			uploaded, err := r.buildUploadedValue(ctx, fieldName, index, item, optionalFields, hosted)
+			if err != nil {
+				return nil, false, err
+			}
+			values = append(values, uploaded)
+		}
+		return values, true, nil
+	case []any:
+		values := make([]any, 0, len(typed))
+		for index, item := range typed {
+			filePath, ok := item.(string)
+			if !ok {
+				return nil, false, nil
+			}
+			uploaded, err := r.buildUploadedValue(ctx, fieldName, index, filePath, optionalFields, hosted)
+			if err != nil {
+				return nil, false, err
+			}
+			values = append(values, uploaded)
+		}
+		return values, true, nil
+	default:
+		return nil, false, nil
+	}
+}
+
+func (r *OpenAIFileRewriter) buildUploadedValue(ctx context.Context, fieldName string, index int, filePath string, optionalFields []string, hosted *HostedFileUploadContext) (map[string]any, error) {
+	if r == nil {
+		return nil, fmt.Errorf("failed to upload `%s` for `%s`: rewriter is nil", filePath, fieldName)
+	}
+	if r.Auth == nil || !r.Auth.ChatGPTBackend {
+		return nil, fmt.Errorf("ChatGPT auth is required to upload files for Codex Apps tools")
+	}
+	cwd := strings.TrimSpace(r.CWD)
+	if cwd == "" {
+		return nil, r.contextualize(fieldName, index, filePath, "no primary turn environment is available")
+	}
+	cwdURI, err := openAIFileDirectoryURI(cwd)
+	if err != nil {
+		return nil, r.contextualize(fieldName, index, filePath, err.Error())
+	}
+	resolved, err := cwdURI.Join(filePath)
+	if err != nil {
+		return nil, r.contextualize(fieldName, index, filePath, err.Error())
+	}
+	displayPath := resolved.NativePathString()
+	if r.ReadPolicy != nil {
+		if err := r.ReadPolicy(displayPath); err != nil && !r.grantedReadPath(displayPath) {
+			return nil, r.contextualize(fieldName, index, filePath, err.Error())
+		}
+	}
+	fileSystem := r.FileSystem
+	if fileSystem == nil {
+		fileSystem = localOpenAIFileSystem{}
+	}
+	info, err := fileSystem.Metadata(ctx, resolved.String())
+	if err != nil {
+		return nil, r.contextualize(fieldName, index, filePath, err.Error())
+	}
+	if info == nil || !info.IsFile {
+		return nil, r.contextualize(fieldName, index, filePath, fmt.Sprintf("path `%s` is not a file", displayPath))
+	}
+	limit := r.UploadLimitBytes
+	if limit <= 0 {
+		limit = DefaultOpenAIFileUploadLimitBytes
+	}
+	if info.Size > limit {
+		return nil, r.contextualize(fieldName, index, filePath, fmt.Sprintf("file `%s` is too large: %d bytes exceeds the limit of %d bytes", displayPath, info.Size, limit))
+	}
+	uploader := r.Uploader
+	if uploader == nil {
+		uploader = &LocalOpenAIFileUploader{Auth: r.Auth}
+	}
+	fileName, ok := resolved.Basename()
+	if !ok || strings.TrimSpace(fileName) == "" {
+		fileName = "file"
+	}
+	resolvedURI := resolved.String()
+	uploaded, err := uploader.UploadOpenAIFile(ctx, OpenAIFileUploadRequest{
+		Path:          displayPath,
+		FileName:      fileName,
+		FileSizeBytes: info.Size,
+		HostedContext: hosted,
+		Open: func(openCtx context.Context) (io.ReadCloser, error) {
+			return fileSystem.Open(openCtx, resolvedURI)
+		},
+	})
+	if err != nil {
+		return nil, r.contextualize(fieldName, index, filePath, err.Error())
+	}
+	if uploaded == nil {
+		return nil, r.contextualize(fieldName, index, filePath, "upload returned no file")
+	}
+	payload := map[string]any{
+		"download_url": uploaded.DownloadURL,
+		"file_id":      uploaded.FileID,
+	}
+	if containsOpenAIFileOptionalField(optionalFields, "mime_type") && strings.TrimSpace(uploaded.MimeType) != "" {
+		payload["mime_type"] = uploaded.MimeType
+	}
+	if containsOpenAIFileOptionalField(optionalFields, "file_name") {
+		payload["file_name"] = uploaded.FileName
+	}
+	return payload, nil
+}
+
+func (r *OpenAIFileRewriter) grantedReadPath(path string) bool {
+	if r == nil {
+		return false
+	}
+	normalized := filepath.ToSlash(filepath.Clean(path))
+	for _, granted := range r.GrantedReadPaths {
+		if strings.EqualFold(normalized, filepath.ToSlash(filepath.Clean(granted))) {
+			return true
+		}
+	}
+	return false
+}
+
+func openAIFileDirectoryURI(cwd string) (*utils.PathURI, error) {
+	cwd = strings.TrimSpace(cwd)
+	if parsed, err := utils.Parse(cwd); err == nil {
+		if strings.HasSuffix(parsed.EncodedPath(), "/") {
+			return parsed, nil
+		}
+		return utils.Parse(parsed.String() + "/")
+	}
+	legacy := utils.NewLegacyAppPathString(cwd)
+	convention, absolute := legacy.InferAbsolutePathConvention()
+	if !absolute {
+		hostPath, err := filepath.Abs(cwd)
+		if err != nil {
+			return nil, err
+		}
+		return openAIFileDirectoryURI(hostPath)
+	}
+	separator := "/"
+	if convention == utils.ConventionWindows {
+		separator = `\`
+	}
+	if !strings.HasSuffix(cwd, "/") && !strings.HasSuffix(cwd, `\`) {
+		cwd += separator
+	}
+	return utils.FromAbsoluteNativePath(cwd, convention)
+}
+
+func containsOpenAIFileOptionalField(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *OpenAIFileRewriter) contextualize(fieldName string, index int, filePath string, message string) error {
+	if index >= 0 {
+		return fmt.Errorf("failed to upload `%s` for `%s[%d]`: %s", filePath, fieldName, index, message)
+	}
+	return fmt.Errorf("failed to upload `%s` for `%s`: %s", filePath, fieldName, message)
+}
+
+func cloneOpenAIFileMap(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}

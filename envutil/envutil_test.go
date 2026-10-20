@@ -1,0 +1,250 @@
+package envutil
+
+import (
+	"os/exec"
+	"runtime"
+	"strings"
+	"testing"
+
+	"codex_core/applypatch"
+)
+
+func TestSetExecutionMetadataEnvLikeRust(t *testing.T) {
+	empty := ""
+	for _, testCase := range []struct {
+		name          string
+		toolCallID    *string
+		wantValue     string
+		wantCanonical bool
+	}{
+		{name: "set", toolCallID: stringPointer("call-1"), wantValue: "call-1", wantCanonical: true},
+		{name: "empty ID is preserved", toolCallID: &empty, wantValue: "", wantCanonical: true},
+		{name: "missing ID removes stale value"},
+		{name: "NUL ID is omitted", toolCallID: stringPointer("call\x00bad")},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			env := map[string]string{
+				CodexToolCallIDEnvVar:                  "stale",
+				strings.ToLower(CodexToolCallIDEnvVar): "stale-lower",
+				"CODEX_THREAD_ID":                      "thread-1",
+				"UNCHANGED":                            "kept",
+			}
+			SetToolCallIDEnv(env, testCase.toolCallID)
+			value, ok := env[CodexToolCallIDEnvVar]
+			if ok != testCase.wantCanonical || value != testCase.wantValue {
+				t.Fatalf("tool call id = %q, present=%t; want %q, present=%t; env=%#v",
+					value, ok, testCase.wantValue, testCase.wantCanonical, env)
+			}
+			if runtime.GOOS == "windows" {
+				for key := range env {
+					if strings.EqualFold(key, CodexToolCallIDEnvVar) && (!ok || key != CodexToolCallIDEnvVar) {
+						t.Fatalf("case-variant tool call id survived on Windows: %#v", env)
+					}
+				}
+			} else if _, ok := env[strings.ToLower(CodexToolCallIDEnvVar)]; !ok {
+				t.Fatalf("Unix exact-name replacement removed a case-variant key: %#v", env)
+			}
+			if env["CODEX_THREAD_ID"] != "thread-1" || env["UNCHANGED"] != "kept" {
+				t.Fatalf("tool call metadata changed unrelated values: %#v", env)
+			}
+		})
+	}
+
+	threadID := "thread-2"
+	env := map[string]string{"CODEX_THREAD_ID": "stale", "Codex_Thread_Id": "mixed"}
+	SetThreadIDEnv(env, &threadID)
+	if env[CodexThreadIDEnvVar] != threadID {
+		t.Fatalf("thread id = %q", env[CodexThreadIDEnvVar])
+	}
+	if runtime.GOOS == "windows" {
+		if _, ok := env["Codex_Thread_Id"]; ok {
+			t.Fatalf("case-variant thread id survived on Windows: %#v", env)
+		}
+	}
+	SetThreadIDEnv(env, nil)
+	if _, ok := env[CodexThreadIDEnvVar]; ok {
+		t.Fatalf("nil thread id did not clear the label: %#v", env)
+	}
+}
+
+func stringPointer(value string) *string {
+	return &value
+}
+
+func TestIsNonInheritableEnvVarCaseInsensitiveLikeRust(t *testing.T) {
+	for _, name := range []string{
+		"OPENAI_FEDERATION_RULE_ID",
+		"openai_federation_rule_id",
+		"OpenAI_Federation_Rule_Id",
+		"NODE_REPL_AUTH_TOKEN",
+		"node_repl_auth_token",
+		"Node_Repl_Auth_Token",
+		"OPENAI_IDENTITY_TOKEN_FILE",
+		"openai_identity_token_file",
+		"OPENAI_WORKLOAD_IDENTITY_CONTEXT",
+		"openai_workload_identity_context",
+		"CODEX_GUARDIAN_DECISIONS_API_KEY",
+		"codex_guardian_decisions_api_key",
+		"Codex_Guardian_Decisions_Api_Key",
+		CodexExecServerNoiseAuthTokenEnvVar,
+		"codex_exec_server_noise_auth_token",
+		"Codex_Exec_Server_Noise_Auth_Token",
+	} {
+		if !IsNonInheritableEnvVar(name) {
+			t.Fatalf("IsNonInheritableEnvVar(%q) = false, want true", name)
+		}
+	}
+	for _, name := range []string{"PATH", "OPENAI_API_KEY", "OPENAI_FEDERATION_RULE", "CODEX_EXEC_SERVER_NOISE_REGISTRY_URL"} {
+		if IsNonInheritableEnvVar(name) {
+			t.Fatalf("IsNonInheritableEnvVar(%q) = true, want false", name)
+		}
+	}
+}
+
+func TestScrubSliceAndCommandEnv(t *testing.T) {
+	scrubbed := ScrubSlice([]string{
+		"PATH=C:\\bin",
+		"OPENAI_FEDERATION_RULE_ID=rule-1",
+		"openai_identity_token_file=C:\\token",
+		"OPENAI_WORKLOAD_IDENTITY_CONTEXT=ctx-1",
+		CodexExecServerNoiseAuthTokenEnvVar + "=configured-noise-token",
+		"codex_exec_server_noise_auth_token=case-variant-noise-token",
+		"HOME=C:\\home",
+	})
+	if len(scrubbed) != 2 || scrubbed[0] != "PATH=C:\\bin" || scrubbed[1] != "HOME=C:\\home" {
+		t.Fatalf("ScrubSlice() = %#v", scrubbed)
+	}
+
+	cmd := exec.Command("echo", "hi")
+	cmd.Env = []string{"OPENAI_FEDERATION_RULE_ID=inherited", "Codex_Exec_Server_Noise_Auth_Token=inherited"}
+	ScrubCommandEnv(cmd)
+	if len(cmd.Env) != 0 {
+		t.Fatalf("ScrubCommandEnv() = %#v, want empty", cmd.Env)
+	}
+}
+
+// TestScrubCommandEnvRemovesNoiseAuthTokenAfterPolicyOverrides mirrors Rust
+// command_hook_does_not_expose_configured_noise_auth_token (#38941): a shell
+// environment policy that explicitly sets the Noise auth token (or a case
+// variant) must still be scrubbed before the command or hook runs.
+func TestScrubCommandEnvRemovesNoiseAuthTokenAfterPolicyOverrides(t *testing.T) {
+	for _, name := range []string{
+		CodexExecServerNoiseAuthTokenEnvVar,
+		strings.ToLower(CodexExecServerNoiseAuthTokenEnvVar),
+		strings.ToUpper(CodexExecServerNoiseAuthTokenEnvVar),
+	} {
+		cmd := exec.Command("echo", "hi")
+		cmd.Env = []string{
+			name + "=configured-noise-token",
+			"CODEX_HOOK_SAFE_ENV=visible",
+		}
+		ScrubCommandEnv(cmd)
+		for _, pair := range cmd.Env {
+			pairName := pair
+			for i := 0; i < len(pair); i++ {
+				if pair[i] == '=' {
+					pairName = pair[:i]
+					break
+				}
+			}
+			if IsNonInheritableEnvVar(pairName) {
+				t.Fatalf("policy override leaked %q through the scrubber", pair)
+			}
+		}
+		found := false
+		for _, pair := range cmd.Env {
+			if pair == "CODEX_HOOK_SAFE_ENV=visible" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("safe hook env was dropped: %#v", cmd.Env)
+		}
+	}
+}
+
+// TestNonInheritableEnvironmentIsRemovedAfterPolicyOverridesLikeRust mirrors
+// Rust #50019 `9552906b2b`
+// (codex-rs/protocol/src/shell_environment_tests.rs,
+// non_inheritable_environment_is_removed_after_policy_overrides): an inherited
+// guardian decisions key and an explicit shell-policy override (any casing) are
+// both removed, while unrelated variables are preserved.
+func TestNonInheritableEnvironmentIsRemovedAfterPolicyOverridesLikeRust(t *testing.T) {
+	scrubbed := ScrubSlice([]string{
+		"Safe=inherited",
+		"codex_guardian_decisions_api_key=synthetic-inherited-key",
+		"node_repl_auth_token=inherited-token",
+		"openai_federation_rule_id=rule-inherited",
+		"KEEP=value",
+		"SAFE=override",
+		"CODEX_GUARDIAN_DECISIONS_API_KEY=synthetic-override-key",
+		"Node_Repl_Auth_Token=configured-token",
+	})
+	for _, pair := range scrubbed {
+		if IsNonInheritableEnvVar(pair) {
+			t.Fatalf("non-inheritable variable leaked after policy overrides: %q", pair)
+		}
+	}
+	want := []string{"Safe=inherited", "KEEP=value", "SAFE=override"}
+	if len(scrubbed) != len(want) {
+		t.Fatalf("ScrubSlice() = %#v, want %#v", scrubbed, want)
+	}
+	for i := range want {
+		if scrubbed[i] != want[i] {
+			t.Fatalf("ScrubSlice()[%d] = %q, want %q", i, scrubbed[i], want[i])
+		}
+	}
+}
+
+func TestScrubCommandEnvInheritsFilteredEnvironment(t *testing.T) {
+	t.Setenv("OPENAI_FEDERATION_RULE_ID", "rule-1")
+	t.Setenv("OPENAI_IDENTITY_TOKEN_FILE", "token")
+	t.Setenv("Codex_Guardian_Decisions_Api_Key", "synthetic-inherited-key")
+	cmd := exec.Command("echo", "hi")
+	ScrubCommandEnv(cmd)
+	for _, pair := range cmd.Env {
+		name := pair
+		for i := 0; i < len(pair); i++ {
+			if pair[i] == '=' {
+				name = pair[:i]
+				break
+			}
+		}
+		if IsNonInheritableEnvVar(name) {
+			t.Fatalf("inherited env leaked %q", pair)
+		}
+	}
+}
+
+// Rust #51203: line-ending preservation is always on, so injection overrides a
+// stale inherited value rather than following a feature flag.
+func TestInjectApplyPatchEnvAlwaysEnablesPreservation(t *testing.T) {
+	env := map[string]string{
+		"KEEP":                               "value",
+		applypatch.PreserveLineEndingsEnvVar: "stale",
+	}
+	out := InjectApplyPatchEnv(env)
+	if got := out[applypatch.PreserveLineEndingsEnvVar]; got != "1" {
+		t.Fatalf("preserve var = %q, want 1", got)
+	}
+	if out["KEEP"] != "value" {
+		t.Fatalf("KEEP = %q, want value", out["KEEP"])
+	}
+}
+
+func TestInjectApplyPatchEnvRemovesDifferentlyCasedStaleKey(t *testing.T) {
+	env := InjectApplyPatchEnv(map[string]string{
+		"codex_apply_patch_preserve_line_endings": "0",
+	})
+	if len(env) != 1 || env[applypatch.PreserveLineEndingsEnvVar] != "1" {
+		t.Fatalf("InjectApplyPatchEnv() = %#v", env)
+	}
+}
+
+func TestInjectApplyPatchEnvHandlesNilMap(t *testing.T) {
+	out := InjectApplyPatchEnv(nil)
+	if out == nil || out[applypatch.PreserveLineEndingsEnvVar] != "1" {
+		t.Fatalf("InjectApplyPatchEnv(nil) = %#v", out)
+	}
+}

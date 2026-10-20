@@ -1,0 +1,939 @@
+package state
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"codex_core/context"
+	"codex_core/retainedctx"
+)
+
+const (
+	ReviewerUser       Reviewer = "user"
+	ReviewerAutoReview Reviewer = "auto_review"
+	ReviewerLegacy     Reviewer = "guardian_subagent"
+
+	ReviewTimeout                     = 90 * time.Second
+	MaxConsecutiveDenialsPerTurn      = 3
+	MaxConsecutiveCyberDenialsPerTurn = 1
+	MaxRecentDenialsPerTurn           = 10
+	MaxRecentCyberDenialsPerTurn      = 1
+	AutoReviewDenialWindowSize        = 50
+	// ManualApprovalDeveloperPrefix mirrors Rust's
+	// MANUAL_APPROVAL_DEVELOPER_PREFIX: the trusted developer marker that
+	// preserves an explicit manual action approval.
+	ManualApprovalDeveloperPrefix = "The user has manually approved a specific action that was previously `Rejected`."
+	DeniedActionApprovalPrefix    = ManualApprovalDeveloperPrefix
+)
+
+var ErrInvalidGuardianRequest = errors.New("invalid guardian request")
+
+type Reviewer string
+
+func ReviewerFromString(value string) Reviewer {
+	switch strings.TrimSpace(value) {
+	case string(ReviewerAutoReview), string(ReviewerLegacy):
+		return ReviewerAutoReview
+	case string(ReviewerUser), "":
+		return ReviewerUser
+	default:
+		return Reviewer(value)
+	}
+}
+
+func (r *Reviewer) RoutesToGuardian() bool {
+	return r != nil && *r == ReviewerAutoReview
+}
+
+type RiskLevel string
+
+const (
+	RiskLow      RiskLevel = "low"
+	RiskMedium   RiskLevel = "medium"
+	RiskHigh     RiskLevel = "high"
+	RiskCritical RiskLevel = "critical"
+)
+
+type UserAuthorization string
+
+const (
+	AuthorizationUnknown UserAuthorization = "unknown"
+	AuthorizationLow     UserAuthorization = "low"
+	AuthorizationMedium  UserAuthorization = "medium"
+	AuthorizationHigh    UserAuthorization = "high"
+)
+
+type Outcome string
+
+const (
+	OutcomeAllow Outcome = "allow"
+	OutcomeDeny  Outcome = "deny"
+)
+
+type Status string
+
+const (
+	StatusInProgress Status = "in_progress"
+	StatusApproved   Status = "approved"
+	StatusDenied     Status = "denied"
+	StatusTimedOut   Status = "timed_out"
+	StatusAborted    Status = "aborted"
+)
+
+type DecisionSource string
+
+const DecisionSourceAgent DecisionSource = "agent"
+
+type CommandSource string
+
+const (
+	CommandSourceShell       CommandSource = "shell"
+	CommandSourceUnifiedExec CommandSource = "unified_exec"
+)
+
+type Action struct {
+	Type    string        `json:"type"`
+	Source  CommandSource `json:"source,omitempty"`
+	Command string        `json:"command,omitempty"`
+	Program string        `json:"program,omitempty"`
+	Argv    []string      `json:"argv,omitempty"`
+	CWD     string        `json:"cwd,omitempty"`
+	Files   []string      `json:"files,omitempty"`
+	// Patch is the raw apply_patch body an apply_patch action carries (Rust
+	// GuardianApprovalRequest::ApplyPatch).
+	Patch         string         `json:"patch,omitempty"`
+	Target        string         `json:"target,omitempty"`
+	Host          string         `json:"host,omitempty"`
+	Protocol      string         `json:"protocol,omitempty"`
+	Port          uint16         `json:"port,omitempty"`
+	Server        string         `json:"server,omitempty"`
+	ToolName      string         `json:"toolName,omitempty"`
+	ConnectorID   string         `json:"connectorId,omitempty"`
+	ConnectorName string         `json:"connectorName,omitempty"`
+	ToolTitle     string         `json:"toolTitle,omitempty"`
+	Reason        string         `json:"reason,omitempty"`
+	Permissions   map[string]any `json:"permissions,omitempty"`
+	Extra         map[string]any `json:"extra,omitempty"`
+
+	// The fields below exist only for the reviewer prompt projection
+	// (Rust's guardian_approval_request_to_json). They are never part of the
+	// app-server review notification, so they stay off the wire.
+	//
+	// CommandArgv is Rust ExecCommand.command: the exact argv the command runs
+	// with. SandboxPermissions / AdditionalPermissions / Justification / TTY
+	// carry the same request's per-command overrides.
+	CommandArgv           []string       `json:"-"`
+	SandboxPermissions    string         `json:"-"`
+	AdditionalPermissions map[string]any `json:"-"`
+	Justification         string         `json:"-"`
+	TTY                   *bool          `json:"-"`
+	// Arguments and Annotations mirror Rust McpToolCallApprovalAction's
+	// `arguments` and `annotations`.
+	Arguments   any                `json:"-"`
+	Annotations *ActionAnnotations `json:"-"`
+	// EnvironmentID / SessionID / Chars mirror Rust WriteStdinApprovalAction.
+	EnvironmentID string `json:"-"`
+	SessionID     *int   `json:"-"`
+	Chars         string `json:"-"`
+	// ApprovalID / ProcessID mirror Rust GuardianAssessmentAction::WriteStdin.
+	ApprovalID string `json:"-"`
+	ProcessID  string `json:"-"`
+	// TurnID mirrors Rust RequestPermissionsApprovalAction.turn_id.
+	TurnID string `json:"-"`
+	// ToolDescription / ConnectorDescription are the invoked MCP tool's own
+	// descriptions, rendered as Rust's separate bounded
+	// `<guardian_tool_descriptions>` block instead of the action JSON.
+	ToolDescription      string `json:"-"`
+	ConnectorDescription string `json:"-"`
+}
+
+// ActionAnnotations mirrors Rust GuardianMcpAnnotations: the privileged hints
+// the invoked MCP tool declared, rendered with the reviewed action.
+type ActionAnnotations struct {
+	DestructiveHint *bool `json:"-"`
+	OpenWorldHint   *bool `json:"-"`
+	ReadOnlyHint    *bool `json:"-"`
+}
+
+func (a *Action) Validate() error {
+	if a == nil {
+		return fmt.Errorf("%w: action is required", ErrInvalidGuardianRequest)
+	}
+	switch a.Type {
+	case "command":
+		if a.Command == "" || a.CWD == "" {
+			return fmt.Errorf("%w: command and cwd are required", ErrInvalidGuardianRequest)
+		}
+	case "execve":
+		if a.Program == "" || a.CWD == "" {
+			return fmt.Errorf("%w: program and cwd are required", ErrInvalidGuardianRequest)
+		}
+	case "apply_patch":
+		if a.CWD == "" || len(a.Files) == 0 {
+			return fmt.Errorf("%w: cwd and files are required", ErrInvalidGuardianRequest)
+		}
+	case "network_access":
+		if a.Host == "" || a.Protocol == "" || a.Port == 0 {
+			return fmt.Errorf("%w: host protocol and port are required", ErrInvalidGuardianRequest)
+		}
+	case "mcp_tool_call":
+		if a.Server == "" || a.ToolName == "" {
+			return fmt.Errorf("%w: server and toolName are required", ErrInvalidGuardianRequest)
+		}
+	case "request_permissions":
+		if len(a.Permissions) == 0 {
+			return fmt.Errorf("%w: permissions are required", ErrInvalidGuardianRequest)
+		}
+	default:
+		return fmt.Errorf("%w: unsupported action %q", ErrInvalidGuardianRequest, a.Type)
+	}
+	return nil
+}
+
+type Assessment struct {
+	RiskLevel         RiskLevel         `json:"riskLevel"`
+	UserAuthorization UserAuthorization `json:"userAuthorization"`
+	Outcome           Outcome           `json:"outcome"`
+	Rationale         string            `json:"rationale"`
+}
+
+func (a *Assessment) Validate() error {
+	if a == nil {
+		return fmt.Errorf("%w: assessment is required", ErrInvalidGuardianRequest)
+	}
+	if a.RiskLevel == "" || a.UserAuthorization == "" || a.Outcome == "" {
+		return fmt.Errorf("%w: assessment fields are required", ErrInvalidGuardianRequest)
+	}
+	if a.Outcome != OutcomeAllow && a.Outcome != OutcomeDeny {
+		return fmt.Errorf("%w: unsupported outcome %q", ErrInvalidGuardianRequest, a.Outcome)
+	}
+	return nil
+}
+
+type Event struct {
+	ID                string             `json:"id"`
+	TargetItemID      string             `json:"targetItemId,omitempty"`
+	TurnID            string             `json:"turnId"`
+	StartedAtMS       int64              `json:"startedAtMs"`
+	CompletedAtMS     *int64             `json:"completedAtMs,omitempty"`
+	Status            Status             `json:"status"`
+	RiskLevel         *RiskLevel         `json:"riskLevel,omitempty"`
+	UserAuthorization *UserAuthorization `json:"userAuthorization,omitempty"`
+	Rationale         string             `json:"rationale,omitempty"`
+	DecisionSource    *DecisionSource    `json:"decisionSource,omitempty"`
+	Action            Action             `json:"action"`
+}
+
+func NewInProgressEvent(id string, turnID string, targetItemID string, action Action, now time.Time) (*Event, error) {
+	if err := action.Validate(); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(id) == "" {
+		return nil, fmt.Errorf("%w: id is required", ErrInvalidGuardianRequest)
+	}
+	return &Event{
+		ID:           id,
+		TurnID:       turnID,
+		TargetItemID: targetItemID,
+		StartedAtMS:  unixMillis(now),
+		Status:       StatusInProgress,
+		Action:       action,
+	}, nil
+}
+
+func (e *Event) Complete(assessment Assessment, now time.Time) (*Event, error) {
+	if e == nil {
+		return nil, fmt.Errorf("%w: event is nil", ErrInvalidGuardianRequest)
+	}
+	if err := assessment.Validate(); err != nil {
+		return nil, err
+	}
+	completed := *e
+	completedMS := unixMillis(now)
+	completed.CompletedAtMS = &completedMS
+	completed.RiskLevel = &assessment.RiskLevel
+	completed.UserAuthorization = &assessment.UserAuthorization
+	completed.Rationale = assessment.Rationale
+	source := DecisionSourceAgent
+	completed.DecisionSource = &source
+	if assessment.Outcome == OutcomeAllow {
+		completed.Status = StatusApproved
+	} else {
+		completed.Status = StatusDenied
+	}
+	return &completed, nil
+}
+
+func (e *Event) Timeout(now time.Time) *Event {
+	if e == nil {
+		return nil
+	}
+	completed := *e
+	completedMS := unixMillis(now)
+	completed.CompletedAtMS = &completedMS
+	completed.Status = StatusTimedOut
+	completed.Rationale = GuardianTimeoutRationale()
+	return &completed
+}
+
+// FailClosed mirrors Rust's review-failure completion: automatic approval could
+// not be completed, so the event is denied with the failure rationale and no
+// risk/authorization/outcome attribution (fail closed, not aborted).
+func (e *Event) FailClosed(now time.Time, rationale string) *Event {
+	if e == nil {
+		return nil
+	}
+	completed := *e
+	completedMS := unixMillis(now)
+	completed.CompletedAtMS = &completedMS
+	completed.Status = StatusDenied
+	completed.Rationale = rationale
+	return &completed
+}
+
+func (e *Event) Aborted(now time.Time, reason string) *Event {
+	if e == nil {
+		return nil
+	}
+	completed := *e
+	completedMS := unixMillis(now)
+	completed.CompletedAtMS = &completedMS
+	completed.Status = StatusAborted
+	completed.Rationale = reason
+	return &completed
+}
+
+func (e *Event) Terminal() bool {
+	return e != nil && e.Status != StatusInProgress
+}
+
+func GuardianRejectionMessage(event *Event) string {
+	if event == nil {
+		return "Auto-approval review denied the request."
+	}
+	if event.Rationale != "" {
+		return event.Rationale
+	}
+	return "Auto-approval review denied the request."
+}
+
+type ReviewDecision string
+
+const (
+	DecisionApproved ReviewDecision = "approved"
+	DecisionDenied   ReviewDecision = "denied"
+	DecisionTimedOut ReviewDecision = "timed_out"
+	DecisionAborted  ReviewDecision = "aborted"
+)
+
+func DecisionFromEvent(event *Event) ReviewDecision {
+	if event == nil {
+		return DecisionDenied
+	}
+	switch event.Status {
+	case StatusApproved:
+		return DecisionApproved
+	case StatusTimedOut:
+		return DecisionTimedOut
+	case StatusAborted:
+		return DecisionAborted
+	default:
+		return DecisionDenied
+	}
+}
+
+type CircuitBreakerAction struct {
+	InterruptTurn      bool
+	ConsecutiveDenials uint32
+	RecentDenials      uint32
+}
+
+// CircuitBreakerPolicy selects denial thresholds, mirroring Rust's
+// GuardianRejectionCircuitBreakerPolicy (f141dc77f0, #37190).
+type CircuitBreakerPolicy string
+
+const (
+	CircuitBreakerPolicyStandard CircuitBreakerPolicy = "standard"
+	CircuitBreakerPolicyCyber    CircuitBreakerPolicy = "cyber"
+)
+
+type CircuitBreaker struct {
+	mu    sync.Mutex
+	turns map[string]*turnState
+}
+
+type turnState struct {
+	consecutiveDenials uint32
+	recentDenials      []bool
+	interruptTriggered bool
+}
+
+func NewCircuitBreaker() *CircuitBreaker {
+	return &CircuitBreaker{turns: map[string]*turnState{}}
+}
+
+func (b *CircuitBreaker) ClearTurn(turnID string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.turns, turnID)
+}
+
+func (b *CircuitBreaker) RecordDenial(turnID string) CircuitBreakerAction {
+	return b.RecordDenialWithPolicy(turnID, CircuitBreakerPolicyStandard)
+}
+
+func (b *CircuitBreaker) RecordDenialWithPolicy(turnID string, policy CircuitBreakerPolicy) CircuitBreakerAction {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	state := b.state(turnID)
+	state.consecutiveDenials++
+	recordRecent(state, true)
+	recent := countRecentDenials(state)
+	maxConsecutive := uint32(MaxConsecutiveDenialsPerTurn)
+	maxRecent := uint32(MaxRecentDenialsPerTurn)
+	if policy == CircuitBreakerPolicyCyber {
+		maxConsecutive = MaxConsecutiveCyberDenialsPerTurn
+		maxRecent = MaxRecentCyberDenialsPerTurn
+	}
+	action := CircuitBreakerAction{ConsecutiveDenials: state.consecutiveDenials, RecentDenials: recent}
+	if !state.interruptTriggered && (state.consecutiveDenials >= maxConsecutive || recent >= maxRecent) {
+		state.interruptTriggered = true
+		action.InterruptTurn = true
+	}
+	return action
+}
+
+func (b *CircuitBreaker) RecordNonDenial(turnID string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	state := b.state(turnID)
+	state.consecutiveDenials = 0
+	recordRecent(state, false)
+}
+
+func (b *CircuitBreaker) state(turnID string) *turnState {
+	if b.turns == nil {
+		b.turns = map[string]*turnState{}
+	}
+	state := b.turns[turnID]
+	if state == nil {
+		state = &turnState{}
+		b.turns[turnID] = state
+	}
+	return state
+}
+
+type ReviewStore struct {
+	mu      sync.Mutex
+	events  map[string]*Event
+	counter uint64
+	now     func() time.Time
+}
+
+func NewReviewStore() *ReviewStore {
+	return &ReviewStore{events: map[string]*Event{}, now: time.Now}
+}
+
+func (s *ReviewStore) SetClock(clock func() time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if clock == nil {
+		s.now = time.Now
+		return
+	}
+	s.now = clock
+}
+
+func (s *ReviewStore) NewReviewID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.counter++
+	return fmt.Sprintf("guardian-review-%d", s.counter)
+}
+
+func (s *ReviewStore) Start(turnID string, targetItemID string, action Action) (*Event, error) {
+	id := s.NewReviewID()
+	event, err := NewInProgressEvent(id, turnID, targetItemID, action, s.now())
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.events[id] = event
+	return cloneEvent(event), nil
+}
+
+func (s *ReviewStore) Complete(id string, assessment Assessment) (*Event, error) {
+	s.mu.Lock()
+	event := s.events[id]
+	s.mu.Unlock()
+	if event == nil {
+		return nil, fmt.Errorf("%w: review not found", ErrInvalidGuardianRequest)
+	}
+	completed, err := event.Complete(assessment, s.now())
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	s.events[id] = completed
+	s.mu.Unlock()
+	return cloneEvent(completed), nil
+}
+
+func (s *ReviewStore) Timeout(id string) (*Event, error) {
+	return s.finish(id, func(event *Event, now time.Time) *Event { return event.Timeout(now) })
+}
+
+func (s *ReviewStore) Abort(id string, reason string) (*Event, error) {
+	return s.finish(id, func(event *Event, now time.Time) *Event { return event.Aborted(now, reason) })
+}
+
+// FailClosed denies the review with the failure rationale (Rust's failed_closed
+// completion).
+func (s *ReviewStore) FailClosed(id string, rationale string) (*Event, error) {
+	return s.finish(id, func(event *Event, now time.Time) *Event { return event.FailClosed(now, rationale) })
+}
+
+func (s *ReviewStore) finish(id string, transition func(*Event, time.Time) *Event) (*Event, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	event := s.events[id]
+	if event == nil {
+		return nil, fmt.Errorf("%w: review not found", ErrInvalidGuardianRequest)
+	}
+	completed := transition(event, s.now())
+	s.events[id] = completed
+	return cloneEvent(completed), nil
+}
+
+func (s *ReviewStore) Get(id string) (*Event, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	event := s.events[id]
+	if event == nil {
+		return nil, false
+	}
+	return cloneEvent(event), true
+}
+
+type NotificationMethod string
+
+const (
+	NotificationReviewStarted   NotificationMethod = "item/autoApprovalReview/started"
+	NotificationReviewCompleted NotificationMethod = "item/autoApprovalReview/completed"
+)
+
+type Notification struct {
+	Method NotificationMethod `json:"method"`
+	Params any                `json:"params"`
+}
+
+type ApprovalReview struct {
+	ID                string             `json:"id"`
+	TargetItemID      string             `json:"targetItemId,omitempty"`
+	Status            Status             `json:"status"`
+	RiskLevel         *RiskLevel         `json:"riskLevel,omitempty"`
+	UserAuthorization *UserAuthorization `json:"userAuthorization,omitempty"`
+	Rationale         string             `json:"rationale,omitempty"`
+	Action            Action             `json:"action"`
+}
+
+type ReviewStartedNotification struct {
+	ThreadID string         `json:"threadId"`
+	TurnID   string         `json:"turnId"`
+	Review   ApprovalReview `json:"review"`
+}
+
+type ReviewCompletedNotification struct {
+	ThreadID string         `json:"threadId"`
+	TurnID   string         `json:"turnId"`
+	Review   ApprovalReview `json:"review"`
+}
+
+func NotificationFromEvent(threadID string, event *Event) Notification {
+	review := ApprovalReview{
+		ID:                event.ID,
+		TargetItemID:      event.TargetItemID,
+		Status:            event.Status,
+		RiskLevel:         event.RiskLevel,
+		UserAuthorization: event.UserAuthorization,
+		Rationale:         event.Rationale,
+		Action:            event.Action,
+	}
+	if event.Status == StatusInProgress {
+		return Notification{Method: NotificationReviewStarted, Params: ReviewStartedNotification{ThreadID: threadID, TurnID: event.TurnID, Review: review}}
+	}
+	return Notification{Method: NotificationReviewCompleted, Params: ReviewCompletedNotification{ThreadID: threadID, TurnID: event.TurnID, Review: review}}
+}
+
+func ParseAssessment(data []byte) (*Assessment, error) {
+	var assessment Assessment
+	if err := json.Unmarshal(data, &assessment); err != nil {
+		return nil, err
+	}
+	if err := assessment.Validate(); err != nil {
+		return nil, err
+	}
+	return &assessment, nil
+}
+
+func BuildPrompt(action Action, transcript []string) (string, error) {
+	return BuildPromptWithOptions(action, transcript, BuildPromptOptions{})
+}
+
+// BuildPromptOptions controls optional Guardian prompt specialization.
+type BuildPromptOptions struct {
+	// Presentation selects the framing the reviewed consumer uses. The default
+	// is the full synchronous review.
+	Presentation ActionPresentation
+	// TranscriptFormat selects the rendering of transcript entries: line keeps
+	// the role-prefixed form, json emits host-attributed records (#51465).
+	TranscriptFormat GuardianTranscriptFormat
+	// TranscriptOmissionNote is the profile's notice that retention dropped at
+	// least one collected entry (#43806). It is separate from the transcript
+	// records so JSON mode cannot mistake it for authored evidence.
+	TranscriptOmissionNote string
+	// NodeReplEvidence includes bounded node_repl results as untrusted
+	// evidence in the review prompt (Rust #38397).
+	NodeReplEvidence *context.NodeReplReviewEvidenceFragment
+	// RootUserAuthorization carries bounded, role-preserving root-conversation
+	// evidence for subagent (MultiAgent V2) reviews so late root-user
+	// authorization is not lost when the worker's own transcript lacks it
+	// (#39975). Only root user messages are treated as authorization evidence;
+	// assistant messages remain labeled untrusted context.
+	RootUserAuthorization []RootMessage
+	// RetainedContext carries the host-owned retained snapshot so the review
+	// prompt includes the retained user-instruction section: bounded original
+	// instructions in acceptance order, with assistant text as untrusted
+	// context (Rust's RetainedUserInstructionsSection). A nil context renders no
+	// section.
+	RetainedContext *retainedctx.RetainedContext
+	// PreviousRetainedOmissions is the omission availability the reviewer
+	// conversation already received (#49796). Missing (nil) means unknown, so
+	// every notice is delivered; unchanged notice-only sections are suppressed
+	// and a cleared omission emits an availability-change notice.
+	PreviousRetainedOmissions *GuardianRetainedOmissions
+	// PermissionContext carries the reviewed environment's active-policy
+	// evidence: denied read paths and globs the reviewer must not approve an
+	// escalation to read (Rust's PermissionContextSection). A nil or empty
+	// context renders no section.
+	PermissionContext *PermissionContext
+}
+
+// GuardianPromptPart is one ordered piece of review input: a text block or a
+// native response item. Native parts carry encrypted agent messages that must
+// reach the reviewer unchanged and in transcript order (#49038).
+type GuardianPromptPart struct {
+	Text   string
+	Native json.RawMessage
+}
+
+// GuardianPromptSectionCost is payload-free accounting for one composed
+// Guardian prompt section.
+type GuardianPromptSectionCost struct {
+	Section    string
+	TextBytes  int
+	ImageBytes int
+	ImageCount int
+}
+
+// GuardianPromptMeasurement is one numeric section-cost measurement.
+type GuardianPromptMeasurement struct {
+	Measurement string
+	Value       int
+}
+
+// Measurements returns Rust SectionCost::measurements for this section.
+func (c GuardianPromptSectionCost) Measurements() []GuardianPromptMeasurement {
+	return []GuardianPromptMeasurement{
+		{Measurement: "text_bytes", Value: c.TextBytes},
+		{Measurement: "estimated_text_tokens", Value: approximateTokensFromBytes(c.TextBytes)},
+		{Measurement: "image_bytes", Value: c.ImageBytes},
+		{Measurement: "image_count", Value: c.ImageCount},
+	}
+}
+
+func approximateTokensFromBytes(bytes int) int {
+	if bytes <= 0 {
+		return 0
+	}
+	return (bytes + 3) / 4
+}
+
+type guardianPromptSection struct {
+	id   string
+	text string
+}
+
+// BuildPromptWithOptions renders the Guardian review prompt in the order Rust's
+// composed context uses: the stable evidence first and the planned action last,
+// so the evidence stays a reusable history prefix across approval requests
+// (#46279). Rust's registry order places the root conversation, then the
+// retained user instructions, then the trusted user answers, then the
+// transcript, the node-repl evidence and the parent-turn permission context, and
+// finally the planned action with its tool descriptions; the sections Go does not
+// model (previous reviews, trusted tool/skills) come from the review's inherited
+// context instead. The stateful synchronous reviewer keeps the retained snapshot
+// in that single instructions section (#51627); only the asynchronous framing
+// separates the retained assistant context into its own section after the
+// transcript, so growing assistant evidence cannot invalidate the instruction
+// prefix for independent snapshots.
+func BuildPromptWithOptions(action Action, transcript []string, options BuildPromptOptions) (string, error) {
+	prompt, _, err := BuildPromptWithSectionCosts(action, transcript, options)
+	return prompt, err
+}
+
+// BuildPromptWithSectionCosts renders the concatenated prompt and returns its
+// section cost measurements.
+func BuildPromptWithSectionCosts(
+	action Action,
+	transcript []string,
+	options BuildPromptOptions,
+) (string, []GuardianPromptSectionCost, error) {
+	entries := make([]GuardianTranscriptEntry, 0, len(transcript))
+	for _, line := range transcript {
+		// A pre-rendered line keeps its exact text: Author and LineRole stay
+		// empty so Render returns the line unchanged.
+		entries = append(entries, GuardianTranscriptEntry{Text: line})
+	}
+	parts, costs, err := BuildPromptPartsWithSectionCosts(action, entries, options)
+	if err != nil {
+		return "", nil, err
+	}
+	var builder strings.Builder
+	for _, part := range parts {
+		if len(part.Native) > 0 {
+			continue
+		}
+		writeGuardianPromptSection(&builder, part.Text)
+	}
+	return builder.String(), costs, nil
+}
+
+// BuildPromptPartsWithOptions renders the review input in Rust's ordered
+// section form. Text sections between native agent messages are merged into one
+// text block, so the caller can deliver the first block as the prompt and the
+// remaining text blocks and native items in order.
+func BuildPromptPartsWithOptions(action Action, transcript []GuardianTranscriptEntry, options BuildPromptOptions) ([]GuardianPromptPart, error) {
+	parts, _, err := BuildPromptPartsWithSectionCosts(action, transcript, options)
+	return parts, err
+}
+
+// BuildPromptPartsWithSectionCosts renders the same ordered prompt and returns
+// stable section IDs with payload-free size measurements.
+func BuildPromptPartsWithSectionCosts(
+	action Action,
+	transcript []GuardianTranscriptEntry,
+	options BuildPromptOptions,
+) ([]GuardianPromptPart, []GuardianPromptSectionCost, error) {
+	if err := action.Validate(); err != nil {
+		return nil, nil, err
+	}
+	var textSections []guardianPromptSection
+	var parts []GuardianPromptPart
+	var costs []GuardianPromptSectionCost
+	recordCost := func(section string, textBytes int, imageBytes int, imageCount int) {
+		if textBytes == 0 && imageBytes == 0 && imageCount == 0 {
+			return
+		}
+		if len(costs) > 0 && costs[len(costs)-1].Section == section {
+			costs[len(costs)-1].TextBytes += textBytes
+			costs[len(costs)-1].ImageBytes += imageBytes
+			costs[len(costs)-1].ImageCount += imageCount
+			return
+		}
+		costs = append(costs, GuardianPromptSectionCost{
+			Section:    section,
+			TextBytes:  textBytes,
+			ImageBytes: imageBytes,
+			ImageCount: imageCount,
+		})
+	}
+	addSection := func(sectionID string, section string) {
+		textSections = append(textSections, guardianPromptSection{id: sectionID, text: section})
+	}
+	flushSections := func() {
+		for _, section := range textSections {
+			trimmed := strings.TrimRight(section.text, "\n")
+			if strings.TrimSpace(trimmed) == "" {
+				continue
+			}
+			recordCost(section.id, len(trimmed), 0, 0)
+			if len(parts) > 0 && len(parts[len(parts)-1].Native) == 0 {
+				parts[len(parts)-1].Text += "\n\n" + trimmed
+				continue
+			}
+			parts = append(parts, GuardianPromptPart{Text: trimmed})
+		}
+		textSections = nil
+	}
+	if len(options.RootUserAuthorization) > 0 {
+		messages := make([]RootMessage, 0, len(options.RootUserAuthorization))
+		for _, message := range options.RootUserAuthorization {
+			if strings.TrimSpace(message.Text) == "" {
+				continue
+			}
+			// The host resolves roles before composition so assistant context
+			// cannot be mistaken for user authorization.
+			messages = append(messages, message)
+		}
+		if items := RootConversationSectionItems(messages); len(items) > 0 {
+			addSection("root_conversation", strings.Join(items, ""))
+		}
+	}
+	if items := SenderUserMessagesSectionItems(options.RetainedContext); len(items) > 0 {
+		addSection("sender_user_messages", strings.Join(items, ""))
+	}
+	// The retained snapshot layout follows the reviewed consumer's framing
+	// (#51627): the stateful synchronous reviewer renders one section ahead of the
+	// transcript, while the asynchronous independent snapshot keeps the
+	// instruction prefix there and moves the assistant context behind it.
+	retainedSections := RenderRetainedInstructionSectionsForPresentation(options.RetainedContext, options.Presentation)
+	retainedSections = ApplyRetainedOmissionDeduplication(retainedSections, options.PreviousRetainedOmissions, HasLegacyRetainedOrder(options.RetainedContext))
+	if len(retainedSections.Instructions) > 0 {
+		addSection("retained_user_instructions", strings.Join(retainedSections.Instructions, ""))
+	}
+	// Rust feeds the review's selected-answer evidence into the composer as
+	// `trusted_user_answers` (guardian/prompt.rs's `user_input_snapshot`), which
+	// the TrustedUserAnswers section renders.
+	if items := TrustedUserAnswersSectionItems(RenderVerifiedAnswers(options.RetainedContext).Fragments); len(items) > 0 {
+		addSection("trusted_user_answers", strings.Join(items, ""))
+	}
+	if len(transcript) > 0 || options.TranscriptOmissionNote != "" {
+		var run strings.Builder
+		run.WriteString("Recent transcript:\n")
+		for _, entry := range transcript {
+			if len(entry.Native) > 0 {
+				// Rust flushes the accumulated transcript text before the
+				// native message and continues the section after it.
+				addSection("conversation_transcript", run.String())
+				flushSections()
+				parts = append(parts, GuardianPromptPart{Native: append(json.RawMessage(nil), entry.Native...)})
+				recordCost("conversation_transcript", len(entry.Native), 0, 0)
+				run.Reset()
+				continue
+			}
+			line := strings.TrimSpace(entry.Render(options.TranscriptFormat))
+			if line == "" {
+				continue
+			}
+			run.WriteString("- ")
+			run.WriteString(line)
+			run.WriteByte('\n')
+		}
+		if options.TranscriptOmissionNote != "" {
+			run.WriteString(options.TranscriptOmissionNote)
+			run.WriteByte('\n')
+		}
+		addSection("conversation_transcript", run.String())
+	}
+	if len(retainedSections.AssistantContext) > 0 {
+		addSection("retained_assistant_context", strings.Join(retainedSections.AssistantContext, ""))
+	}
+	if options.NodeReplEvidence != nil {
+		if rendered := context.Render(options.NodeReplEvidence); rendered != nil && strings.TrimSpace(rendered.Content) != "" {
+			addSection("node_repl_evidence", rendered.Content)
+		}
+	}
+	if items := PermissionContextSectionItems(options.PermissionContext); len(items) > 0 {
+		// Rust's marker opens with its own newline inside the message that carries
+		// it; the block separator already supplies that paragraph break here.
+		addSection("permissions", strings.TrimLeft(strings.Join(items, ""), "\n"))
+	}
+	actionPrompt, err := joinPlannedAction(action, options.Presentation)
+	if err != nil {
+		return nil, nil, err
+	}
+	addSection("planned_action", actionPrompt)
+	if descriptions := renderGuardianToolDescriptions(action); descriptions != "" {
+		addSection("planned_action", descriptions)
+	}
+	flushSections()
+	return parts, costs, nil
+}
+
+// writeGuardianPromptSection appends one prompt block, separated from the
+// previous block by exactly one blank line. Rust delivers these blocks as
+// separate content items; Go concatenates them into one prompt string, so the
+// separator is normalized here rather than inherited from each block's own
+// trailing newline.
+func writeGuardianPromptSection(builder *strings.Builder, section string) {
+	if builder == nil {
+		return
+	}
+	section = strings.TrimRight(section, "\n")
+	if strings.TrimSpace(section) == "" {
+		return
+	}
+	if builder.Len() > 0 {
+		builder.WriteString("\n\n")
+	}
+	builder.WriteString(section)
+}
+
+func guardianPromptAction(action Action) any {
+	if action.Type != "network_access" {
+		return action
+	}
+	value := map[string]any{
+		"host":     action.Host,
+		"port":     action.Port,
+		"protocol": action.Protocol,
+		"target":   action.Target,
+		"tool":     "network_access",
+	}
+	if trigger := action.Extra["trigger"]; trigger != nil {
+		value["trigger"] = trigger
+	}
+	return value
+}
+
+func recordRecent(state *turnState, denied bool) {
+	state.recentDenials = append(state.recentDenials, denied)
+	if len(state.recentDenials) > AutoReviewDenialWindowSize {
+		state.recentDenials = state.recentDenials[1:]
+	}
+}
+
+func countRecentDenials(state *turnState) uint32 {
+	var count uint32
+	for _, denied := range state.recentDenials {
+		if denied {
+			count++
+		}
+	}
+	return count
+}
+
+func cloneEvent(event *Event) *Event {
+	if event == nil {
+		return nil
+	}
+	cloned := *event
+	cloned.Action.Files = append([]string(nil), event.Action.Files...)
+	cloned.Action.Argv = append([]string(nil), event.Action.Argv...)
+	if event.Action.Permissions != nil {
+		cloned.Action.Permissions = map[string]any{}
+		for key, value := range event.Action.Permissions {
+			cloned.Action.Permissions[key] = value
+		}
+	}
+	if event.Action.Extra != nil {
+		cloned.Action.Extra = map[string]any{}
+		for key, value := range event.Action.Extra {
+			cloned.Action.Extra[key] = value
+		}
+	}
+	return &cloned
+}
+
+func unixMillis(t time.Time) int64 {
+	if t.IsZero() {
+		t = time.Now().UTC()
+	}
+	return t.UTC().UnixNano() / int64(time.Millisecond)
+}

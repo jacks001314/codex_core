@@ -1,0 +1,134 @@
+//go:build windows
+
+package execserver
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"strings"
+
+	"codex_core/sandbox"
+	"codex_core/sandbox/windowssandbox"
+	windowsunified "codex_core/sandbox/windowssandbox/unified_exec"
+)
+
+func startExecServerSandboxProcess(params *ExecParams) (*startedExecServerSandboxProcess, bool, error) {
+	if params == nil || !hasJSONValue(params.Sandbox) {
+		return nil, false, nil
+	}
+	if params.EnforceManagedNetwork && params.ManagedNetwork == nil {
+		return nil, true, requestError(-32602, "managed network enforcement requires managedNetwork context")
+	}
+	var sandboxContext FileSystemSandboxContext
+	if err := json.Unmarshal(params.Sandbox, &sandboxContext); err != nil {
+		return nil, true, requestError(-32602, fmt.Sprintf("invalid sandbox context: %v", err))
+	}
+	if err := sandboxContext.SandboxOverride.Validate(); err != nil {
+		return nil, true, requestError(-32602, "invalid sandbox context: "+err.Error())
+	}
+	// Rust deserializes windows_sandbox_level as a kebab-case enum, so an
+	// unrecognized level is an invalid-params error rather than a silent
+	// fallback; "mxc" then has its own launch restrictions (Rust #45176).
+	selection, err := selectWindowsSandboxForExecutor(sandboxContext.WindowsSandboxLevel, params.CWD)
+	if err != nil {
+		return nil, true, requestError(-32602, "invalid sandbox context: "+err.Error())
+	}
+	if selection == WindowsSandboxSelectionMXC {
+		if params.TTY || params.Arg0 != nil {
+			return nil, true, requestError(-32602, "MXC currently supports ordinary pipe launches only")
+		}
+		if params.EnforceManagedNetwork || params.ManagedNetwork != nil || params.NetworkProxy != nil {
+			return nil, true, requestError(-32602, "MXC managed networking is not supported yet")
+		}
+		// Go has no native MXC runner, so an MXC request is rejected exactly like
+		// Rust on an executor without a usable MXC environment.
+		return nil, true, requestError(-32602, "native MXC is unavailable on this executor")
+	}
+	if !hasJSONValue(sandboxContext.Permissions) {
+		return nil, true, requestError(-32602, "invalid sandbox context: permissions are required")
+	}
+	if params.EnforceManagedNetwork && selection != WindowsSandboxSelectionElevated {
+		return nil, true, fmt.Errorf("managed networking requires the elevated Windows sandbox backend")
+	}
+	if err := sandboxContext.WindowsSandboxProxySettingsMode.Validate(); err != nil {
+		return nil, true, requestError(-32602, "invalid sandbox context: "+err.Error())
+	}
+	cwd, err := nativeExecServerPath(params.CWD, "cwd")
+	if err != nil {
+		return nil, true, err
+	}
+	if strings.TrimSpace(cwd) == "" {
+		return nil, true, requestError(-32602, "cwd is required for Windows sandbox process launch")
+	}
+	profileJSON, err := nativePermissionProfileJSON(sandboxContext.Permissions)
+	if err != nil {
+		return nil, true, requestError(-32602, fmt.Sprintf("invalid sandbox permission path URI: %v", err))
+	}
+	profile, err := sandbox.ParseRuntimePermissionProfileJSON(profileJSON)
+	if err != nil {
+		return nil, true, requestError(-32602, fmt.Sprintf("invalid sandbox permission profile: %v", err))
+	}
+	if profile.Disabled {
+		return nil, true, requestError(-32602, "sandbox intent cannot be enforced on this executor")
+	}
+	workspaceRoots := make([]string, 0, len(sandboxContext.WorkspaceRoots))
+	for _, root := range sandboxContext.WorkspaceRoots {
+		native, rootErr := nativeExecServerPath(root, "workspace root")
+		if rootErr != nil {
+			return nil, true, rootErr
+		}
+		workspaceRoots = append(workspaceRoots, native)
+	}
+	if len(workspaceRoots) == 0 {
+		workspaceRoots = []string{cwd}
+	}
+	level := windowsunified.WindowsSandboxLevelLegacy
+	if selection == WindowsSandboxSelectionElevated {
+		level = windowsunified.WindowsSandboxLevelElevated
+	}
+	// Rust #49098: a remote controller cannot resolve a sandbox-compatible
+	// PowerShell on this host, so request preparation applies the existing
+	// fallback for the elevated/MXC Windows sandbox backends.
+	command := append([]string(nil), params.Argv...)
+	if len(command) > 0 {
+		command[0] = windowsSandboxPowerShellProgram(command[0], string(selection))
+	}
+	session, err := windowsunified.SpawnWindowsSandboxLiveSessionForLevel(&windowsunified.WindowsSandboxSessionRequest{
+		Capture: windowssandbox.CaptureRequest{
+			PermissionProfileID:              "exec-server",
+			PermissionProfile:                profile,
+			WorkspaceRoots:                   workspaceRoots,
+			CodexHome:                        fsHelperCodexHome(),
+			Command:                          command,
+			CWD:                              cwd,
+			Env:                              childEnv(params),
+			TTY:                              params.TTY,
+			StdinOpen:                        params.TTY || params.PipeStdin,
+			UsePrivateDesktop:                sandboxContext.WindowsSandboxPrivateDesktop,
+			ProxyEnforced:                    params.EnforceManagedNetwork,
+			ProxySettingsMode:                windowsSandboxProxySettingsMode(sandboxContext.WindowsSandboxProxySettingsMode),
+			ReadRootsIncludePlatformDefaults: true,
+		},
+		PTY:                 params.TTY,
+		WindowsSandboxLevel: level,
+		ProxyEnforced:       params.EnforceManagedNetwork,
+	})
+	if err != nil {
+		return nil, true, err
+	}
+	return &startedExecServerSandboxProcess{
+		stdin:     session.Stdin,
+		readers:   append([]io.ReadCloser(nil), session.Readers...),
+		wait:      session.Wait,
+		terminate: session.Terminate,
+		close:     session.Close,
+	}, true, nil
+}
+
+func windowsSandboxProxySettingsMode(mode WindowsSandboxProxySettingsMode) windowssandbox.ProxySettingsMode {
+	if mode == WindowsSandboxProxySettingsPreserve {
+		return windowssandbox.ProxySettingsPreserve
+	}
+	return windowssandbox.ProxySettingsReconcile
+}

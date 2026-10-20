@@ -1,0 +1,3224 @@
+package rollout
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"codex_core/retainedctx"
+	"codex_core/session"
+
+	"github.com/klauspost/compress/zstd"
+)
+
+const (
+	SessionsSubdir         = "sessions"
+	ArchivedSessionsSubdir = "archived_sessions"
+)
+
+var materializeReferenceMu sync.Mutex
+
+type SortKey string
+
+const (
+	SortCreatedAt SortKey = "created_at"
+	SortUpdatedAt SortKey = "updated_at"
+	SortRecencyAt SortKey = "recency_at"
+)
+
+type SortDirection string
+
+const (
+	SortAsc  SortDirection = "asc"
+	SortDesc SortDirection = "desc"
+)
+
+type Config struct {
+	CodexHome        string
+	SQLiteHome       string
+	CWD              string
+	Model            string
+	ModelProviderID  string
+	GenerateMemories bool
+}
+
+// ForkedFromOrdinal resolves the fork cutoff ordinal for a session meta,
+// preferring the persisted forked_from_ordinal_exclusive and falling back to the
+// history base when it belongs to the parent thread or this is the thread's
+// original rollout (Rust rollout::forked_from_ordinal_exclusive, #40987).
+func ForkedFromOrdinal(meta *SessionMeta) *uint64 {
+	if meta == nil || strings.TrimSpace(meta.ForkedFromID) == "" {
+		return nil
+	}
+	if meta.ForkedFromOrdinalExclusive != nil {
+		return meta.ForkedFromOrdinalExclusive
+	}
+	if base := meta.HistoryBase; base != nil && base.ThreadID == meta.ForkedFromID {
+		out := base.EndOrdinalExclusive
+		return &out
+	}
+	return nil
+}
+
+type Item struct {
+	ID         string          `json:"id,omitempty"`
+	Type       string          `json:"type"`
+	Role       string          `json:"role,omitempty"`
+	Text       string          `json:"text,omitempty"`
+	Name       string          `json:"name,omitempty"`
+	CallID     string          `json:"call_id,omitempty"`
+	Content    []ContentPart   `json:"content,omitempty"`
+	Data       map[string]any  `json:"data,omitempty"`
+	Raw        json.RawMessage `json:"raw,omitempty"`
+	ResponseID string          `json:"response_id,omitempty"`
+	Metadata   map[string]any  `json:"metadata,omitempty"`
+}
+
+type ContentPart struct {
+	Type     string  `json:"type"`
+	Text     string  `json:"text,omitempty"`
+	ImageURL string  `json:"image_url,omitempty"`
+	Detail   *string `json:"detail,omitempty"`
+}
+
+type SessionMeta struct {
+	ID            string `json:"id"`
+	SessionID     string `json:"session_id"`
+	SessionPrefix string `json:"session_prefix,omitempty"`
+	ForkedFromID  string `json:"forked_from_id,omitempty"`
+	// ForkedFromOrdinalExclusive persists the fork cutoff ordinal separately
+	// from the physical history base so fork lineage stays accurate after
+	// reverts and cold resumes (Rust #40987).
+	ForkedFromOrdinalExclusive  *uint64                             `json:"forked_from_ordinal_exclusive,omitempty"`
+	Timestamp                   string                              `json:"timestamp"`
+	CWD                         string                              `json:"cwd"`
+	Source                      string                              `json:"source,omitempty"`
+	ThreadSource                string                              `json:"thread_source,omitempty"`
+	Originator                  string                              `json:"originator"`
+	CreatorUserID               string                              `json:"creator_user_id,omitempty"`
+	CreatorAccountID            string                              `json:"creator_account_id,omitempty"`
+	Model                       string                              `json:"model,omitempty"`
+	ModelProvider               string                              `json:"model_provider,omitempty"`
+	HistoryMode                 string                              `json:"history_mode,omitempty"`
+	HistoryBase                 *HistoryPosition                    `json:"history_base,omitempty"`
+	SubagentHistoryStartOrdinal *uint64                             `json:"subagent_history_start_ordinal,omitempty"`
+	MemoryMode                  string                              `json:"memory_mode,omitempty"`
+	ParentThreadID              string                              `json:"parent_thread_id,omitempty"`
+	BaseInstructions            string                              `json:"base_instructions,omitempty"`
+	BaseInstructionsProvenance  *session.BaseInstructionsProvenance `json:"-"`
+	AgentNickname               string                              `json:"agent_nickname,omitempty"`
+	AgentRole                   string                              `json:"agent_role,omitempty"`
+	AgentPath                   string                              `json:"agent_path,omitempty"`
+	DynamicTools                []json.RawMessage                   `json:"dynamic_tools,omitempty"`
+	SelectedCapabilityRoots     []json.RawMessage                   `json:"selected_capability_roots,omitempty"`
+	MultiAgentVersion           string                              `json:"multi_agent_version,omitempty"`
+	ContextWindow               json.RawMessage                     `json:"context_window,omitempty"`
+	CLIVersion                  string                              `json:"cli_version"`
+	Git                         map[string]string                   `json:"git,omitempty"`
+	// RuntimeWorkspaceRoots mirrors Rust's SessionMeta field (#43848). A nil
+	// value means unknown; an empty list is an explicit empty selection.
+	RuntimeWorkspaceRoots *[]string      `json:"runtime_workspace_roots,omitempty"`
+	Extra                 map[string]any `json:"extra,omitempty"`
+}
+
+// UnmarshalJSON accepts both the legacy Go string representation and the
+// object representation emitted by current Rust rollouts:
+// {"base_instructions":"..."} and {"base_instructions":{"text":"..."}}.
+func (m *SessionMeta) UnmarshalJSON(data []byte) error {
+	type sessionMetaAlias SessionMeta
+	var wire struct {
+		*sessionMetaAlias
+		BaseInstructions json.RawMessage `json:"base_instructions"`
+		Source           json.RawMessage `json:"source"`
+	}
+	wire.sessionMetaAlias = (*sessionMetaAlias)(m)
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	// Rust serializes SessionSource externally tagged, so subagent rollouts
+	// carry an object ({"subagent":{"other":"guardian"}}) instead of a string.
+	// Normalize either form to the display string the rest of the store uses.
+	m.Source = ""
+	if len(wire.Source) > 0 && string(wire.Source) != "null" {
+		source, err := session.ParseSessionSourceJSON(wire.Source)
+		if err != nil {
+			return fmt.Errorf("source: %w", err)
+		}
+		m.Source = source
+	}
+	if len(wire.BaseInstructions) == 0 || string(wire.BaseInstructions) == "null" {
+		m.BaseInstructions = ""
+		m.BaseInstructionsProvenance = nil
+		return nil
+	}
+	var legacy string
+	if err := json.Unmarshal(wire.BaseInstructions, &legacy); err == nil {
+		m.BaseInstructions = legacy
+		m.BaseInstructionsProvenance = nil
+		return nil
+	}
+	var object struct {
+		Text       string                              `json:"text"`
+		Provenance *session.BaseInstructionsProvenance `json:"provenance,omitempty"`
+	}
+	if err := json.Unmarshal(wire.BaseInstructions, &object); err != nil {
+		return fmt.Errorf("base_instructions: expected string or object: %w", err)
+	}
+	m.BaseInstructions = object.Text
+	m.BaseInstructionsProvenance = object.Provenance
+	return nil
+}
+
+// MarshalJSON emits the Rust-compatible object representation while retaining
+// the Go string field internally for callers and legacy metadata.
+func (m SessionMeta) MarshalJSON() ([]byte, error) {
+	type sessionMetaAlias SessionMeta
+	var wire struct {
+		*sessionMetaAlias
+		BaseInstructions any `json:"base_instructions,omitempty"`
+		Source           any `json:"source,omitempty"`
+	}
+	wire.sessionMetaAlias = (*sessionMetaAlias)(&m)
+	// Keep the Rust externally tagged representation for sources whose enum
+	// payload is reconstructible from the canonical display string.
+	if subAgent, ok := session.SubAgentSourceWire(m.Source); ok {
+		wire.Source = map[string]any{"subagent": subAgent}
+	} else if m.Source != "" {
+		wire.Source = m.Source
+	}
+	if m.BaseInstructions != "" {
+		wire.BaseInstructions = struct {
+			Text       string                              `json:"text"`
+			Provenance *session.BaseInstructionsProvenance `json:"provenance,omitempty"`
+		}{Text: m.BaseInstructions, Provenance: cloneBaseInstructionsProvenance(m.BaseInstructionsProvenance)}
+	}
+	return json.Marshal(&wire)
+}
+
+func cloneBaseInstructionsProvenance(value *session.BaseInstructionsProvenance) *session.BaseInstructionsProvenance {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}
+
+type HistoryPosition struct {
+	ThreadID            string `json:"thread_id"`
+	EndOrdinalExclusive uint64 `json:"end_ordinal_exclusive"`
+	EndByteOffset       uint64 `json:"end_byte_offset"`
+}
+
+type Line struct {
+	Type      string          `json:"type"`
+	Timestamp string          `json:"timestamp,omitempty"`
+	Ordinal   *uint64         `json:"ordinal,omitempty"`
+	Meta      *SessionMeta    `json:"meta,omitempty"`
+	Payload   json.RawMessage `json:"payload,omitempty"`
+	Item      json.RawMessage `json:"item,omitempty"`
+	// ItemMetadata is the optional harness-owned metadata sibling stored
+	// beside a response-item payload (Rust RolloutItemWire::ResponseItem
+	// metadata field, #38058). Absent for legacy lines.
+	ItemMetadata      json.RawMessage `json:"metadata,omitempty"`
+	ItemID            string          `json:"item_id,omitempty"`
+	TurnID            string          `json:"turn_id,omitempty"`
+	Role              string          `json:"role,omitempty"`
+	ResponseID        string          `json:"response_id,omitempty"`
+	ThreadRolledBack  *RollbackEvent  `json:"thread_rolled_back,omitempty"`
+	TurnContext       json.RawMessage `json:"turn_context,omitempty"`
+	WorldState        json.RawMessage `json:"world_state,omitempty"`
+	SecurityRiskScore json.RawMessage `json:"security_risk_score,omitempty"`
+	// RetainedContext carries the sparse, model-invisible retained-context event
+	// of a `retained_context` line (Rust RolloutItem::RetainedContext). The wire
+	// form is Rust's `payload` key, so this field is only populated by the reader.
+	RetainedContext json.RawMessage `json:"-"`
+	Data            map[string]any  `json:"data,omitempty"`
+}
+
+type RollbackEvent struct {
+	NumTurns uint32 `json:"num_turns"`
+}
+
+type CompactedEvent struct {
+	Message            string          `json:"message"`
+	ReplacementHistory json.RawMessage `json:"replacement_history,omitempty"`
+	// GuardianHistory is the model-invisible bounded review transcript stored
+	// beside compacted model history (Rust #42065).
+	GuardianHistory json.RawMessage `json:"guardian_history,omitempty"`
+	// ReplacementHistoryMetadata is an aligned sidecar for the replacement
+	// history's harness metadata (Rust CompactedItemWire
+	// replacement_history_metadata, #38058). It is optional; legacy payloads
+	// omit it.
+	ReplacementHistoryMetadata json.RawMessage `json:"replacement_history_metadata,omitempty"`
+	WindowNumber               *uint64         `json:"window_number,omitempty"`
+	FirstWindowID              string          `json:"first_window_id,omitempty"`
+	PreviousWindowID           string          `json:"previous_window_id,omitempty"`
+	WindowID                   string          `json:"window_id,omitempty"`
+	// RetainedContext is the bounded host-owned retained snapshot taken with this
+	// checkpoint (Rust CompactedItemWire retained_context). The facts live until
+	// their instruction boundary is rolled back; compaction does not expire them,
+	// so a resumed thread can still show its original instructions to the
+	// Guardian reviewer.
+	RetainedContext *retainedctx.RetainedContext `json:"retained_context,omitempty"`
+	// CompactionResponseID and LatestTokenUsageRecord mirror Rust #41912's
+	// checkpoint fields. They serialize as null when absent, matching the Rust
+	// wire shape.
+	CompactionResponseID   *string           `json:"compaction_response_id"`
+	LatestTokenUsageRecord *TokenUsageRecord `json:"latest_token_usage_record"`
+}
+
+// TokenUsageRecord mirrors Rust RolloutItem::TokenUsageRecord (#41912): one
+// completed Responses API usage observation with response, turn, thread,
+// session, and root-turn attribution.
+type TokenUsageRecord struct {
+	ThreadID         string         `json:"thread_id"`
+	TurnID           string         `json:"turn_id"`
+	SessionID        string         `json:"session_id"`
+	RootTurnID       string         `json:"root_turn_id"`
+	ResponseID       string         `json:"response_id"`
+	Usage            map[string]any `json:"usage"`
+	TurnTokenUsage   map[string]any `json:"turn_token_usage"`
+	ThreadTokenUsage map[string]any `json:"thread_token_usage"`
+}
+
+type ThreadGoal struct {
+	ThreadID        string `json:"threadId"`
+	Objective       string `json:"objective"`
+	Status          string `json:"status"`
+	TokenBudget     *int64 `json:"tokenBudget,omitempty"`
+	TokensUsed      int64  `json:"tokensUsed"`
+	TimeUsedSeconds int64  `json:"timeUsedSeconds"`
+	CreatedAt       int64  `json:"createdAt"`
+	UpdatedAt       int64  `json:"updatedAt"`
+}
+
+type Recorder struct {
+	mu          sync.Mutex
+	path        string
+	file        *os.File
+	paginated   bool
+	threadID    string
+	nextOrdinal uint64
+	afterFlush  func(string)
+}
+
+type CreateParams struct {
+	CodexHome                   string
+	SessionID                   string
+	SessionPrefix               string
+	ThreadID                    string
+	ForkedFromID                string
+	Source                      string
+	ThreadSource                string
+	Originator                  string
+	CWD                         string
+	Model                       string
+	ModelProvider               string
+	HistoryMode                 string
+	HistoryBase                 *HistoryPosition
+	SubagentHistoryStartOrdinal *uint64
+	MemoryMode                  string
+	ParentThreadID              string
+	BaseInstructions            string
+	BaseInstructionsProvenance  *session.BaseInstructionsProvenance
+	AgentNickname               string
+	AgentRole                   string
+	AgentPath                   string
+	DynamicTools                []json.RawMessage
+	SelectedCapabilityRoots     []json.RawMessage
+	MultiAgentVersion           string
+	ContextWindow               json.RawMessage
+	CLIVersion                  string
+	Git                         map[string]string
+	Extra                       map[string]any
+	Now                         time.Time
+	// Path pins the created rollout file. The app server records a thread's
+	// rollout path when the thread starts, so the recorder must write there even
+	// when its own timestamp differs (Rust pins the filename through
+	// `RolloutRecorderParams::Create::rollout_id_override`).
+	Path string
+}
+
+func NewRecorder(params *CreateParams) (*Recorder, error) {
+	if params == nil {
+		return nil, errors.New("create params are required")
+	}
+	if params.ThreadID == "" {
+		return nil, errors.New("thread id is required")
+	}
+	sessionID := strings.TrimSpace(params.SessionID)
+	if sessionID == "" {
+		sessionID = params.ThreadID
+	}
+	now := params.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	path := strings.TrimSpace(params.Path)
+	if path == "" {
+		path = PathForThread(params.CodexHome, params.ThreadID, now)
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	recorder := &Recorder{
+		path:      path,
+		file:      file,
+		paginated: strings.EqualFold(strings.TrimSpace(params.HistoryMode), "paginated"),
+		threadID:  params.ThreadID,
+	}
+	if recorder.paginated && params.HistoryBase != nil {
+		recorder.nextOrdinal = params.HistoryBase.EndOrdinalExclusive
+	}
+	meta := &SessionMeta{
+		ID:                          params.ThreadID,
+		SessionID:                   sessionID,
+		SessionPrefix:               params.SessionPrefix,
+		ForkedFromID:                params.ForkedFromID,
+		Timestamp:                   now.UTC().Format(time.RFC3339),
+		CWD:                         params.CWD,
+		Model:                       params.Model,
+		Source:                      params.Source,
+		ThreadSource:                params.ThreadSource,
+		Originator:                  params.Originator,
+		ModelProvider:               params.ModelProvider,
+		HistoryMode:                 params.HistoryMode,
+		HistoryBase:                 cloneHistoryPosition(params.HistoryBase),
+		SubagentHistoryStartOrdinal: cloneUint64Ptr(params.SubagentHistoryStartOrdinal),
+		MemoryMode:                  params.MemoryMode,
+		ParentThreadID:              params.ParentThreadID,
+		BaseInstructions:            params.BaseInstructions,
+		BaseInstructionsProvenance:  cloneBaseInstructionsProvenance(params.BaseInstructionsProvenance),
+		AgentNickname:               params.AgentNickname,
+		AgentRole:                   params.AgentRole,
+		AgentPath:                   params.AgentPath,
+		DynamicTools:                cloneRawMessages(params.DynamicTools),
+		SelectedCapabilityRoots:     cloneRawMessages(params.SelectedCapabilityRoots),
+		MultiAgentVersion:           params.MultiAgentVersion,
+		ContextWindow:               append(json.RawMessage(nil), params.ContextWindow...),
+		CLIVersion:                  params.CLIVersion,
+		Git:                         cloneStringMap(params.Git),
+		Extra:                       cloneAnyMap(params.Extra),
+	}
+	// Go historically kept this selection inside the nested extra object. Write
+	// the Rust-compatible top-level field while still accepting the legacy
+	// spelling when reading.
+	if roots := runtimeWorkspaceRootsFromAny(meta.Extra["runtime_workspace_roots"]); roots != nil {
+		meta.RuntimeWorkspaceRoots = roots
+		delete(meta.Extra, "runtime_workspace_roots")
+	}
+	if err := recorder.AppendLine(Line{Type: "session_meta", Timestamp: now.UTC().Format(time.RFC3339Nano), Meta: meta}); err != nil {
+		file.Close()
+		return nil, err
+	}
+	return recorder, nil
+}
+
+func PathForThread(codexHome string, threadID string, now time.Time) string {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return filepath.Join(
+		codexHome,
+		SessionsSubdir,
+		now.Format("2006"),
+		now.Format("01"),
+		now.Format("02"),
+		fmt.Sprintf("rollout-%s-%s.jsonl", now.Format("2006-01-02T15-04-05"), threadID),
+	)
+}
+
+func Resume(path string) (*Recorder, error) {
+	lines, _, err := Load(path)
+	if err != nil {
+		return nil, err
+	}
+	paginated := false
+	threadID := ""
+	nextOrdinal := uint64(0)
+	for i := range lines {
+		if lines[i].Meta != nil && strings.EqualFold(strings.TrimSpace(lines[i].Meta.HistoryMode), "paginated") {
+			paginated = true
+		}
+		if lines[i].Meta != nil && threadID == "" {
+			threadID = lines[i].Meta.ID
+		}
+		if lines[i].Ordinal != nil && *lines[i].Ordinal >= nextOrdinal {
+			nextOrdinal = *lines[i].Ordinal + 1
+		}
+	}
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	return &Recorder{path: path, file: file, paginated: paginated, threadID: threadID, nextOrdinal: nextOrdinal}, nil
+}
+
+func (line Line) MarshalJSON() ([]byte, error) {
+	if line.Type == "session_meta" && line.Meta != nil {
+		return json.Marshal(struct {
+			Timestamp string       `json:"timestamp"`
+			Ordinal   *uint64      `json:"ordinal,omitempty"`
+			Type      string       `json:"type"`
+			Payload   *SessionMeta `json:"payload"`
+		}{Timestamp: line.Timestamp, Ordinal: line.Ordinal, Type: line.Type, Payload: line.Meta})
+	}
+	if line.Type == "response_item" && len(line.Item) > 0 {
+		if len(line.ItemMetadata) > 0 && string(line.ItemMetadata) != "null" {
+			return json.Marshal(struct {
+				Timestamp string          `json:"timestamp"`
+				Ordinal   *uint64         `json:"ordinal,omitempty"`
+				Type      string          `json:"type"`
+				Payload   json.RawMessage `json:"payload"`
+				Metadata  json.RawMessage `json:"metadata"`
+			}{Timestamp: line.Timestamp, Ordinal: line.Ordinal, Type: line.Type, Payload: line.Item, Metadata: line.ItemMetadata})
+		}
+		return json.Marshal(struct {
+			Timestamp string          `json:"timestamp"`
+			Ordinal   *uint64         `json:"ordinal,omitempty"`
+			Type      string          `json:"type"`
+			Payload   json.RawMessage `json:"payload"`
+		}{Timestamp: line.Timestamp, Ordinal: line.Ordinal, Type: line.Type, Payload: line.Item})
+	}
+	type lineAlias Line
+	return json.Marshal(lineAlias(line))
+}
+
+func (r *Recorder) Path() string {
+	if r == nil {
+		return ""
+	}
+	return r.path
+}
+
+func (r *Recorder) IsPaginated() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.paginated
+}
+
+func (r *Recorder) SetAfterFlush(callback func(string)) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.afterFlush = callback
+	r.mu.Unlock()
+}
+
+func (r *Recorder) AppendItem(item Item) error {
+	if r.IsPaginated() {
+		return r.appendPaginatedItem(item, time.Now().UTC())
+	}
+	line, err := LineFromItem(&item, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	return r.AppendLine(*line)
+}
+
+// AppendItemStarted persists the canonical lifecycle event emitted before a
+// paginated turn item reaches a terminal state.
+func (r *Recorder) AppendItemStarted(item json.RawMessage, turnID string, startedAt time.Time) error {
+	if len(item) == 0 {
+		return errors.New("started item payload is required")
+	}
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return errors.New("started item turn id is required")
+	}
+	if startedAt.IsZero() {
+		startedAt = time.Now().UTC()
+	}
+	payload, err := json.Marshal(map[string]any{
+		"type":          "item_started",
+		"thread_id":     r.threadID,
+		"turn_id":       turnID,
+		"item":          json.RawMessage(item),
+		"started_at_ms": startedAt.UTC().UnixMilli(),
+	})
+	if err != nil {
+		return err
+	}
+	return r.AppendLine(Line{Type: "event_msg", Timestamp: startedAt.UTC().Format(time.RFC3339Nano), Payload: payload})
+}
+
+// AppendItemCompleted persists the canonical lifecycle event used by Rust
+// paginated rollouts and consumed by the thread-history SQLite projection.
+func (r *Recorder) AppendItemCompleted(item json.RawMessage, turnID string, startedAt time.Time, completedAt time.Time) error {
+	if len(item) == 0 {
+		return errors.New("completed item payload is required")
+	}
+	// Mirror Rust's persisted ItemCompleted representation (rollout/src/policy.rs)
+	// so oversized fields are capped before they reach the durable rollout.
+	originalItem := item
+	item = applyPersistedItemTruncation(item)
+	// Rust #50454: measure the persisted size reduction of this item across the
+	// persistence projection.
+	recordRolloutPersistenceItemSizes(r.threadID, originalItem, item)
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return errors.New("completed item turn id is required")
+	}
+	if completedAt.IsZero() {
+		completedAt = time.Now().UTC()
+	}
+	payload := map[string]any{
+		"type":            "item_completed",
+		"thread_id":       r.threadID,
+		"turn_id":         turnID,
+		"item":            json.RawMessage(item),
+		"completed_at_ms": completedAt.UTC().UnixMilli(),
+	}
+	if !startedAt.IsZero() {
+		payload["started_at_ms"] = startedAt.UTC().UnixMilli()
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return r.AppendLine(Line{Type: "event_msg", Timestamp: completedAt.UTC().Format(time.RFC3339Nano), Payload: raw})
+}
+
+func (r *Recorder) AppendThreadGoalUpdated(goal ThreadGoal, turnID string, now time.Time) error {
+	goal.ThreadID = strings.TrimSpace(goal.ThreadID)
+	if goal.ThreadID == "" {
+		goal.ThreadID = strings.TrimSpace(r.threadID)
+	}
+	if goal.ThreadID == "" || strings.TrimSpace(goal.Objective) == "" {
+		return errors.New("thread goal payload is invalid")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	payload := struct {
+		Type     string     `json:"type"`
+		ThreadID string     `json:"threadId"`
+		TurnID   string     `json:"turnId,omitempty"`
+		Goal     ThreadGoal `json:"goal"`
+	}{
+		Type: "thread_goal_updated", ThreadID: goal.ThreadID, TurnID: strings.TrimSpace(turnID), Goal: goal,
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return r.AppendLine(Line{Type: "event_msg", Timestamp: now.UTC().Format(time.RFC3339Nano), Payload: raw})
+}
+
+func (r *Recorder) AppendThreadRolledBack(numTurns uint32, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	payload, err := json.Marshal(struct {
+		Type     string `json:"type"`
+		NumTurns uint32 `json:"num_turns"`
+	}{
+		Type:     "thread_rolled_back",
+		NumTurns: numTurns,
+	})
+	if err != nil {
+		return err
+	}
+	return r.AppendLine(Line{
+		Type:      "event_msg",
+		Timestamp: now.UTC().Format(time.RFC3339Nano),
+		Payload:   payload,
+	})
+}
+
+// AppendThreadSettingsApplied persists the settings snapshot used to restore
+// thread-level approval behavior after a cold resume.
+func (r *Recorder) AppendThreadSettingsApplied(approvalPolicy string, now time.Time) error {
+	return r.AppendThreadSettingsAppliedWithOwner("", approvalPolicy, "", now)
+}
+
+// AppendThreadSettingsAppliedWithOwner persists the thread-owned settings
+// snapshot used to restore thread-level approval behavior and working directory
+// after a cold resume. The owner thread ID and cwd let a resumed thread restore
+// its own retained cwd while ignoring snapshots copied from a forking thread
+// (Rust #41567). Snapshots without an owner remain readable but do not override
+// the startup cwd.
+func (r *Recorder) AppendThreadSettingsAppliedWithOwner(threadID, approvalPolicy, cwd string, now time.Time) error {
+	return r.AppendThreadSettingsAppliedWithSnapshot(threadID, approvalPolicy, cwd, nil, now)
+}
+
+// AppendThreadSettingsAppliedWithSnapshot persists the thread-owned settings
+// snapshot, including the collaboration mode when one is set (Rust #45519: a
+// resumed thread restores the saved Plan mode from the latest matching
+// ThreadSettingsApplied event).
+func (r *Recorder) AppendThreadSettingsAppliedWithSnapshot(threadID, approvalPolicy, cwd string, collaborationMode json.RawMessage, now time.Time) error {
+	return r.AppendThreadSettingsAppliedWithWorkspaceRoots(threadID, approvalPolicy, cwd, collaborationMode, nil, now)
+}
+
+// AppendThreadSettingsAppliedWithWorkspaceRoots persists the thread-owned
+// settings snapshot together with the runtime workspace root selection
+// (Rust #43848). A non-nil roots pointer preserves an explicit empty list,
+// which is distinct from an unknown/omitted selection.
+func (r *Recorder) AppendThreadSettingsAppliedWithWorkspaceRoots(threadID, approvalPolicy, cwd string, collaborationMode json.RawMessage, runtimeWorkspaceRoots *[]string, now time.Time) error {
+	approvalPolicy = strings.TrimSpace(approvalPolicy)
+	threadID = strings.TrimSpace(threadID)
+	cwd = strings.TrimSpace(cwd)
+	collaborationMode = append(json.RawMessage(nil), collaborationMode...)
+	var roots *[]string
+	if runtimeWorkspaceRoots != nil {
+		copied := make([]string, len(*runtimeWorkspaceRoots))
+		copy(copied, *runtimeWorkspaceRoots)
+		roots = &copied
+	}
+	if approvalPolicy == "" && cwd == "" && len(collaborationMode) == 0 && roots == nil {
+		return errors.New("thread settings require an approval policy or cwd")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	payload, err := json.Marshal(struct {
+		Type           string `json:"type"`
+		ThreadID       string `json:"thread_id,omitempty"`
+		ThreadSettings struct {
+			ApprovalPolicy        string          `json:"approval_policy"`
+			CWD                   string          `json:"cwd,omitempty"`
+			CollaborationMode     json.RawMessage `json:"collaboration_mode,omitempty"`
+			RuntimeWorkspaceRoots *[]string       `json:"runtime_workspace_roots,omitempty"`
+		} `json:"thread_settings"`
+	}{
+		Type:     "thread_settings_applied",
+		ThreadID: threadID,
+		ThreadSettings: struct {
+			ApprovalPolicy        string          `json:"approval_policy"`
+			CWD                   string          `json:"cwd,omitempty"`
+			CollaborationMode     json.RawMessage `json:"collaboration_mode,omitempty"`
+			RuntimeWorkspaceRoots *[]string       `json:"runtime_workspace_roots,omitempty"`
+		}{ApprovalPolicy: approvalPolicy, CWD: cwd, CollaborationMode: collaborationMode, RuntimeWorkspaceRoots: roots},
+	})
+	if err != nil {
+		return err
+	}
+	return r.AppendLine(Line{Type: "event_msg", Timestamp: now.UTC().Format(time.RFC3339Nano), Payload: payload})
+}
+
+// SecurityRiskScorePayload is the durable, rollout-only snapshot of a security
+// risk classifier result (Rust codex_protocol::security_risk::SecurityRiskScore).
+// In addition to per-category scores it may carry the provenance of the tool
+// call and bounded action that produced it (#40901) plus the sampling time.
+type SecurityRiskScorePayload struct {
+	Scores    map[string]float64 `json:"scores"`
+	CallID    *string            `json:"call_id,omitempty"`
+	Action    json.RawMessage    `json:"action,omitempty"`
+	SampledAt string             `json:"sampled_at,omitempty"`
+}
+
+// AppendSecurityRiskScore persists a durable thread-owned snapshot of
+// security risk classifier scores (Rust #38567). These records are
+// rollout-only and must not enter user-visible thread projections. Scores are
+// validated to [0,1] before the whole snapshot is stored.
+func (r *Recorder) AppendSecurityRiskScore(scores map[string]float64, now time.Time) error {
+	return r.AppendSecurityRiskScoreWithProvenance(scores, nil, nil, now)
+}
+
+// AppendSecurityRiskScoreWithProvenance persists a security risk classifier
+// result together with the optional tool call and bounded action provenance
+// (Rust #40901). callID corresponds to the tool call whose action produced the
+// score, and action is the bounded tool action that was reviewed. Both are
+// stored rollout-only and never enter user-visible projections.
+func (r *Recorder) AppendSecurityRiskScoreWithProvenance(scores map[string]float64, callID *string, action json.RawMessage, now time.Time) error {
+	if r == nil {
+		return errors.New("recorder is nil")
+	}
+	if len(scores) == 0 {
+		return errors.New("security risk scores are required")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	normalized := make(map[string]float64, len(scores))
+	for category, score := range scores {
+		category = strings.TrimSpace(category)
+		if category == "" {
+			return errors.New("security risk category is required")
+		}
+		if score < 0 || score > 1 {
+			return fmt.Errorf("invalid security risk score for %s: %v", category, score)
+		}
+		normalized[category] = score
+	}
+	sampledAt := ""
+	if !now.IsZero() {
+		sampledAt = now.UTC().Format(time.RFC3339Nano)
+	}
+	payload, err := json.Marshal(SecurityRiskScorePayload{
+		Scores:    normalized,
+		CallID:    callID,
+		Action:    action,
+		SampledAt: sampledAt,
+	})
+	if err != nil {
+		return err
+	}
+	return r.AppendLine(Line{Type: "security_risk_score", Timestamp: now.UTC().Format(time.RFC3339Nano), Payload: payload})
+}
+
+func (r *Recorder) AppendTurnStarted(turnID string, startedAt time.Time) error {
+	return r.AppendTurnStartedWithRoot("", turnID, startedAt)
+}
+
+// AppendTurnStartedWithRoot persists a turn-start event with root-turn
+// attribution (Rust #44611): the inherited root turn ID when available,
+// otherwise the caller passes the turn's own ID. No regular-turn attribution is
+// recorded, so non-regular tasks keep the pre-#51402 line shape.
+func (r *Recorder) AppendTurnStartedWithRoot(rootTurnID string, turnID string, startedAt time.Time) error {
+	return r.AppendTurnStartedWithAttribution(nil, rootTurnID, turnID, startedAt)
+}
+
+// AppendTurnStartedWithAttribution persists a turn-start event carrying both the
+// root-turn attribution (Rust #44611) and the regular-turn provenance Rust
+// #51402 records before startup work can be suspended (`TurnStartedEvent::
+// turn_attribution`). A nil attribution omits the field, which is what Rust
+// does for non-regular tasks and what older records look like.
+func (r *Recorder) AppendTurnStartedWithAttribution(attribution *TurnAttribution, rootTurnID string, turnID string, startedAt time.Time) error {
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return nil
+	}
+	if startedAt.IsZero() {
+		startedAt = time.Now().UTC()
+	}
+	payload, err := json.Marshal(struct {
+		Type            string           `json:"type"`
+		TurnID          string           `json:"turn_id"`
+		RootTurnID      string           `json:"root_turn_id,omitempty"`
+		StartedAt       int64            `json:"started_at"`
+		TurnAttribution *TurnAttribution `json:"turn_attribution,omitempty"`
+	}{
+		Type:            "task_started",
+		TurnID:          turnID,
+		RootTurnID:      strings.TrimSpace(rootTurnID),
+		StartedAt:       startedAt.UTC().Unix(),
+		TurnAttribution: attribution,
+	})
+	if err != nil {
+		return err
+	}
+	return r.AppendLine(Line{
+		Type:      "event_msg",
+		Timestamp: startedAt.UTC().Format(time.RFC3339Nano),
+		Payload:   payload,
+	})
+}
+
+// TurnContextRecord is the per-turn context snapshot persisted as a
+// `turn_context` rollout line. Rust writes one `TurnContextItem` per real user
+// turn "so resume/lazy replay can recover the latest durable baseline", and its
+// rollout reconstruction reads the model and compaction compatibility hash back
+// from the last record.
+// TurnContextSummaryPlaceholder is the legacy placeholder Rust persists for
+// `TurnContextItem::summary`: the active reasoning-summary setting is no longer
+// recorded, but older readers still expect the field, so the compatibility
+// value `"none"` is written instead (Rust #51492).
+const TurnContextSummaryPlaceholder = "none"
+
+type TurnContextRecord struct {
+	TurnID string `json:"turn_id,omitempty"`
+	// RootTurnID is the root turn that owns this turn's attribution, retained
+	// across recovery (Rust `TurnContextItem::root_turn_id`, Rust #51402
+	// `551bd409eb`). Rust's rollout reconstruction falls back to it when a
+	// `turn_started` record predates the persisted `turn_attribution`.
+	RootTurnID     string `json:"root_turn_id,omitempty"`
+	CWD            string `json:"cwd,omitempty"`
+	ApprovalPolicy string `json:"approval_policy,omitempty"`
+	SandboxPolicy  any    `json:"sandbox_policy,omitempty"`
+	// PermissionProfile is the turn's unnamed runtime permission profile
+	// (Rust TurnContextItem::permission_profile, #53419). It lets a cold resume
+	// restore the profile the turn actually ran with instead of the current
+	// configured default.
+	PermissionProfile json.RawMessage `json:"permission_profile,omitempty"`
+	Effort            string          `json:"effort,omitempty"`
+	Model             string          `json:"model,omitempty"`
+	CompHash          string          `json:"comp_hash,omitempty"`
+	// CyberAccessProgram is the turn's selected cyber access program (Rust
+	// TurnContextItem::cyber_access_program, core snake_case). It is persisted so
+	// resume/fork replay can rebuild the model/program pair the turn used
+	// (Rust #48224).
+	CyberAccessProgram string `json:"cyber_access_program,omitempty"`
+	// Summary is the compatibility placeholder described by
+	// TurnContextSummaryPlaceholder. Rectified fields that Rust removed from
+	// `TurnContextItem` (#51492) — `personality` (Go-only field, removed here),
+	// plus `workspace_roots`, `current_date`, `timezone`, `network` and
+	// `multi_agent_mode` (never persisted by Go) — are deliberately absent.
+	Summary string `json:"summary,omitempty"`
+}
+
+// AppendTurnContext persists one turn-context record for the turn.
+func (r *Recorder) AppendTurnContext(record TurnContextRecord, now time.Time) error {
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	return r.AppendLine(Line{
+		Type:      "turn_context",
+		Timestamp: now.UTC().Format(time.RFC3339Nano),
+		// Rust's RolloutItemWire serializes every variant's body under `payload`
+		// (tag = "type"), so a Go-written rollout stays readable by the Rust
+		// implementation; the reader maps `payload` back onto TurnContext for
+		// this type.
+		Payload: payload,
+	})
+}
+
+// AppendTokenUsageRecord persists one response's usage observation.
+func (r *Recorder) AppendTokenUsageRecord(record TokenUsageRecord, now time.Time) error {
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	return r.AppendLine(Line{
+		Type:      "token_usage_record",
+		Timestamp: now.UTC().Format(time.RFC3339Nano),
+		Payload:   payload,
+	})
+}
+
+// AppendRetainedContext persists one sparse retained-context event (Rust
+// RolloutItem::RetainedContext): a model-invisible host fact recorded between
+// compaction checkpoints, which a resumed thread replays in order.
+func (r *Recorder) AppendRetainedContext(event retainedctx.RetainedContextEvent, now time.Time) error {
+	event.Bound()
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	return r.AppendLine(Line{
+		Type:      "retained_context",
+		Timestamp: now.UTC().Format(time.RFC3339Nano),
+		Payload:   payload,
+	})
+}
+
+// RetainedContextEvents returns the sparse retained-context events a rollout
+// carries, oldest first. A resumed thread restores its newest checkpoint's
+// snapshot and then replays these; re-recording an event the checkpoint already
+// holds is idempotent (Rust's `RetainedContext::record`).
+func RetainedContextEvents(lines []Line) []retainedctx.RetainedContextEvent {
+	events := []retainedctx.RetainedContextEvent{}
+	for i := range lines {
+		if lines[i].Type != "retained_context" {
+			continue
+		}
+		payload := lines[i].RetainedContext
+		if len(payload) == 0 {
+			payload = lines[i].Payload
+		}
+		if len(payload) == 0 {
+			continue
+		}
+		var event retainedctx.RetainedContextEvent
+		if err := json.Unmarshal(payload, &event); err != nil {
+			continue
+		}
+		events = append(events, event)
+	}
+	return events
+}
+
+// TokenUsageRecords returns durable response usage observations in rollout
+// order.
+func TokenUsageRecords(lines []Line) []TokenUsageRecord {
+	records := []TokenUsageRecord{}
+	for i := range lines {
+		if lines[i].Type != "token_usage_record" || len(lines[i].Payload) == 0 {
+			continue
+		}
+		var record TokenUsageRecord
+		if err := json.Unmarshal(lines[i].Payload, &record); err != nil {
+			continue
+		}
+		records = append(records, record)
+	}
+	return records
+}
+
+// LatestTokenUsageRecord returns the newest durable response usage record.
+func LatestTokenUsageRecord(lines []Line) *TokenUsageRecord {
+	records := TokenUsageRecords(lines)
+	if len(records) == 0 {
+		return nil
+	}
+	return &records[len(records)-1]
+}
+
+// TurnContextSettings returns the model, compaction compatibility hash and cyber
+// access program from a turn-context payload (Rust's `PreviousTurnSettings`
+// fields). ok is false when the payload carries no model, so callers never treat
+// an unidentifiable record as a previous turn. An absent program is an empty
+// string, which Rust keeps distinct from "inherit the next turn's selection"
+// (Rust #48224).
+func TurnContextSettings(raw json.RawMessage) (model string, compHash string, cyberAccessProgram string, ok bool) {
+	if len(raw) == 0 {
+		return "", "", "", false
+	}
+	var values map[string]any
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return "", "", "", false
+	}
+	model = strings.TrimSpace(stringFromAny(values["model"]))
+	if model == "" {
+		return "", "", "", false
+	}
+	return model, strings.TrimSpace(stringFromAny(values["comp_hash"])), strings.TrimSpace(stringFromAny(values["cyber_access_program"])), true
+}
+
+func (r *Recorder) AppendTurnComplete(turnID string, completedAt time.Time, durationMS int64) error {
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return nil
+	}
+	if completedAt.IsZero() {
+		completedAt = time.Now().UTC()
+	}
+	payload, err := json.Marshal(struct {
+		Type        string `json:"type"`
+		TurnID      string `json:"turn_id"`
+		CompletedAt int64  `json:"completed_at"`
+		DurationMS  int64  `json:"duration_ms"`
+	}{
+		Type:        "task_complete",
+		TurnID:      turnID,
+		CompletedAt: completedAt.UTC().Unix(),
+		DurationMS:  durationMS,
+	})
+	if err != nil {
+		return err
+	}
+	return r.AppendLine(Line{
+		Type:      "event_msg",
+		Timestamp: completedAt.UTC().Format(time.RFC3339Nano),
+		Payload:   payload,
+	})
+}
+
+func (r *Recorder) AppendTurnError(message string, now time.Time) error {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	payload, err := json.Marshal(struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	}{
+		Type:    "error",
+		Message: message,
+	})
+	if err != nil {
+		return err
+	}
+	return r.AppendLine(Line{
+		Type:      "event_msg",
+		Timestamp: now.UTC().Format(time.RFC3339Nano),
+		Payload:   payload,
+	})
+}
+
+func (r *Recorder) AppendTurnAborted(turnID string, reason string, completedAt time.Time, durationMS int64) error {
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return nil
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "interrupted"
+	}
+	if completedAt.IsZero() {
+		completedAt = time.Now().UTC()
+	}
+	payload, err := json.Marshal(struct {
+		Type        string `json:"type"`
+		TurnID      string `json:"turn_id"`
+		Reason      string `json:"reason"`
+		CompletedAt int64  `json:"completed_at"`
+		DurationMS  int64  `json:"duration_ms"`
+	}{
+		Type:        "turn_aborted",
+		TurnID:      turnID,
+		Reason:      reason,
+		CompletedAt: completedAt.UTC().Unix(),
+		DurationMS:  durationMS,
+	})
+	if err != nil {
+		return err
+	}
+	return r.AppendLine(Line{
+		Type:      "event_msg",
+		Timestamp: completedAt.UTC().Format(time.RFC3339Nano),
+		Payload:   payload,
+	})
+}
+
+// CompactionResumeMetadata is the resume metadata Rust #51402
+// (`551bd409eb`) persists on a compaction checkpoint
+// (`codex_history::CompactionResumeMetadata`): the turn identity that admits
+// continuations after a cold resume plus the attribution of the newest regular
+// turn, retained independently of continuation eligibility. The reader
+// (`turn_attribution_reconstruction.go::selectAttributionCheckpoint`) decodes
+// exactly these snake_case wire names, so the writer must not invent a
+// different shape. Rust also persists `multi_agent_version` and
+// `previous_turn_settings`; Go keeps neither on the compaction path, and both
+// are optional on the wire.
+type CompactionResumeMetadata struct {
+	// LastStartedTurnID is the turn identity the checkpoint was written under.
+	// Rust clears it when standalone settings changes invalidate a pending
+	// continuation; the saved attribution still identifies the turn.
+	LastStartedTurnID *string `json:"last_started_turn_id,omitempty"`
+	// TurnAttribution is the provenance of the newest regular turn, independent
+	// of continuation eligibility. Rust #51402 (`state.turn_attribution`).
+	TurnAttribution *TurnAttribution `json:"turn_attribution,omitempty"`
+}
+
+func (r *Recorder) AppendCompacted(message string, replacement []Item, now time.Time) error {
+	return r.AppendCompactedWithContext(message, replacement, nil, now)
+}
+
+// AppendCompactedWithContext also persists the checkpoint's retained-context
+// snapshot (Rust CompactedItem::retained_context): the host-owned evidence a
+// resumed thread must keep even though the model's history was compacted.
+func (r *Recorder) AppendCompactedWithContext(message string, replacement []Item, retained *retainedctx.RetainedContext, now time.Time) error {
+	return r.AppendCompactedWithResumeMetadata(message, replacement, retained, nil, nil, now)
+}
+
+// AppendCompactedWithResumeMetadata also persists the checkpoint's window
+// number and its Rust #51402 resume metadata. Rust stamps both on the compacted
+// item (`CompactedItem::window_number` / `resume_metadata`) so a cold resume
+// restores the window the compaction started and the provenance of the newest
+// regular turn instead of falling back to the model-context root. The reader
+// only accepts a checkpoint that names a window
+// (`selectAttributionCheckpoint`), so the window number is part of the contract,
+// not decoration.
+func (r *Recorder) AppendCompactedWithResumeMetadata(message string, replacement []Item, retained *retainedctx.RetainedContext, resume *CompactionResumeMetadata, windowNumber *uint64, now time.Time) error {
+	return r.AppendCompactedWithCheckpoint(message, replacement, retained, resume, windowNumber, "", nil, nil, now)
+}
+
+// AppendCompactedWithCheckpoint also persists the compaction response identity
+// and latest response usage record (Rust #41912).
+func (r *Recorder) AppendCompactedWithCheckpoint(message string, replacement []Item, retained *retainedctx.RetainedContext, resume *CompactionResumeMetadata, windowNumber *uint64, compactionResponseID string, latestTokenUsage *TokenUsageRecord, guardianHistory json.RawMessage, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	history := make([]json.RawMessage, 0, len(replacement))
+	var historyMetadata []json.RawMessage
+	for i := range replacement {
+		item := replacement[i]
+		line, err := LineFromItem(&item, now)
+		if err != nil {
+			return err
+		}
+		raw := line.Item
+		if len(raw) == 0 {
+			data, marshalErr := json.Marshal(item)
+			if marshalErr != nil {
+				return marshalErr
+			}
+			raw = data
+		}
+		history = append(history, append(json.RawMessage(nil), raw...))
+		// Rust #38058: carry harness metadata in an aligned sidecar so the
+		// persisted replacement-history payload shape stays backward
+		// compatible. Metadata missing on an item is stored as an empty
+		// object so the sidecar stays aligned.
+		if metadata, ok := rolloutItemHarnessMetadata(item); ok {
+			historyMetadata = append(historyMetadata, append(json.RawMessage(nil), metadata...))
+		} else if len(historyMetadata) > 0 || i > 0 {
+			historyMetadata = append(historyMetadata, json.RawMessage(`{}`))
+		}
+	}
+	var compactionID *string
+	if value := strings.TrimSpace(compactionResponseID); value != "" {
+		compactionID = &value
+	}
+	payloadValues := struct {
+		Message                    string                       `json:"message"`
+		ReplacementHistory         []json.RawMessage            `json:"replacement_history,omitempty"`
+		GuardianHistory            json.RawMessage              `json:"guardian_history,omitempty"`
+		ReplacementHistoryMetadata []json.RawMessage            `json:"replacement_history_metadata,omitempty"`
+		RetainedContext            *retainedctx.RetainedContext `json:"retained_context,omitempty"`
+		WindowNumber               *uint64                      `json:"window_number,omitempty"`
+		ResumeMetadata             *CompactionResumeMetadata    `json:"resume_metadata,omitempty"`
+		CompactionResponseID       *string                      `json:"compaction_response_id"`
+		LatestTokenUsageRecord     *TokenUsageRecord            `json:"latest_token_usage_record"`
+	}{
+		Message:                    strings.TrimSpace(message),
+		ReplacementHistory:         history,
+		GuardianHistory:            guardianHistory,
+		ReplacementHistoryMetadata: historyMetadata,
+		RetainedContext:            retained,
+		WindowNumber:               windowNumber,
+		ResumeMetadata:             resume,
+		CompactionResponseID:       compactionID,
+		LatestTokenUsageRecord:     latestTokenUsage,
+	}
+	payload, err := json.Marshal(payloadValues)
+	if err != nil {
+		return err
+	}
+	return r.AppendLine(Line{
+		Type:      "compacted",
+		Timestamp: now.UTC().Format(time.RFC3339Nano),
+		Payload:   payload,
+	})
+}
+
+// rolloutItemHarnessMetadata returns the harness-owned metadata carried on a
+// replacement history item (Rust CodexHarnessMetadata, #38058). It is stored
+// out-of-band in the item's data map and never included in the model-visible
+// response item payload.
+func rolloutItemHarnessMetadata(item Item) (json.RawMessage, bool) {
+	if len(item.Data) == 0 {
+		return nil, false
+	}
+	switch value := item.Data["harness_metadata"].(type) {
+	case json.RawMessage:
+		if len(value) > 0 && string(value) != "null" {
+			return value, true
+		}
+	case string:
+		if strings.TrimSpace(value) != "" {
+			return json.RawMessage(value), true
+		}
+	}
+	return nil, false
+}
+
+func LineFromItem(item *Item, now time.Time) (*Line, error) {
+	if item == nil {
+		return nil, errors.New("rollout item is nil")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	raw := item.Raw
+	if len(raw) > 0 {
+		var object map[string]any
+		if json.Unmarshal(raw, &object) == nil && !legacyRolloutItemWrapper(object) {
+			stampResponseItemTurnID(object, item)
+			stampResponseItemCreateTime(object, now)
+			if encoded, marshalErr := json.Marshal(object); marshalErr == nil {
+				raw = encoded
+			}
+		}
+	}
+	if len(raw) == 0 || legacyRolloutRawItem(raw) {
+		payload, ok := canonicalResponseItemPayload(item)
+		if !ok {
+			payload = item
+		}
+		data, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		raw = data
+	}
+	if len(raw) > 0 {
+		var object map[string]any
+		if json.Unmarshal(raw, &object) == nil && !legacyRolloutItemWrapper(object) {
+			stampResponseItemCreateTime(object, now)
+			if encoded, marshalErr := json.Marshal(object); marshalErr == nil {
+				raw = encoded
+			}
+		}
+	}
+	line := &Line{
+		Type:       "response_item",
+		Timestamp:  now.UTC().Format(time.RFC3339Nano),
+		Item:       append(json.RawMessage(nil), raw...),
+		ItemID:     item.ID,
+		Role:       item.Role,
+		ResponseID: item.ResponseID,
+		Data:       cloneAnyMap(item.Data),
+	}
+	if raw, ok := item.Data["harness_metadata"].(json.RawMessage); ok {
+		line.ItemMetadata = append(json.RawMessage(nil), raw...)
+	} else if raw, ok := item.Data["harness_metadata"].(string); ok && strings.TrimSpace(raw) != "" {
+		line.ItemMetadata = json.RawMessage(raw)
+	}
+	if turnID, ok := item.Metadata["turnId"].(string); ok {
+		line.TurnID = turnID
+	}
+	if line.TurnID == "" {
+		if turnID, ok := item.Metadata["turn_id"].(string); ok {
+			line.TurnID = turnID
+		}
+	}
+	return line, nil
+}
+
+func (r *Recorder) AppendLine(line Line) error {
+	if r == nil || r.file == nil {
+		return errors.New("rollout recorder is closed")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.paginated {
+		if line.Ordinal == nil {
+			ordinal := r.nextOrdinal
+			line.Ordinal = &ordinal
+		} else if *line.Ordinal != r.nextOrdinal {
+			return fmt.Errorf("paginated rollout expected ordinal %d, got %d", r.nextOrdinal, *line.Ordinal)
+		}
+	}
+	data, err := json.Marshal(line)
+	if err != nil {
+		return err
+	}
+	if _, err := r.file.Write(append(data, '\n')); err != nil {
+		return err
+	}
+	if r.paginated {
+		r.nextOrdinal++
+	}
+	return nil
+}
+
+func (r *Recorder) Flush() error {
+	r.mu.Lock()
+	if r.file == nil {
+		r.mu.Unlock()
+		return nil
+	}
+	err := r.file.Sync()
+	path, callback := r.path, r.afterFlush
+	r.mu.Unlock()
+	if err == nil && callback != nil {
+		callback(path)
+	}
+	return err
+}
+
+func (r *Recorder) Close() error {
+	r.mu.Lock()
+	if r.file == nil {
+		r.mu.Unlock()
+		return nil
+	}
+	syncErr := r.file.Sync()
+	closeErr := r.file.Close()
+	r.file = nil
+	path, callback := r.path, r.afterFlush
+	r.mu.Unlock()
+	if syncErr == nil && callback != nil {
+		callback(path)
+	}
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
+}
+
+func cloneHistoryPosition(value *HistoryPosition) *HistoryPosition {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}
+
+func cloneUint64Ptr(value *uint64) *uint64 {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}
+
+func Load(path string) ([]Line, int, error) {
+	// Rust's `open_rollout_line_reader` resolves the current representation and
+	// retries a not-found transition, recording one read metric per reader.
+	lineReader, err := OpenRolloutLineReader(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer func() { _ = lineReader.Close() }()
+	var lines []Line
+	parseErrors := 0
+	for {
+		raw, readErr := lineReader.ReadLine()
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return lines, parseErrors, readErr
+		}
+		raw = bytes.TrimRight(raw, "\r\n")
+		// Rust's `load_rollout_items` skips whitespace-only lines instead of
+		// counting them as parse errors (rollout/src/recorder.rs:
+		// `if line.trim().is_empty() { continue; }`), which keeps the reported
+		// parse-error count identical across representations that carry a blank
+		// separator line.
+		if len(bytes.TrimSpace(raw)) == 0 {
+			continue
+		}
+		var line Line
+		if err := unmarshalLine(raw, &line); err != nil {
+			parseErrors++
+		} else {
+			lines = append(lines, line)
+		}
+	}
+	return lines, parseErrors, nil
+}
+
+// EnsureRustCompatibleSessionMeta makes legacy Go rollouts readable by the
+// Rust ThreadStore used by the Desktop app. Older Go rollouts omitted required
+// string fields when they were empty, so Rust discarded their session_meta
+// record. Appending a complete metadata record is safe for an active rollout
+// and avoids rewriting a file that another recorder may still have open.
+func EnsureRustCompatibleSessionMeta(path string) (string, error) {
+	existing, ok := ExistingRolloutPath(path)
+	if !ok {
+		return "", os.ErrNotExist
+	}
+	if strings.HasSuffix(strings.ToLower(existing), ".zst") {
+		var err error
+		existing, err = MaterializeRolloutForReference(existing)
+		if err != nil {
+			return "", err
+		}
+	}
+	compatible, err := hasRustCompatibleSessionMeta(existing)
+	if err != nil {
+		return "", err
+	}
+	if compatible {
+		return existing, nil
+	}
+	meta, err := FirstSessionMeta(existing)
+	if err != nil {
+		return "", err
+	}
+	if meta == nil || strings.TrimSpace(meta.ID) == "" {
+		return "", errors.New("rollout session metadata is missing a thread id")
+	}
+	compatibilityMeta := *meta
+	if strings.TrimSpace(compatibilityMeta.SessionID) == "" {
+		compatibilityMeta.SessionID = compatibilityMeta.ID
+	}
+	now := time.Now().UTC()
+	if strings.TrimSpace(compatibilityMeta.Timestamp) == "" {
+		compatibilityMeta.Timestamp = now.Format(time.RFC3339)
+	}
+	encoded, err := json.Marshal(Line{
+		Type:      "session_meta",
+		Timestamp: now.Format(time.RFC3339Nano),
+		Meta:      &compatibilityMeta,
+	})
+	if err != nil {
+		return "", err
+	}
+	file, err := os.OpenFile(existing, os.O_APPEND|os.O_RDWR, 0o600)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	if info, statErr := file.Stat(); statErr != nil {
+		return "", statErr
+	} else if info.Size() > 0 {
+		last := make([]byte, 1)
+		if _, readErr := file.ReadAt(last, info.Size()-1); readErr != nil {
+			return "", readErr
+		}
+		if last[0] != '\n' {
+			encoded = append([]byte{'\n'}, encoded...)
+		}
+	}
+	encoded = append(encoded, '\n')
+	if _, err := file.Write(encoded); err != nil {
+		return "", err
+	}
+	if err := file.Sync(); err != nil {
+		return "", err
+	}
+	return existing, nil
+}
+
+func hasRustCompatibleSessionMeta(path string) (bool, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+	reader := bufio.NewReader(file)
+	for {
+		raw, readErr := reader.ReadBytes('\n')
+		if len(raw) > 0 {
+			var envelope struct {
+				Type    string                     `json:"type"`
+				Payload map[string]json.RawMessage `json:"payload"`
+			}
+			if json.Unmarshal(bytes.TrimSpace(raw), &envelope) == nil && envelope.Type == "session_meta" {
+				if rustRequiredSessionMetaStrings(envelope.Payload) {
+					return true, nil
+				}
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return false, nil
+			}
+			return false, readErr
+		}
+	}
+}
+
+func rustRequiredSessionMetaStrings(payload map[string]json.RawMessage) bool {
+	for _, key := range []string{"session_id", "id", "timestamp", "cwd", "originator", "cli_version"} {
+		raw, ok := payload[key]
+		if !ok {
+			return false
+		}
+		var value string
+		if json.Unmarshal(raw, &value) != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// PlainRolloutPath returns the canonical state-DB path for either a plain or compressed rollout.
+func PlainRolloutPath(path string) string {
+	if strings.HasSuffix(strings.ToLower(path), ".jsonl.zst") {
+		return strings.TrimSuffix(path, filepath.Ext(path))
+	}
+	return path
+}
+
+// ExistingRolloutPath resolves the canonical plain state-DB path to the
+// rollout file that currently exists, including its compressed representation.
+func ExistingRolloutPath(path string) (string, bool) {
+	plain := PlainRolloutPath(strings.TrimSpace(path))
+	if plain == "" {
+		return "", false
+	}
+	for _, candidate := range []string{plain, plain + ".zst"} {
+		if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+// ReadRolloutPrefix mirrors Rust `read_rollout_prefix`
+// (codex-rs/rollout/src/seekable_reader.rs, Rust #44175): it returns at most
+// maxBytes DECODED rollout bytes, resolving the plain or compressed
+// representation without materializing a durable JSONL file. Plain siblings win
+// over a compressed copy, matching `RolloutReader::open`. ok is false for a
+// missing or non-regular source (Rust returns `Ok(None)`).
+func ReadRolloutPrefix(path string, maxBytes int64) ([]byte, bool, error) {
+	if maxBytes < 0 {
+		maxBytes = 0
+	}
+	existing, found := ExistingRolloutPath(path)
+	if !found {
+		return nil, false, nil
+	}
+	info, err := os.Stat(existing)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, false, nil
+	}
+	file, err := os.Open(existing)
+	if err != nil {
+		return nil, false, err
+	}
+	defer file.Close()
+	var reader io.Reader = file
+	if strings.HasSuffix(strings.ToLower(existing), ".zst") {
+		decoder, decodeErr := zstd.NewReader(file)
+		if decodeErr != nil {
+			return nil, false, decodeErr
+		}
+		defer decoder.Close()
+		reader = decoder
+	}
+	var buffer bytes.Buffer
+	if _, err := io.Copy(&buffer, io.LimitReader(reader, maxBytes)); err != nil {
+		return nil, false, err
+	}
+	return buffer.Bytes(), true, nil
+}
+
+// MaterializeRolloutForReference restores a compressed rollout to its
+// canonical JSONL path before a HistoryPosition records physical byte offsets.
+func MaterializeRolloutForReference(path string) (string, error) {
+	materializeReferenceMu.Lock()
+	defer materializeReferenceMu.Unlock()
+
+	plain := PlainRolloutPath(strings.TrimSpace(path))
+	if plain == "" {
+		return "", errors.New("rollout path is required")
+	}
+	startedAt := time.Now()
+	stage := "read_metadata"
+	outcome, result, err := materializeRolloutForReferenceLocked(plain, &stage)
+	if err != nil {
+		rolloutCompressionFailure(rolloutCompressionMaterializeCounter, "outcome", nil, stage, err)
+		rolloutCompressionMaterializeDuration("failed", time.Since(startedAt))
+		return "", err
+	}
+	rolloutCompressionMaterialize(outcome)
+	if outcome == "decompressed" {
+		rolloutCompressionMaterializeDuration(outcome, time.Since(startedAt))
+	}
+	return result, nil
+}
+
+// materializeRolloutForReferenceLocked ports Rust's
+// `materialize_rollout_for_append_blocking`: a compressed rollout is decoded to a
+// sibling temp file, verified, and published with a no-clobber rename. `stage`
+// carries the failing step for the failure metric labels.
+func materializeRolloutForReferenceLocked(plain string, stage *string) (string, string, error) {
+	if info, err := os.Stat(plain); err == nil && info.Mode().IsRegular() {
+		return "plain_exists", plain, nil
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", "", err
+	}
+	compressed := plain + ".zst"
+	metadata, err := os.Stat(compressed)
+	if errors.Is(err, os.ErrNotExist) {
+		return "missing", plain, nil
+	}
+	if err != nil {
+		return "", "", err
+	}
+	*stage = "prepare_directory"
+	if parent := filepath.Dir(plain); parent != "" && parent != "." {
+		if err := os.MkdirAll(parent, 0o755); err != nil {
+			return "", "", err
+		}
+	}
+	*stage = "create_temp"
+	temporary, err := os.CreateTemp(filepath.Dir(plain), "."+filepath.Base(plain)+".decompress-*")
+	if err != nil {
+		return "", "", err
+	}
+	temporaryPath := temporary.Name()
+	published := false
+	defer func() {
+		_ = temporary.Close()
+		_ = os.Remove(temporaryPath)
+	}()
+	if err := temporary.Chmod(metadata.Mode().Perm()); err != nil {
+		return "", "", err
+	}
+	*stage = "open_source"
+	input, err := os.Open(compressed)
+	if err != nil {
+		return "", "", err
+	}
+	*stage = "decode_and_write"
+	decoder, err := zstd.NewReader(input)
+	if err != nil {
+		_ = input.Close()
+		return "", "", err
+	}
+	_, copyErr := io.Copy(temporary, decoder)
+	decoder.Close()
+	closeInputErr := input.Close()
+	if copyErr != nil {
+		return "", "", copyErr
+	}
+	if closeInputErr != nil {
+		return "", "", closeInputErr
+	}
+	*stage = "sync"
+	if err := temporary.Sync(); err != nil {
+		return "", "", err
+	}
+	*stage = "flush"
+	if err := temporary.Close(); err != nil {
+		return "", "", err
+	}
+	*stage = "set_metadata"
+	if err := os.Chtimes(temporaryPath, metadata.ModTime(), metadata.ModTime()); err != nil {
+		return "", "", err
+	}
+	*stage = "publish"
+	if err := os.Link(temporaryPath, plain); err == nil {
+		published = true
+	} else if _, statErr := os.Stat(plain); statErr == nil {
+		published = true
+	} else {
+		destination, createErr := os.OpenFile(plain, os.O_CREATE|os.O_EXCL|os.O_WRONLY, metadata.Mode().Perm())
+		if createErr != nil {
+			return "", "", createErr
+		}
+		source, openErr := os.Open(temporaryPath)
+		if openErr != nil {
+			_ = destination.Close()
+			return "", "", openErr
+		}
+		_, copyErr = io.Copy(destination, source)
+		_ = source.Close()
+		if copyErr == nil {
+			copyErr = destination.Sync()
+		}
+		if closeErr := destination.Close(); copyErr == nil {
+			copyErr = closeErr
+		}
+		if copyErr != nil {
+			_ = os.Remove(plain)
+			return "", "", copyErr
+		}
+		published = true
+	}
+	if published {
+		*stage = "remove_source"
+		if err := os.Chtimes(plain, metadata.ModTime(), metadata.ModTime()); err != nil {
+			return "", "", err
+		}
+		if err := os.Remove(compressed); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", "", err
+		}
+	}
+	return "decompressed", plain, nil
+}
+
+// RolloutByteLength reports the uncompressed JSONL length used by persisted
+// HistoryPosition byte offsets.
+func RolloutByteLength(path string) (uint64, error) {
+	existing, ok := ExistingRolloutPath(path)
+	if !ok {
+		return 0, os.ErrNotExist
+	}
+	if !strings.HasSuffix(strings.ToLower(existing), ".zst") {
+		info, err := os.Stat(existing)
+		if err != nil {
+			return 0, err
+		}
+		return uint64(info.Size()), nil
+	}
+	file, err := os.Open(existing)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+	decoder, err := zstd.NewReader(file)
+	if err != nil {
+		return 0, err
+	}
+	defer decoder.Close()
+	count, err := io.Copy(io.Discard, decoder)
+	if err != nil {
+		return 0, err
+	}
+	return uint64(count), nil
+}
+
+func unmarshalLine(data []byte, line *Line) error {
+	if err := json.Unmarshal(data, line); err != nil {
+		return err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err == nil {
+		if metadata, ok := raw["metadata"]; ok && len(metadata) > 0 && string(metadata) != "null" && len(line.ItemMetadata) == 0 {
+			line.ItemMetadata = append(json.RawMessage(nil), metadata...)
+		}
+		if payload, ok := raw["payload"]; ok {
+			if len(line.Payload) == 0 {
+				line.Payload = append(json.RawMessage(nil), payload...)
+			}
+			switch line.Type {
+			case "session_meta":
+				if line.Meta == nil {
+					var meta SessionMeta
+					if err := json.Unmarshal(payload, &meta); err == nil && meta.ID != "" {
+						line.Meta = &meta
+					}
+				}
+			case "response_item":
+				if len(line.Item) == 0 {
+					line.Item = append(json.RawMessage(nil), payload...)
+				}
+			case "event_msg":
+				if line.ThreadRolledBack == nil {
+					line.ThreadRolledBack = rollbackEventFromPayload(payload)
+				}
+			case "compacted":
+				line.Payload = append(json.RawMessage(nil), payload...)
+			case "turn_context":
+				line.TurnContext = append(json.RawMessage(nil), payload...)
+			case "world_state":
+				line.WorldState = append(json.RawMessage(nil), payload...)
+			case "security_risk_score":
+				line.SecurityRiskScore = append(json.RawMessage(nil), payload...)
+			case "retained_context":
+				line.RetainedContext = append(json.RawMessage(nil), payload...)
+			}
+		}
+		if line.ThreadRolledBack == nil {
+			if payload, ok := raw["thread_rolled_back"]; ok {
+				line.ThreadRolledBack = rollbackEventFromPayload(payload)
+			}
+		}
+		if len(line.TurnContext) == 0 {
+			if payload, ok := raw["turn_context"]; ok {
+				line.TurnContext = append(json.RawMessage(nil), payload...)
+			}
+		}
+		if len(line.WorldState) == 0 {
+			if payload, ok := raw["world_state"]; ok {
+				line.WorldState = append(json.RawMessage(nil), payload...)
+			}
+		}
+		if len(line.SecurityRiskScore) == 0 {
+			if payload, ok := raw["security_risk_score"]; ok {
+				line.SecurityRiskScore = append(json.RawMessage(nil), payload...)
+			}
+		}
+		if len(line.RetainedContext) == 0 {
+			if payload, ok := raw["retained_context"]; ok {
+				line.RetainedContext = append(json.RawMessage(nil), payload...)
+			}
+		}
+	}
+	if line.Type == "response_item" {
+		line.Type = "item"
+	}
+	return nil
+}
+
+func compactedEventFromPayload(data json.RawMessage) *CompactedEvent {
+	if len(data) == 0 {
+		return nil
+	}
+	var event CompactedEvent
+	if err := json.Unmarshal(data, &event); err != nil {
+		return nil
+	}
+	if len(event.ReplacementHistory) == 0 && strings.TrimSpace(event.Message) == "" {
+		return nil
+	}
+	return &event
+}
+
+func rollbackEventFromPayload(data json.RawMessage) *RollbackEvent {
+	if len(data) == 0 {
+		return nil
+	}
+	var tagged struct {
+		Type          string  `json:"type"`
+		NumTurns      *uint32 `json:"num_turns"`
+		NumTurnsCamel *uint32 `json:"numTurns"`
+	}
+	if err := json.Unmarshal(data, &tagged); err == nil {
+		switch strings.ToLower(tagged.Type) {
+		case "thread_rolled_back", "threadrolledback":
+			if tagged.NumTurns != nil {
+				return &RollbackEvent{NumTurns: *tagged.NumTurns}
+			}
+			if tagged.NumTurnsCamel != nil {
+				return &RollbackEvent{NumTurns: *tagged.NumTurnsCamel}
+			}
+		}
+	}
+	if tagged.Type != "" {
+		return nil
+	}
+	var direct struct {
+		NumTurns      *uint32 `json:"num_turns"`
+		NumTurnsCamel *uint32 `json:"numTurns"`
+	}
+	if err := json.Unmarshal(data, &direct); err == nil {
+		switch {
+		case direct.NumTurns != nil:
+			return &RollbackEvent{NumTurns: *direct.NumTurns}
+		case direct.NumTurnsCamel != nil:
+			return &RollbackEvent{NumTurns: *direct.NumTurnsCamel}
+		}
+	}
+	var variant struct {
+		ThreadRolledBack *struct {
+			NumTurns      *uint32 `json:"num_turns"`
+			NumTurnsCamel *uint32 `json:"numTurns"`
+		} `json:"ThreadRolledBack"`
+		ThreadRolledBackSnake *struct {
+			NumTurns      *uint32 `json:"num_turns"`
+			NumTurnsCamel *uint32 `json:"numTurns"`
+		} `json:"thread_rolled_back"`
+	}
+	if err := json.Unmarshal(data, &variant); err == nil {
+		if variant.ThreadRolledBack != nil {
+			if variant.ThreadRolledBack.NumTurns != nil {
+				return &RollbackEvent{NumTurns: *variant.ThreadRolledBack.NumTurns}
+			}
+			if variant.ThreadRolledBack.NumTurnsCamel != nil {
+				return &RollbackEvent{NumTurns: *variant.ThreadRolledBack.NumTurnsCamel}
+			}
+		}
+		if variant.ThreadRolledBackSnake != nil {
+			if variant.ThreadRolledBackSnake.NumTurns != nil {
+				return &RollbackEvent{NumTurns: *variant.ThreadRolledBackSnake.NumTurns}
+			}
+			if variant.ThreadRolledBackSnake.NumTurnsCamel != nil {
+				return &RollbackEvent{NumTurns: *variant.ThreadRolledBackSnake.NumTurnsCamel}
+			}
+		}
+	}
+	return nil
+}
+
+func ItemsFromLines(lines []Line) []Item {
+	items := make([]Item, 0, len(lines))
+	for i := range lines {
+		if lines[i].ThreadRolledBack != nil {
+			items = rollbackItems(items, int(lines[i].ThreadRolledBack.NumTurns))
+			continue
+		}
+		if lines[i].Type == "compacted" {
+			if replacement, ok := compactedReplacementItems(lines[i].Payload); ok {
+				items = replacement
+			}
+			continue
+		}
+		if item, ok := ItemFromLine(&lines[i]); ok {
+			items = append(items, *item)
+		}
+	}
+	return items
+}
+
+// CompactedRetainedContext returns the retained-context snapshot of the latest
+// checkpoint in the rollout, or nil when the rollout has none. It mirrors Rust's
+// resume rule of reading `CompactedItem::retained_context` from the newest
+// checkpoint before replaying later evidence.
+func CompactedRetainedContext(lines []Line) *retainedctx.RetainedContext {
+	for i := len(lines) - 1; i >= 0; i-- {
+		if lines[i].Type != "compacted" {
+			continue
+		}
+		event := compactedEventFromPayload(lines[i].Payload)
+		if event == nil || event.RetainedContext == nil {
+			continue
+		}
+		return event.RetainedContext
+	}
+	return nil
+}
+
+func compactedReplacementItems(payload json.RawMessage) ([]Item, bool) {
+	event := compactedEventFromPayload(payload)
+	if event == nil || len(event.ReplacementHistory) == 0 {
+		return nil, false
+	}
+	var rawItems []json.RawMessage
+	if err := json.Unmarshal(event.ReplacementHistory, &rawItems); err != nil {
+		return nil, false
+	}
+	var historyMetadata []json.RawMessage
+	if len(event.ReplacementHistoryMetadata) > 0 {
+		_ = json.Unmarshal(event.ReplacementHistoryMetadata, &historyMetadata)
+	}
+	items := make([]Item, 0, len(rawItems))
+	for i := range rawItems {
+		line := Line{Type: "item", Item: rawItems[i]}
+		item, ok := ItemFromLine(&line)
+		if !ok {
+			continue
+		}
+		// Rust #38058: restore the aligned harness metadata sidecar so it
+		// survives compaction/truncation and later resume/fork replay.
+		if i < len(historyMetadata) && len(historyMetadata[i]) > 0 && string(historyMetadata[i]) != "null" && string(historyMetadata[i]) != "{}" {
+			if item.Data == nil {
+				item.Data = map[string]any{}
+			}
+			item.Data["harness_metadata"] = append(json.RawMessage(nil), historyMetadata[i]...)
+		}
+		items = append(items, *item)
+	}
+	return items, true
+}
+
+func rollbackItems(items []Item, numTurns int) []Item {
+	if numTurns <= 0 || len(items) == 0 {
+		return append([]Item(nil), items...)
+	}
+	turnIDs := make([]string, 0)
+	seen := make(map[string]bool)
+	for i := range items {
+		turnID := itemTurnID(&items[i], i)
+		if seen[turnID] {
+			continue
+		}
+		seen[turnID] = true
+		turnIDs = append(turnIDs, turnID)
+	}
+	if numTurns >= len(turnIDs) {
+		return []Item{}
+	}
+	drop := make(map[string]bool)
+	for _, turnID := range turnIDs[len(turnIDs)-numTurns:] {
+		drop[turnID] = true
+	}
+	out := make([]Item, 0, len(items))
+	for i := range items {
+		if drop[itemTurnID(&items[i], i)] {
+			continue
+		}
+		out = append(out, items[i])
+	}
+	return out
+}
+
+func itemTurnID(item *Item, index int) string {
+	if item != nil {
+		if value, ok := item.Metadata["turnId"].(string); ok && strings.TrimSpace(value) != "" {
+			return value
+		}
+		if value, ok := item.Metadata["turn_id"].(string); ok && strings.TrimSpace(value) != "" {
+			return value
+		}
+		if value, ok := item.Data["turnId"].(string); ok && strings.TrimSpace(value) != "" {
+			return value
+		}
+		if value, ok := item.Data["turn_id"].(string); ok && strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return fmt.Sprintf("turn-%d", index+1)
+}
+
+func ItemFromLine(line *Line) (*Item, bool) {
+	if line == nil || line.Type != "item" {
+		return nil, false
+	}
+	var item Item
+	if len(line.Item) > 0 {
+		if err := json.Unmarshal(line.Item, &item); err != nil {
+			item = Item{Raw: append(json.RawMessage(nil), line.Item...)}
+		}
+		item.Raw = append(json.RawMessage(nil), line.Item...)
+	}
+	if item.Type == "" {
+		if value, ok := line.Data["type"].(string); ok {
+			item.Type = value
+		}
+	}
+	if item.ID == "" {
+		item.ID = line.ItemID
+	}
+	if item.Role == "" {
+		item.Role = line.Role
+	}
+	if item.ResponseID == "" {
+		item.ResponseID = line.ResponseID
+	}
+	if item.Data == nil {
+		item.Data = cloneAnyMap(line.Data)
+	}
+	if len(line.ItemMetadata) > 0 {
+		if item.Data == nil {
+			item.Data = map[string]any{}
+		}
+		item.Data["harness_metadata"] = append(json.RawMessage(nil), line.ItemMetadata...)
+	}
+	if item.Metadata == nil {
+		item.Metadata = map[string]any{}
+	}
+	if line.TurnID != "" {
+		item.Metadata["turnId"] = line.TurnID
+	}
+	if turnID := responseItemTurnID(item.Raw); turnID != "" {
+		item.Metadata["turnId"] = turnID
+	}
+	return &item, item.Type != ""
+}
+
+func InputItemsFromLines(lines []Line, includeToolOutputs bool) []any {
+	return InputItemsFromItems(ItemsFromLines(lines), includeToolOutputs)
+}
+
+func InputItemsFromItems(items []Item, includeToolOutputs bool) []any {
+	out := make([]any, 0, len(items))
+	for i := range items {
+		if input := inputItemFromItem(&items[i], includeToolOutputs); input != nil {
+			out = append(out, input)
+		}
+	}
+	return out
+}
+
+func inputItemFromItem(item *Item, includeToolOutputs bool) any {
+	if item == nil {
+		return nil
+	}
+	if len(item.Raw) > 0 {
+		var raw any
+		if err := json.Unmarshal(item.Raw, &raw); err == nil {
+			if object, ok := raw.(map[string]any); ok {
+				if legacyRolloutItemWrapper(object) {
+					return inputItemFromStructuredItem(item, includeToolOutputs)
+				}
+				delete(object, "internal_chat_message_metadata_passthrough")
+			}
+			return raw
+		}
+	}
+	return inputItemFromStructuredItem(item, includeToolOutputs)
+}
+
+func inputItemFromStructuredItem(item *Item, includeToolOutputs bool) any {
+	switch item.Type {
+	case "message", "user_message", "agent_message", "assistant_message":
+		return messageInputItem(item)
+	case "function_call", "custom_tool_call", "tool_search_call":
+		return toolCallInputItem(item)
+	case "function_call_output", "custom_tool_call_output", "tool_search_output", "tool_output":
+		if !includeToolOutputs {
+			return nil
+		}
+		return toolOutputInputItem(item)
+	default:
+		if strings.TrimSpace(item.Text) == "" {
+			return nil
+		}
+		return messageInputItem(item)
+	}
+}
+
+func canonicalResponseItemPayload(item *Item) (any, bool) {
+	if item == nil {
+		return nil, false
+	}
+	var payload any
+	switch item.Type {
+	case "message", "user_message", "agent_message", "assistant_message":
+		payload = messageInputItem(item)
+	case "function_call", "custom_tool_call", "tool_search_call":
+		payload = toolCallInputItem(item)
+	case "function_call_output", "custom_tool_call_output", "tool_search_output", "tool_output":
+		payload = toolOutputInputItem(item)
+	default:
+		return nil, false
+	}
+	object, ok := payload.(map[string]any)
+	if !ok || object == nil {
+		return nil, false
+	}
+	if strings.TrimSpace(item.ID) != "" {
+		object["id"] = item.ID
+	}
+	if object["type"] == "message" {
+		if phase := firstNonEmpty(stringValue(item.Data, "phase"), stringValue(item.Metadata, "phase")); phase != "" {
+			object["phase"] = phase
+		}
+	}
+	stampResponseItemTurnID(object, item)
+	return object, true
+}
+
+func stampResponseItemTurnID(object map[string]any, item *Item) {
+	if object == nil || item == nil {
+		return
+	}
+	turnID := firstNonEmpty(stringValue(item.Metadata, "turnId"), stringValue(item.Metadata, "turn_id"), stringValue(item.Data, "turnId"), stringValue(item.Data, "turn_id"))
+	if turnID == "" {
+		return
+	}
+	metadata, _ := object["internal_chat_message_metadata_passthrough"].(map[string]any)
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	if strings.TrimSpace(stringValue(metadata, "turn_id")) == "" {
+		metadata["turn_id"] = turnID
+	}
+	object["internal_chat_message_metadata_passthrough"] = metadata
+}
+
+// stampResponseItemCreateTime mirrors Rust #38272. It stores the fractional
+// Unix creation time on locally authored durable response items without
+// replacing a time already supplied by a client or an upstream response.
+func stampResponseItemCreateTime(object map[string]any, now time.Time) {
+	if object == nil || !responseItemCreateTimeEligible(object) {
+		return
+	}
+	metadata, _ := object["internal_chat_message_metadata_passthrough"].(map[string]any)
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	if !responseItemMetadataCreateTime(metadata).IsZero() {
+		return
+	}
+	seconds := float64(now.UnixNano()) / 1e9
+	metadata["create_time"] = json.Number(strconv.FormatFloat(seconds, 'f', -1, 64))
+	object["internal_chat_message_metadata_passthrough"] = metadata
+}
+
+func responseItemCreateTimeEligible(object map[string]any) bool {
+	if object == nil {
+		return false
+	}
+	itemType := strings.TrimSpace(stringFromMap(object, "type"))
+	if itemType == "message" {
+		switch strings.TrimSpace(stringFromMap(object, "role")) {
+		case "user", "developer":
+			return true
+		default:
+			return false
+		}
+	}
+	switch itemType {
+	case "agent_message", "function_call_output", "custom_tool_call_output", "tool_search_output":
+		return true
+	default:
+		return false
+	}
+}
+
+func responseItemMetadataCreateTime(metadata map[string]any) time.Time {
+	if metadata == nil {
+		return time.Time{}
+	}
+	switch value := metadata["create_time"].(type) {
+	case json.Number:
+		return createTimeFromJSONNumber(value)
+	case string:
+		if value == "" {
+			return time.Time{}
+		}
+		return createTimeFromJSONNumber(json.Number(value))
+	case float64:
+		return time.Unix(0, int64(value*1e9)).UTC()
+	}
+	return time.Time{}
+}
+
+func createTimeFromJSONNumber(value json.Number) time.Time {
+	seconds, err := value.Float64()
+	if err != nil {
+		return time.Time{}
+	}
+	whole, fraction := math.Modf(seconds)
+	if whole < 0 {
+		return time.Time{}
+	}
+	return time.Unix(int64(whole), int64(fraction*1e9)).UTC()
+}
+
+func responseItemTurnID(raw json.RawMessage) string {
+	var object map[string]any
+	if len(raw) == 0 || json.Unmarshal(raw, &object) != nil {
+		return ""
+	}
+	metadata, _ := object["internal_chat_message_metadata_passthrough"].(map[string]any)
+	return firstNonEmpty(stringValue(metadata, "turn_id"), stringValue(metadata, "turnId"))
+}
+
+func legacyRolloutRawItem(raw json.RawMessage) bool {
+	var object map[string]any
+	return len(raw) > 0 && json.Unmarshal(raw, &object) == nil && legacyRolloutItemWrapper(object)
+}
+
+func legacyRolloutItemWrapper(object map[string]any) bool {
+	if object == nil {
+		return false
+	}
+	for _, key := range []string{"metadata", "data", "raw", "response_id"} {
+		if _, ok := object[key]; ok {
+			return true
+		}
+	}
+	itemType := strings.TrimSpace(stringValue(object, "type"))
+	_, hasText := object["text"]
+	return hasText && (itemType == "message" || itemType == "user_message" || itemType == "agent_message" || itemType == "assistant_message")
+}
+
+type ThreadItem struct {
+	Path             string
+	ThreadID         string
+	Preview          string
+	FirstUserMessage string
+	CWD              string
+	Source           string
+	HistoryMode      string
+	ParentThreadID   string
+	AgentNickname    string
+	AgentRole        string
+	Model            string
+	ModelProvider    string
+	CLIVersion       string
+	LastResponseID   string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	RecencyAt        time.Time
+	Archived         bool
+}
+
+type Page struct {
+	Items           []ThreadItem
+	NextCursor      string
+	NumScannedFiles int
+	ReachedScanCap  bool
+}
+
+type ListOptions struct {
+	PageSize       int
+	Cursor         string
+	SortKey        SortKey
+	SortDirection  SortDirection
+	Archived       bool
+	AllowedSources []string
+	ModelProviders []string
+	CWDFilters     []string
+	Search         string
+}
+
+func ListThreads(codexHome string, options ListOptions) (*Page, error) {
+	root := filepath.Join(codexHome, SessionsSubdir)
+	if options.Archived {
+		root = filepath.Join(codexHome, ArchivedSessionsSubdir)
+	}
+	paths, err := collectRolloutPaths(root)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]ThreadItem, 0, len(paths))
+	for _, path := range paths {
+		item, ok := BuildThreadItem(path, options.Archived)
+		if !ok {
+			continue
+		}
+		if !matchesOptions(&item, &options) {
+			continue
+		}
+		items = append(items, item)
+	}
+	sortThreadItems(items, options.SortKey, options.SortDirection)
+	start, err := parseCursor(options.Cursor)
+	if err != nil {
+		return nil, err
+	}
+	if start > len(items) {
+		start = len(items)
+	}
+	pageSize := options.PageSize
+	if pageSize <= 0 || pageSize > len(items)-start {
+		pageSize = len(items) - start
+	}
+	end := start + pageSize
+	nextCursor := ""
+	if end < len(items) {
+		nextCursor = strconv.Itoa(end)
+	}
+	return &Page{
+		Items:           append([]ThreadItem(nil), items[start:end]...),
+		NextCursor:      nextCursor,
+		NumScannedFiles: len(paths),
+	}, nil
+}
+
+func BuildThreadItem(path string, archived bool) (ThreadItem, bool) {
+	lines, _, err := Load(path)
+	if err != nil || len(lines) == 0 {
+		return ThreadItem{}, false
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return ThreadItem{}, false
+	}
+	item := ThreadItem{
+		Path:      path,
+		UpdatedAt: info.ModTime().UTC(),
+		RecencyAt: info.ModTime().UTC(),
+		Archived:  archived,
+	}
+	for _, line := range lines {
+		if line.Meta != nil {
+			item.ThreadID = line.Meta.ID
+			item.CWD = line.Meta.CWD
+			item.Source = line.Meta.Source
+			item.HistoryMode = line.Meta.HistoryMode
+			item.ParentThreadID = line.Meta.ParentThreadID
+			item.AgentNickname = line.Meta.AgentNickname
+			item.AgentRole = line.Meta.AgentRole
+			item.Model = line.Meta.Model
+			item.ModelProvider = line.Meta.ModelProvider
+			item.CLIVersion = line.Meta.CLIVersion
+			if created, err := time.Parse(time.RFC3339, line.Meta.Timestamp); err == nil {
+				item.CreatedAt = created.UTC()
+			}
+			continue
+		}
+		if !lineItemTime(line).IsZero() {
+			item.RecencyAt = lineItemTime(line)
+		}
+		if line.ResponseID != "" {
+			item.LastResponseID = line.ResponseID
+		}
+		if item.FirstUserMessage == "" {
+			item.FirstUserMessage = userTextFromLine(&line)
+			item.Preview = item.FirstUserMessage
+		}
+	}
+	if item.CreatedAt.IsZero() {
+		if created, ok := ParseTimestampFromFilename(filepath.Base(path)); ok {
+			item.CreatedAt = created
+		} else {
+			item.CreatedAt = item.UpdatedAt
+		}
+	}
+	if item.RecencyAt.IsZero() {
+		item.RecencyAt = item.UpdatedAt
+	}
+	return item, true
+}
+
+func ThreadIDFromPath(path string) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", errors.New("rollout path is required")
+	}
+	// Mirrors Rust's rollout_file_name.rs: the stable thread id is the segment
+	// before the first '_', so a reverted rollout filename still resolves to the
+	// owning thread without reading the file (Rust #54060).
+	if parsed, ok := ParseRolloutFileName(filepath.Base(path)); ok {
+		return parsed.ThreadID, nil
+	}
+	lines, _, err := Load(path)
+	if err != nil {
+		return "", err
+	}
+	for _, line := range lines {
+		if line.Meta == nil {
+			continue
+		}
+		if threadID := strings.TrimSpace(line.Meta.ID); threadID != "" {
+			return threadID, nil
+		}
+	}
+	return "", fmt.Errorf("rollout thread id not found: %s", path)
+}
+
+const rolloutTimestampLayout = "2006-01-02T15-04-05"
+
+// ThreadIDFromFilename extracts the thread id embedded in a standard rollout
+// filename (rollout-<timestamp>-<threadID>.jsonl[.zst]) without opening the
+// file. Standard rollouts always encode the thread id in the filename, so
+// callers can locate a thread by scanning filenames instead of reading every
+// rollout, which is prohibitively slow for homes with thousands of sessions.
+func ThreadIDFromFilename(name string) (string, bool) {
+	base := strings.TrimSuffix(filepath.Base(name), ".zst")
+	base = strings.TrimSuffix(base, ".jsonl")
+	if !strings.HasPrefix(base, "rollout-") {
+		return "", false
+	}
+	rest := strings.TrimPrefix(base, "rollout-")
+	if len(rest) <= len(rolloutTimestampLayout) {
+		return "", false
+	}
+	if _, err := time.Parse(rolloutTimestampLayout, rest[:len(rolloutTimestampLayout)]); err != nil {
+		return "", false
+	}
+	threadID := strings.TrimPrefix(rest[len(rolloutTimestampLayout):], "-")
+	if strings.TrimSpace(threadID) == "" {
+		return "", false
+	}
+	return threadID, true
+}
+
+func ParseTimestampFromFilename(name string) (time.Time, bool) {
+	name = strings.TrimPrefix(name, "rollout-")
+	if len(name) < len(rolloutTimestampLayout) {
+		return time.Time{}, false
+	}
+	stamp := name[:len(rolloutTimestampLayout)]
+	created, err := time.Parse(rolloutTimestampLayout, stamp)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return created.UTC(), true
+}
+
+func Archive(path string, codexHome string) (string, error) {
+	return moveRollout(path, filepath.Join(codexHome, ArchivedSessionsSubdir))
+}
+
+func Unarchive(path string, codexHome string) (string, error) {
+	createdAt, ok := ParseTimestampFromFilename(filepath.Base(PlainRolloutPath(path)))
+	if !ok {
+		return "", fmt.Errorf("rollout path %q missing filename timestamp", path)
+	}
+	targetDir := filepath.Join(
+		codexHome,
+		SessionsSubdir,
+		createdAt.Format("2006"),
+		createdAt.Format("01"),
+		createdAt.Format("02"),
+	)
+	target, err := moveRollout(path, targetDir)
+	if err != nil {
+		return "", err
+	}
+	now := time.Now().UTC()
+	if err := os.Chtimes(target, now, now); err != nil {
+		return "", err
+	}
+	return target, nil
+}
+
+func Delete(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return errors.New("rollout path is required")
+	}
+	if err := os.Remove(path); errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("rollout not found: %s", path)
+	} else if err != nil {
+		return err
+	}
+	return nil
+}
+
+func FindThreadPath(codexHome string, threadID string, archived bool) (string, error) {
+	threadID = strings.TrimSpace(threadID)
+	root := filepath.Join(codexHome, SessionsSubdir)
+	if archived {
+		root = filepath.Join(codexHome, ArchivedSessionsSubdir)
+	}
+	paths, err := collectRolloutPaths(root)
+	if err != nil {
+		return "", err
+	}
+	// Mirrors Rust `visit_rollout_filenames` + `find_thread_path_by_id_from_filenames`
+	// (codex-rs/rollout/src/list.rs): the canonical filename decides the candidate
+	// set, so unrelated history is never opened (Rust #54060). The newest candidate
+	// wins, with the rollout id as a deterministic tie-breaker for files that share
+	// a timestamp.
+	var fallback string
+	var newest *RolloutFileName
+	newestPath := ""
+	for _, path := range paths {
+		parsed, ok := ParseRolloutFileName(filepath.Base(path))
+		if !ok {
+			// Rust answers a filename-only query (`file_search::run`) here instead of
+			// reading rollout metadata; keep the deterministic substring form.
+			if fallback == "" && threadID != "" && strings.Contains(filepath.Base(path), threadID) {
+				fallback = path
+			}
+			continue
+		}
+		if parsed.ThreadID != threadID {
+			continue
+		}
+		if existing, ok := ExistingRolloutPath(PlainRolloutPath(path)); ok {
+			// Rust's `RolloutFile::from_path` hides a compressed rollout whose plain
+			// sibling exists.
+			path = existing
+		}
+		if newest == nil || parsed.Timestamp.After(newest.Timestamp) ||
+			(parsed.Timestamp.Equal(newest.Timestamp) && parsed.RolloutID > newest.RolloutID) {
+			parsedCopy := parsed
+			newest = &parsedCopy
+			newestPath = path
+		}
+	}
+	if newest != nil {
+		return newestPath, nil
+	}
+	if fallback != "" {
+		return fallback, nil
+	}
+	return "", fmt.Errorf("rollout thread not found: %s", threadID)
+}
+
+// FindRolloutPathByRolloutID mirrors Rust `find_rollout_path_by_rollout_id`
+// (codex-rs/rollout/src/list.rs, Rust #47653): locate one immutable rollout file
+// by its rollout id across the unarchived and archived trees. Unlike
+// FindThreadPath it never consults the state DB and never picks among several
+// rollouts of one thread - the first canonical filename match wins, with a
+// plain sibling preferred over its compressed copy.
+func FindRolloutPathByRolloutID(codexHome string, rolloutID string) (string, bool, error) {
+	rolloutID = strings.TrimSpace(rolloutID)
+	if rolloutID == "" {
+		return "", false, nil
+	}
+	for _, subdir := range []string{SessionsSubdir, ArchivedSessionsSubdir} {
+		paths, err := collectRolloutPaths(filepath.Join(codexHome, subdir))
+		if err != nil {
+			return "", false, err
+		}
+		// Sort so a filesystem-order change cannot make the answer nondeterministic.
+		sort.Strings(paths)
+		for _, path := range paths {
+			parsed, ok := ParseRolloutFileName(filepath.Base(path))
+			if !ok || parsed.RolloutID != rolloutID {
+				continue
+			}
+			if existing, ok := ExistingRolloutPath(PlainRolloutPath(path)); ok {
+				path = existing
+			}
+			return path, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+// RolloutFileName is the parsed canonical basename of a rollout file. Ordinary
+// rollouts encode one id that is both the thread id and the immutable rollout id;
+// reverted rollouts append "_<rollout id>" after the stable thread id. Mirrors
+// Rust codex-rollout's `RolloutFileName` (rollout_file_name.rs).
+type RolloutFileName struct {
+	Timestamp time.Time
+	ThreadID  string
+	RolloutID string
+}
+
+// ParseRolloutFileName parses `rollout-<timestamp>-<threadID>[_<rolloutID>].jsonl[.zst]`.
+//
+// It mirrors Rust `RolloutFileName::parse` (rollout_file_name.rs, Rust #54060):
+// callers decide whether a file is a scan candidate from this value alone, so
+// unrelated rollouts never cost a metadata read.
+func ParseRolloutFileName(name string) (RolloutFileName, bool) {
+	base := filepath.Base(strings.TrimSpace(name))
+	base = strings.TrimSuffix(base, ".zst")
+	if !strings.HasPrefix(base, "rollout-") || !strings.HasSuffix(base, ".jsonl") {
+		return RolloutFileName{}, false
+	}
+	core := strings.TrimSuffix(strings.TrimPrefix(base, "rollout-"), ".jsonl")
+	if len(core) <= len(rolloutTimestampLayout) || core[len(rolloutTimestampLayout)] != '-' {
+		return RolloutFileName{}, false
+	}
+	stamp, err := time.Parse(rolloutTimestampLayout, core[:len(rolloutTimestampLayout)])
+	if err != nil {
+		return RolloutFileName{}, false
+	}
+	threadID := core[len(rolloutTimestampLayout)+1:]
+	rolloutID := threadID
+	if index := strings.Index(threadID, "_"); index >= 0 {
+		threadID, rolloutID = threadID[:index], threadID[index+1:]
+	}
+	if strings.TrimSpace(threadID) == "" || strings.TrimSpace(rolloutID) == "" {
+		return RolloutFileName{}, false
+	}
+	return RolloutFileName{
+		Timestamp: stamp.UTC(),
+		ThreadID:  threadID,
+		RolloutID: rolloutID,
+	}, true
+}
+
+// OwnedUnarchivedThreadRollouts mirrors Rust's `scan_unarchived_threads`
+// combined with `owned_rollout_paths_from_index` (Rust #41908, #54060):
+// archiving only needs the active rollouts that still have to be moved, so
+// discovery is restricted to the `sessions` tree and to canonical filenames
+// belonging to the requested threads. Session metadata still decides ownership
+// among those candidates, and compressed originals plus reverted replacements
+// are included.
+func OwnedUnarchivedThreadRollouts(codexHome string, threadIDs []string) ([]string, error) {
+	return ownedThreadRollouts(filepath.Join(codexHome, SessionsSubdir), threadIDs)
+}
+
+// OwnedArchivedThreadRollouts mirrors Rust's
+// `RolloutReferenceIndex::scan_archived_threads` combined with
+// `owned_rollout_paths_from_index` (Rust #54060): discovery is restricted to
+// archived files whose canonical filenames belong to the requested threads, and
+// session metadata still decides ownership among those candidates. Compressed
+// originals and reverted replacements are included; unrelated archived history is
+// never opened.
+func OwnedArchivedThreadRollouts(codexHome string, threadIDs []string) ([]string, error) {
+	return ownedThreadRollouts(filepath.Join(codexHome, ArchivedSessionsSubdir), threadIDs)
+}
+
+func ownedThreadRollouts(root string, threadIDs []string) ([]string, error) {
+	wanted := make(map[string]struct{}, len(threadIDs))
+	for _, threadID := range threadIDs {
+		if trimmed := strings.TrimSpace(threadID); trimmed != "" {
+			wanted[trimmed] = struct{}{}
+		}
+	}
+	if len(wanted) == 0 {
+		return nil, nil
+	}
+	paths, err := collectRolloutPaths(root)
+	if err != nil {
+		return nil, err
+	}
+	// Sort first so identical rollout ids resolve deterministically; the Rust index
+	// keys rollouts by immutable rollout id and keeps the first entry.
+	sort.Strings(paths)
+	owned := []string{}
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		parsed, ok := ParseRolloutFileName(filepath.Base(path))
+		if !ok {
+			continue
+		}
+		if _, ok := wanted[parsed.ThreadID]; !ok {
+			continue
+		}
+		if existing, ok := ExistingRolloutPath(PlainRolloutPath(path)); ok {
+			path = existing
+		}
+		if _, ok := seen[parsed.RolloutID]; ok {
+			continue
+		}
+		meta, err := FirstSessionMeta(path)
+		if err != nil {
+			continue
+		}
+		if _, ok := wanted[meta.ID]; !ok {
+			continue
+		}
+		seen[parsed.RolloutID] = struct{}{}
+		owned = append(owned, path)
+	}
+	sort.Strings(owned)
+	return owned, nil
+}
+
+// ArchiveThreadRollouts mirrors Rust's `archive_thread_with_paths`
+// (thread-store/src/local/archive_thread.rs, Rust #41908): every active rollout
+// owned by the requested threads is moved into the archived sessions directory,
+// the selected rollout's archived path is reported, and already-archived or
+// duplicate entries are skipped. A failed move rolls the earlier moves back.
+func ArchiveThreadRollouts(codexHome string, threadIDs []string, selectedActivePath string) (string, error) {
+	owned, err := OwnedUnarchivedThreadRollouts(codexHome, threadIDs)
+	if err != nil {
+		return "", err
+	}
+	selected := filepath.Clean(strings.TrimSpace(selectedActivePath))
+	if strings.TrimSpace(selectedActivePath) != "" && !contains(owned, selected) {
+		owned = append(owned, selected)
+	}
+	archiveDir := filepath.Join(codexHome, ArchivedSessionsSubdir)
+	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
+		return "", err
+	}
+	archivedPath := ""
+	moved := make([][2]string, 0, len(owned))
+	seen := make(map[string]struct{}, len(owned))
+	for _, path := range owned {
+		source := filepath.Clean(path)
+		if _, ok := seen[source]; ok {
+			continue
+		}
+		seen[source] = struct{}{}
+		if rolloutPathIsArchived(codexHome, source) {
+			continue
+		}
+		if _, ok := ParseRolloutFileName(filepath.Base(source)); !ok {
+			return "", fmt.Errorf("rollout path %q has an invalid filename", source)
+		}
+		destination := filepath.Join(archiveDir, filepath.Base(source))
+		if source == selected {
+			archivedPath = destination
+		}
+		target, err := moveRollout(source, archiveDir)
+		if err != nil {
+			for i := len(moved) - 1; i >= 0; i-- {
+				_ = os.Rename(moved[i][1], moved[i][0])
+			}
+			return "", err
+		}
+		moved = append(moved, [2]string{source, target})
+	}
+	if archivedPath == "" {
+		return "", fmt.Errorf("failed to archive selected rollout for thread %s", strings.Join(threadIDs, ","))
+	}
+	return archivedPath, nil
+}
+
+// RestoreThreadRollouts mirrors Rust's `unarchive_thread`
+// (thread-store/src/local/unarchive_thread.rs, Rust #54060): every archived
+// rollout owned by threadID is moved back to the dated sessions layout, and the
+// requested rollout is the one whose restored path is reported. Moves are rolled
+// back when one of them fails.
+func RestoreThreadRollouts(codexHome string, threadID string, selectedArchivedPath string) (string, error) {
+	owned, err := OwnedArchivedThreadRollouts(codexHome, []string{threadID})
+	if err != nil {
+		return "", err
+	}
+	if !contains(owned, selectedArchivedPath) {
+		owned = append(owned, selectedArchivedPath)
+	}
+	restored := ""
+	moved := make([][2]string, 0, len(owned))
+	seen := make(map[string]struct{}, len(owned))
+	for _, path := range owned {
+		source := filepath.Clean(path)
+		if _, ok := seen[source]; ok {
+			continue
+		}
+		seen[source] = struct{}{}
+		if !rolloutPathIsArchived(codexHome, source) {
+			continue
+		}
+		target, err := Unarchive(source, codexHome)
+		if err != nil {
+			for i := len(moved) - 1; i >= 0; i-- {
+				_ = os.Rename(moved[i][1], moved[i][0])
+			}
+			return "", err
+		}
+		moved = append(moved, [2]string{source, target})
+		if filepath.Clean(selectedArchivedPath) == source {
+			restored = target
+		}
+	}
+	if restored == "" {
+		return "", fmt.Errorf("failed to unarchive selected rollout for thread %s", threadID)
+	}
+	return restored, nil
+}
+
+// rolloutPathIsArchived mirrors Rust `rollout_path_is_archived`: a path is
+// archived when any component is the archived sessions subdirectory.
+func rolloutPathIsArchived(codexHome string, path string) bool {
+	if strings.HasPrefix(path, filepath.Join(codexHome, ArchivedSessionsSubdir)) {
+		return true
+	}
+	for _, component := range strings.Split(filepath.ToSlash(path), "/") {
+		if component == ArchivedSessionsSubdir {
+			return true
+		}
+	}
+	return false
+}
+
+func moveRollout(path string, targetDir string) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", errors.New("rollout path is required")
+	}
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		return "", err
+	}
+	target := filepath.Join(targetDir, filepath.Base(path))
+	if filepath.Clean(path) == filepath.Clean(target) {
+		return target, nil
+	}
+	if err := os.Rename(path, target); err != nil {
+		return "", err
+	}
+	return target, nil
+}
+
+func matchesOptions(item *ThreadItem, options *ListOptions) bool {
+	if len(options.AllowedSources) > 0 && !contains(options.AllowedSources, item.Source) {
+		return false
+	}
+	if len(options.ModelProviders) > 0 && !contains(options.ModelProviders, item.ModelProvider) {
+		return false
+	}
+	if len(options.CWDFilters) > 0 && !contains(options.CWDFilters, item.CWD) {
+		return false
+	}
+	if options.Search != "" {
+		needle := strings.ToLower(options.Search)
+		return strings.Contains(strings.ToLower(item.Preview), needle) ||
+			strings.Contains(strings.ToLower(item.FirstUserMessage), needle)
+	}
+	return true
+}
+
+func collectRolloutPaths(root string) ([]string, error) {
+	return CollectRolloutPaths(root)
+}
+
+// CollectRolloutPaths recursively returns plain and zstd-compressed rollout
+// files. Both the legacy flat layout and the date-nested layout are accepted.
+func CollectRolloutPaths(root string) ([]string, error) {
+	info, err := os.Stat(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, nil
+	}
+	paths := []string{}
+	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		name := strings.ToLower(entry.Name())
+		if strings.HasSuffix(name, ".jsonl") || strings.HasSuffix(name, ".jsonl.zst") {
+			paths = append(paths, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return paths, nil
+}
+
+func sortThreadItems(items []ThreadItem, key SortKey, direction SortDirection) {
+	if key == "" {
+		key = SortCreatedAt
+	}
+	if direction == "" {
+		direction = SortDesc
+	}
+	sort.SliceStable(items, func(i int, j int) bool {
+		left := threadSortTime(&items[i], key)
+		right := threadSortTime(&items[j], key)
+		if left.Equal(right) {
+			if direction == SortAsc {
+				return items[i].ThreadID < items[j].ThreadID
+			}
+			return items[i].ThreadID > items[j].ThreadID
+		}
+		if direction == SortAsc {
+			return left.Before(right)
+		}
+		return left.After(right)
+	})
+}
+
+func threadSortTime(item *ThreadItem, key SortKey) time.Time {
+	switch key {
+	case SortUpdatedAt:
+		return item.UpdatedAt
+	case SortRecencyAt:
+		return item.RecencyAt
+	default:
+		return item.CreatedAt
+	}
+}
+
+func parseCursor(cursor string) (int, error) {
+	if cursor == "" {
+		return 0, nil
+	}
+	value, err := strconv.Atoi(cursor)
+	if err != nil || value < 0 {
+		return 0, fmt.Errorf("invalid cursor %q", cursor)
+	}
+	return value, nil
+}
+
+func userTextFromRaw(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var item Item
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return ""
+	}
+	if item.Type != "user_message" && !(item.Type == "message" && item.Role == "user") {
+		return ""
+	}
+	if strings.TrimSpace(item.Text) != "" {
+		return item.Text
+	}
+	if text, ok := item.Data["text"].(string); ok {
+		return text
+	}
+	for i := range item.Content {
+		if strings.TrimSpace(item.Content[i].Text) != "" {
+			return item.Content[i].Text
+		}
+	}
+	return ""
+}
+
+func userTextFromLine(line *Line) string {
+	if line == nil {
+		return ""
+	}
+	if text := userTextFromRaw(line.Item); text != "" {
+		return text
+	}
+	if line.Type == "event_msg" {
+		if text := userTextFromEventPayload(line.Payload); text != "" {
+			return text
+		}
+	}
+	if text, ok := line.Data["text"].(string); ok {
+		return text
+	}
+	return ""
+}
+
+func userTextFromEventPayload(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var payload struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+		Text    string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return ""
+	}
+	if normalizeRolloutEventType(payload.Type) != "user_message" {
+		return ""
+	}
+	return firstNonEmpty(payload.Message, payload.Text)
+}
+
+func lineItemTime(line Line) time.Time {
+	if line.Timestamp == "" {
+		return time.Time{}
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, line.Timestamp)
+	if err != nil {
+		return time.Time{}
+	}
+	return parsed.UTC()
+}
+
+func messageInputItem(item *Item) map[string]any {
+	role := firstNonEmpty(item.Role, roleForItemType(item.Type), "user")
+	content := contentBlocksFromItem(item, role)
+	if len(content) == 0 {
+		return nil
+	}
+	return map[string]any{
+		"type":    "message",
+		"role":    role,
+		"content": content,
+	}
+}
+
+func toolCallInputItem(item *Item) map[string]any {
+	callID := firstNonEmpty(item.CallID, stringValue(item.Data, "call_id"), item.ID)
+	switch item.Type {
+	case "custom_tool_call":
+		return map[string]any{
+			"id":      item.ID,
+			"type":    "custom_tool_call",
+			"call_id": callID,
+			"name":    firstNonEmpty(item.Name, stringValue(item.Data, "name")),
+			"input":   firstNonEmpty(item.Text, stringValue(item.Data, "input")),
+		}
+	case "tool_search_call":
+		out := map[string]any{
+			"id":        item.ID,
+			"type":      "tool_search_call",
+			"call_id":   callID,
+			"execution": firstNonEmpty(stringValue(item.Data, "execution"), "client"),
+		}
+		if search := mapValue(item.Data, "arguments"); search != nil {
+			out["arguments"] = search
+		} else if search := mapValue(item.Data, "search"); search != nil {
+			out["arguments"] = search
+		}
+		return out
+	default:
+		return map[string]any{
+			"id":        item.ID,
+			"type":      "function_call",
+			"call_id":   callID,
+			"name":      firstNonEmpty(item.Name, stringValue(item.Data, "name")),
+			"arguments": firstNonEmpty(item.Text, stringValue(item.Data, "arguments")),
+		}
+	}
+}
+
+func toolOutputInputItem(item *Item) map[string]any {
+	callID := firstNonEmpty(item.CallID, stringValue(item.Data, "call_id"), item.ID)
+	outputType := item.Type
+	if outputType == "tool_output" {
+		outputType = "function_call_output"
+	}
+	out := map[string]any{
+		"type":    outputType,
+		"call_id": callID,
+	}
+	if outputType == "tool_search_output" {
+		out["status"] = firstNonEmpty(stringValue(item.Data, "status"), "completed")
+		out["execution"] = firstNonEmpty(stringValue(item.Data, "execution"), "client")
+		if tools, ok := item.Data["tools"]; ok {
+			out["tools"] = tools
+		}
+		return out
+	}
+	output := any(firstNonEmpty(item.Text, stringValue(item.Data, "output")))
+	if value, ok := item.Data["content_items"]; ok {
+		output = value
+	}
+	out["output"] = output
+	return out
+}
+
+func contentBlocksFromItem(item *Item, role string) []map[string]any {
+	if len(item.Content) > 0 {
+		blocks := make([]map[string]any, 0, len(item.Content))
+		for i := range item.Content {
+			block := map[string]any{"type": firstNonEmpty(item.Content[i].Type, defaultContentType(role))}
+			if item.Content[i].Text != "" {
+				block["text"] = item.Content[i].Text
+			}
+			if item.Content[i].ImageURL != "" {
+				block["image_url"] = item.Content[i].ImageURL
+			}
+			if item.Content[i].Detail != nil {
+				block["detail"] = *item.Content[i].Detail
+			}
+			blocks = append(blocks, block)
+		}
+		return blocks
+	}
+	text := firstNonEmpty(item.Text, stringValue(item.Data, "text"))
+	if strings.TrimSpace(text) == "" {
+		return nil
+	}
+	return []map[string]any{{"type": defaultContentType(role), "text": text}}
+}
+
+func roleForItemType(itemType string) string {
+	switch itemType {
+	case "agent_message", "assistant_message":
+		return "assistant"
+	case "user_message", "message":
+		return "user"
+	default:
+		return ""
+	}
+}
+
+func defaultContentType(role string) string {
+	if role == "assistant" {
+		return "output_text"
+	}
+	return "input_text"
+}
+
+func stringValue(values map[string]any, key string) string {
+	if values == nil {
+		return ""
+	}
+	value, _ := values[key].(string)
+	return value
+}
+
+func mapValue(values map[string]any, key string) map[string]any {
+	if values == nil {
+		return nil
+	}
+	value, _ := values[key].(map[string]any)
+	return value
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func cloneAnyMap(values map[string]any) map[string]any {
+	if values == nil {
+		return nil
+	}
+	cloned := make(map[string]any, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func ensureExtraMap(values map[string]any) map[string]any {
+	if values == nil {
+		return map[string]any{}
+	}
+	return values
+}
+
+// runtimeWorkspaceRootsFromAny normalizes the runtime workspace root selection
+// from record metadata, which may hold either a []string or the []any produced
+// by a JSON round trip. A nil result means the field was absent.
+func runtimeWorkspaceRootsFromAny(value any) *[]string {
+	switch typed := value.(type) {
+	case []string:
+		roots := append([]string{}, typed...)
+		return &roots
+	case []any:
+		roots := make([]string, 0, len(typed))
+		for _, item := range typed {
+			text, ok := item.(string)
+			if !ok {
+				continue
+			}
+			roots = append(roots, text)
+		}
+		return &roots
+	default:
+		return nil
+	}
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func cloneRawMessages(values []json.RawMessage) []json.RawMessage {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make([]json.RawMessage, 0, len(values))
+	for _, value := range values {
+		if len(value) == 0 {
+			continue
+		}
+		cloned = append(cloned, append(json.RawMessage(nil), value...))
+	}
+	if len(cloned) == 0 {
+		return nil
+	}
+	return cloned
+}
+
+func contains(values []string, needle string) bool {
+	for _, value := range values {
+		if value == needle {
+			return true
+		}
+	}
+	return false
+}

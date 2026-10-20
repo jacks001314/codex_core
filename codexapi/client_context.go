@@ -1,0 +1,613 @@
+package codexapi
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+)
+
+const (
+	ClientOpenAIBetaHeader                       = "OpenAI-Beta"
+	ClientCodexInstallationIDHeader              = "x-codex-installation-id"
+	ClientCodexRoutingHintHeader                 = "x-codex-routing-hint"
+	ClientCodexTurnStateHeader                   = "x-codex-turn-state"
+	ClientCodexTurnMetadataHeader                = "x-codex-turn-metadata"
+	ClientCodexParentThreadIDHeader              = "x-codex-parent-thread-id"
+	ClientCodexWindowIDHeader                    = "x-codex-window-id"
+	ClientCodexBetaFeaturesHeader                = "x-codex-beta-features"
+	ClientOpenAIMemgenRequestHeader              = "x-openai-memgen-request"
+	ClientOpenAISubagentHeader                   = "x-openai-subagent"
+	ClientResponsesAPIIncludeTimingMetricsHeader = "x-responsesapi-include-timing-metrics"
+)
+
+type ClientContentKind string
+
+const (
+	ClientContentText  ClientContentKind = "text"
+	ClientContentImage ClientContentKind = "image"
+)
+
+type ClientContentItem struct {
+	Kind     ClientContentKind
+	Text     string
+	ImageURL string
+	Detail   string
+}
+
+type ClientResponseItem struct {
+	Type    string
+	Role    string
+	Content []ClientContentItem
+}
+
+type ClientPrompt struct {
+	Input              []ClientResponseItem
+	Tools              []string
+	ParallelToolCalls  bool
+	BaseInstructions   string
+	OutputSchema       map[string]any
+	OutputSchemaStrict bool
+}
+
+func NewClientPrompt() *ClientPrompt {
+	return &ClientPrompt{OutputSchemaStrict: true}
+}
+
+// FormattedInput returns a request copy of the prompt input with image details
+// normalized for the receiving model, mirroring Rust
+// Prompt::get_formatted_input_for_request (#44249): Responses Lite strips image
+// details entirely, while other models downgrade `original` to the default
+// detail when they do not advertise supports_image_detail_original. The stored
+// prompt is never mutated, so switching back to a supporting model retains
+// `original`.
+func (p *ClientPrompt) FormattedInput(useResponsesLite bool, supportsImageDetailOriginal bool) []ClientResponseItem {
+	if p == nil {
+		return nil
+	}
+	input := cloneClientResponseItems(p.Input)
+	normalizeClientImageDetails(input, useResponsesLite, supportsImageDetailOriginal)
+	return input
+}
+
+type ClientRequestKind string
+
+const (
+	ClientRequestTurn       ClientRequestKind = "turn"
+	ClientRequestPrewarm    ClientRequestKind = "prewarm"
+	ClientRequestCompaction ClientRequestKind = "compaction"
+	ClientRequestMemory     ClientRequestKind = "memory"
+)
+
+type ClientCompactionMetadata struct {
+	Trigger        string `json:"trigger"`
+	Reason         string `json:"reason"`
+	Implementation string `json:"implementation"`
+	Phase          string `json:"phase"`
+	Strategy       string `json:"strategy"`
+}
+
+type ClientWorkspaceMetadata struct {
+	AssociatedRemoteURLs map[string]string `json:"associated_remote_urls,omitempty"`
+	LatestGitCommitHash  string            `json:"latest_git_commit_hash,omitempty"`
+	HasChanges           *bool             `json:"has_changes,omitempty"`
+}
+
+type ClientMetadata struct {
+	InstallationID  string
+	SessionID       string
+	ThreadID        string
+	TurnID          string
+	WindowID        string
+	ContextWindowID string
+	// WindowNumber is the zero-based number of the current context window,
+	// included in Responses turn metadata (Rust #40987).
+	WindowNumber *uint64
+	RequestKind  ClientRequestKind
+	Compaction   *ClientCompactionMetadata
+	// AgentName is the canonical agent path for sub-agent turns (Rust #38483).
+	// It is emitted in turn metadata only when set; callers fall back to
+	// "/root" like Rust.
+	AgentName          string
+	ForkedFromThreadID string
+	// ForkedFromOrdinalExclusive is emitted only alongside fork lineage.
+	ForkedFromOrdinalExclusive *uint64
+	ParentThreadID             string
+	ParentTurnID               string
+	RootTurnID                 string
+	SubagentHeader             string
+	SubagentKind               string
+	ThreadSource               string
+	TurnTrigger                string
+	CodexVersion               string
+	Sandbox                    string
+	SandboxMode                string
+	// Model and ReasoningEffort describe the execution settings that issued the
+	// request (Rust `ExecutionMetadata::apply_to`), so request metadata reports
+	// the capturing step's settings instead of a turn's initial ones. Empty
+	// values omit the key.
+	Model                      string
+	ReasoningEffort            string
+	AutoReviewEnabled          *bool
+	NodeReplAutoReviewRequired *bool
+	NodeReplDisabled           *bool
+	// AnalyticsEnabled reports the selected session analytics client's
+	// collection state; absent when the request has no initialized session
+	// analytics context (Rust #44628).
+	AnalyticsEnabled    *bool
+	Workspaces          map[string]ClientWorkspaceMetadata
+	TurnStartedAtUnixMS int64
+	// HistoryIngestRequested reports that the session's token-budget config
+	// enables the history-notes extension (Rust
+	// `with_window_and_fork_metadata`); only the true value is serialized.
+	HistoryIngestRequested bool
+	// HistoryInitialization classifies how the runtime's starting history was
+	// obtained. It remains fixed for the runtime lifetime.
+	HistoryInitialization string
+	Extra                 map[string]string
+	// ResponsesAPIMetadata carries bounded, product-owned metadata from the
+	// `responses_api_metadata` config (Rust 9e301c8c9a). Product metadata takes
+	// precedence over client-provided Extra values and is kept out of metadata
+	// sent to external MCP servers.
+	ResponsesAPIMetadata map[string]string
+}
+
+func NewClientMetadata(installationID string, sessionID string, threadID string, windowID string) *ClientMetadata {
+	return &ClientMetadata{
+		InstallationID: installationID,
+		SessionID:      sessionID,
+		ThreadID:       threadID,
+		WindowID:       windowID,
+		Workspaces:     map[string]ClientWorkspaceMetadata{},
+		Extra:          map[string]string{},
+	}
+}
+
+func (m *ClientMetadata) HasTurnMetadata() bool {
+	return m != nil && m.RequestKind != ""
+}
+
+func (m *ClientMetadata) TurnMetadataValue() map[string]any {
+	if m == nil {
+		return nil
+	}
+	value := map[string]any{}
+	hasTurnIdentity := m.RequestKind != ClientRequestMemory
+	hasRequestIdentity := m.RequestKind != "" && m.RequestKind != ClientRequestMemory
+	if hasRequestIdentity {
+		value["installation_id"] = m.InstallationID
+		value["window_id"] = m.WindowID
+		if m.ContextWindowID != "" {
+			value["context_window_id"] = m.ContextWindowID
+		}
+		if m.WindowNumber != nil {
+			value["window_number"] = *m.WindowNumber
+		}
+	}
+	if hasTurnIdentity {
+		value["session_id"] = m.SessionID
+		value["thread_id"] = m.ThreadID
+		if m.AgentName != "" {
+			value[AgentNameKey] = m.AgentName
+		}
+	}
+	// Rust #42900: turn identity is reported even for detached memory requests,
+	// which omit only session/thread identity.
+	if m.TurnID != "" {
+		value["turn_id"] = m.TurnID
+	}
+	if m.RequestKind != "" {
+		value["request_kind"] = string(m.RequestKind)
+	}
+	if m.Compaction != nil {
+		value["compaction"] = m.Compaction
+	}
+	if m.ForkedFromThreadID != "" {
+		value["forked_from_thread_id"] = m.ForkedFromThreadID
+	}
+	if m.ForkedFromOrdinalExclusive != nil {
+		value[ForkedFromOrdinalExclusiveKey] = *m.ForkedFromOrdinalExclusive
+	}
+	if m.ParentThreadID != "" {
+		value["parent_thread_id"] = m.ParentThreadID
+	}
+	if m.ParentTurnID != "" {
+		value["parent_turn_id"] = m.ParentTurnID
+	}
+	if m.RootTurnID != "" {
+		value[RootTurnIDKey] = m.RootTurnID
+	}
+	if m.SubagentKind != "" {
+		value["subagent_kind"] = m.SubagentKind
+	}
+	if m.ThreadSource != "" {
+		value["thread_source"] = m.ThreadSource
+	}
+	if m.TurnTrigger != "" {
+		value["turn_trigger"] = m.TurnTrigger
+	}
+	if m.CodexVersion != "" {
+		value["codex_version"] = m.CodexVersion
+	}
+	if m.Sandbox != "" {
+		value["sandbox"] = m.Sandbox
+	}
+	if m.SandboxMode != "" {
+		value["sandbox_mode"] = m.SandboxMode
+	}
+	if m.Model != "" {
+		value[ModelKey] = m.Model
+	}
+	if m.ReasoningEffort != "" {
+		value[ReasoningEffortKey] = m.ReasoningEffort
+	}
+	if m.AutoReviewEnabled != nil {
+		value[AutoReviewEnabledKey] = *m.AutoReviewEnabled
+	}
+	if m.NodeReplAutoReviewRequired != nil {
+		value[NodeReplAutoReviewRequiredKey] = *m.NodeReplAutoReviewRequired
+	}
+	if m.NodeReplDisabled != nil {
+		value[NodeReplDisabledKey] = *m.NodeReplDisabled
+	}
+	if m.AnalyticsEnabled != nil {
+		value[AnalyticsEnabledKey] = *m.AnalyticsEnabled
+	}
+	if len(m.Workspaces) > 0 {
+		value["workspaces"] = m.Workspaces
+	}
+	if m.TurnStartedAtUnixMS != 0 {
+		value["turn_started_at_unix_ms"] = m.TurnStartedAtUnixMS
+	}
+	if m.HistoryIngestRequested {
+		value[HistoryIngestRequestedKey] = true
+	}
+	if initialization := strings.TrimSpace(m.HistoryInitialization); initialization != "" {
+		value[HistoryInitializationKey] = initialization
+	}
+	for key, extra := range m.Extra {
+		if ClientReservedMetadataKeys()[key] || m.capturedMetadataKey(key) {
+			continue
+		}
+		value[key] = extra
+	}
+	for key, productValue := range m.ResponsesAPIMetadata {
+		if ClientReservedMetadataKeys()[key] || m.capturedMetadataKey(key) {
+			continue
+		}
+		value[key] = productValue
+	}
+	return value
+}
+
+// capturedMetadataKey reports whether the key is owned by the captured step
+// settings instead of a client-provided entry. Rust's ExecutionMetadata::apply_to
+// inserts the issuing step's model into the turn-metadata extra map and inserts
+// or removes the reasoning effort there, after the client entries, so the
+// captured settings win whenever a step applied them.
+func (m *ClientMetadata) capturedMetadataKey(key string) bool {
+	if m == nil || m.Model == "" {
+		return false
+	}
+	switch key {
+	case ModelKey, ReasoningEffortKey:
+		return true
+	default:
+		return false
+	}
+}
+
+// MCPTurnMetadataValue returns the turn-metadata document external MCP servers
+// receive in `_meta` under `x-codex-turn-metadata` (Rust
+// TurnMetadataState::current_meta_value_for_mcp_request): the turn metadata
+// without the request identity, minus the harness-owned agent and parent/root
+// turn fields, plus the per-turn user-input flag. It returns nil when the
+// metadata carries no turn identity at all.
+func (m *ClientMetadata) MCPTurnMetadataValue(userInputRequested bool) map[string]any {
+	if m == nil {
+		return nil
+	}
+	clone := *m
+	// Rust's MCP template is built without a request kind, so the request
+	// identity (installation id, window id/number, context window id) and the
+	// compaction metadata are omitted, and the window/fork extras the Responses
+	// path adds (history ingest) are absent as well.
+	clone.RequestKind = ""
+	clone.Compaction = nil
+	clone.HistoryIngestRequested = false
+	value := clone.TurnMetadataValue()
+	if value == nil {
+		return nil
+	}
+	// Never serialize the harness-owned agent identity or the parent/root turn
+	// ids for an external MCP server.
+	for _, key := range []string{AgentNameKey, ParentTurnIDKey, RootTurnIDKey} {
+		delete(value, key)
+	}
+	if userInputRequested {
+		value[UserInputRequestedDuringTurnKey] = true
+	}
+	return value
+}
+
+func (m *ClientMetadata) TurnMetadataJSON() (string, bool) {
+	value := m.TurnMetadataValue()
+	if value == nil {
+		return "", false
+	}
+	bytes, err := json.Marshal(value)
+	if err != nil {
+		return "", false
+	}
+	return string(bytes), true
+}
+
+func (m *ClientMetadata) ClientMetadata() map[string]string {
+	if m == nil {
+		return nil
+	}
+	out := map[string]string{
+		ClientCodexInstallationIDHeader: m.InstallationID,
+		"session_id":                    m.SessionID,
+		"thread_id":                     m.ThreadID,
+		ClientCodexWindowIDHeader:       m.WindowID,
+	}
+	if m.TurnID != "" {
+		out["turn_id"] = m.TurnID
+	}
+	if m.SubagentHeader != "" {
+		out[ClientOpenAISubagentHeader] = m.SubagentHeader
+	}
+	if m.ParentThreadID != "" {
+		out[ClientCodexParentThreadIDHeader] = m.ParentThreadID
+	}
+	if m.ParentTurnID != "" {
+		out["parent_turn_id"] = m.ParentTurnID
+	}
+	if m.HasTurnMetadata() {
+		if jsonText, ok := m.TurnMetadataJSON(); ok {
+			out[ClientCodexTurnMetadataHeader] = jsonText
+		}
+	}
+	return out
+}
+
+func (m *ClientMetadata) CompatibilityHeaders() map[string]string {
+	if m == nil {
+		return nil
+	}
+	headers := map[string]string{ClientCodexWindowIDHeader: m.WindowID}
+	if m.HasTurnMetadata() {
+		if jsonText, ok := clientCompatibilityTurnMetadataJSON(m.TurnMetadataValue()); ok {
+			headers[ClientCodexTurnMetadataHeader] = jsonText
+		}
+	}
+	if m.ParentThreadID != "" {
+		headers[ClientCodexParentThreadIDHeader] = m.ParentThreadID
+	}
+	if m.SubagentHeader != "" {
+		headers[ClientOpenAISubagentHeader] = m.SubagentHeader
+	}
+	return headers
+}
+
+func clientCompatibilityTurnMetadataJSON(value map[string]any) (string, bool) {
+	if value == nil {
+		return "", false
+	}
+	delete(value, CodeModeToolNamesKey)
+	bytes, err := json.Marshal(value)
+	return string(bytes), err == nil
+}
+
+func ClientFilterExtraMetadata(values map[string]string) map[string]string {
+	out := make(map[string]string, len(values))
+	reserved := ClientReservedMetadataKeys()
+	for key, value := range values {
+		if reserved[strings.ToLower(key)] || key == "" {
+			continue
+		}
+		out[key] = value
+	}
+	return out
+}
+
+func ClientReservedMetadataKeys() map[string]bool {
+	keys := []string{
+		GuardianCreditsRequestedKey,
+		"installation_id", strings.ToLower(ClientCodexInstallationIDHeader),
+		"session_id", "thread_id", "turn_id", AgentNameKey, "window_id", "window_number", "context_window_id", strings.ToLower(ClientCodexWindowIDHeader),
+		strings.ToLower(ClientCodexTurnMetadataHeader), strings.ToLower(ClientCodexParentThreadIDHeader),
+		strings.ToLower(ClientOpenAISubagentHeader), "request_kind", "compaction",
+		"turn_started_at_unix_ms", HistoryIngestRequestedKey, HistoryInitializationKey, "forked_from_thread_id", ForkedFromOrdinalExclusiveKey,
+		"parent_thread_id", "parent_turn_id", RootTurnIDKey,
+		AnalyticsEnabledKey,
+		"subagent_kind", "thread_source", "sandbox", "sandbox_mode", "workspaces",
+		"turn_trigger", "codex_version",
+		AutoReviewEnabledKey, NodeReplAutoReviewRequiredKey, NodeReplDisabledKey, CodeModeToolNamesKey, ToolNamespacesInfoKey,
+	}
+	out := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		out[key] = true
+	}
+	return out
+}
+
+type ClientRetryRequest string
+
+const (
+	ClientRetrySampling           ClientRetryRequest = "sampling"
+	ClientRetryRemoteCompactionV2 ClientRetryRequest = "remote_compaction_v2"
+)
+
+type ClientRetryState struct {
+	Retries      uint64
+	MaxRetries   uint64
+	UsedFallback bool
+}
+
+type ClientRetryDecision struct {
+	Retry      bool
+	Fallback   bool
+	Delay      time.Duration
+	NotifyUser bool
+	Error      error
+}
+
+type ClientRetryableError struct {
+	Message        string
+	RequestedDelay time.Duration
+}
+
+func (e *ClientRetryableError) Error() string {
+	return e.Message
+}
+
+func (e *ClientRetryableError) RequestedRetryDelay() (time.Duration, bool) {
+	if e == nil {
+		return 0, false
+	}
+	return e.RequestedDelay, e.RequestedDelay > 0
+}
+
+func (s *ClientRetryState) Handle(err error, request ClientRetryRequest, canFallback bool, websocketEnabled bool, debug bool) ClientRetryDecision {
+	if s.MaxRetries == 0 {
+		s.MaxRetries = 3
+	}
+	if s.Retries >= s.MaxRetries && canFallback && !s.UsedFallback {
+		s.Retries = 0
+		s.UsedFallback = true
+		return ClientRetryDecision{Retry: true, Fallback: true, Delay: 0}
+	}
+	if s.Retries < s.MaxRetries {
+		s.Retries++
+		delay := ClientBackoff(s.Retries)
+		if requested, ok := RetryDelayInfo(err); ok {
+			delay = requested
+		}
+		notify := s.Retries > 1 || debug || !websocketEnabled || request == ClientRetryRemoteCompactionV2
+		return ClientRetryDecision{Retry: true, Delay: delay, NotifyUser: notify}
+	}
+	return ClientRetryDecision{Error: err}
+}
+
+func ClientBackoff(retry uint64) time.Duration {
+	if retry == 0 {
+		return 0
+	}
+	delay := time.Duration(1<<minClientUint64(retry-1, 5)) * 100 * time.Millisecond
+	return delay
+}
+
+func cloneClientResponseItems(items []ClientResponseItem) []ClientResponseItem {
+	out := make([]ClientResponseItem, len(items))
+	for i := range items {
+		out[i] = items[i]
+		out[i].Content = append([]ClientContentItem(nil), items[i].Content...)
+	}
+	return out
+}
+
+func normalizeClientImageDetails(items []ClientResponseItem, useResponsesLite bool, supportsImageDetailOriginal bool) {
+	for i := range items {
+		for j := range items[i].Content {
+			if items[i].Content[j].Kind != ClientContentImage {
+				continue
+			}
+			if useResponsesLite {
+				items[i].Content[j].Detail = ""
+			} else if items[i].Content[j].Detail == "original" && !supportsImageDetailOriginal {
+				items[i].Content[j].Detail = "high"
+			}
+		}
+	}
+}
+
+func minClientUint64(a uint64, b uint64) uint64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func ClientSubagentHeaderValue(sessionSource string) string {
+	header, _ := ClientSubagentMetadataFromSource(sessionSource)
+	return header
+}
+
+func ClientSubagentMetadataKind(sessionSource string) string {
+	_, kind := ClientSubagentMetadataFromSource(sessionSource)
+	return kind
+}
+
+func ClientSubagentMetadataFromSource(sessionSource string) (string, string) {
+	raw := strings.TrimSpace(sessionSource)
+	if raw == "" {
+		return "", ""
+	}
+	label, isSubagent := clientSubagentSourceLabel(raw)
+	normalizedLabel := clientNormalizeSubagentSource(label)
+	if isSubagent {
+		switch normalizedLabel {
+		case "review":
+			return "review", "review"
+		case "compact":
+			return "compact", "compact"
+		case "memoryconsolidation":
+			return "memory_consolidation", "memory_consolidation"
+		}
+		if strings.HasPrefix(normalizedLabel, "threadspawn") {
+			return "collab_spawn", "thread_spawn"
+		}
+		if trimmed := strings.TrimSpace(label); trimmed != "" {
+			return trimmed, trimmed
+		}
+		return "", ""
+	}
+	switch clientNormalizeSubagentSource(raw) {
+	case "internalmemoryconsolidation":
+		return "memory_consolidation", ""
+	case "review":
+		return "review", "review"
+	case "compact":
+		return "compact", "compact"
+	case "memoryconsolidation":
+		return "memory_consolidation", "memory_consolidation"
+	case "threadspawn":
+		return "collab_spawn", "thread_spawn"
+	default:
+		return "", ""
+	}
+}
+
+func clientSubagentSourceLabel(source string) (string, bool) {
+	lower := strings.ToLower(source)
+	for _, prefix := range []string{"subagent:", "subagent_", "subagent-"} {
+		if strings.HasPrefix(lower, prefix) {
+			return strings.TrimSpace(source[len(prefix):]), true
+		}
+	}
+	return "", false
+}
+
+func clientNormalizeSubagentSource(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	return strings.NewReplacer("_", "", "-", "", ":", "", " ", "").Replace(value)
+}
+
+func (c *ClientCompactionMetadata) EnsureDefaults() {
+	if c == nil {
+		return
+	}
+	if c.Strategy == "" {
+		c.Strategy = "memento"
+	}
+}
+
+func (m *ClientMetadata) String() string {
+	text, ok := m.TurnMetadataJSON()
+	if !ok {
+		return "{}"
+	}
+	return fmt.Sprintf("%s", text)
+}

@@ -1,0 +1,3929 @@
+package config
+
+import (
+	"bytes"
+	featureflags "codex_core/features"
+	_ "embed"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"codex_core/keymapschema"
+	"codex_core/network"
+
+	"github.com/pelletier/go-toml/v2"
+)
+
+//go:embed defaults.toml
+var embeddedDefaultsTOML string
+
+type Config struct {
+	Values       map[string]any
+	Requirements *ConfigRequirements
+	// allowedSymlinkedCodexHome is the macOS Seatbelt opt-out resolved only from
+	// the host's top-level user config (Rust #42716). Project config, CLI
+	// overrides, and selected profiles cannot set it.
+	allowedSymlinkedCodexHome string
+	// ApplicationNetworkPolicy is the live application network policy the runtime
+	// published for this config (Rust Config::application_network_policy). Client
+	// factories built from this config bind it, so every application transport
+	// shares one policy generation. It is never serialized.
+	ApplicationNetworkPolicy *network.NetworkPolicy `json:"-"`
+	// ApplicationDestinationPolicy is the composed destination policy that
+	// generation publishes, so a transport can tell whether binding it would
+	// restrict anything. It is never serialized.
+	ApplicationDestinationPolicy *network.DestinationPolicy `json:"-"`
+	// isProjectless records that configuration discovery found no project-root
+	// marker, no Git checkout root and no project-local config directory
+	// (Rust #46328 ConfigLayerStack::is_projectless). Discovery that was
+	// skipped leaves it false.
+	isProjectless bool
+	// cloudConfigBinding is the runtime-only enterprise MCP authority this
+	// configuration was loaded from (Rust #49269
+	// ConfigLayerStack::cloud_config_binding). It does not change the
+	// configuration contents and is never serialized.
+	cloudConfigBinding *CloudConfigBundleBinding
+}
+
+type ForcedLoginMethod string
+
+const (
+	ForcedLoginMethodAPI     ForcedLoginMethod = "api"
+	ForcedLoginMethodChatGPT ForcedLoginMethod = "chatgpt"
+)
+
+type CurrentTimeSource string
+
+const (
+	CurrentTimeSourceSystem   CurrentTimeSource = "system"
+	CurrentTimeSourceExternal CurrentTimeSource = "external"
+)
+
+type CurrentTimeReminderDeliveryMode string
+
+const (
+	CurrentTimeReminderAnyInference          CurrentTimeReminderDeliveryMode = "any_inference"
+	CurrentTimeReminderAfterUserOrToolOutput CurrentTimeReminderDeliveryMode = "after_user_or_tool_output"
+)
+
+type CurrentTimeReminderConfig struct {
+	Enabled                 bool
+	ReminderIntervalSeconds uint64
+	ClockSource             CurrentTimeSource
+	DeliveryMode            CurrentTimeReminderDeliveryMode
+	SleepTool               bool
+}
+
+type SleepToolMode string
+
+const (
+	// SleepToolModeModelDriven registers sleep based on the model and the legacy
+	// current_time_reminder config (Rust SleepToolMode::ModelDriven, the default).
+	SleepToolModeModelDriven SleepToolMode = "model_driven"
+	// SleepToolModeAlwaysOn registers sleep whenever the sleep_tool feature is
+	// enabled, regardless of the model or legacy clock config.
+	SleepToolModeAlwaysOn SleepToolMode = "always_on"
+)
+
+func (c *Config) IncludeEnvironmentContext() bool {
+	if c == nil || c.Values == nil {
+		return true
+	}
+	value, ok := c.Values["include_environment_context"].(bool)
+	if !ok {
+		return true
+	}
+	return value
+}
+func (c *Config) IncludeEnvironmentContextTime() bool {
+	if c == nil || c.Values == nil {
+		return true
+	}
+	value, ok := c.Values["include_environment_context_time"].(bool)
+	if !ok {
+		return true
+	}
+	return value
+}
+
+// ShowRawAgentReasoning reports whether raw chain-of-thought reasoning deltas
+// should be surfaced, mirroring Rust show_raw_agent_reasoning (default false).
+func (c *Config) ShowRawAgentReasoning() bool {
+	if c == nil || c.Values == nil {
+		return false
+	}
+	value, ok := c.Values["show_raw_agent_reasoning"].(bool)
+	if !ok {
+		return false
+	}
+	return value
+}
+
+// HideAgentReasoning reports whether agent reasoning items should be hidden from
+// the human-readable output, mirroring Rust hide_agent_reasoning (default
+// false). `codex exec` shows reasoning when this is false.
+func (c *Config) HideAgentReasoning() bool {
+	if c == nil || c.Values == nil {
+		return false
+	}
+	value, ok := c.Values["hide_agent_reasoning"].(bool)
+	if !ok {
+		return false
+	}
+	return value
+}
+
+// SQLiteHome returns the configured SQLite data directory override, mirroring
+// Rust sqlite_home. Empty when unset (callers fall back to CODEX_SQLITE_HOME
+// and then the codex home).
+func (c *Config) SQLiteHome() string {
+	if c == nil || c.Values == nil {
+		return ""
+	}
+	return strings.TrimSpace(stringFromConfigValue(c.Values["sqlite_home"]))
+}
+
+// SuppressUnstableFeaturesWarning reports whether the under-development
+// feature warning should be suppressed, mirroring Rust
+// suppress_unstable_features_warning (default false).
+func (c *Config) SuppressUnstableFeaturesWarning() bool {
+	if c == nil || c.Values == nil {
+		return false
+	}
+	value, ok := c.Values["suppress_unstable_features_warning"].(bool)
+	if !ok {
+		return false
+	}
+	return value
+}
+
+// HideGovCloudGuidance reports whether the user acknowledged the AWS GovCloud
+// startup guidance (Rust #52176's notice.hide_gov_cloud_guidance). The legacy
+// plural [notices] table is accepted as a fallback.
+func (c *Config) HideGovCloudGuidance() bool {
+	if c == nil || c.Values == nil {
+		return false
+	}
+	for _, key := range []string{"notice", "notices"} {
+		values, ok := c.Values[key].(map[string]any)
+		if !ok {
+			continue
+		}
+		if value, ok := values["hide_gov_cloud_guidance"].(bool); ok {
+			return value
+		}
+	}
+	return false
+}
+
+// DisablePasteBurst reports whether burst-paste detection for typed input is
+// disabled, mirroring Rust disable_paste_burst (default false): when true, all
+// characters are inserted as received and no buffering or placeholder
+// replacement occurs for fast keypress bursts.
+func (c *Config) DisablePasteBurst() bool {
+	if c == nil || c.Values == nil {
+		return false
+	}
+	// Rust #41976: the [tui] location is preferred; the top-level key remains a
+	// legacy fallback.
+	if tuiValues, ok := c.Values["tui"].(map[string]any); ok {
+		if value, ok := tuiValues["disable_paste_burst"].(bool); ok {
+			return value
+		}
+	}
+	value, ok := c.Values["disable_paste_burst"].(bool)
+	if !ok {
+		return false
+	}
+	return value
+}
+
+// DaybreakEnabled reports the default Daybreak preference for new threads and
+// non-interactive turns, mirroring Rust Config::daybreak_enabled, which is
+// `cfg.daybreak.unwrap_or(false)` (#49856). Rust additionally gates the CLI
+// Daybreak selection behind the `cli_daybreak` feature (#51207); Go only
+// grounds the config key here.
+func (c *Config) DaybreakEnabled() bool {
+	if c == nil || c.Values == nil {
+		return false
+	}
+	value, ok := c.Values["daybreak"].(bool)
+	if !ok {
+		return false
+	}
+	return value
+}
+
+type ResumeCWDMode string
+
+const (
+	ResumeCWDCurrent ResumeCWDMode = "current"
+	ResumeCWDSession ResumeCWDMode = "session"
+)
+
+func (c *Config) ResumeCWDMode() (ResumeCWDMode, error) {
+	if c == nil || c.Values == nil {
+		return "", nil
+	}
+	raw, ok := c.Values["resume_cwd"]
+	if !ok || raw == nil {
+		return "", nil
+	}
+	value, ok := raw.(string)
+	if !ok {
+		return "", fmt.Errorf("invalid resume_cwd: expected string")
+	}
+	value = strings.TrimSpace(value)
+	switch ResumeCWDMode(value) {
+	case "":
+		return "", nil
+	case ResumeCWDCurrent, ResumeCWDSession:
+		return ResumeCWDMode(value), nil
+	default:
+		return "", fmt.Errorf("invalid resume_cwd %q: expected current or session", value)
+	}
+}
+
+func ResolveResumeCWD(mode ResumeCWDMode, currentCWD, sessionCWD string) string {
+	if mode == ResumeCWDCurrent && strings.TrimSpace(currentCWD) != "" {
+		return strings.TrimSpace(currentCWD)
+	}
+	return strings.TrimSpace(sessionCWD)
+}
+
+const DefaultChatGPTBaseURL = "https://chatgpt.com/backend-api/"
+
+const DefaultProjectDocMaxBytes = 32 * 1024
+
+type LoadOptions struct {
+	Profile              string
+	CWD                  string
+	PackagedDefaultsPath string
+	IncludeManagedConfig bool
+	ManagedConfigPath    string
+	CloudConfigBundle    *CloudConfigLoader
+	// IgnoreProjectConfig bypasses project-root discovery and all project
+	// configuration layers (Rust LoaderOverrides::ignore_project_config,
+	// #38647). Other configuration sources stay active.
+	IgnoreProjectConfig bool
+}
+
+type EffectiveOptions struct {
+	Profile              string
+	CWD                  string
+	PackagedDefaultsPath string
+	RawOverrides         []string
+	EnableFeatures       []string
+	DisableFeatures      []string
+	StrictConfig         bool
+	IncludeManagedConfig bool
+	ManagedConfigPath    string
+	CloudConfigBundle    *CloudConfigLoader
+	IgnoreProjectConfig  bool
+}
+
+func Load(codexHome string) (*Config, error) {
+	return LoadWithOptions(codexHome, nil)
+}
+
+func LoadWithOptions(codexHome string, opts *LoadOptions) (*Config, error) {
+	values := map[string]any{}
+	packagedDefaultsPath := ""
+	if opts != nil {
+		packagedDefaultsPath = strings.TrimSpace(opts.PackagedDefaultsPath)
+	}
+	if packagedDefaultsPath != "" {
+		packagedDefaults, exists, err := loadConfigFileIfExists(packagedDefaultsPath)
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			return nil, fmt.Errorf("packaged defaults config file %s not found", packagedDefaultsPath)
+		}
+		values = packagedDefaults
+	} else {
+		// Rust #38179: when no packaged-defaults path is supplied, always
+		// install the embedded defaults as the lowest-precedence layer.
+		embedded, err := embeddedDefaultsValues()
+		if err != nil {
+			return nil, err
+		}
+		values = embedded
+	}
+	userValues, err := loadConfigFile(ConfigPath(codexHome))
+	if err != nil {
+		return nil, err
+	}
+	allowedSymlinkedCodexHome := resolveAllowedSymlinkedCodexHome(codexHome, userValues)
+	mergeConfigMaps(values, userValues)
+	profile := ""
+	cwd := ""
+	if opts != nil {
+		profile = strings.TrimSpace(opts.Profile)
+		cwd = strings.TrimSpace(opts.CWD)
+	}
+	ignoreProjectConfig := opts != nil && opts.IgnoreProjectConfig
+	// Rust #39306: legacy managed-file settings also govern the project
+	// boundary and trust, so discovery uses a snapshot that includes managed
+	// values before loading project config.
+	discoveryValues := cloneMap(values)
+	if opts != nil && opts.IncludeManagedConfig && !shouldIgnoreDefaultManagedConfig(opts.ManagedConfigPath) {
+		if managedValues, exists, err := loadConfigFileIfExists(managedConfigPath(codexHome, opts.ManagedConfigPath)); err != nil {
+			return nil, err
+		} else if exists {
+			mergeConfigMaps(discoveryValues, managedValues)
+		}
+	}
+	if cwd != "" && !ignoreProjectConfig && ProjectConfigEnabled(discoveryValues, cwd) {
+		// Rust #44241: derive the credential-broker protections from the trusted
+		// layers before project config is merged, so a repository cannot rebind
+		// providers the trusted configuration already bound.
+		brokerState := CredentialBrokerProjectStateForValues(discoveryValues)
+		trustedProviderEnvKeys := CredentialBrokerProviderEnvKeys(discoveryValues)
+		for _, path := range projectConfigPathsWithMarkers(cwd, projectRootMarkersFromValues(discoveryValues)) {
+			projectValues, exists, err := loadConfigFileIfExists(path)
+			if err != nil {
+				return nil, err
+			}
+			if exists {
+				resolveProjectRelativeConfigValues(projectValues, filepath.Dir(path))
+				sanitizeProjectConfigValues(projectValues, brokerState, trustedProviderEnvKeys)
+				mergeConfigMaps(values, projectValues)
+			}
+		}
+	}
+	// Rust #46328: record whether discovery completed without any project input.
+	// The classification is independent of trust (a saved trust decision for an
+	// unmarked directory still leaves it projectless) and is false whenever
+	// project discovery was skipped.
+	isProjectless := false
+	if cwd != "" && !ignoreProjectConfig {
+		isProjectless = projectDiscoveryIsProjectless(cwd, codexHome, projectRootMarkersFromValues(discoveryValues))
+	}
+	if profile != "" {
+		if err := applyProfileLayer(codexHome, values, profile); err != nil {
+			return nil, err
+		}
+	}
+	if opts != nil && opts.IncludeManagedConfig {
+		if shouldIgnoreDefaultManagedConfig(opts.ManagedConfigPath) {
+			// Rust #38947: on Windows the default CODEX_HOME/managed_config.toml
+			// is no longer loaded; explicit managed-config path overrides are
+			// preserved. The startup warning for an existing deprecated file is
+			// surfaced by the app-server ConfigService.
+		} else {
+			managedValues, exists, err := loadConfigFileIfExists(managedConfigPath(codexHome, opts.ManagedConfigPath))
+			if err != nil {
+				return nil, err
+			}
+			if exists {
+				mergeConfigMaps(values, managedValues)
+			}
+		}
+	}
+	requirements, err := LoadRequirementsFile(filepath.Join(codexHome, "requirements.toml"))
+	if err != nil {
+		return nil, err
+	}
+	var cloudConfigBinding *CloudConfigBundleBinding
+	if opts != nil && opts.IncludeManagedConfig && opts.CloudConfigBundle != nil {
+		// Rust #49269: the loader returns the bundle together with the policy
+		// revision binding it was resolved from, and the binding travels with
+		// the loaded configuration so a later reload can tell whether the
+		// enterprise policy it was built from is still current.
+		snapshot := opts.CloudConfigBundle.GetSnapshot()
+		if snapshot.Err != nil {
+			return nil, snapshot.Err
+		}
+		if bundle := snapshot.Bundle; bundle != nil && !bundle.IsEmpty() {
+			cloudRequirements, err := applyCloudConfigBundle(values, requirements, *bundle, codexHome)
+			if err != nil {
+				return nil, err
+			}
+			requirements = cloudRequirements
+		}
+		cloudConfigBinding = snapshot.Binding
+	}
+	applyManagedApprovalsReviewerGuardianV2Override(values, requirements)
+	applyManagedAuthBackendOverride(values, requirements)
+	applyManagedModelProviderOverride(values, requirements)
+	applyManagedExactOverrides(values, requirements)
+	if err := applyManagedConstrainedOverrides(values, requirements); err != nil {
+		return nil, err
+	}
+	cfg := &Config{
+		Values:                    values,
+		Requirements:              requirements,
+		allowedSymlinkedCodexHome: allowedSymlinkedCodexHome,
+		isProjectless:             isProjectless,
+		cloudConfigBinding:        cloudConfigBinding,
+	}
+	if err := cfg.ValidateWindowsMXCRequirement(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// AllowedSymlinkedCodexHome returns the configured CODEX_HOME path whose
+// writable roots may traverse symlinks on macOS, or an empty string when the
+// user config did not opt in. The value is resolved when the configuration is
+// loaded and is not affected by project config, CLI overrides, or profiles.
+func (c *Config) AllowedSymlinkedCodexHome() string {
+	if c == nil {
+		return ""
+	}
+	return c.allowedSymlinkedCodexHome
+}
+
+// AllowedSymlinkedCodexHome reads only the host's top-level user config and
+// returns the CODEX_HOME alias it authorizes. Callers that deliberately skip
+// the user config must not call this helper (Rust #42716).
+func AllowedSymlinkedCodexHome(codexHome string) (string, error) {
+	codexHome = strings.TrimSpace(codexHome)
+	if codexHome == "" {
+		return "", nil
+	}
+	userValues, err := loadConfigFile(ConfigPath(codexHome))
+	if err != nil {
+		return "", err
+	}
+	return resolveAllowedSymlinkedCodexHome(codexHome, userValues), nil
+}
+
+// resolveAllowedSymlinkedCodexHome mirrors Rust
+// codex_config::allowed_symlinked_codex_home: only a boolean at the top level
+// of the user layer opts in, and the configured CODEX_HOME alias is preserved
+// only when it resolves to the same home.
+func resolveAllowedSymlinkedCodexHome(codexHome string, userValues map[string]any) string {
+	enabled, ok := userValues["allow_symlinked_codex_home"].(bool)
+	if !ok || !enabled {
+		return ""
+	}
+	canonicalHome := canonicalCodexHomePath(codexHome)
+	if canonicalHome == "" {
+		return ""
+	}
+	for _, envName := range []string{"CODEX_HOME", "GCODE_HOME"} {
+		alias := strings.TrimSpace(os.Getenv(envName))
+		if alias == "" || !filepath.IsAbs(alias) {
+			continue
+		}
+		alias = filepath.Clean(alias)
+		resolved, err := filepath.EvalSymlinks(alias)
+		if err != nil {
+			continue
+		}
+		if filepath.Clean(resolved) == canonicalHome {
+			return alias
+		}
+	}
+	return canonicalHome
+}
+
+func canonicalCodexHomePath(codexHome string) string {
+	codexHome = strings.TrimSpace(codexHome)
+	if codexHome == "" {
+		return ""
+	}
+	absolute, err := filepath.Abs(codexHome)
+	if err != nil {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(absolute); err == nil {
+		return filepath.Clean(resolved)
+	}
+	return filepath.Clean(absolute)
+}
+
+// IsProjectless reports whether configuration discovery found no project-root
+// marker, no Git checkout root, and no project-local config directory (Rust
+// #46328 ConfigLayerStack::is_projectless). It is false when discovery was
+// skipped, so callers can rely on it only for a discovery that actually ran.
+func (c *Config) IsProjectless() bool {
+	return c != nil && c.isProjectless
+}
+
+// CloudConfigBinding reports the enterprise policy revision binding this
+// configuration was resolved from, or nil when it was loaded without a cloud
+// bundle loader. Callers use it to reject refreshes derived from a superseded
+// or suspended policy (Rust #49269
+// ConfigLayerStack::cloud_config_binding).
+func (c *Config) CloudConfigBinding() *CloudConfigBundleBinding {
+	if c == nil {
+		return nil
+	}
+	return c.cloudConfigBinding
+}
+
+// applyManagedExactOverrides mirrors Rust ConfigRequirementsToml::apply_to_config
+// / core apply_to_config for the remaining exact managed requirements: the
+// required sqlite_home, log_dir, model_catalog_json, check_for_update_on_startup,
+// allow_login_shell, and feedback.enabled values replace the configured ones.
+func applyManagedExactOverrides(values map[string]any, requirements *ConfigRequirements) {
+	if values == nil || requirements == nil {
+		return
+	}
+	if requirements.SQLiteHome != nil {
+		values["sqlite_home"] = *requirements.SQLiteHome
+	}
+	if requirements.LogDir != nil {
+		values["log_dir"] = *requirements.LogDir
+	}
+	if requirements.ModelCatalogJSON != nil {
+		values["model_catalog_json"] = *requirements.ModelCatalogJSON
+	}
+	if requirements.CheckForUpdateOnStartup != nil {
+		values["check_for_update_on_startup"] = *requirements.CheckForUpdateOnStartup
+	}
+	if requirements.AllowLoginShell != nil {
+		values["allow_login_shell"] = *requirements.AllowLoginShell
+	}
+	if requirements.Feedback != nil && requirements.Feedback.Enabled != nil {
+		feedback, _ := values["feedback"].(map[string]any)
+		if feedback == nil {
+			feedback = map[string]any{}
+		}
+		feedback["enabled"] = *requirements.Feedback.Enabled
+		values["feedback"] = feedback
+	}
+}
+
+// applyManagedAuthBackendOverride mirrors Rust 0f21cb3413 (#39043): exact
+// managed cli_auth_credentials_store / chatgpt_base_url requirements override
+// user-configured values in the effective configuration, so runtime and
+// bootstrap authentication use the managed backend settings.
+func applyManagedAuthBackendOverride(values map[string]any, requirements *ConfigRequirements) {
+	if values == nil || requirements == nil {
+		return
+	}
+	if requirements.CliAuthCredentialsStore != nil {
+		values["cli_auth_credentials_store"] = string(*requirements.CliAuthCredentialsStore)
+	}
+	if requirements.ChatgptBaseURL != nil {
+		values["chatgpt_base_url"] = *requirements.ChatgptBaseURL
+	}
+}
+
+// applyManagedModelProviderOverride mirrors Rust #44650: a required
+// model_provider overrides local and session configuration, and each required
+// provider definition replaces the corresponding local entry wholesale
+// (including authentication and headers).
+func applyManagedModelProviderOverride(values map[string]any, requirements *ConfigRequirements) {
+	if values == nil || requirements == nil {
+		return
+	}
+	if requirements.ModelProvider != nil {
+		values["model_provider"] = *requirements.ModelProvider
+	}
+	if len(requirements.ModelProviders) == 0 {
+		return
+	}
+	providers, _ := values["model_providers"].(map[string]any)
+	if providers == nil {
+		providers = map[string]any{}
+	}
+	for id, definition := range requirements.ModelProviders {
+		providers[id] = cloneManagedProviderDefinition(definition)
+	}
+	values["model_providers"] = providers
+}
+
+func cloneManagedProviderDefinition(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return cloneMap(typed)
+	case []any:
+		out := make([]any, len(typed))
+		for index := range typed {
+			out[index] = cloneManagedProviderDefinition(typed[index])
+		}
+		return out
+	default:
+		return typed
+	}
+}
+
+// applyManagedApprovalsReviewerGuardianV2Override mirrors Rust
+// ConfigRequirementsToml::apply_to_config / core config requirements
+// apply_to_config (#39005): when allowed_approvals_reviewers is set and does not
+// include the user reviewer, Guardian V2 is disabled so it cannot override a
+// managed approval-reviewer policy that excludes the user reviewer. Lists that
+// keep "user" allowed, or requirements without the reviewer list (e.g. legacy
+// guardian_approval-only requirements), preserve the setting.
+func applyManagedApprovalsReviewerGuardianV2Override(values map[string]any, requirements *ConfigRequirements) {
+	if values == nil || requirements == nil || requirements.AllowedApprovalsReviewers == nil {
+		return
+	}
+	for _, reviewer := range requirements.AllowedApprovalsReviewers {
+		if reviewer == ApprovalsReviewerUser {
+			return
+		}
+	}
+	featuresTable, ok := values["features"].(map[string]any)
+	if !ok {
+		featuresTable = map[string]any{}
+		values["features"] = featuresTable
+	}
+	featuresTable["guardianv2"] = false
+}
+
+func LoadEffective(codexHome string, rawOverrides, enableFeatures, disableFeatures []string, cwd ...string) (*Config, error) {
+	workingDir := ""
+	if len(cwd) > 0 {
+		workingDir = cwd[0]
+	}
+	return LoadEffectiveWithOptions(codexHome, &EffectiveOptions{
+		RawOverrides:    rawOverrides,
+		EnableFeatures:  enableFeatures,
+		DisableFeatures: disableFeatures,
+		CWD:             workingDir,
+	})
+}
+
+func LoadEffectiveWithOptions(codexHome string, opts *EffectiveOptions) (*Config, error) {
+	loadOpts := &LoadOptions{}
+	if opts != nil {
+		loadOpts.Profile = opts.Profile
+		loadOpts.CWD = opts.CWD
+		loadOpts.PackagedDefaultsPath = opts.PackagedDefaultsPath
+		loadOpts.IncludeManagedConfig = opts.IncludeManagedConfig
+		loadOpts.ManagedConfigPath = opts.ManagedConfigPath
+		loadOpts.CloudConfigBundle = opts.CloudConfigBundle
+		loadOpts.IgnoreProjectConfig = opts.IgnoreProjectConfig
+	}
+	cfg, err := LoadWithOptions(codexHome, loadOpts)
+	if err != nil {
+		return nil, err
+	}
+	rawOverrides := []string(nil)
+	enableFeatures := []string(nil)
+	disableFeatures := []string(nil)
+	if opts != nil {
+		rawOverrides = opts.RawOverrides
+		enableFeatures = opts.EnableFeatures
+		disableFeatures = opts.DisableFeatures
+	}
+	overrides, err := ParseOverrides(rawOverrides)
+	if err != nil {
+		return nil, err
+	}
+	for _, feature := range enableFeatures {
+		overrides = append(overrides, Override{
+			Path:  "features." + feature,
+			Value: true,
+		})
+	}
+	for _, feature := range disableFeatures {
+		overrides = append(overrides, Override{
+			Path:  "features." + feature,
+			Value: false,
+		})
+	}
+	ApplyOverrides(cfg.Values, overrides)
+	applyDisablePasteBurstOverride(overrides, cfg.Values)
+	// Rust #39630: the untrusted approval policy is retired. Explicit
+	// `approval_policy = "untrusted"` settings fail with an actionable error
+	// regardless of strict mode so callers cannot silently fall back.
+	if policy, ok := cfg.Values["approval_policy"].(string); ok && strings.TrimSpace(policy) == "untrusted" {
+		return nil, fmt.Errorf(`approval_policy = "untrusted" is no longer supported; remove this setting`)
+	}
+	// Rust core/src/config/mod.rs::load_config rejects the removed remote
+	// thread-store endpoint for the same reason: a stale config must fail fast
+	// instead of silently falling back to local persistence.
+	if _, ok := cfg.Values["experimental_thread_store_endpoint"]; ok {
+		return nil, errors.New("`experimental_thread_store_endpoint` is no longer supported; remove it from config.toml")
+	}
+	// Rust's experimental_thread_store schema exposes the local selector. Go
+	// always uses the local thread store, so accept that selector and reject
+	// unsupported store types explicitly instead of treating the whole section
+	// as an unknown field.
+	if raw, ok := cfg.Values["experimental_thread_store"]; ok && raw != nil {
+		table, ok := raw.(map[string]any)
+		if !ok {
+			return nil, errors.New("experimental_thread_store must be a table")
+		}
+		storeType, _ := table["type"].(string)
+		if strings.TrimSpace(storeType) != "local" {
+			return nil, fmt.Errorf("experimental_thread_store type %q is not supported; expected \"local\"", storeType)
+		}
+	}
+	// Rust #51547: `windows.allow_mxc = false` is an opt-out of the native MXC
+	// backend. An explicit `windows.sandbox = "mxc"` must fail the load with an
+	// actionable error instead of silently selecting a disallowed backend.
+	if err := ValidateWindowsMXCOptOut(cfg.Values); err != nil {
+		return nil, err
+	}
+	// Rust deserializes `mcp_oauth_credentials_store` as an enum, so an
+	// unrecognized value fails the load rather than silently defaulting.
+	if err := ValidateMCPOAuthCredentialsStoreMode(cfg.Values); err != nil {
+		return nil, err
+	}
+	// Rust converts each `mcp_servers.<name>` table with
+	// RawMcpServerConfig::try_into, which rejects transport-mismatched fields
+	// (e.g. `bearer_token` on an HTTP server, `url` on a stdio server) instead of
+	// silently choosing a transport.
+	if err := ValidateMCPServerValues(cfg.Values); err != nil {
+		return nil, err
+	}
+	// Rust deserializes `otel` into the typed OtelConfigToml, so a malformed
+	// shape (a non-table otel, a non-string span attribute, an unknown exporter
+	// variant, a missing OTLP endpoint/protocol, ...) fails the config load
+	// instead of being ignored.
+	if err := ValidateOtelConfigValues(cfg.Values); err != nil {
+		return nil, err
+	}
+	// Rust #43797: memories.version is a closed enum; an unrecognized value must
+	// fail config load rather than silently falling back to v1.
+	if memories, ok := cfg.Values["memories"].(map[string]any); ok {
+		if raw := memoryString(memories, "version"); raw != nil && strings.TrimSpace(*raw) != "" {
+			if _, valid := ParseMemoryVersion(*raw); !valid {
+				return nil, fmt.Errorf("invalid memories.version %q; expected \"v1\" or \"v2\"", *raw)
+			}
+		}
+	}
+	// Rust #46541: the post-turn compaction threshold is a percentage of the
+	// usable context window; values above 100 are rejected at load time.
+	if percent, ok := configInt(cfg.Values["model_post_turn_compact_threshold_percent"]); ok && percent > 100 {
+		return nil, fmt.Errorf("model_post_turn_compact_threshold_percent must be between 0 and 100")
+	}
+	// Rust #54379: `tui.presets` entries must use a single-digit slot, carry a
+	// nonempty prompt or slash command, and stay under the 8,000-byte limit.
+	if err := ValidateTUIPresets(cfg.Values); err != nil {
+		return nil, err
+	}
+	if opts != nil && opts.StrictConfig {
+		if err := validateKnownTopLevelConfigFields(cfg.Values); err != nil {
+			return nil, err
+		}
+		if err := validateCloudConfigValues(cfg.Values); err != nil {
+			return nil, err
+		}
+		if err := validateBrowserComputerUseConfigValues(cfg.Values); err != nil {
+			return nil, err
+		}
+	}
+	return cfg, nil
+}
+
+// applyDisablePasteBurstOverride keeps CLI top-level overrides ahead of a
+// project/user [tui] value. Rust resolves by layer precedence first, then by
+// preferring the new tui key within the winning layer (#41976).
+func applyDisablePasteBurstOverride(overrides []Override, values map[string]any) {
+	for _, override := range overrides {
+		if strings.TrimSpace(override.Path) != "disable_paste_burst" {
+			continue
+		}
+		tuiValues, ok := values["tui"].(map[string]any)
+		if !ok {
+			tuiValues = map[string]any{}
+			values["tui"] = tuiValues
+		}
+		tuiValues["disable_paste_burst"] = override.Value
+	}
+}
+
+// validateCloudConfigValues mirrors Rust's CloudToml
+// (config/src/config_toml.rs #47074): `[cloud]` owns cloud feature settings,
+// `[cloud.skills]` is a FeatureToggleToml, and both tables deny unknown fields.
+func validateCloudConfigValues(values map[string]any) error {
+	if values == nil {
+		return nil
+	}
+	raw, ok := values["cloud"]
+	if !ok {
+		return nil
+	}
+	table, ok := raw.(map[string]any)
+	if !ok {
+		return fmt.Errorf("cloud must be a table")
+	}
+	for key := range table {
+		if key != "skills" {
+			return fmt.Errorf("cloud: unknown field `%s`", key)
+		}
+	}
+	skills, ok := table["skills"].(map[string]any)
+	if !ok {
+		if _, present := table["skills"]; present {
+			return fmt.Errorf("cloud.skills must be a table")
+		}
+		return nil
+	}
+	for key := range skills {
+		if key != "enabled" {
+			return fmt.Errorf("cloud.skills: unknown field `%s`", key)
+		}
+	}
+	if enabled, present := skills["enabled"]; present {
+		if _, ok := enabled.(bool); !ok {
+			return fmt.Errorf("cloud.skills.enabled must be a boolean")
+		}
+	}
+	return nil
+}
+
+func validateBrowserComputerUseConfigValues(values map[string]any) error {
+	if values == nil {
+		return nil
+	}
+	if raw, ok := values["browser_use"]; ok {
+		table, ok := raw.(map[string]any)
+		if !ok {
+			return fmt.Errorf("browser_use must be a table")
+		}
+		if err := validateBrowserUseConfigValues(table); err != nil {
+			return err
+		}
+	}
+	if raw, ok := values["computer_use"]; ok {
+		table, ok := raw.(map[string]any)
+		if !ok {
+			return fmt.Errorf("computer_use must be a table")
+		}
+		if err := validateComputerUseConfigValues(table); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// knownTopLevelConfigFields includes `daybreak`, grounded from Rust #49856
+// (ConfigToml::daybreak -> Config::daybreak_enabled =
+// cfg.daybreak.unwrap_or(false)); Rust #51207 gates the CLI Daybreak controls
+// behind the cli_daybreak feature.
+var knownTopLevelConfigFields = map[string]struct{}{
+	"analytics":                         {},
+	"agents":                            {},
+	"allow_login_shell":                 {},
+	"allow_symlinked_codex_home":        {},
+	"background_terminal_max_timeout":   {},
+	"apps":                              {},
+	"apps_mcp_product_sku":              {},
+	"approval_policy":                   {},
+	"approvals_reviewer":                {},
+	"auto_review":                       {},
+	"browser_use":                       {},
+	"chatgpt_base_url":                  {},
+	"check_for_update_on_startup":       {},
+	"cli_auth_credentials_store":        {},
+	"cloud":                             {},
+	"compact_prompt":                    {},
+	"computer_use":                      {},
+	"daybreak":                          {},
+	"default_permissions":               {},
+	"desktop":                           {},
+	"developer_instructions":            {},
+	"disable_paste_burst":               {},
+	"audio":                             {},
+	"experimental_realtime_ws_base_url": {},
+	"experimental_compact_prompt_file":  {},
+	"experimental_realtime_webrtc_call_base_url": {},
+	"experimental_realtime_ws_model":             {},
+	"experimental_realtime_ws_backend_prompt":    {},
+	"experimental_realtime_ws_startup_context":   {},
+	"experimental_realtime_start_instructions":   {},
+	"experimental_thread_store":                  {},
+	"experimental_use_unified_exec_tool":         {},
+	"features":                                   {},
+	"feedback":                                   {},
+	"file_opener":                                {},
+	"forced_chatgpt_workspace_id":                {},
+	"forced_login_method":                        {},
+	"goals":                                      {},
+	"ghost_snapshot":                             {},
+	"hide_agent_reasoning":                       {},
+	"history":                                    {},
+	"hooks":                                      {},
+	"include_apps_instructions":                  {},
+	"include_collaboration_mode_instructions":    {},
+	"include_environment_context":                {},
+	"include_environment_context_time":           {},
+	"include_permissions_instructions":           {},
+	"instructions":                               {},
+	"js_repl_node_module_dirs":                   {},
+	"js_repl_node_path":                          {},
+	"log_dir":                                    {},
+	"mcp_oauth_credentials_store":                {},
+	"mcp_oauth_callback_port":                    {},
+	"mcp_oauth_callback_url":                     {},
+	"mcp_enterprise_managed_auth":                {},
+	"mcp_optional_startup_grace_ms":              {},
+	"mcp_servers":                                {},
+	"marketplaces":                               {},
+	"memories":                                   {},
+	"model":                                      {},
+	"model_auto_compact_token_limit":             {},
+	"model_auto_compact_token_limit_scope":       {},
+	"model_catalog_json":                         {},
+	"model_context_window":                       {},
+	"model_instructions_file":                    {},
+	"model_post_turn_compact_threshold_percent":  {},
+	"model_provider":                             {},
+	"model_providers":                            {},
+	"model_reasoning_effort":                     {},
+	"model_reasoning_summary":                    {},
+	"model_verbosity":                            {},
+	"notice":                                     {},
+	"notices":                                    {},
+	"notify":                                     {},
+	"openai_base_url":                            {},
+	"orchestrator":                               {},
+	"oss_provider":                               {},
+	"otel":                                       {},
+	"personality":                                {},
+	"permissions":                                {},
+	"plan_mode_reasoning_effort":                 {},
+	"plugins":                                    {},
+	"project_doc_fallback_filenames":             {},
+	"project_doc_max_bytes":                      {},
+	"project_root_markers":                       {},
+	"profiles":                                   {},
+	"projects":                                   {},
+	"realtime":                                   {},
+	"profile":                                    {},
+	"responsesapi_client_metadata":               {},
+	"responses_api_metadata":                     {},
+	"review_model":                               {},
+	"resume_cwd":                                 {},
+	"requirements":                               {},
+	"sandbox_mode":                               {},
+	"sandbox_workspace_write":                    {},
+	"service_tier":                               {},
+	"shell_environment_policy":                   {},
+	"show_raw_agent_reasoning":                   {},
+	"skills":                                     {},
+	"sqlite_home":                                {},
+	"suppress_unstable_features_warning":         {},
+	"thread_unload_delay_secs":                   {},
+	"tool_suggest":                               {},
+	"tools":                                      {},
+	"trusted_projects":                           {},
+	"tui":                                        {},
+	"tool_output_token_limit":                    {},
+	"web_search":                                 {},
+	"windows":                                    {},
+	"windows_sandbox":                            {},
+}
+
+// KnownTopLevelConfigFields returns the sorted list of recognized top-level
+// configuration keys, used by the parity verifier to diff Go's config surface
+// against Rust's core/config.schema.json (djalign static layer).
+func KnownTopLevelConfigFields() []string {
+	keys := make([]string, 0, len(knownTopLevelConfigFields))
+	for key := range knownTopLevelConfigFields {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// knownTuiConfigFields mirrors the top-level keys Rust's `Tui` accepts
+// (config/src/types.rs, `Tui` + the flattened `TuiNotificationSettings`).
+//
+// Rust #50525 (upstream b65ab465ce) rejects unknown `[tui]` keys by
+// round-tripping `Tui`, because the flattened notification settings hide them
+// from `serde_ignored`. Go has no `[tui]` deserializer, so the accepted set is
+// listed here; TestKnownTuiConfigFieldsCoverHostReadKeysLikeRust locks it
+// against the keys the host actually reads.
+var knownTuiConfigFields = map[string]struct{}{
+	// Flattened TuiNotificationSettings.
+	"notifications":                   {},
+	"notification_method":             {},
+	"notification_condition":          {},
+	"animations":                      {},
+	"screen_reader_detection_done":    {},
+	"effects":                         {},
+	"rendering":                       {},
+	"show_tooltips":                   {},
+	"show_server_version_notice":      {},
+	"auto_recap":                      {},
+	"prompt_suggestions":              {},
+	"disable_paste_burst":             {},
+	"vim_mode_default":                {},
+	"question_esc_back":               {},
+	"raw_output_mode":                 {},
+	"fullscreen_transcript":           {},
+	"mouse_scroll_speed":              {},
+	"copy_on_select":                  {},
+	"right_click_paste":               {},
+	"alternate_screen":                {},
+	"status_line":                     {},
+	"status_line_use_colors":          {},
+	"terminal_title":                  {},
+	"theme":                           {},
+	"pet":                             {},
+	"pet_anchor":                      {},
+	"session_picker_view":             {},
+	"agents_overview_grouping":        {},
+	"resume_cwd":                      {},
+	"keymap":                          {},
+	"presets":                         {},
+	"model_availability_nux":          {},
+	"terminal_resize_reflow_max_rows": {},
+}
+
+// validateKnownTuiConfigFields mirrors Rust unknown_tui_toml_value_path
+// (config/src/strict_config.rs, #50525): only the root `[tui]` table is
+// checked, so `[profiles.<name>.tui]` stays outside this rule.
+func validateKnownTuiConfigFields(values map[string]any) error {
+	tui, ok := values["tui"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	keys := make([]string, 0, len(tui))
+	for key := range tui {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if _, ok := knownTuiConfigFields[key]; !ok {
+			return fmt.Errorf("unknown configuration field `tui.%s`", key)
+		}
+	}
+	// Rust #54766: unknown keymap contexts/actions are ignored during
+	// deserialization and surface here as ignored fields when strict config
+	// validation is on (`serde_ignored` reports `tui.keymap.<context>[.<action>]`).
+	return validateKnownTuiKeymapFields(tui)
+}
+
+// validateKnownTuiKeymapFields reports the first unknown context or action in
+// `[tui.keymap]` with the path shape Rust's `serde_ignored` policy produces.
+func validateKnownTuiKeymapFields(tui map[string]any) error {
+	rawKeymap, ok := tui["keymap"]
+	if !ok {
+		return nil
+	}
+	keymap, ok := rawKeymap.(map[string]any)
+	if !ok {
+		// Type errors belong to the keymap parser; this check only reports the
+		// unknown paths Rust's strict policy sees.
+		return nil
+	}
+	contexts := make([]string, 0, len(keymap))
+	for context := range keymap {
+		contexts = append(contexts, context)
+	}
+	sort.Strings(contexts)
+	for _, context := range contexts {
+		if !keymapschema.KnownContext(context) {
+			return fmt.Errorf("unknown configuration field `tui.keymap.%s`", context)
+		}
+		actions, ok := keymap[context].(map[string]any)
+		if !ok {
+			continue
+		}
+		names := make([]string, 0, len(actions))
+		for action := range actions {
+			names = append(names, action)
+		}
+		sort.Strings(names)
+		for _, action := range names {
+			if !keymapschema.KnownAction(context, action) {
+				return fmt.Errorf("unknown configuration field `tui.keymap.%s.%s`", context, action)
+			}
+		}
+	}
+	return nil
+}
+
+func sortedConfigMapKeys(values map[string]any) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func validateKnownTopLevelConfigFields(values map[string]any) error {
+	if values == nil {
+		return nil
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if _, ok := knownTopLevelConfigFields[key]; !ok {
+			return fmt.Errorf("unknown configuration field `%s`", key)
+		}
+	}
+	// Rust #50525 orders the strict checks as ignored fields, then `[tui]`, then
+	// feature keys (strict_config.rs).
+	if err := validateKnownTuiConfigFields(values); err != nil {
+		return err
+	}
+	if err := validateKnownFeatureFields(values["features"]); err != nil {
+		return err
+	}
+	if profiles, ok := values["profiles"].(map[string]any); ok {
+		// Mirrors Rust unknown_feature_toml_value_path (config/src/
+		// strict_config.rs): unknown feature keys under [profiles.<name>.
+		// features] are rejected with the profile-qualified path.
+		for name, raw := range profiles {
+			profile, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if err := validateKnownFeatureFieldsAt(profile["features"], "profiles."+name+".features"); err != nil {
+				return err
+			}
+			// Rust #54766: `ProfileTui` no longer denies unknown fields during
+			// deserialization; the strict policy reports them as ignored fields.
+			if profileTui, ok := profile["tui"].(map[string]any); ok {
+				for _, key := range sortedConfigMapKeys(profileTui) {
+					if key != "session_picker_view" {
+						return fmt.Errorf("unknown configuration field `profiles.%s.tui.%s`", name, key)
+					}
+				}
+			}
+		}
+	}
+	if err := validateKnownMCPServerFields(values["mcp_servers"]); err != nil {
+		return err
+	}
+	if raw, ok := values["mcp_enterprise_managed_auth"]; ok {
+		if _, err := parseMCPEnterpriseManagedAuth(raw); err != nil {
+			return fmt.Errorf("mcp_enterprise_managed_auth: %w", err)
+		}
+	}
+	if err := validateKnownAgentsFields(values["agents"]); err != nil {
+		return err
+	}
+	if err := ValidateShellEnvironmentPolicy(values["shell_environment_policy"]); err != nil {
+		return err
+	}
+	if feedback, ok := values["feedback"].(map[string]any); ok {
+		// Mirrors Rust FeedbackConfigToml (serde deny_unknown_fields).
+		known := map[string]bool{"enabled": true}
+		for key := range feedback {
+			if !known[key] {
+				return fmt.Errorf("unknown configuration field `feedback.%s`", key)
+			}
+		}
+	}
+	if audio, ok := values["audio"].(map[string]any); ok {
+		// Mirrors Rust RealtimeAudioToml (config/src/config_toml.rs, serde
+		// deny_unknown_fields): machine-local realtime audio device
+		// preferences (microphone/speaker/microphone_channel) accepted so
+		// legacy config loads; the device names are a compatibility no-op in
+		// Go.
+		known := map[string]bool{
+			"microphone":         true,
+			"microphone_channel": true,
+			"speaker":            true,
+		}
+		for key := range audio {
+			if !known[key] {
+				return fmt.Errorf("unknown configuration field `audio.%s`", key)
+			}
+		}
+		// Rust #49836: `audio.microphone_channel` is an untagged
+		// `Single(NonZeroU16) | Multiple(Vec<NonZeroU16>)`, whose schema is an
+		// integer no less than 1 (uint16) or an array of those, so zero,
+		// out-of-range, fractional and non-numeric entries are a serde type
+		// error upstream. The voice host re-decodes the value for the session,
+		// so this check keeps the strict loader from accepting a value Rust
+		// would refuse.
+		if err := validateMicrophoneChannelValues(audio["microphone_channel"]); err != nil {
+			return err
+		}
+	}
+	if notice, ok := values["notice"].(map[string]any); ok {
+		// Mirrors Rust Notice (config/src/types.rs, serde deny_unknown_fields).
+		known := map[string]bool{
+			"hide_gov_cloud_guidance":                 true,
+			"hide_full_access_warning":                true,
+			"hide_world_writable_warning":             true,
+			"fast_default_opt_out":                    true,
+			"hide_rate_limit_model_nudge":             true,
+			"hide_gpt5_1_migration_prompt":            true,
+			"hide_gpt-5.1-codex-max_migration_prompt": true,
+			"model_migrations":                        true,
+			"external_config_migration_prompts":       true,
+		}
+		for key := range notice {
+			if !known[key] {
+				return fmt.Errorf("unknown configuration field `notice.%s`", key)
+			}
+		}
+	}
+	if marketplaces, ok := values["marketplaces"].(map[string]any); ok {
+		// Mirrors Rust MarketplaceConfig (config/src/types.rs, serde
+		// deny_unknown_fields): each marketplace entry allows the Rust fields.
+		known := map[string]bool{
+			"last_updated": true, "last_revision": true, "source_type": true,
+			"source": true, "ref": true, "sparse_paths": true,
+		}
+		for name, raw := range marketplaces {
+			entry, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			for key := range entry {
+				if !known[key] {
+					return fmt.Errorf("unknown configuration field `marketplaces.%s.%s`", name, key)
+				}
+			}
+		}
+	}
+	if ghostSnapshot, ok := values["ghost_snapshot"].(map[string]any); ok {
+		// Mirrors Rust GhostSnapshotToml (config/src/config_toml.rs, serde
+		// deny_unknown_fields): compatibility-only no-op settings retained so
+		// legacy `ghost_snapshot` config still loads. Aliases
+		// ignore_untracked_files_over_bytes / large_untracked_dir_warning_threshold
+		// are accepted too.
+		known := map[string]bool{
+			"ignore_large_untracked_files":          true,
+			"ignore_untracked_files_over_bytes":     true,
+			"ignore_large_untracked_dirs":           true,
+			"large_untracked_dir_warning_threshold": true,
+			"disable_warnings":                      true,
+		}
+		for key := range ghostSnapshot {
+			if !known[key] {
+				return fmt.Errorf("unknown configuration field `ghost_snapshot.%s`", key)
+			}
+		}
+	}
+	if rawWorkspaces, ok := values["forced_chatgpt_workspace_id"].(string); ok {
+		// Mirrors Rust ForcedChatgptWorkspaceIds deserialize (config/src/
+		// config_toml.rs): a single string containing a comma is rejected with
+		// the same message instead of being silently treated as one workspace.
+		if strings.Contains(rawWorkspaces, ",") {
+			return errors.New("forced_chatgpt_workspace_id must be a single workspace ID string or a TOML list of strings; comma-separated strings are not supported. Use `forced_chatgpt_workspace_id = [\"123e4567-e89b-42d3-a456-426614174000\", \"123e4567-e89b-42d3-a456-426614174001\"]` instead.")
+		}
+	}
+	return nil
+}
+
+// validateMicrophoneChannelValues mirrors Rust's `MicrophoneChannels`
+// (config/src/config_toml.rs, Rust #49836): one one-based channel or a list of
+// them, each a `NonZeroU16`. A nil value is an unset selection and leaves the
+// voice host mixing every input channel.
+func validateMicrophoneChannelValues(raw any) error {
+	if raw == nil {
+		return nil
+	}
+	if _, ok := microphoneChannelNumber(raw); ok {
+		return nil
+	}
+	entries, ok := raw.([]any)
+	if !ok {
+		return fmt.Errorf("invalid `audio.microphone_channel`: expected a one-based channel number or a list of channel numbers")
+	}
+	for _, entry := range entries {
+		if _, ok := microphoneChannelNumber(entry); !ok {
+			return fmt.Errorf("invalid `audio.microphone_channel` entry: expected a one-based channel number no greater than 65535")
+		}
+	}
+	return nil
+}
+
+// microphoneChannelNumber decodes the numeric spellings a configuration value
+// can arrive in and enforces Rust's `NonZeroU16` range, so a fractional or
+// zero entry is rejected exactly like the untagged deserializer.
+func microphoneChannelNumber(raw any) (uint16, bool) {
+	switch value := raw.(type) {
+	case int:
+		return microphoneChannelRange(int64(value))
+	case int64:
+		return microphoneChannelRange(value)
+	case float64:
+		if value < 1 || value > 65535 || value != float64(int(value)) {
+			return 0, false
+		}
+		return uint16(value), true
+	default:
+		return 0, false
+	}
+}
+
+func microphoneChannelRange(value int64) (uint16, bool) {
+	if value < 1 || value > 65535 {
+		return 0, false
+	}
+	return uint16(value), true
+}
+
+func validateKnownAgentsFields(value any) error {
+	agents, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	knownSettings := map[string]bool{
+		"enabled": true, "max_concurrent_threads_per_session": true, "max_threads": true,
+		"max_depth": true, "default_subagent_model": true,
+		"default_subagent_reasoning_effort": true, "job_max_runtime_seconds": true,
+		"interrupt_message": true,
+	}
+	knownRoleFields := map[string]bool{"description": true, "config_file": true, "nickname_candidates": true}
+	for key, raw := range agents {
+		if knownSettings[key] {
+			continue
+		}
+		role, ok := raw.(map[string]any)
+		if !ok {
+			return fmt.Errorf("unknown configuration field `agents.%s`", key)
+		}
+		for field := range role {
+			if !knownRoleFields[field] {
+				return fmt.Errorf("unknown configuration field `agents.%s.%s`", key, field)
+			}
+		}
+	}
+	return nil
+}
+
+func validateKnownFeatureFields(value any) error {
+	return validateKnownFeatureFieldsAt(value, "features")
+}
+
+func validateKnownFeatureFieldsAt(value any, prefix string) error {
+	features, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	for key := range features {
+		if !featureflags.Known(key) && key != "tool_registry" {
+			return fmt.Errorf("unknown configuration field `%s.%s`", prefix, key)
+		}
+	}
+	if tokenBudget, ok := features["token_budget"].(map[string]any); ok {
+		known := map[string]bool{"enabled": true, "reminder_threshold_tokens": true, "reminder_message_template": true, "guidance_message": true, "auto_compact_fallback_prompt": true, "auto_compact_fallback_buffer_tokens": true}
+		for key := range tokenBudget {
+			if !known[key] {
+				return fmt.Errorf("unknown configuration field `%s.token_budget.%s`", prefix, key)
+			}
+		}
+	}
+	if contextManagement, ok := features["context_management"].(map[string]any); ok {
+		for key := range contextManagement {
+			if key != "experimental_mode" {
+				return fmt.Errorf("unknown configuration field `%s.context_management.%s`", prefix, key)
+			}
+		}
+	}
+	if nonPrefixed, ok := features["non_prefixed_mcp_tool_names"].(map[string]any); ok {
+		known := map[string]bool{"enabled": true, "server_names": true}
+		for key := range nonPrefixed {
+			if !known[key] {
+				return fmt.Errorf("unknown configuration field `%s.non_prefixed_mcp_tool_names.%s`", prefix, key)
+			}
+		}
+	}
+	if codeModeHost, ok := features["code_mode_host"].(map[string]any); ok {
+		known := map[string]bool{"enabled": true, "disable_in_process_fallback": true}
+		for key := range codeModeHost {
+			if !known[key] {
+				return fmt.Errorf("unknown configuration field `%s.code_mode_host.%s`", prefix, key)
+			}
+		}
+	}
+	if codeMode, ok := features["code_mode"].(map[string]any); ok {
+		// Rust #46288 added experimental_show_cell_overhead to CodeModeConfigToml.
+		known := map[string]bool{
+			"enabled": true, "default_exec_yield_time_ms": true,
+			"tool_input_schema_max_bytes":     true,
+			"experimental_show_cell_overhead": true,
+			"excluded_tool_namespaces":        true, "direct_only_tool_namespaces": true,
+		}
+		for key := range codeMode {
+			if !known[key] {
+				return fmt.Errorf("unknown configuration field `%s.code_mode.%s`", prefix, key)
+			}
+		}
+	}
+	if toolRegistry, ok := features["tool_registry"].(map[string]any); ok {
+		// Rust 248d8c0e22 renamed include_tool_metadata to
+		// turn_metadata_includes_tool_info; the old key is rejected so
+		// configuration matches the upstream schema.
+		known := map[string]bool{"error_on_tool_collisions": true, "turn_metadata_includes_tool_info": true}
+		for key := range toolRegistry {
+			if !known[key] {
+				return fmt.Errorf("unknown configuration field `%s.tool_registry.%s`", prefix, key)
+			}
+		}
+	}
+	if rolloutBudget, ok := features["rollout_budget"].(map[string]any); ok {
+		// Mirrors Rust RolloutBudgetConfigToml (serde deny_unknown_fields).
+		known := map[string]bool{
+			"enabled": true, "limit_tokens": true, "reminder_at_remaining_tokens": true,
+			"sampling_token_weight": true, "prefill_token_weight": true,
+		}
+		for key := range rolloutBudget {
+			if !known[key] {
+				return fmt.Errorf("unknown configuration field `%s.rollout_budget.%s`", prefix, key)
+			}
+		}
+	}
+	if asyncCompaction, ok := features["async_compaction"].(map[string]any); ok {
+		// Mirrors Rust AsyncCompactionConfigToml (serde deny_unknown_fields),
+		// #53595.
+		known := map[string]bool{"enabled": true, "model_async_compact_threshold_percent": true}
+		for key := range asyncCompaction {
+			if !known[key] {
+				return fmt.Errorf("unknown configuration field `%s.async_compaction.%s`", prefix, key)
+			}
+		}
+	}
+	return nil
+}
+
+func validateKnownMCPServerFields(value any) error {
+	servers, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	for server, raw := range servers {
+		fields, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		for key := range fields {
+			if !knownStrictMCPServerFields[key] {
+				return fmt.Errorf("unknown configuration field `mcp_servers.%s.%s`", server, key)
+			}
+		}
+		if oauth, ok := fields["oauth"].(map[string]any); ok {
+			for key := range oauth {
+				if !knownStrictMCPServerOAuthFields[key] {
+					return fmt.Errorf("unknown configuration field `mcp_servers.%s.oauth.%s`", server, key)
+				}
+			}
+		}
+	}
+	// oauth.authorization_server_issuer is an EMA-only setting (Rust #44832).
+	if err := validateMCPEMAServerDeclarations(servers); err != nil {
+		return err
+	}
+	return nil
+}
+
+// knownStrictMCPServerFields mirrors Rust's `RawMcpServerConfig`
+// (`config/src/mcp_types.rs`, `#[schemars(deny_unknown_fields)]`). Every field
+// Go parses must be accepted here, or a valid Rust config fails Go's strict
+// load. `oauth_client_id`/`oauth_callback_port`/`oauth_callback_url` and
+// `disabled_reason` are retained as legacy Go-only spellings.
+var knownStrictMCPServerFields = map[string]bool{
+	// stdio transport
+	"command": true, "args": true, "env": true, "env_vars": true, "cwd": true,
+	// streamable HTTP transport
+	"url": true, "bearer_token": true, "bearer_token_env_var": true,
+	"http_headers": true, "env_http_headers": true, "http_headers_helper": true,
+	// shared
+	"environment_id": true, "auth": true,
+	"startup_timeout_sec": true, "startup_timeout_ms": true, "tool_timeout_sec": true,
+	"enabled": true, "required": true, "startup_readiness": true, "supports_parallel_tool_calls": true,
+	"omit_tools_from": true, "default_tools_approval_mode": true,
+	"enabled_tools": true, "disabled_tools": true, "scopes": true,
+	"oauth": true, "oauth_resource": true, "name": true, "tools": true,
+	// legacy Go-only spellings
+	"oauth_client_id": true, "oauth_callback_port": true, "oauth_callback_url": true,
+	"disabled_reason": true,
+}
+
+var knownStrictMCPServerOAuthFields = map[string]bool{"client_id": true, "callback_url": true, "callback_port": true, "authorization_server_issuer": true}
+
+func ProjectConfigPath(cwd string) string {
+	return filepath.Join(strings.TrimSpace(cwd), ".gcode", "config.toml")
+}
+
+func ProjectConfigPaths(cwd string) []string {
+	folders := ProjectDotCodexFolders(cwd)
+	paths := make([]string, 0, len(folders))
+	for _, folder := range folders {
+		paths = append(paths, filepath.Join(folder, "config.toml"))
+	}
+	return paths
+}
+
+// projectConfigPathsWithMarkers is ProjectConfigPaths using explicit project
+// root markers (which may come from managed config, Rust #39306).
+func projectConfigPathsWithMarkers(cwd string, markers []string) []string {
+	folders := projectDotCodexFoldersWithMarkers(cwd, markers)
+	paths := make([]string, 0, len(folders))
+	for _, folder := range folders {
+		paths = append(paths, filepath.Join(folder, "config.toml"))
+	}
+	return paths
+}
+
+func ProjectDotCodexFolders(cwd string) []string {
+	return projectDotCodexFoldersWithMarkers(cwd, nil)
+}
+
+func projectDotCodexFoldersWithMarkers(cwd string, markers []string) []string {
+	var folders []string
+	root := activeProjectRootWithMarkers(cwd, markers)
+	for _, dir := range projectAncestorDirsWithinRoot(cwd, root) {
+		folder := filepath.Join(dir, ".gcode")
+		if dirExists(folder) {
+			folders = append(folders, folder)
+		}
+	}
+	for i, j := 0, len(folders)-1; i < j; i, j = i+1, j-1 {
+		folders[i], folders[j] = folders[j], folders[i]
+	}
+	return folders
+}
+
+func projectRootMarkersFromValues(values map[string]any) []string {
+	if values == nil {
+		return nil
+	}
+	switch value := values["project_root_markers"].(type) {
+	case string:
+		if strings.TrimSpace(value) != "" {
+			return []string{strings.TrimSpace(value)}
+		}
+	case []any:
+		var out []string
+		for _, item := range value {
+			if text, ok := item.(string); ok && strings.TrimSpace(text) != "" {
+				out = append(out, strings.TrimSpace(text))
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+func ActiveProjectRoot(cwd string) string {
+	return activeProjectRoot(cwd)
+}
+
+func ProjectHooksDotCodexFolder(cwd string, dotCodexFolder string) string {
+	dotCodexFolder = strings.TrimSpace(dotCodexFolder)
+	if dotCodexFolder == "" {
+		return ""
+	}
+	checkoutRoot := activeProjectRoot(cwd)
+	repoRoot := rootCheckoutForLinkedWorktree(checkoutRoot)
+	if checkoutRoot == "" || repoRoot == "" || canonicalProjectPath(checkoutRoot) == canonicalProjectPath(repoRoot) {
+		return dotCodexFolder
+	}
+	layerDir := filepath.Dir(dotCodexFolder)
+	relative, err := filepath.Rel(checkoutRoot, layerDir)
+	if err != nil || strings.HasPrefix(relative, "..") || filepath.IsAbs(relative) {
+		return dotCodexFolder
+	}
+	if relative == "." {
+		return filepath.Join(repoRoot, ".gcode")
+	}
+	return filepath.Join(repoRoot, relative, ".gcode")
+}
+
+func (c *Config) FeatureSettings() map[string]bool {
+	settings, _ := c.FeatureSettingsWithLegacyUsages()
+	return settings
+}
+
+func (c *Config) IncludeSkillInstructions() bool {
+	if c == nil || c.Values == nil {
+		return true
+	}
+	skills, ok := c.Values["skills"].(map[string]any)
+	if !ok {
+		return true
+	}
+	include, ok := skills["include_instructions"].(bool)
+	if !ok {
+		return true
+	}
+	return include
+}
+
+// SkillMaxContextTokens returns the configured [skills].max_context_tokens
+// budget override for the available-skills catalog, if any. Only positive
+// values count (mirrors Rust NonZeroUsize, #38978); the catalog rendering caps
+// the value at 10,000 tokens.
+func (c *Config) SkillMaxContextTokens() (int, bool) {
+	if c == nil || c.Values == nil {
+		return 0, false
+	}
+	skills, ok := c.Values["skills"].(map[string]any)
+	if !ok {
+		return 0, false
+	}
+	raw, ok := skills["max_context_tokens"]
+	if !ok {
+		return 0, false
+	}
+	switch typed := raw.(type) {
+	case int64:
+		if typed > 0 {
+			return int(typed), true
+		}
+	case float64:
+		if typed > 0 && typed == float64(int64(typed)) {
+			return int(typed), true
+		}
+	case int:
+		if typed > 0 {
+			return typed, true
+		}
+	case string:
+		if parsed, err := strconv.ParseInt(strings.TrimSpace(typed), 10, 64); err == nil && parsed > 0 {
+			return int(parsed), true
+		}
+	}
+	return 0, false
+}
+
+// ModelPostTurnCompactThresholdPercent mirrors Rust
+// Config::model_post_turn_compact_threshold_percent (#46541): the percentage of
+// the usable context window that triggers compaction after a final response.
+// Omitted or zero disables turn-end compaction.
+func (c *Config) ModelPostTurnCompactThresholdPercent() int {
+	if c == nil {
+		return 0
+	}
+	percent, ok := configInt(c.Values["model_post_turn_compact_threshold_percent"])
+	if !ok || percent < 0 || percent > 100 {
+		return 0
+	}
+	return percent
+}
+
+// GuardianV2MaxParentCompactionTokens returns the configured
+// [features.guardianv2].max_parent_compaction_tokens bound (default 25,000,
+// clamped to 100..100,000), mirroring Rust
+// GuardianV2Config::max_parent_compaction_tokens (#38980).
+func (c *Config) GuardianV2MaxParentCompactionTokens() int {
+	const (
+		defaultParentCompactionTokens = 25_000
+		minParentCompactionTokens     = 100
+		maxParentCompactionTokens     = 100_000
+	)
+	if c == nil || c.Values == nil {
+		return defaultParentCompactionTokens
+	}
+	featuresTable, ok := c.Values["features"].(map[string]any)
+	if !ok {
+		return defaultParentCompactionTokens
+	}
+	guardianV2, ok := featuresTable["guardianv2"].(map[string]any)
+	if !ok {
+		return defaultParentCompactionTokens
+	}
+	value := int64(0)
+	switch typed := guardianV2["max_parent_compaction_tokens"].(type) {
+	case int64:
+		value = typed
+	case int:
+		value = int64(typed)
+	case float64:
+		if typed == float64(int64(typed)) {
+			value = int64(typed)
+		}
+	case string:
+		if parsed, err := strconv.ParseInt(strings.TrimSpace(typed), 10, 64); err == nil {
+			value = parsed
+		}
+	}
+	if value <= 0 {
+		return defaultParentCompactionTokens
+	}
+	if value < minParentCompactionTokens {
+		value = minParentCompactionTokens
+	}
+	if value > maxParentCompactionTokens {
+		value = maxParentCompactionTokens
+	}
+	return int(value)
+}
+
+// GuardianV2TranscriptFormat returns the configured
+// [features.guardianv2].transcript_mode value (#51465). Rust's TranscriptFormat
+// defaults to `line`; only `json` selects the structured records.
+func (c *Config) GuardianV2TranscriptFormat() string {
+	if c == nil || c.Values == nil {
+		return "line"
+	}
+	featuresTable, ok := c.Values["features"].(map[string]any)
+	if !ok {
+		return "line"
+	}
+	guardianV2, ok := featuresTable["guardianv2"].(map[string]any)
+	if !ok {
+		return "line"
+	}
+	value, _ := guardianV2["transcript_mode"].(string)
+	if strings.EqualFold(strings.TrimSpace(value), "json") {
+		return "json"
+	}
+	return "line"
+}
+
+// GuardianPolicyConfig mirrors Rust Config::guardian_policy_config: the managed
+// `guardian_policy_config` requirement wins over the `[auto_review] policy`
+// config value, and a value that normalizes to empty is treated as unset so the
+// lower-priority layer can still apply.
+func (c *Config) GuardianPolicyConfig() (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	if c.Requirements != nil && c.Requirements.GuardianPolicyConfig != nil {
+		if value := strings.TrimSpace(*c.Requirements.GuardianPolicyConfig); value != "" {
+			return value, true
+		}
+	}
+	return autoReviewConfigValue(c.Values, "policy")
+}
+
+// GuardianExtraPolicy mirrors Rust Config::guardian_extra_policy (#47125): the
+// managed `guardian_extra_policy` requirement wins over the `[auto_review]
+// extra_policy` config value, and a blank value in either layer is ignored so
+// the lower-priority layer can still apply.
+func (c *Config) GuardianExtraPolicy() (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	if c.Requirements != nil && c.Requirements.GuardianExtraPolicy != nil {
+		if value := strings.TrimSpace(*c.Requirements.GuardianExtraPolicy); value != "" {
+			return value, true
+		}
+	}
+	return autoReviewConfigValue(c.Values, "extra_policy")
+}
+
+// GuardianPolicyTemplate mirrors Rust Config::guardian_policy_template
+// (`[auto_review] experimental_policy_template`): the full reviewer prompt
+// template whose `{{ tenant_policy_config }}` placeholder receives the resolved
+// policy.
+func (c *Config) GuardianPolicyTemplate() (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	return autoReviewConfigValue(c.Values, "experimental_policy_template")
+}
+
+// GuardianConversationHistoryPrompt returns the optional reviewer-only history
+// retrieval instructions. Unlike the policy overrides, an explicitly empty
+// string is meaningful: it suppresses the bundled instructions when the
+// feature is enabled.
+func (c *Config) GuardianConversationHistoryPrompt() (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	autoReview, ok := c.Values["auto_review"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	value, ok := autoReview["experimental_conversation_history_prompt"].(string)
+	return value, ok
+}
+
+// GuardianConversationHistoryMaxOutputTokens returns the positive per-call
+// history tool budget, or fallback when the value is absent or invalid.
+func (c *Config) GuardianConversationHistoryMaxOutputTokens(fallback int) int {
+	if c == nil {
+		return fallback
+	}
+	autoReview, ok := c.Values["auto_review"].(map[string]any)
+	if !ok {
+		return fallback
+	}
+	value, ok := nonNegativeIntFromConfigValue(autoReview["conversation_history_max_output_tokens"])
+	if !ok || value == 0 {
+		return fallback
+	}
+	return value
+}
+
+// GuardianCircuitBreakAction mirrors Rust's
+// `auto_review.circuit_break_action` (#48796): "strict" attaches a structured
+// tooManyDenials error to a Guardian denial-limit interruption, while the
+// default leaves the error unset for older clients.
+func (c *Config) GuardianCircuitBreakAction() string {
+	if c == nil {
+		return "default"
+	}
+	value, ok := autoReviewConfigValue(c.Values, "circuit_break_action")
+	if !ok {
+		return "default"
+	}
+	if strings.EqualFold(value, "strict") {
+		return "strict"
+	}
+	return "default"
+}
+
+// autoReviewConfigValue reads a normalized `[auto_review]` string value.
+func autoReviewConfigValue(values map[string]any, key string) (string, bool) {
+	autoReview, ok := values["auto_review"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	value, ok := autoReview[key].(string)
+	if !ok {
+		return "", false
+	}
+	value = strings.TrimSpace(value)
+	return value, value != ""
+}
+
+// GuardianV2MaxToolCallLag returns the configured
+// [features.guardianv2].max_tool_call_lag bound and whether it was set,
+// mirroring Rust GuardianV2Config::max_tool_call_lag (#39001, a `usize`
+// option). The model catalog's `guardian_v2` default fills in when the config
+// leaves it unset, and DEFAULT_MAX_TOOL_CALL_LAG (2) is the final fallback.
+func (c *Config) GuardianV2MaxToolCallLag() (int, bool) {
+	if c == nil || c.Values == nil {
+		return 0, false
+	}
+	featuresTable, ok := c.Values["features"].(map[string]any)
+	if !ok {
+		return 0, false
+	}
+	guardianV2, ok := featuresTable["guardianv2"].(map[string]any)
+	if !ok {
+		return 0, false
+	}
+	value := int64(0)
+	switch typed := guardianV2["max_tool_call_lag"].(type) {
+	case int64:
+		value = typed
+	case int:
+		value = int64(typed)
+	case float64:
+		if typed == float64(int64(typed)) {
+			value = int64(typed)
+		}
+	case string:
+		if parsed, err := strconv.ParseInt(strings.TrimSpace(typed), 10, 64); err == nil {
+			value = parsed
+		}
+	}
+	if value <= 0 {
+		return 0, false
+	}
+	return int(value), true
+}
+
+// GuardianV2PersistScores returns whether Guardian V2 reviewed actions and risk
+// scores are written to rollout files for debugging, mirroring Rust
+// Config::guardian_v2_persist_scores ([features.guardianv2].persist_scores,
+// #40911). The option defaults to false so scores are only persisted when
+// explicitly enabled and the session is not ephemeral.
+func (c *Config) GuardianV2PersistScores() bool {
+	if c == nil || c.Values == nil {
+		return false
+	}
+	featuresTable, ok := c.Values["features"].(map[string]any)
+	if !ok {
+		return false
+	}
+	guardianV2, ok := featuresTable["guardianv2"].(map[string]any)
+	if !ok {
+		return false
+	}
+	switch typed := guardianV2["persist_scores"].(type) {
+	case bool:
+		return typed
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(typed))
+		return err == nil && parsed
+	default:
+		return false
+	}
+}
+
+// GuardianV2FreeGuardian reports whether eligible Guardian reviews and
+// classifiers should use the dedicated Codex backend routes
+// (`[features.guardianv2].free_guardian`, Rust #40892). The option is opt-in.
+func (c *Config) GuardianV2FreeGuardian() bool {
+	if c == nil || c.Values == nil {
+		return false
+	}
+	featuresTable, ok := c.Values["features"].(map[string]any)
+	if !ok {
+		return false
+	}
+	guardianV2, ok := featuresTable["guardianv2"].(map[string]any)
+	if !ok {
+		return false
+	}
+	value, _ := guardianV2["free_guardian"].(bool)
+	return value
+}
+
+func (c *Config) SkillShadowSelectionEnabled() bool {
+	if featureflags.Enabled(c.FeatureSettings(), "skill_search") {
+		return true
+	}
+	if c == nil || c.Values == nil {
+		return false
+	}
+	skills, ok := c.Values["skills"].(map[string]any)
+	if !ok {
+		return false
+	}
+	enabled, ok := skills["shadow_selection_enabled"].(bool)
+	return ok && enabled
+}
+
+func (c *Config) SkillSelectionEnabled() bool {
+	if c == nil || c.Values == nil {
+		return false
+	}
+	skills, ok := c.Values["skills"].(map[string]any)
+	if !ok {
+		return false
+	}
+	enabled, ok := skills["selection_enabled"].(bool)
+	return ok && enabled
+}
+
+// CloudSkillsEnabled reports whether host-supplied cloud skills are discovered
+// and exposed to the model, mirroring Rust's
+// `cfg.cloud.skills.enabled.unwrap_or(true)` (core/config/mod.rs, #47074).
+//
+// `orchestrator.skills` is accepted as a legacy no-op: Rust retired the
+// built-in orchestrator skill provider in favor of the host-supplied cloud
+// provider and only `cloud.skills` gates the catalog now.
+func (c *Config) CloudSkillsEnabled() bool {
+	if c == nil || c.Values == nil {
+		return true
+	}
+	cloud, ok := c.Values["cloud"].(map[string]any)
+	if !ok {
+		return true
+	}
+	skills, ok := cloud["skills"].(map[string]any)
+	if !ok {
+		return true
+	}
+	enabled, ok := skills["enabled"].(bool)
+	if !ok {
+		return true
+	}
+	return enabled
+}
+
+// OrchestratorSkillsEnabled is retained for the legacy `orchestrator.skills`
+// setting. Rust keeps the key as a compatibility no-op, so the effective gate
+// is always the cloud-skills setting.
+func (c *Config) OrchestratorSkillsEnabled() bool {
+	return c.CloudSkillsEnabled()
+}
+
+func (c *Config) UpdatePlanEnabled() bool {
+	if c == nil || c.Values == nil {
+		return false
+	}
+	tools, ok := c.Values["tools"].(map[string]any)
+	if !ok {
+		return false
+	}
+	updatePlan, ok := tools["update_plan"].(map[string]any)
+	if !ok {
+		return false
+	}
+	enabled, ok := updatePlan["enabled"].(bool)
+	return ok && enabled
+}
+
+// ExperimentalRequestUserInputEnabled reports whether request_user_input and
+// its asynchronous catalog variant may be exposed. Rust defaults an absent
+// tools.experimental_request_user_input table to enabled.
+func (c *Config) ExperimentalRequestUserInputEnabled() bool {
+	if c == nil || c.Values == nil {
+		return true
+	}
+	tools, ok := c.Values["tools"].(map[string]any)
+	if !ok {
+		return true
+	}
+	value, ok := tools["experimental_request_user_input"].(map[string]any)
+	if !ok {
+		return true
+	}
+	enabled, ok := value["enabled"].(bool)
+	return !ok || enabled
+}
+
+// AllowLoginShell reports whether shell tools may expose the `login`
+// parameter. Rust defaults to allowing login shells
+// (`allow_login_shell.unwrap_or(true)`, per-environment since b258c028fe).
+func (c *Config) AllowLoginShell() bool {
+	if c == nil || c.Values == nil {
+		return true
+	}
+	value, ok := c.Values["allow_login_shell"].(bool)
+	return !ok || value
+}
+
+// AllowSymlinkedCodexHome reports whether the execution host's top-level user
+// config opted into trusting symlink targets beneath CODEX_HOME, mirroring
+// Rust allow_symlinked_codex_home (default false). Project config, CLI
+// overrides, and profiles cannot enable it.
+func (c *Config) AllowSymlinkedCodexHome() bool {
+	return c != nil && c.allowedSymlinkedCodexHome != ""
+}
+
+// ThreadUnloadDelaySecs returns how long the app server keeps an unloaded
+// thread resident before evicting it, mirroring Rust thread_unload_delay_secs
+// (default 1800 seconds, Rust #52081).
+func (c *Config) ThreadUnloadDelaySecs() time.Duration {
+	const defaultThreadUnloadDelay = 1800 * time.Second
+	if c == nil || c.Values == nil {
+		return defaultThreadUnloadDelay
+	}
+	raw, ok := c.Values["thread_unload_delay_secs"]
+	if !ok || raw == nil {
+		return defaultThreadUnloadDelay
+	}
+	seconds, ok := configInt64(raw)
+	if !ok || seconds < 0 {
+		return defaultThreadUnloadDelay
+	}
+	// Rust rejects values that overflow a Duration ("thread_unload_delay_secs
+	// is too large"); this accessor cannot surface an error, so it stays on the
+	// documented default instead of wrapping around.
+	if seconds > int64((time.Duration(1<<63-1))/time.Second) {
+		return defaultThreadUnloadDelay
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func (c *Config) WaitAgentEnabled() bool {
+	if c == nil || c.Values == nil {
+		return true
+	}
+	features, ok := c.Values["features"].(map[string]any)
+	if !ok {
+		return true
+	}
+	multiAgentV2, ok := features["multi_agent_v2"].(map[string]any)
+	if !ok {
+		return true
+	}
+	enabled, ok := multiAgentV2["wait_agent_enabled"].(bool)
+	return !ok || enabled
+}
+
+func (c *Config) OmitLegacyMCPToolPrefix(serverName string) bool {
+	if c == nil || !featureflags.Enabled(c.FeatureSettings(), "non_prefixed_mcp_tool_names") {
+		return false
+	}
+	features, ok := c.Values["features"].(map[string]any)
+	if !ok {
+		return true
+	}
+	feature, ok := features["non_prefixed_mcp_tool_names"].(map[string]any)
+	if !ok {
+		return true
+	}
+	rawServerNames, configured := feature["server_names"]
+	if !configured {
+		return true
+	}
+	serverName = strings.TrimSpace(serverName)
+	for _, configuredName := range stringListFromConfigValue(rawServerNames) {
+		if configuredName == serverName {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Config) DisableCodeModeInProcessFallback() bool {
+	if c == nil || c.Values == nil {
+		return false
+	}
+	featureValues, ok := c.Values["features"].(map[string]any)
+	if !ok {
+		return false
+	}
+	codeModeHost, ok := featureValues["code_mode_host"].(map[string]any)
+	if !ok {
+		return false
+	}
+	disabled, _ := codeModeHost["disable_in_process_fallback"].(bool)
+	return disabled
+}
+
+const DefaultCodeModeExecYieldTime = 30 * time.Second
+
+func (c *Config) CodeModeDefaultExecYieldTime() time.Duration {
+	if c == nil || c.Values == nil {
+		return DefaultCodeModeExecYieldTime
+	}
+	features, ok := c.Values["features"].(map[string]any)
+	if !ok {
+		return DefaultCodeModeExecYieldTime
+	}
+	codeMode, ok := features["code_mode"].(map[string]any)
+	if !ok {
+		return DefaultCodeModeExecYieldTime
+	}
+	value, ok := nonNegativeIntFromConfigValue(codeMode["default_exec_yield_time_ms"])
+	const maxDurationMilliseconds = int64(^uint64(0)>>1) / int64(time.Millisecond)
+	if !ok || int64(value) > maxDurationMilliseconds {
+		return DefaultCodeModeExecYieldTime
+	}
+	return time.Duration(value) * time.Millisecond
+}
+
+// CodeModeExperimentalShowCellOverhead mirrors Rust's
+// `features.code_mode.experimental_show_cell_overhead` (#46288): when enabled,
+// code-mode cell responses report the handler duration, the code-mode host
+// duration, and their difference in the response header. Disabled by default.
+func (c *Config) CodeModeExperimentalShowCellOverhead() bool {
+	if c == nil || c.Values == nil {
+		return false
+	}
+	features, ok := c.Values["features"].(map[string]any)
+	if !ok {
+		return false
+	}
+	codeMode, ok := features["code_mode"].(map[string]any)
+	if !ok {
+		return false
+	}
+	value, ok := codeMode["experimental_show_cell_overhead"].(bool)
+	return ok && value
+}
+
+// CodeModeToolDescriptionFirst reports whether nested Code Mode tool
+// definitions put the tool description before its namespace description
+// (Rust #51690/#51704). The feature is disabled by default.
+func (c *Config) CodeModeToolDescriptionFirst() bool {
+	if c == nil || c.Values == nil {
+		return false
+	}
+	features, ok := c.Values["features"].(map[string]any)
+	if !ok {
+		return false
+	}
+	enabled, _ := features["code_mode_tool_description_first"].(bool)
+	return enabled
+}
+
+// CodeModeDirectOnlyToolNamespaces returns the exact namespaces that must be
+// exposed only as direct model tools (Rust
+// features.code_mode.direct_only_tool_namespaces). A nil result leaves every
+// tool on its normal exposure path.
+func (c *Config) CodeModeDirectOnlyToolNamespaces() []string {
+	if c == nil || c.Values == nil {
+		return nil
+	}
+	features, ok := c.Values["features"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	codeMode, ok := features["code_mode"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	return stringListFromConfigValue(codeMode["direct_only_tool_namespaces"])
+}
+
+// CodeModeExcludedToolNamespaces returns the exact namespaces omitted from the
+// nested Code Mode tool surface (Rust
+// features.code_mode.excluded_tool_namespaces). The tools stay registered for
+// direct model access.
+func (c *Config) CodeModeExcludedToolNamespaces() []string {
+	if c == nil || c.Values == nil {
+		return nil
+	}
+	features, ok := c.Values["features"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	codeMode, ok := features["code_mode"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	return stringListFromConfigValue(codeMode["excluded_tool_namespaces"])
+}
+
+// CodeModeOnlyStrictThirdPartyTools reports whether eligible MCP/app and
+// client-supplied dynamic tools stay deferred in Code Mode Only (Rust #50687).
+func (c *Config) CodeModeOnlyStrictThirdPartyTools() bool {
+	if c == nil || c.Values == nil {
+		return false
+	}
+	features, ok := c.Values["features"].(map[string]any)
+	if !ok {
+		return false
+	}
+	enabled, _ := features["code_mode_only_strict_3p_tools"].(bool)
+	return enabled
+}
+
+// CodeModeToolInputSchemaMaxBytes returns
+// features.code_mode.tool_input_schema_max_bytes (Rust #47936). Zero means the
+// 16,000-byte Code Mode default.
+func (c *Config) CodeModeToolInputSchemaMaxBytes() int {
+	if c == nil || c.Values == nil {
+		return 0
+	}
+	features, ok := c.Values["features"].(map[string]any)
+	if !ok {
+		return 0
+	}
+	codeMode, ok := features["code_mode"].(map[string]any)
+	if !ok {
+		return 0
+	}
+	value, ok := nonNegativeIntFromConfigValue(codeMode["tool_input_schema_max_bytes"])
+	if !ok {
+		return 0
+	}
+	return int(value)
+}
+
+// DefaultMCPOptionalStartupGrace mirrors Rust
+// codex_mcp::DEFAULT_OPTIONAL_MCP_STARTUP_GRACE (#41199): how long tool-catalog
+// capture waits for optional MCP servers before omitting them.
+const DefaultMCPOptionalStartupGrace = time.Second
+
+// MCPOptionalStartupGrace reads the optional [mcp_optional_startup_grace_ms]
+// window used while building the initial tool catalog. An absent key falls back
+// to DefaultMCPOptionalStartupGrace (1s); an explicit 0 disables the shared
+// grace so optional servers wait for their configured startup_timeout_sec.
+func (c *Config) MCPOptionalStartupGrace() time.Duration {
+	if c == nil || c.Values == nil {
+		return DefaultMCPOptionalStartupGrace
+	}
+	raw, ok := c.Values["mcp_optional_startup_grace_ms"]
+	if !ok {
+		return DefaultMCPOptionalStartupGrace
+	}
+	if value, ok := nonNegativeIntFromConfigValue(raw); ok {
+		return time.Duration(value) * time.Millisecond
+	}
+	return DefaultMCPOptionalStartupGrace
+}
+
+func (c *Config) ToolRegistryTurnMetadataIncludesToolInfo() bool {
+	if c == nil || c.Values == nil {
+		return false
+	}
+	features, ok := c.Values["features"].(map[string]any)
+	if !ok {
+		return false
+	}
+	toolRegistry, ok := features["tool_registry"].(map[string]any)
+	if !ok {
+		return false
+	}
+	enabled, _ := toolRegistry["turn_metadata_includes_tool_info"].(bool)
+	return enabled
+}
+
+func (c *Config) ToolOutputTokenLimit() *int {
+	if c == nil || c.Values == nil {
+		return nil
+	}
+	value, ok := nonNegativeIntFromConfigValue(c.Values["tool_output_token_limit"])
+	if !ok {
+		return nil
+	}
+	return &value
+}
+
+func (c *Config) FeatureSettingsWithLegacyUsages() (map[string]bool, []featureflags.LegacyFeatureUsage) {
+	if c == nil {
+		return map[string]bool{}, nil
+	}
+	values := map[string]any{}
+	if featuresValue, ok := c.Values["features"].(map[string]any); ok {
+		for key, value := range featuresValue {
+			values[key] = value
+		}
+	}
+	if enabled, ok := c.Values["experimental_use_unified_exec_tool"].(bool); ok {
+		values["experimental_use_unified_exec_tool"] = enabled
+	}
+	settings, usages := featureflags.ResolveSettings(values)
+	if c.Requirements != nil {
+		requirementValues := make(map[string]any, len(c.Requirements.FeatureRequirements))
+		for key, enabled := range c.Requirements.FeatureRequirements {
+			requirementValues[key] = enabled
+		}
+		if autoReview, ok := c.Requirements.FeatureRequirements["auto_review"]; ok {
+			if _, hasCanonical := c.Requirements.FeatureRequirements["guardian_approval"]; !hasCanonical {
+				requirementValues["guardian_approval"] = autoReview
+			}
+			delete(requirementValues, "auto_review")
+		}
+		requirementSettings, _ := featureflags.ResolveSettings(requirementValues)
+		for key, enabled := range requirementSettings {
+			settings[key] = enabled
+		}
+	}
+	if c.Requirements != nil {
+		if requirements := c.Requirements; requirements.AllowedApprovalsReviewers != nil {
+			userAllowed := false
+			for _, reviewer := range requirements.AllowedApprovalsReviewers {
+				if reviewer == ApprovalsReviewerUser {
+					userAllowed = true
+					break
+				}
+			}
+			if !userAllowed {
+				settings["guardianv2"] = false
+			}
+		}
+	}
+	return settings, usages
+}
+
+func (c *Config) LegacyFeatureUsages() []featureflags.LegacyFeatureUsage {
+	_, usages := c.FeatureSettingsWithLegacyUsages()
+	return usages
+}
+
+func (c *Config) ForcedChatGPTWorkspaceIDs() []string {
+	if c == nil {
+		return nil
+	}
+	return stringListFromConfigValue(c.Values["forced_chatgpt_workspace_id"])
+}
+
+func (c *Config) ForcedLoginMethod() ForcedLoginMethod {
+	if c == nil {
+		return ""
+	}
+	switch strings.TrimSpace(strings.ToLower(stringFromConfigValue(c.Values["forced_login_method"]))) {
+	case string(ForcedLoginMethodAPI):
+		return ForcedLoginMethodAPI
+	case string(ForcedLoginMethodChatGPT):
+		return ForcedLoginMethodChatGPT
+	default:
+		return ""
+	}
+}
+
+func (c *Config) ResponsesAPIClientMetadata() map[string]string {
+	if c == nil {
+		return nil
+	}
+	return stringMapFromConfigValue(c.Values["responsesapi_client_metadata"])
+}
+
+// ResponsesAPIMetadata returns the bounded, product-owned metadata attached to
+// every Responses API turn metadata payload (Rust 9e301c8c9a). The setting is
+// ignored in project-local configuration.
+func (c *Config) ResponsesAPIMetadata() map[string]string {
+	if c == nil {
+		return nil
+	}
+	return stringMapFromConfigValue(c.Values["responses_api_metadata"])
+}
+
+func (c *Config) CLIAuthCredentialsStoreMode() string {
+	if c == nil {
+		return ""
+	}
+	return strings.TrimSpace(stringFromConfigValue(c.Values["cli_auth_credentials_store"]))
+}
+
+func (c *Config) SecretAuthStorageEnabled() bool {
+	if c == nil {
+		return false
+	}
+	value, ok := c.Values["features"].(map[string]any)
+	if !ok {
+		return runtime.GOOS == "windows"
+	}
+	enabled, ok := value["secret_auth_storage"].(bool)
+	if ok {
+		return enabled
+	}
+	return runtime.GOOS == "windows"
+}
+
+func (c *Config) RespectSystemProxyEnabled() bool {
+	if c == nil {
+		return false
+	}
+	value, ok := c.Values["features"].(map[string]any)
+	if !ok {
+		return false
+	}
+	enabled, ok := value["respect_system_proxy"].(bool)
+	return ok && enabled
+}
+
+// SystemProxyFallbackEnabled reports whether eligible bootstrap requests may be
+// retried through the system proxy (Rust Feature::SystemProxyFallback, #46562).
+// The feature is default-enabled and honors managed feature requirements.
+func (c *Config) SystemProxyFallbackEnabled() bool {
+	if c == nil {
+		return false
+	}
+	return featureflags.Enabled(c.FeatureSettings(), "system_proxy_fallback")
+}
+
+func (c *Config) CurrentTimeReminder() *CurrentTimeReminderConfig {
+	if c == nil {
+		return nil
+	}
+	featuresValue, ok := c.Values["features"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	raw, ok := featuresValue["current_time_reminder"]
+	if !ok {
+		return nil
+	}
+	cfg := &CurrentTimeReminderConfig{
+		ReminderIntervalSeconds: 1,
+		ClockSource:             CurrentTimeSourceSystem,
+		DeliveryMode:            CurrentTimeReminderAnyInference,
+	}
+	switch value := raw.(type) {
+	case bool:
+		cfg.Enabled = value
+	case map[string]any:
+		if enabled, ok := value["enabled"].(bool); ok {
+			cfg.Enabled = enabled
+		}
+		if rawInterval, ok := value["reminder_interval_seconds"]; ok {
+			cfg.ReminderIntervalSeconds = uint64FromConfigValue(rawInterval)
+		}
+		if source := currentTimeSourceFromConfig(value["clock_source"]); source != "" {
+			cfg.ClockSource = source
+		}
+		if mode := currentTimeDeliveryModeFromConfig(value["delivery_mode"]); mode != "" {
+			cfg.DeliveryMode = mode
+		}
+		if sleepTool, ok := value["sleep_tool"].(bool); ok {
+			cfg.SleepTool = sleepTool
+		}
+	default:
+		return nil
+	}
+	return cfg
+}
+
+// SleepToolMode reads the structured [features].sleep_tool.mode override
+// (Rust #41243 SleepToolConfigToml). It defaults to ModelDriven when the
+// features.sleep_tool key is absent, a bool, or the mode is omitted/invalid.
+func (c *Config) SleepToolMode() SleepToolMode {
+	if c == nil {
+		return SleepToolModeModelDriven
+	}
+	featuresValue, ok := c.Values["features"].(map[string]any)
+	if !ok {
+		return SleepToolModeModelDriven
+	}
+	raw, ok := featuresValue["sleep_tool"]
+	if !ok {
+		return SleepToolModeModelDriven
+	}
+	value, ok := raw.(map[string]any)
+	if !ok {
+		return SleepToolModeModelDriven
+	}
+	switch strings.TrimSpace(stringFromConfigValue(value["mode"])) {
+	case string(SleepToolModeAlwaysOn):
+		return SleepToolModeAlwaysOn
+	default:
+		return SleepToolModeModelDriven
+	}
+}
+
+func (c *Config) ChatGPTBaseURL() string {
+	if c == nil {
+		return DefaultChatGPTBaseURL
+	}
+	value := stringFromConfigValue(c.Values["chatgpt_base_url"])
+	if value == "" {
+		return DefaultChatGPTBaseURL
+	}
+	return value
+}
+
+// ProjectDocMaxBytes is the aggregate project-instruction budget. The current
+// local runtime has one project filesystem; remote environment filesystems will
+// share this same budget when executor-scoped instruction loading is wired in.
+func (c *Config) ProjectDocMaxBytes() int {
+	if c == nil || c.Values == nil {
+		return DefaultProjectDocMaxBytes
+	}
+	if value, ok := nonNegativeIntFromConfigValue(c.Values["project_doc_max_bytes"]); ok {
+		return value
+	}
+	return DefaultProjectDocMaxBytes
+}
+
+// ProjectDocFallbackFilenames ports the config half of Rust
+// core/src/agents_md.rs::candidate_filenames: extra project-doc filenames tried
+// after `AGENTS.override.md` and `AGENTS.md`, in order and without duplicates.
+func (c *Config) ProjectDocFallbackFilenames() []string {
+	if c == nil || c.Values == nil {
+		return nil
+	}
+	return stringListFromConfigValue(c.Values["project_doc_fallback_filenames"])
+}
+
+// ProjectRootMarkers ports Rust's `project_root_markers`: the markers used to
+// detect the project root when walking parent directories. An empty result
+// leaves the default marker list to the discovery helper (Rust defaults to
+// [".git"]).
+func (c *Config) ProjectRootMarkers() []string {
+	if c == nil || c.Values == nil {
+		return nil
+	}
+	return projectRootMarkersFromValues(c.Values)
+}
+
+// IncludeCollaborationModeInstructions ports Rust's
+// `include_collaboration_mode_instructions` (default true): when false the
+// collaboration-mode world state is omitted from model requests.
+func (c *Config) IncludeCollaborationModeInstructions() bool {
+	if c == nil || c.Values == nil {
+		return true
+	}
+	if value, ok := c.Values["include_collaboration_mode_instructions"].(bool); ok {
+		return value
+	}
+	return true
+}
+
+// IncludePermissionsInstructions ports Rust's
+// `include_permissions_instructions` (default true): when false the full
+// permissions instructions are replaced by the compact approved-prefix
+// section.
+func (c *Config) IncludePermissionsInstructions() bool {
+	if c == nil || c.Values == nil {
+		return true
+	}
+	if value, ok := c.Values["include_permissions_instructions"].(bool); ok {
+		return value
+	}
+	return true
+}
+
+// DefaultBackgroundTerminalMaxTimeoutMS mirrors Rust
+// unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS (and the value in
+// config/defaults.toml).
+const DefaultBackgroundTerminalMaxTimeoutMS = 300_000
+
+// BackgroundTerminalMaxTimeoutMS ports Rust's
+// `background_terminal_max_timeout`: the cap on how long a unified-exec call
+// yields to a background terminal before returning. The caller clamps it to the
+// minimum yield time (Rust MIN_EMPTY_YIELD_TIME_MS).
+func (c *Config) BackgroundTerminalMaxTimeoutMS() uint64 {
+	if c == nil || c.Values == nil {
+		return DefaultBackgroundTerminalMaxTimeoutMS
+	}
+	switch value := c.Values["background_terminal_max_timeout"].(type) {
+	case int:
+		if value > 0 {
+			return uint64(value)
+		}
+	case int64:
+		if value > 0 {
+			return uint64(value)
+		}
+	case float64:
+		if value > 0 {
+			return uint64(value)
+		}
+	case uint64:
+		if value > 0 {
+			return value
+		}
+	}
+	return DefaultBackgroundTerminalMaxTimeoutMS
+}
+
+// MCPOAuthCredentialsStoreModeValues lists the accepted
+// `mcp_oauth_credentials_store` values (Rust OAuthCredentialsStoreMode).
+var MCPOAuthCredentialsStoreModeValues = []string{"auto", "file", "keyring"}
+
+// ValidateMCPOAuthCredentialsStoreMode rejects an unrecognized
+// `mcp_oauth_credentials_store` value, mirroring Rust's enum deserialization,
+// which fails the config load.
+func ValidateMCPOAuthCredentialsStoreMode(values map[string]any) error {
+	if values == nil {
+		return nil
+	}
+	for _, key := range []string{"mcp_oauth_credentials_store", "mcpOauthCredentialsStore"} {
+		raw, ok := values[key]
+		if !ok {
+			continue
+		}
+		text, ok := raw.(string)
+		if !ok {
+			return fmt.Errorf("invalid %s: expected one of %s", key, strings.Join(MCPOAuthCredentialsStoreModeValues, ", "))
+		}
+		switch strings.ToLower(strings.TrimSpace(text)) {
+		case "", "auto", "file", "keyring":
+		default:
+			return fmt.Errorf("invalid %s %q; expected one of %s", key, text, strings.Join(MCPOAuthCredentialsStoreModeValues, ", "))
+		}
+	}
+	return nil
+}
+
+// MCPOAuthCredentialsStoreMode returns the configured MCP OAuth credential
+// store mode (default auto), mirroring Rust
+// `mcp_oauth_credentials_store`.
+func (c *Config) MCPOAuthCredentialsStoreMode() string {
+	if c == nil || c.Values == nil {
+		return "auto"
+	}
+	for _, key := range []string{"mcp_oauth_credentials_store", "mcpOauthCredentialsStore"} {
+		if raw, ok := c.Values[key].(string); ok {
+			switch strings.ToLower(strings.TrimSpace(raw)) {
+			case "file":
+				return "file"
+			case "keyring":
+				return "keyring"
+			case "", "auto":
+				return "auto"
+			}
+		}
+	}
+	return "auto"
+}
+
+func stringFromConfigValue(value any) string {
+	if raw, ok := value.(string); ok {
+		return strings.TrimSpace(raw)
+	}
+	return ""
+}
+
+func stringListFromConfigValue(value any) []string {
+	switch v := value.(type) {
+	case string:
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			return []string{trimmed}
+		}
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if value, ok := item.(string); ok {
+				value = strings.TrimSpace(value)
+				if value != "" {
+					out = append(out, value)
+				}
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	case []string:
+		out := make([]string, 0, len(v))
+		for _, value := range v {
+			value = strings.TrimSpace(value)
+			if value != "" {
+				out = append(out, value)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return nil
+}
+
+func uint64FromConfigValue(value any) uint64 {
+	switch v := value.(type) {
+	case int:
+		if v > 0 {
+			return uint64(v)
+		}
+	case int64:
+		if v > 0 {
+			return uint64(v)
+		}
+	case uint64:
+		return v
+	case float64:
+		if v > 0 {
+			return uint64(v)
+		}
+	case string:
+		if parsed, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64); err == nil {
+			return parsed
+		}
+	}
+	return 0
+}
+
+func nonNegativeIntFromConfigValue(value any) (int, bool) {
+	switch v := value.(type) {
+	case int:
+		return v, v >= 0
+	case int64:
+		if v < 0 || uint64(v) > uint64(^uint(0)>>1) {
+			return 0, false
+		}
+		return int(v), true
+	case uint64:
+		if v > uint64(^uint(0)>>1) {
+			return 0, false
+		}
+		return int(v), true
+	case float64:
+		if v < 0 || v != float64(int64(v)) || v > float64(^uint(0)>>1) {
+			return 0, false
+		}
+		return int(v), true
+	default:
+		return 0, false
+	}
+}
+
+func currentTimeSourceFromConfig(value any) CurrentTimeSource {
+	switch strings.TrimSpace(strings.ToLower(stringFromConfigValue(value))) {
+	case string(CurrentTimeSourceSystem):
+		return CurrentTimeSourceSystem
+	case string(CurrentTimeSourceExternal):
+		return CurrentTimeSourceExternal
+	default:
+		return ""
+	}
+}
+
+func currentTimeDeliveryModeFromConfig(value any) CurrentTimeReminderDeliveryMode {
+	switch strings.TrimSpace(strings.ToLower(stringFromConfigValue(value))) {
+	case string(CurrentTimeReminderAnyInference), "any-inference", "anyinference":
+		return CurrentTimeReminderAnyInference
+	case string(CurrentTimeReminderAfterUserOrToolOutput), "after-user-or-tool-output", "afteruserortooloutput":
+		return CurrentTimeReminderAfterUserOrToolOutput
+	default:
+		return ""
+	}
+}
+
+func loadConfigFile(path string) (map[string]any, error) {
+	values, _, err := loadConfigFileIfExists(path)
+	return values, err
+}
+
+// embeddedDefaultsValues parses the embedded packaged defaults TOML. A parse
+// failure is a build error and is surfaced as such (mirrors the Rust loader).
+func embeddedDefaultsValues() (map[string]any, error) {
+	var values map[string]any
+	if err := toml.Unmarshal([]byte(embeddedDefaultsTOML), &values); err != nil {
+		return nil, fmt.Errorf("invalid embedded packaged defaults; this is a Codex build error: %w", err)
+	}
+	if values == nil {
+		values = map[string]any{}
+	}
+	return values, nil
+}
+
+func loadConfigFileIfExists(path string) (map[string]any, bool, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return map[string]any{}, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	var values map[string]any
+	if err := toml.Unmarshal(stripUTF8BOM(data), &values); err != nil {
+		// Rust #46962: keep the failure typed so diagnostics can report the
+		// location instead of echoing values that may be credentials.
+		return nil, false, newConfigLoadError(path, err)
+	}
+	if values == nil {
+		values = map[string]any{}
+	}
+	resolveConfigFileRelativeValues(values, filepath.Dir(path))
+	return values, true, nil
+}
+
+func stripUTF8BOM(data []byte) []byte {
+	return bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
+}
+
+func managedConfigPath(codexHome string, override string) string {
+	if strings.TrimSpace(override) != "" {
+		return strings.TrimSpace(override)
+	}
+	if runtime.GOOS == "windows" {
+		return filepath.Join(codexHome, "managed_config.toml")
+	}
+	return filepath.Join(string(filepath.Separator), "etc", "codex", "managed_config.toml")
+}
+
+// shouldIgnoreDefaultManagedConfig reports whether the default legacy
+// managed_config.toml must be ignored for this load. Mirrors Rust #38947: on
+// Windows, when no explicit managed-config path is configured, the default
+// CODEX_HOME/managed_config.toml is no longer loaded (explicit overrides and
+// Unix legacy support are preserved).
+func shouldIgnoreDefaultManagedConfig(override string) bool {
+	return shouldIgnoreDefaultManagedConfigForOS(override, runtime.GOOS == "windows")
+}
+
+func shouldIgnoreDefaultManagedConfigForOS(override string, isWindows bool) bool {
+	if strings.TrimSpace(override) != "" {
+		return false
+	}
+	return isWindows
+}
+
+// HasLocalManagedConfiguration reports whether local managed configuration is
+// present. Mirrors Rust loader::has_local_managed_configuration (#38947): on
+// Windows only the system requirements file
+// (%ProgramData%\OpenAI\Codex\requirements.toml) counts, while Unix also
+// honors the legacy /etc/codex/managed_config.toml default.
+func HasLocalManagedConfiguration(codexHome string) bool {
+	if !shouldIgnoreDefaultManagedConfig("") {
+		if pathExists(managedConfigPath(codexHome, "")) {
+			return true
+		}
+	}
+	if pathExists(filepath.Join(codexHome, "requirements.toml")) {
+		return true
+	}
+	return false
+}
+
+// ProjectConfigEnabled reports whether the effective project config for cwd is
+// enabled: the active project root (or an ancestor within it) carries
+// trust_level = "trusted". It is the pre-session trust signal the interactive
+// Windows sandbox NUX uses to mirror Rust's
+// onboarding_result.directory_trust_persisted (a cwd that was already trusted
+// produces no session trust decision).
+func ProjectConfigEnabled(userValues map[string]any, cwd string) bool {
+	trustLevels := projectTrustLevels(userValues)
+	if len(trustLevels) == 0 {
+		return false
+	}
+	trustTarget := activeProjectTrustTarget(cwd)
+	for _, dir := range projectAncestorDirsWithinRoot(cwd, trustTarget) {
+		if level, ok := trustLevels[canonicalProjectPath(dir)]; ok {
+			return strings.EqualFold(level, "trusted")
+		}
+	}
+	return strings.EqualFold(trustLevels[canonicalProjectPath(trustTarget)], "trusted")
+}
+
+// ProjectTrustLevelForTarget reports the explicit trust_level decision for a
+// project path using the same canonicalization as ProjectConfigEnabled
+// (Rust project trust levels, #39082). ok=false when no explicit decision
+// exists for the path.
+func ProjectTrustLevelForTarget(userValues map[string]any, path string) (string, bool) {
+	// Rust #47620: the lookup tries the canonical spelling before the original
+	// one, so an entry written with either spelling is honored.
+	cfg := &Config{Values: userValues}
+	return cfg.ProjectTrustLevelForLookup(ProjectTrustLookupFromNativePath(path))
+}
+
+func projectTrustLevels(values map[string]any) map[string]string {
+	projects, ok := values["projects"].(map[string]any)
+	if !ok || len(projects) == 0 {
+		return nil
+	}
+	out := map[string]string{}
+	for rawPath, rawProject := range projects {
+		project, ok := rawProject.(map[string]any)
+		if !ok {
+			continue
+		}
+		trustLevel, ok := project["trust_level"].(string)
+		if !ok {
+			continue
+		}
+		path := canonicalProjectPath(rawPath)
+		if path != "" {
+			out[path] = strings.TrimSpace(trustLevel)
+		}
+	}
+	return out
+}
+
+func projectAncestorDirs(cwd string) []string {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
+		return nil
+	}
+	start, err := filepath.Abs(cwd)
+	if err != nil {
+		start = filepath.Clean(cwd)
+	}
+	if info, statErr := os.Stat(start); statErr == nil && !info.IsDir() {
+		start = filepath.Dir(start)
+	}
+	var dirs []string
+	for dir := start; dir != ""; {
+		dirs = append(dirs, dir)
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return dirs
+}
+
+func projectAncestorDirsWithinRoot(cwd string, root string) []string {
+	dirs := projectAncestorDirs(cwd)
+	root = canonicalProjectPath(root)
+	if root == "" {
+		return dirs
+	}
+	var out []string
+	for _, dir := range dirs {
+		out = append(out, dir)
+		if canonicalProjectPath(dir) == root {
+			break
+		}
+	}
+	return out
+}
+
+func activeProjectTrustTarget(cwd string) string {
+	if root := nearestGitRoot(cwd); root != "" {
+		if checkout := rootCheckoutForLinkedWorktree(root); checkout != "" {
+			return checkout
+		}
+		return root
+	}
+	return activeProjectRoot(cwd)
+}
+
+func activeProjectRoot(cwd string) string {
+	return activeProjectRootWithMarkers(cwd, nil)
+}
+
+func activeProjectRootWithMarkers(cwd string, markers []string) string {
+	// Rust's `find_project_root` (config/src/loader/mod.rs:1490) is
+	// `discover_project_root(..).unwrap_or_else(|| cwd.clone())`: the marker
+	// walk preserves absence, and only this fallback reintroduces cwd. An
+	// unconfigured marker list means the default markers, matching the walk
+	// this function performed before the #49160 split.
+	discoverMarkers := markers
+	if len(discoverMarkers) == 0 {
+		discoverMarkers = DefaultProjectRootMarkers()
+	}
+	if root, found := DiscoverProjectRoot(cwd, discoverMarkers); found {
+		return root
+	}
+	dirs := projectAncestorDirs(cwd)
+	if len(dirs) > 0 {
+		return dirs[0]
+	}
+	return strings.TrimSpace(cwd)
+}
+
+// projectDiscoveryIsProjectless mirrors Rust #46328's loader classification:
+// a completed discovery is projectless when no ancestor carries a project-root
+// marker, no Git checkout root exists above cwd, and no project-local config
+// directory is present between the discovered project root and cwd. CODEX_HOME
+// itself never counts as a project layer (Rust's
+// user_codex_home_is_not_a_project_layer).
+func projectDiscoveryIsProjectless(cwd string, codexHome string, markers []string) bool {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
+		return false
+	}
+	if projectRootMarkerFound(cwd, markers) {
+		return false
+	}
+	if nearestGitRoot(cwd) != "" {
+		return false
+	}
+	home := canonicalProjectPath(codexHome)
+	for _, folder := range projectDotCodexFoldersWithMarkers(cwd, markers) {
+		if home != "" && canonicalProjectPath(folder) == home {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// projectRootMarkerFound reports whether any ancestor of cwd (including cwd)
+// carries one of the project root markers. It is the marker half of
+// activeProjectRootWithMarkers, which falls back to cwd when none is found.
+func projectRootMarkerFound(cwd string, markers []string) bool {
+	for _, dir := range projectAncestorDirs(cwd) {
+		if projectRootMarkerExistsWithMarkers(dir, markers) {
+			return true
+		}
+	}
+	return false
+}
+
+func nearestGitRoot(cwd string) string {
+	for _, dir := range projectAncestorDirs(cwd) {
+		if gitMetadataPathExists(filepath.Join(dir, ".git")) {
+			return dir
+		}
+	}
+	return ""
+}
+
+func projectRootMarkerExists(dir string) bool {
+	for _, marker := range []string{".git", ".hg", ".svn"} {
+		if marker == ".git" {
+			if gitMetadataPathExists(filepath.Join(dir, marker)) {
+				return true
+			}
+			continue
+		}
+		if pathExists(filepath.Join(dir, marker)) {
+			return true
+		}
+	}
+	return false
+}
+
+func projectRootMarkerExistsWithMarkers(dir string, markers []string) bool {
+	if len(markers) == 0 {
+		markers = DefaultProjectRootMarkers()
+	}
+	for _, marker := range markers {
+		if marker == "" {
+			continue
+		}
+		if marker == ".git" {
+			if gitMetadataPathExists(filepath.Join(dir, marker)) {
+				return true
+			}
+			continue
+		}
+		if pathExists(filepath.Join(dir, marker)) {
+			return true
+		}
+	}
+	return false
+}
+
+// gitMetadataPathExists mirrors Rust #39629: a `.git` path counts as
+// repository metadata only when it is a file-based gitdir pointer or a real
+// checkout directory containing HEAD. A synthetic or incomplete `.git`
+// directory (e.g. a sandbox read-only mount) must not hide a parent
+// repository during project discovery.
+func gitMetadataPathExists(gitPath string) bool {
+	if gitPath == "" {
+		return false
+	}
+	info, err := os.Stat(gitPath)
+	if err != nil {
+		return false
+	}
+	if !info.IsDir() {
+		// File-based `.git` entries (gitdir: pointers) remain valid metadata.
+		return true
+	}
+	if _, err := os.Stat(filepath.Join(gitPath, "HEAD")); err == nil {
+		return true
+	}
+	return false
+}
+
+func pathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+func rootCheckoutForLinkedWorktree(checkoutRoot string) string {
+	checkoutRoot = strings.TrimSpace(checkoutRoot)
+	if checkoutRoot == "" {
+		return ""
+	}
+	gitFile := filepath.Join(checkoutRoot, ".git")
+	info, err := os.Lstat(gitFile)
+	if err != nil || info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return checkoutRoot
+	}
+	if info.Size() > maxGitMetadataFileBytes {
+		return checkoutRoot
+	}
+	data, err := os.ReadFile(gitFile)
+	if err != nil {
+		return checkoutRoot
+	}
+	target := parseGitDirPointer(string(data))
+	if target == "" {
+		return checkoutRoot
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(checkoutRoot, target)
+	}
+	target = filepath.Clean(target)
+	// Rust #39616: validate the linked worktree before inheriting the main
+	// repository's trust. The `.git` pointer alone is not proof that the
+	// repository registered this checkout.
+	gitDirInfo, err := os.Lstat(target)
+	if err != nil || !gitDirInfo.IsDir() || gitDirInfo.Mode()&os.ModeSymlink != 0 {
+		return checkoutRoot
+	}
+	canonicalGitDir, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		return checkoutRoot
+	}
+	if filepath.Base(filepath.Dir(canonicalGitDir)) != "worktrees" {
+		return checkoutRoot
+	}
+	commonDir := filepath.Dir(filepath.Dir(canonicalGitDir))
+
+	gitdirBytes, ok := readGitMetadataFile(filepath.Join(canonicalGitDir, "gitdir"))
+	if !ok {
+		return checkoutRoot
+	}
+	gitdirTarget := strings.TrimSpace(string(gitdirBytes))
+	if gitdirTarget == "" {
+		return checkoutRoot
+	}
+	if !filepath.IsAbs(gitdirTarget) {
+		gitdirTarget = filepath.Join(canonicalGitDir, gitdirTarget)
+	}
+	gitdirTarget = filepath.Clean(gitdirTarget)
+	if filepath.Base(gitdirTarget) != ".git" {
+		return checkoutRoot
+	}
+	registeredCheckout := filepath.Dir(gitdirTarget)
+
+	commondirBytes, ok := readGitMetadataFile(filepath.Join(canonicalGitDir, "commondir"))
+	if !ok {
+		return checkoutRoot
+	}
+	commondirValue := strings.TrimSpace(string(commondirBytes))
+	if commondirValue == "" {
+		return checkoutRoot
+	}
+	if !filepath.IsAbs(commondirValue) {
+		commondirValue = filepath.Join(canonicalGitDir, commondirValue)
+	}
+	linkedCommonDir := filepath.Clean(commondirValue)
+
+	canonicalRegistered, err := filepath.EvalSymlinks(registeredCheckout)
+	if err != nil {
+		return checkoutRoot
+	}
+	canonicalCheckout, err := filepath.EvalSymlinks(checkoutRoot)
+	if err != nil {
+		return checkoutRoot
+	}
+	canonicalLinkedCommon, err := filepath.EvalSymlinks(linkedCommonDir)
+	if err != nil {
+		return checkoutRoot
+	}
+	if filepath.Clean(canonicalRegistered) != filepath.Clean(canonicalCheckout) ||
+		filepath.Clean(canonicalLinkedCommon) != filepath.Clean(commonDir) {
+		return checkoutRoot
+	}
+
+	// Prove that the main checkout owns the canonical common directory.
+	mainRoot := filepath.Dir(commonDir)
+	mainGitDir := filepath.Join(mainRoot, ".git")
+	if mainInfo, err := os.Lstat(mainGitDir); err == nil && !mainInfo.IsDir() && mainInfo.Mode()&os.ModeSymlink == 0 {
+		if mainInfo.Size() > maxGitMetadataFileBytes {
+			return checkoutRoot
+		}
+		mainData, err := os.ReadFile(mainGitDir)
+		if err != nil {
+			return checkoutRoot
+		}
+		mainTarget := parseGitDirPointer(string(mainData))
+		if mainTarget == "" {
+			return checkoutRoot
+		}
+		if !filepath.IsAbs(mainTarget) {
+			mainTarget = filepath.Join(mainRoot, mainTarget)
+		}
+		mainGitDir = filepath.Clean(mainTarget)
+	}
+	canonicalMainGitDir, err := filepath.EvalSymlinks(mainGitDir)
+	if err != nil {
+		return checkoutRoot
+	}
+	if filepath.Clean(canonicalMainGitDir) != filepath.Clean(commonDir) {
+		return checkoutRoot
+	}
+	return mainRoot
+}
+
+const maxGitMetadataFileBytes = 64 * 1024
+
+func readGitMetadataFile(path string) ([]byte, bool) {
+	info, err := os.Lstat(path)
+	if err != nil || info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Size() > maxGitMetadataFileBytes {
+		return nil, false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || int64(len(data)) > maxGitMetadataFileBytes {
+		return nil, false
+	}
+	return data, true
+}
+
+func parseGitDirPointer(contents string) string {
+	for _, line := range strings.Split(strings.ReplaceAll(contents, "\r\n", "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToLower(line), "gitdir:") {
+			return strings.TrimSpace(line[len("gitdir:"):])
+		}
+	}
+	return ""
+}
+
+func canonicalProjectPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	absolute, err := filepath.Abs(path)
+	if err == nil {
+		path = absolute
+	}
+	path = filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		path = strings.ToLower(path)
+	}
+	return path
+}
+
+// sanitizeProjectConfigValues mirrors Rust's sanitize_project_config: it strips
+// the project-local settings that repository contents may not control and
+// returns the ignored key paths, which the loader reports back to the user
+// (Rust project_ignored_config_keys_warning).
+func sanitizeProjectConfigValues(values map[string]any, broker CredentialBrokerProjectState, trustedProviderEnvKeys []string) []string {
+	if values == nil {
+		return nil
+	}
+	var ignored []string
+	// Rust's PROJECT_LOCAL_CONFIG_DENYLIST, in order. The realtime ws model,
+	// backend prompt, startup context, start instructions, and the realtime
+	// table are user-settable, so project-local config may set them too.
+	for _, key := range []string{
+		"openai_base_url",
+		"chatgpt_base_url",
+		"apps_mcp_product_sku",
+		"responses_api_metadata",
+		"model_provider",
+		"model_providers",
+		"notify",
+		"profile",
+		"profiles",
+		"experimental_realtime_webrtc_call_base_url",
+		"experimental_realtime_ws_base_url",
+		"otel",
+	} {
+		if _, ok := values[key]; ok {
+			delete(values, key)
+			ignored = append(ignored, key)
+		}
+	}
+	if features, ok := values["features"].(map[string]any); ok {
+		// Rust sanitize_project_config: a configured credential broker owns the
+		// shell-snapshot and network-proxy feature switches, so a project cannot
+		// change the broker state or rebind its providers.
+		if broker == CredentialBrokerProjectEnabled {
+			if _, ok := features["shell_snapshot"]; ok {
+				delete(features, "shell_snapshot")
+				ignored = append(ignored, "features.shell_snapshot")
+			}
+		}
+		// Rust sanitize_project_config: the message board's remote endpoint and
+		// credential are user settings, so a project cannot redirect the board
+		// or supply a credential.
+		if multiAgentV2, ok := features["multi_agent_v2"].(map[string]any); ok {
+			if _, ok := multiAgentV2["message_board_remote"]; ok {
+				delete(multiAgentV2, "message_board_remote")
+				ignored = append(ignored, "features.multi_agent_v2.message_board_remote")
+			}
+		}
+		// Rust sanitize_project_config: project configuration cannot change the
+		// system-proxy switches.
+		// Rust sanitize_project_config (config/src/loader/mod.rs:1191-1202)
+		// also strips `credential_masking`: a project must not be able to turn
+		// credential masking on or off (#52302).
+		for _, key := range []string{"respect_system_proxy", "system_proxy_fallback", "credential_masking"} {
+			if _, ok := features[key]; ok {
+				delete(features, key)
+				ignored = append(ignored, "features."+key)
+			}
+		}
+		if broker != CredentialBrokerProjectUnconfigured {
+			if _, ok := features["network_proxy"].(bool); ok {
+				delete(features, "network_proxy")
+				ignored = append(ignored, "features.network_proxy")
+			}
+		}
+		// The broker definition and credentials never come from a project,
+		// configured broker or not (Rust sanitize_project_config).
+		if networkProxy, ok := features["network_proxy"].(map[string]any); ok {
+			if _, ok := networkProxy["credential_broker"]; ok {
+				delete(networkProxy, "credential_broker")
+				ignored = append(ignored, "features.network_proxy.credential_broker")
+			}
+			if _, ok := networkProxy["credentials"]; ok {
+				delete(networkProxy, "credentials")
+				ignored = append(ignored, "features.network_proxy.credentials")
+			}
+			if broker != CredentialBrokerProjectUnconfigured {
+				if _, ok := networkProxy["enabled"]; ok {
+					delete(networkProxy, "enabled")
+					ignored = append(ignored, "features.network_proxy.enabled")
+				}
+			}
+		}
+		if len(features) == 0 {
+			delete(values, "features")
+		}
+	}
+	if broker == CredentialBrokerProjectEnabled {
+		if policy, ok := values["shell_environment_policy"].(map[string]any); ok {
+			if _, ok := policy["experimental_use_profile"]; ok {
+				delete(policy, "experimental_use_profile")
+				ignored = append(ignored, "shell_environment_policy.experimental_use_profile")
+			}
+			if overrides, ok := policy["set"].(map[string]any); ok {
+				keys := make([]string, 0, len(overrides))
+				for key := range overrides {
+					keys = append(keys, key)
+				}
+				sort.Strings(keys)
+				for _, key := range keys {
+					// Child startup overrides and the trusted providers' env
+					// bindings must not be rebound by a repository.
+					if strings.EqualFold(key, "ZDOTDIR") ||
+						strings.EqualFold(key, "BASH_ENV") ||
+						isCredentialBrokerProviderEnvKey(key) ||
+						matchesTrustedProviderEnvKey(key, trustedProviderEnvKeys) {
+						delete(overrides, key)
+						ignored = append(ignored, "shell_environment_policy.set."+key)
+					}
+				}
+			}
+		}
+	}
+	// Repository contents must not turn an ordinary key into a permission
+	// increase (#39873): permission-mode cycling shortcuts are session-only and
+	// are stripped from project config.
+	if tui, ok := values["tui"].(map[string]any); ok {
+		if keymap, ok := tui["keymap"].(map[string]any); ok {
+			if chat, ok := keymap["chat"].(map[string]any); ok {
+				for _, key := range []string{"previous_permission_mode", "next_permission_mode"} {
+					if _, ok := chat[key]; ok {
+						delete(chat, key)
+						ignored = append(ignored, "tui.keymap.chat."+key)
+					}
+				}
+			}
+		}
+	}
+	return ignored
+}
+
+// matchesTrustedProviderEnvKey reports whether a project shell override targets
+// an env key a trusted credential provider binds (Rust's
+// trusted_provider_env_keys comparison).
+func matchesTrustedProviderEnvKey(key string, trustedProviderEnvKeys []string) bool {
+	for _, candidate := range trustedProviderEnvKeys {
+		if credentialEnvKeyMatches(key, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveProjectRelativeConfigValues(values map[string]any, dotCodexDir string) {
+	if values == nil || strings.TrimSpace(dotCodexDir) == "" {
+		return
+	}
+	for _, key := range []string{"model_instructions_file"} {
+		value, ok := values[key].(string)
+		if !ok {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if value == "" || filepath.IsAbs(value) {
+			continue
+		}
+		values[key] = filepath.Join(dotCodexDir, value)
+	}
+}
+
+func resolveConfigFileRelativeValues(values map[string]any, baseDir string) {
+	if values == nil || strings.TrimSpace(baseDir) == "" {
+		return
+	}
+	resolveModelProviderAuthCWDValues(values, baseDir)
+	profiles, ok := values["profiles"].(map[string]any)
+	if !ok {
+		return
+	}
+	for _, rawProfile := range profiles {
+		profileValues, ok := rawProfile.(map[string]any)
+		if ok {
+			resolveModelProviderAuthCWDValues(profileValues, baseDir)
+		}
+	}
+}
+
+func resolveModelProviderAuthCWDValues(values map[string]any, baseDir string) {
+	rawProviders, ok := values["model_providers"].(map[string]any)
+	if !ok {
+		return
+	}
+	for _, rawProvider := range rawProviders {
+		providerValues, ok := rawProvider.(map[string]any)
+		if !ok {
+			continue
+		}
+		authValues, ok := providerValues["auth"].(map[string]any)
+		if !ok {
+			continue
+		}
+		cwd, ok := authValues["cwd"].(string)
+		if !ok || strings.TrimSpace(cwd) == "" {
+			authValues["cwd"] = filepath.Clean(baseDir)
+			continue
+		}
+		authValues["cwd"] = resolveConfigFileRelativePath(cwd, baseDir)
+	}
+}
+
+func resolveConfigFileRelativePath(value string, baseDir string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return filepath.Clean(baseDir)
+	}
+	if filepath.IsAbs(value) {
+		return filepath.Clean(value)
+	}
+	return filepath.Clean(filepath.Join(baseDir, value))
+}
+
+func applyProfileLayer(codexHome string, values map[string]any, profile string) error {
+	profilePath, err := ResolveProfileConfigPath(codexHome, profile)
+	if err != nil {
+		return err
+	}
+	profileValues, exists, err := loadConfigFileIfExists(profilePath)
+	if err != nil {
+		return err
+	}
+	if exists {
+		mergeConfigMaps(values, profileValues)
+		return nil
+	}
+	if legacyProfile, ok, err := legacyProfileValues(values, profile); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		mergeConfigMaps(values, legacyProfile)
+		return nil
+	}
+	return fmt.Errorf("profile %q not found", profile)
+}
+
+func legacyProfileValues(values map[string]any, profile string) (map[string]any, bool, error) {
+	profiles, ok := values["profiles"].(map[string]any)
+	if !ok {
+		return nil, false, nil
+	}
+	raw, ok := profiles[profile]
+	if !ok {
+		return nil, false, nil
+	}
+	profileValues, ok := raw.(map[string]any)
+	if !ok {
+		return nil, true, fmt.Errorf("profile %q is not a table", profile)
+	}
+	return profileValues, true, nil
+}
+
+func mergeConfigMaps(dst map[string]any, src map[string]any) {
+	if src == nil {
+		return
+	}
+	// Rust #47903: normalize the whole overlay before merging, then normalize
+	// base aliases only in tables the overlay reaches. Normalizing unrelated
+	// base tables in memory would desynchronize the returned config version from
+	// the file on disk.
+	overlay, _ := normalizeConfigKeyAliasesDeep(src, nil).(map[string]any)
+	mergeConfigMapsAt(dst, overlay, nil)
+}
+
+// normalizeConfigKeyAliasesDeep mirrors Rust `normalize_key_aliases`: it clones
+// the value and normalizes aliases in every table.
+func normalizeConfigKeyAliasesDeep(value any, path []string) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, child := range typed {
+			childPath := append(append([]string(nil), path...), key)
+			out[key] = normalizeConfigKeyAliasesDeep(child, childPath)
+		}
+		normalizeConfigKeyAliases(path, out)
+		return out
+	case []any:
+		out := make([]any, 0, len(typed))
+		for _, item := range typed {
+			out = append(out, normalizeConfigKeyAliasesDeep(item, path))
+		}
+		return out
+	default:
+		return cloneConfigValue(value)
+	}
+}
+
+func mergeConfigMapsAt(dst map[string]any, src map[string]any, path []string) {
+	for key, value := range src {
+		childPath := append(append([]string(nil), path...), key)
+		if _, ok := structuredFeatureName(childPath); ok {
+			// Mirrors Rust merge_toml_values_at_path's multi_agent_v2 handling
+			// (config/src/merge.rs): a legacy boolean toggle converts to an
+			// `enabled` field when merged with a nested table, in either
+			// direction, without discarding nested configuration.
+			if baseBool, ok := dst[key].(bool); ok {
+				if _, overlayIsMap := value.(map[string]any); overlayIsMap {
+					dst[key] = map[string]any{"enabled": baseBool}
+				}
+			} else if baseTable, ok := dst[key].(map[string]any); ok {
+				if overlayBool, ok := value.(bool); ok {
+					baseTable["enabled"] = overlayBool
+					continue
+				}
+			}
+		}
+		if key == "shell_environment_policy" {
+			if srcPolicy, ok := value.(map[string]any); ok {
+				basePolicy, _ := dst[key].(map[string]any)
+				dst[key] = mergeShellEnvironmentPolicy(basePolicy, srcPolicy)
+				continue
+			}
+		}
+		srcMap, srcIsMap := value.(map[string]any)
+		dstMap, dstIsMap := dst[key].(map[string]any)
+		if srcIsMap && dstIsMap {
+			if isCredentialProviderTablePath(childPath) {
+				// Mirrors Rust merge.rs (#44241): a higher-priority provider in
+				// features.network_proxy.credentials displaces lower-priority
+				// providers that declare an overlapping `env` source.
+				displaceCredentialProvidersBySource(dstMap, srcMap)
+			}
+			normalizeConfigKeyAliases(childPath, dstMap)
+			if isPermissionNetworkDomainsPath(childPath) {
+				// Mirrors Rust merge_toml_values (config/src/merge.rs
+				// normalize_network_domain_keys): permission network domain
+				// keys are normalized (trim, strip ports/brackets, lowercase,
+				// drop trailing dots) before overlaying so equivalent hosts
+				// in different layers land on the same key.
+				normalizeNetworkDomainKeys(dstMap)
+				normalizeNetworkDomainKeys(srcMap)
+			}
+			mergeConfigMapsAt(dstMap, srcMap, childPath)
+			continue
+		}
+		if srcIsMap {
+			if isPermissionNetworkDomainsPath(childPath) {
+				normalizeNetworkDomainKeys(srcMap)
+			}
+		}
+		dst[key] = cloneConfigValue(value)
+	}
+}
+
+func isMultiAgentV2FeaturePath(path []string) bool {
+	if len(path) == 2 && path[0] == "features" && path[1] == "multi_agent_v2" {
+		return true
+	}
+	return len(path) == 4 && path[0] == "profiles" && path[2] == "features" && path[3] == "multi_agent_v2"
+}
+
+// structuredFeatureName mirrors Rust is_structured_feature_path
+// (config/src/merge.rs): the named feature paths whose legacy boolean toggle
+// converts to an `enabled` field when merged with a nested table.
+func structuredFeatureName(path []string) (string, bool) {
+	feature := ""
+	switch {
+	case len(path) == 2 && path[0] == "features":
+		feature = path[1]
+	case len(path) == 4 && path[0] == "profiles" && path[2] == "features":
+		feature = path[3]
+	default:
+		return "", false
+	}
+	switch feature {
+	case "multi_agent_v2", "network_proxy", "sleep_tool":
+		return feature, true
+	default:
+		return "", false
+	}
+}
+
+// isCredentialProviderTablePath reports whether path points at the
+// features.network_proxy.credentials table (including the profile form).
+func isCredentialProviderTablePath(path []string) bool {
+	if len(path) < 2 || path[len(path)-1] != "credentials" {
+		return false
+	}
+	_, ok := structuredFeatureName(path[:len(path)-1])
+	if !ok {
+		return false
+	}
+	return path[len(path)-2] == "network_proxy"
+}
+
+// displaceCredentialProvidersBySource mirrors the #44241 merge rule: when an
+// overlay defines a provider with `env` sources, any lower-priority provider
+// (whose id is not redefined by the overlay) that declares an overlapping
+// source is removed. Windows compares environment names case-insensitively.
+func displaceCredentialProvidersBySource(base map[string]any, overlay map[string]any) {
+	for providerID, rawOverlay := range overlay {
+		overlayProvider, ok := rawOverlay.(map[string]any)
+		if !ok {
+			continue
+		}
+		overlaySources := stringSliceFromAny(overlayProvider["env"])
+		if len(overlaySources) == 0 {
+			continue
+		}
+		for existingID, rawExisting := range base {
+			if existingID == providerID {
+				continue
+			}
+			var existingSources []string
+			if overlayExisting, ok := overlay[existingID].(map[string]any); ok {
+				existingSources = stringSliceFromAny(overlayExisting["env"])
+			}
+			if len(existingSources) == 0 {
+				if existingProvider, ok := rawExisting.(map[string]any); ok {
+					existingSources = stringSliceFromAny(existingProvider["env"])
+				}
+			}
+			if credentialSourcesOverlap(existingSources, overlaySources) {
+				delete(base, existingID)
+			}
+		}
+	}
+}
+
+func credentialSourcesOverlap(existing []string, overlay []string) bool {
+	for _, existingSource := range existing {
+		for _, overlaySource := range overlay {
+			if existingSource == overlaySource {
+				return true
+			}
+			if runtime.GOOS == "windows" && strings.EqualFold(existingSource, overlaySource) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func stringSliceFromAny(value any) []string {
+	switch typed := value.(type) {
+	case []string:
+		return typed
+	case []any:
+		out := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if text, ok := item.(string); ok {
+				out = append(out, text)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func isPermissionNetworkDomainsPath(path []string) bool {
+	return len(path) == 4 && path[0] == "permissions" && path[2] == "network" && path[3] == "domains"
+}
+
+func normalizeNetworkDomainKeys(table map[string]any) {
+	for key, value := range table {
+		normalized := network.NormalizeProxyHost(key)
+		if normalized != key {
+			delete(table, key)
+			table[normalized] = value
+		}
+	}
+}
+
+// configKeyAlias mirrors Rust's `ConfigKeyAlias` (config/src/key_aliases.rs).
+// `canonical` may point at a nested path below the legacy key's containing
+// table (e.g. `tui.whimsy` -> `tui.effects.starfield`), so normalization can
+// create intermediate tables while moving the value.
+type configKeyAlias struct {
+	legacy    []string
+	canonical []string
+}
+
+// configKeyAliases mirrors Rust's `CONFIG_KEY_ALIASES` table.
+var configKeyAliases = []configKeyAlias{
+	{legacy: []string{"tui", "whimsy"}, canonical: []string{"tui", "effects", "starfield"}},
+	{legacy: []string{"memories", "no_memories_if_mcp_or_web_search"}, canonical: []string{"memories", "disable_on_external_context"}},
+	{legacy: []string{"agents", "max_threads"}, canonical: []string{"agents", "max_concurrent_threads_per_session"}},
+}
+
+// normalizeConfigKeyAliases mirrors Rust normalize_table_key_aliases
+// (config/src/key_aliases.rs): within the table reached by `path`, a legacy key
+// is moved to its canonical path (or_insert semantics - the canonical value wins
+// when both are present in the same layer), so an overlay's legacy key overrides
+// a base layer's canonical key exactly like Rust's merge_toml_values.
+//
+// Rust normalizes a whole layer ahead of merging (#47903/#47904) and applies the
+// subtree guard from #50354 ("alias normalization cannot affect subtrees outside
+// the registered legacy paths") so unrelated subtrees are cloned untouched. Go
+// normalizes each layer in place at the merge site, so the same guard is
+// expressed as an early return when `path` is not a prefix of any registered
+// legacy path.
+func normalizeConfigKeyAliases(path []string, table map[string]any) {
+	if len(table) == 0 || !configPathIsAliasPrefix(path) {
+		return
+	}
+	for _, alias := range configKeyAliases {
+		if len(alias.legacy) == 0 {
+			continue
+		}
+		tablePath := alias.legacy[:len(alias.legacy)-1]
+		legacyKey := alias.legacy[len(alias.legacy)-1]
+		if !stringSlicesEqual(tablePath, path) {
+			continue
+		}
+		if !stringSlicesHasPrefix(alias.canonical, tablePath) {
+			continue
+		}
+		canonicalPath := alias.canonical[len(tablePath):]
+		if len(canonicalPath) == 0 {
+			continue
+		}
+		legacyValue, ok := table[legacyKey]
+		if !ok {
+			continue
+		}
+		delete(table, legacyKey)
+		insertAtCanonicalPath(table, canonicalPath, legacyValue)
+	}
+}
+
+// configPathIsAliasPrefix reports whether `path` equals the first len(path)
+// elements of at least one registered legacy path (Rust's
+// `alias.legacy.get(..path.len())` equality check).
+func configPathIsAliasPrefix(path []string) bool {
+	for _, alias := range configKeyAliases {
+		if len(alias.legacy) < len(path) {
+			continue
+		}
+		if stringSlicesEqual(alias.legacy[:len(path)], path) {
+			return true
+		}
+	}
+	return false
+}
+
+// insertAtCanonicalPath inserts `value` at `canonicalPath` inside `table`,
+// creating intermediate tables as needed and keeping an existing canonical value
+// (Rust's `entry(..).or_insert(value)`). A non-table intermediate aborts the
+// insert, mirroring Rust's `continue 'aliases`.
+func insertAtCanonicalPath(table map[string]any, canonicalPath []string, value any) {
+	key := canonicalPath[len(canonicalPath)-1]
+	destination := table
+	for _, parent := range canonicalPath[:len(canonicalPath)-1] {
+		child, ok := destination[parent]
+		if !ok {
+			nested := map[string]any{}
+			destination[parent] = nested
+			destination = nested
+			continue
+		}
+		childTable, ok := child.(map[string]any)
+		if !ok {
+			return
+		}
+		destination = childTable
+	}
+	if _, exists := destination[key]; !exists {
+		destination[key] = value
+	}
+}
+
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func stringSlicesHasPrefix(value, prefix []string) bool {
+	if len(prefix) > len(value) {
+		return false
+	}
+	return stringSlicesEqual(value[:len(prefix)], prefix)
+}
+
+func cloneConfigValue(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for key, nested := range v {
+			out[key] = cloneConfigValue(nested)
+		}
+		return out
+	case []any:
+		out := make([]any, len(v))
+		for i := range v {
+			out[i] = cloneConfigValue(v[i])
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func stringMapFromConfigValue(value any) map[string]string {
+	values, ok := value.(map[string]any)
+	if !ok || len(values) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(values))
+	for key, raw := range values {
+		text, ok := raw.(string)
+		if !ok || strings.TrimSpace(key) == "" || strings.TrimSpace(text) == "" {
+			continue
+		}
+		out[key] = text
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func splitDottedPath(path string) []string {
+	if path == "" {
+		return nil
+	}
+	parts := splitDottedPathRespectingQuotes(path)
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = unquoteDottedPathPart(strings.TrimSpace(part))
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func unquoteDottedPathPart(part string) string {
+	if len(part) >= 2 && part[0] == '"' && part[len(part)-1] == '"' {
+		if value, err := strconv.Unquote(part); err == nil {
+			return value
+		}
+	}
+	return strings.Trim(part, "\"'")
+}
+
+func splitDottedPathRespectingQuotes(path string) []string {
+	var parts []string
+	var current strings.Builder
+	var quote rune
+	escaped := false
+	for _, ch := range path {
+		switch {
+		case escaped:
+			current.WriteRune(ch)
+			escaped = false
+		case ch == '\\' && quote != 0:
+			current.WriteRune(ch)
+			escaped = true
+		case quote != 0:
+			current.WriteRune(ch)
+			if ch == quote {
+				quote = 0
+			}
+		case ch == '"' || ch == '\'':
+			quote = ch
+			current.WriteRune(ch)
+		case ch == '.':
+			parts = append(parts, current.String())
+			current.Reset()
+		default:
+			current.WriteRune(ch)
+		}
+	}
+	parts = append(parts, current.String())
+	return parts
+}

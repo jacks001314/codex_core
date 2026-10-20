@@ -1,0 +1,469 @@
+package features
+
+import (
+	"fmt"
+	"runtime"
+	"sort"
+	"strings"
+)
+
+type Stage string
+
+const (
+	StageUnderDevelopment Stage = "under development"
+	StageExperimental     Stage = "experimental"
+	StageStable           Stage = "stable"
+	StageDeprecated       Stage = "deprecated"
+	StageRemoved          Stage = "removed"
+)
+
+// UseXAAKey is the feature key that enables enterprise refresh-token
+// authorization for configured MCP resources (Rust #44832).
+const UseXAAKey = "use_xaa"
+
+// remoteCompactionV2Key is the retired remote-compaction toggle that stays in
+// the model-client beta features header (Rust
+// `Session::build_model_client_beta_features_header`).
+const remoteCompactionV2Key = "remote_compaction_v2"
+
+type Spec struct {
+	Key                         string
+	Stage                       Stage
+	DefaultEnabled              bool
+	ExperimentalName            string
+	ExperimentalMenuDescription string
+	ExperimentalAnnouncement    string
+}
+
+var Registry = []Spec{
+	// Rust (codex-rs/features/src/lib.rs #45766): preview five-hour and weekly
+	// allowance history for consumer accounts in /analytics.
+	{
+		Key:                         "analytics_plan_history",
+		Stage:                       StageExperimental,
+		ExperimentalName:            "Analytics plan history",
+		ExperimentalMenuDescription: "Preview five-hour and weekly allowance history for consumer accounts in /analytics.",
+	},
+	// Rust (codex-rs/features/src/lib.rs #47179): automatic background-server
+	// startup was promoted to stable and is enabled by default; the
+	// experimental menu entry and announcement are gone.
+	{Key: "daemon_auto_start", Stage: StageStable, DefaultEnabled: true},
+	// Rust #54949: negotiated zstd app-server WebSocket/UDS compression is
+	// opt-in while the transport feature is under development.
+	{Key: "app_server_websocket_compression", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "undo", Stage: StageRemoved},
+	{Key: "shell_tool", Stage: StageStable, DefaultEnabled: true},
+	{Key: "secret_auth_storage", Stage: StageStable, DefaultEnabled: runtime.GOOS == "windows"},
+	// Rust (codex-rs/features/src/lib.rs d8d7ca73f8 #38625): unified exec is
+	// enabled by default on every platform, including Windows.
+	{Key: "unified_exec", Stage: StageStable, DefaultEnabled: true},
+	// Rust (codex-rs/features/src/lib.rs #42718): gate unified-exec TTY
+	// support behind a feature flag.
+	{Key: "unified_exec_tty", Stage: StageStable, DefaultEnabled: true},
+	{Key: "shell_zsh_fork", Stage: StageRemoved},
+	{Key: "sleep_tool", Stage: StageStable, DefaultEnabled: true},
+	{Key: "unified_exec_zsh_fork", Stage: StageRemoved, DefaultEnabled: false},
+	{Key: "shell_snapshot", Stage: StageStable, DefaultEnabled: true},
+	{Key: "shell_snapshot_v2", Stage: StageUnderDevelopment},
+	{Key: "deferred_executor", Stage: StageUnderDevelopment},
+	{Key: "js_repl", Stage: StageRemoved},
+	{Key: "executed_tool_call_metadata", Stage: StageUnderDevelopment},
+	// Rust (codex-rs/features/src/lib.rs) defines code_mode with
+	// default_enabled: false. An unset model tool_mode therefore resolves to
+	// direct mode unless code_mode is explicitly enabled; models that require
+	// code mode declare tool_mode in the catalog instead.
+	{Key: "code_mode", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "code_mode_buffered_exec", Stage: StageRemoved},
+	{Key: "code_mode_host", Stage: StageStable, DefaultEnabled: true},
+	// Rust (codex-rs/features/src/lib.rs 509565820f): terminate active code-mode
+	// cells when their turn is interrupted.
+	{Key: "code_mode_interrupt", Stage: StageStable, DefaultEnabled: true},
+	// Rust (codex-rs/features/src/lib.rs 95ec468619 #51690): place each tool
+	// description before its namespace description in Code Mode.
+	{Key: "code_mode_tool_description_first", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "code_mode_only", Stage: StageUnderDevelopment},
+	{Key: "js_repl_tools_only", Stage: StageRemoved},
+	{Key: "terminal_resize_reflow", Stage: StageRemoved, DefaultEnabled: true},
+	{Key: "web_search_request", Stage: StageDeprecated},
+	{Key: "web_search_cached", Stage: StageDeprecated},
+	{Key: "standalone_web_search", Stage: StageUnderDevelopment},
+	{Key: "search_tool", Stage: StageRemoved},
+	{Key: "codex_git_commit", Stage: StageRemoved},
+	{Key: "runtime_metrics", Stage: StageUnderDevelopment},
+	{Key: "sqlite", Stage: StageRemoved, DefaultEnabled: true},
+	{Key: "memories", Stage: StageStable},
+	{Key: "external_agent_memory_import", Stage: StageUnderDevelopment},
+	{Key: "local_thread_store_compression", Stage: StageUnderDevelopment},
+	{Key: "local_thread_store_shared_compression", Stage: StageRemoved},
+	{Key: "background_paginated_rollout_migration", Stage: StageUnderDevelopment},
+	{Key: "chronicle", Stage: StageUnderDevelopment},
+	{Key: "apply_patch_freeform", Stage: StageRemoved},
+	{Key: "apply_patch_streaming_events", Stage: StageUnderDevelopment},
+	// Rust (codex-rs/features/src/lib.rs #51203): removed compatibility flag.
+	// Patches always preserve existing line endings.
+	{Key: "apply_patch_preserve_line_endings", Stage: StageRemoved, DefaultEnabled: false},
+	{Key: "exec_permission_approvals", Stage: StageUnderDevelopment},
+	{Key: "hooks", Stage: StageStable, DefaultEnabled: true},
+	{Key: "request_permissions_tool", Stage: StageUnderDevelopment},
+	{Key: "use_linux_sandbox_bwrap", Stage: StageRemoved},
+	{Key: "use_legacy_landlock", Stage: StageDeprecated},
+	{Key: "request_rule", Stage: StageRemoved},
+	{Key: "experimental_windows_sandbox", Stage: StageRemoved},
+	// Rust (codex-rs/features/src/lib.rs #42353): managed Windows sandbox
+	// service provisioning.
+	{Key: "windows_sandbox_service", Stage: StageUnderDevelopment},
+	{Key: "elevated_windows_sandbox", Stage: StageRemoved},
+	{Key: "remote_models", Stage: StageRemoved},
+	// Rust (codex-rs/features/src/lib.rs #44392, promoted by 7d4c7a0767
+	// #49807): API-key model discovery is stable and enabled by default while
+	// explicit user opt-outs and provider catalog requirements still apply.
+	{Key: "api_key_model_discovery", Stage: StageStable, DefaultEnabled: true},
+	{Key: "enable_request_compression", Stage: StageStable, DefaultEnabled: true},
+	{
+		Key:                         "network_proxy",
+		Stage:                       StageExperimental,
+		ExperimentalName:            "Network proxy",
+		ExperimentalMenuDescription: "Apply network proxy restrictions to sandboxed sessions that already have network access.",
+		ExperimentalAnnouncement:    "NEW: Network proxy can now be enabled from /experimental. Restart Codex after enabling it.",
+	},
+	{Key: "respect_system_proxy", Stage: StageUnderDevelopment},
+	// Rust (codex-rs/features/src/lib.rs #46562): retry eligible bootstrap
+	// requests through the system proxy after normal routing fails.
+	{Key: "system_proxy_fallback", Stage: StageStable, DefaultEnabled: true},
+	{Key: "multi_agent", Stage: StageStable, DefaultEnabled: true},
+	{Key: "multi_agent_v2", Stage: StageStable},
+	{Key: "multi_agent_mode", Stage: StageRemoved},
+	// Rust (codex-rs/features/src/lib.rs #50082): inherit client-defined
+	// dynamic tools in fresh V2 subagents (disabled by default).
+	{Key: "multi_agent_v2_dynamic_tools", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs #47913): keep sampling through
+	// reasoning and commentary boundaries when agent mail arrives; pending mail
+	// is delivered at the next normal input boundary instead.
+	{Key: "defer_mailbox_preemption", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust #54961: queue-only agent messages may start a new turn for a
+	// completed root session. Interrupted sessions, Plan mode, and child agents
+	// remain queue-only.
+	{Key: "wake_on_agent_messages", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs #48135): yield foreground code-mode
+	// observations when new user input arrives, so a queued message is delivered
+	// while the cell keeps running.
+	{Key: "instant_interrupt", Stage: StageUnderDevelopment, DefaultEnabled: true},
+	// Rust (codex-rs/features/src/lib.rs #47946): shared discussion tools for an
+	// agent tree (the in-memory agent message board).
+	{Key: "agent_message_board", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "enable_fanout", Stage: StageRemoved},
+	{Key: "apps", Stage: StageStable, DefaultEnabled: true},
+	{Key: "enable_mcp_apps", Stage: StageUnderDevelopment},
+	{Key: "mcp_2026_07_28", Stage: StageUnderDevelopment},
+	// Rust (codex-rs/features/src/lib.rs eb680c0558 #44318): hosted Codex Apps
+	// get an independent MCP protocol opt-in.
+	{Key: "codex_apps_mcp_2026_07_28", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs #54656): honor ordinary MCP server
+	// tools/list_changed notifications within a turn.
+	{Key: "mcp_tool_list_changed", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs #42413): coordinated MCP OAuth
+	// refresh across servers sharing an account.
+	{Key: "mcp_oauth_refresh_coordination", Stage: StageUnderDevelopment},
+	// Rust (codex-rs/features/src/lib.rs #44832): enterprise refresh-token
+	// authorization for configured MCP resources; opt-in must come from a
+	// non-project config layer or a managed requirement.
+	{Key: UseXAAKey, Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "apps_mcp_path_override", Stage: StageRemoved},
+	{Key: "tool_search", Stage: StageRemoved},
+	{Key: "tool_search_always_defer_mcp_tools", Stage: StageRemoved, DefaultEnabled: true},
+	{Key: "deferred_tool_world_state", Stage: StageUnderDevelopment},
+	// Rust (codex-rs/features/src/lib.rs #50464): track top-level tool
+	// definitions in world state and emit incremental context updates.
+	{Key: "incremental_tools", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "non_prefixed_mcp_tool_names", Stage: StageUnderDevelopment},
+	{Key: "omit_app_server_notification_media", Stage: StageUnderDevelopment},
+	{Key: "unavailable_dummy_tools", Stage: StageRemoved},
+	{Key: "tool_suggest", Stage: StageStable, DefaultEnabled: true},
+	{Key: "recommended_plugins", Stage: StageStable, DefaultEnabled: false},
+	{Key: "plugins", Stage: StageStable, DefaultEnabled: true},
+	{Key: "powershell_shell_version", Stage: StageUnderDevelopment},
+	{Key: "executor_capability_discovery", Stage: StageUnderDevelopment},
+	{Key: "plugin_hooks", Stage: StageRemoved},
+	{Key: "in_app_browser", Stage: StageStable, DefaultEnabled: true},
+	{Key: "in_app_chat", Stage: StageStable, DefaultEnabled: true},
+	{Key: "in_app_dictation", Stage: StageStable, DefaultEnabled: true},
+	{Key: "in_app_updates", Stage: StageStable, DefaultEnabled: true},
+	{Key: "browser_use", Stage: StageStable, DefaultEnabled: true},
+	{Key: "browser_use_full_cdp_access", Stage: StageStable, DefaultEnabled: true},
+	{Key: "browser_use_external", Stage: StageStable, DefaultEnabled: true},
+	{Key: "computer_use", Stage: StageStable, DefaultEnabled: true},
+	{Key: "remote_plugin", Stage: StageStable, DefaultEnabled: true},
+	{Key: "plugin_sharing", Stage: StageStable, DefaultEnabled: true},
+	{Key: "external_migration", Stage: StageRemoved},
+	{Key: "image_generation", Stage: StageStable, DefaultEnabled: true},
+	{Key: "view_image", Stage: StageStable, DefaultEnabled: true},
+	{Key: "image_resize_notice", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "unified_image_budget", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "resize_all_images", Stage: StageRemoved, DefaultEnabled: true},
+	{Key: "item_ids", Stage: StageRemoved, DefaultEnabled: true},
+	{Key: "concurrent_reasoning_summaries", Stage: StageUnderDevelopment},
+	{Key: "skill_mcp_dependency_install", Stage: StageStable, DefaultEnabled: true},
+	{Key: "skill_search", Stage: StageStable, DefaultEnabled: true},
+	{Key: "skill_env_var_dependency_prompt", Stage: StageRemoved},
+	{Key: "mentions_v2", Stage: StageStable, DefaultEnabled: true},
+	{Key: "steer", Stage: StageRemoved, DefaultEnabled: true},
+	{Key: "default_mode_request_user_input", Stage: StageUnderDevelopment},
+	// Rust (codex-rs/features/src/lib.rs #39625): cwd-relative turn diff paths.
+	{Key: "cwd_relative_turn_diffs", Stage: StageUnderDevelopment},
+	{Key: "terminal_visualization_instructions", Stage: StageUnderDevelopment},
+	// Rust (codex-rs/features/src/lib.rs #39288/#39452): the async user
+	// message feature gate was registered then retired; the tool itself is
+	// unconditionally available.
+	{Key: "send_async_message", Stage: StageRemoved},
+	// Rust (codex-rs/features/src/lib.rs #45124): let root agents use the
+	// free-form send_message_to_user_async tool without model catalog support.
+	{Key: "send_message_to_user_async", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "guardian_approval", Stage: StageStable, DefaultEnabled: true},
+	{Key: "guardian_enhanced_node_repl_transcripts", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "guardian_node_repl_transcript_images", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs #46522): reuse encrypted parent
+	// compaction when restarting Guardian review sessions. Promoted to stable
+	// and enabled by default.
+	{Key: "guardian_reuse_parent_compaction", Stage: StageStable, DefaultEnabled: true},
+	// Rust (codex-rs/features/src/lib.rs e4ce83419b #43104): retain thread
+	// context for Guardian reviews; renamed from guardian_thread_context into
+	// the guardianv2 configuration namespace.
+	// Rust (codex-rs/features/src/lib.rs #47686/#47688/#47689/#47690): the
+	// flag was promoted to stable/default-on and then retired - thread-owned
+	// Guardian context capture is unconditional, and the key is kept as a
+	// removed compatibility no-op.
+	{Key: "guardianv2.thread_context", Stage: StageRemoved, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs #45679): the extension-owned
+	// synchronous Guardian reviewer prototype was retired; the flag is kept as
+	// a removed compatibility no-op.
+	{Key: "guardian_ext", Stage: StageRemoved, DefaultEnabled: false},
+	{Key: "guardianv2", Stage: StageUnderDevelopment},
+	{Key: "goals", Stage: StageStable, DefaultEnabled: true},
+	{Key: "token_budget", Stage: StageUnderDevelopment},
+	{Key: "rollout_budget", Stage: StageUnderDevelopment},
+	// Rust (codex-rs/features/src/lib.rs #43795): pin reasoning effort while
+	// configuration overrides are active.
+	{Key: "reasoning_effort_override", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "current_time_reminder", Stage: StageUnderDevelopment},
+	// Rust (codex-rs/features/src/lib.rs #45825): report failed clock reads to
+	// the model without failing the turn.
+	{Key: "nonfatal_clock_read_errors", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "collaboration_modes", Stage: StageRemoved, DefaultEnabled: true},
+	{Key: "tool_call_mcp_elicitation", Stage: StageStable, DefaultEnabled: true},
+	{Key: "auth_elicitation", Stage: StageStable, DefaultEnabled: true},
+	// Rust (codex-rs/features/src/lib.rs #45809): the personality feature flag
+	// was retired; friendly/pragmatic no longer select a style and the flag is
+	// kept as a removed compatibility no-op.
+	{Key: "personality", Stage: StageRemoved, DefaultEnabled: false},
+	{Key: "artifact", Stage: StageUnderDevelopment},
+	{Key: "fast_mode", Stage: StageStable, DefaultEnabled: true},
+	{Key: "realtime_conversation", Stage: StageRemoved, DefaultEnabled: true},
+	{Key: "remote_control", Stage: StageRemoved},
+	{Key: "image_detail_original", Stage: StageRemoved},
+	{Key: "tui_app_server", Stage: StageRemoved, DefaultEnabled: true},
+	{
+		Key:                         "prevent_idle_sleep",
+		Stage:                       preventIdleSleepStage(),
+		ExperimentalName:            "Prevent sleep while running",
+		ExperimentalMenuDescription: "Keep your computer awake while Codex is running a thread.",
+		ExperimentalAnnouncement:    "NEW: Prevent sleep while running is now available in /experimental.",
+	},
+	{Key: "workspace_owner_usage_nudge", Stage: StageRemoved},
+	{Key: "responses_websockets", Stage: StageRemoved},
+	{Key: "responses_websockets_v2", Stage: StageRemoved},
+	// Rust (codex-rs/features/src/lib.rs): remote compaction v2 is retired as a
+	// toggle - Stage::Removed, disabled, and skipped by `apply_map` - while the
+	// model-client beta header still advertises it unconditionally.
+	{Key: remoteCompactionV2Key, Stage: StageRemoved},
+	// Rust (codex-rs/features/src/lib.rs da898490fc #38601): keep active
+	// sampling turns alive until a failed network connection recovers.
+	{Key: "unbounded_connection_retries", Stage: StageStable, DefaultEnabled: true},
+	// Rust (codex-rs/features/src/lib.rs 1ad4397821): retain client-authored
+	// developer messages across compacted context windows.
+	{Key: "retain_client_developer_messages", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "use_agent_identity", Stage: StageUnderDevelopment},
+	{Key: "workspace_dependencies", Stage: StageStable, DefaultEnabled: true},
+	// Rust (codex-rs/features/src/lib.rs #42196, #44870): managed Git
+	// worktrees; stable and enabled by default since #44870.
+	{Key: "worktrees", Stage: StageRemoved, DefaultEnabled: true},
+	{Key: "psp", Stage: StageUnderDevelopment},
+	// Rust (codex-rs/features/src/lib.rs f5420174da): feature-key surface frozen
+	// during the sync26 static re-target.
+	// Rust (codex-rs/features/src/lib.rs #46849): the fullscreen transcript
+	// control moved into the TUI configuration; the flag is deprecated.
+	{Key: "transcript_v2", Stage: StageDeprecated, DefaultEnabled: false},
+	{Key: "content_item_kinds", Stage: StageStable, DefaultEnabled: true},
+	{Key: "code_mode_prewarm", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "skip_host_skill_discovery", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "in_app_local_automation", Stage: StageStable, DefaultEnabled: true},
+	{Key: "bedrock_setup_wizard", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "step_model_switching", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs 307ce6cda9): write_stdin_approval
+	// added; compaction_image_budget promoted to stable/default-on (sync28).
+	// Rust #47799 ("Enable terminal input approval by default") then promoted
+	// write_stdin_approval to stable and enabled it by default.
+	{Key: "write_stdin_approval", Stage: StageStable, DefaultEnabled: true},
+	{Key: "compaction_image_budget", Stage: StageStable, DefaultEnabled: true},
+	// Rust (codex-rs/features/src/lib.rs #47375): opt into the local MXC
+	// sandbox as the preferred Windows sandbox backend.
+	{Key: "prefer_mxc", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs #42385): experimental context
+	// management activation.
+	{Key: "context_management", Stage: StageUnderDevelopment},
+	// Rust (codex-rs/features/src/lib.rs 17a9df60e4 #49403): keep bundled
+	// tools such as ripgrep available when login shell startup resets PATH.
+	{
+		Key:                         "login_shell_package_path",
+		Stage:                       StageExperimental,
+		ExperimentalName:            "Bundled tools in login shells",
+		ExperimentalMenuDescription: "Keep bundled tools such as ripgrep available when login shell startup resets PATH.",
+		ExperimentalAnnouncement:    "",
+	},
+	// Rust (codex-rs/features/src/lib.rs 335c7f8eca #50962): gate stable
+	// environment tool exposure behind a feature flag.
+	{Key: "stable_environment_tools", Stage: StageRemoved, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs #54741 `6d8b4c7479`): opt-in
+	// multi-environment file copying, under development and off by default. The
+	// Go host installs the tool only when this feature is enabled
+	// (appserver/runtime_router.go, exec/exec.go).
+	{Key: "multi_env_copy_file", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs 4d15794336 #51209): ranked tool
+	// discovery for JavaScript code mode.
+	{Key: "code_mode_tool_search", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs 58ae3ba611 #50687): keep third-party
+	// tools deferred in strict Code Mode Only.
+	{Key: "code_mode_only_strict_3p_tools", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs 5ad6891696 #51207): gate the CLI
+	// Daybreak controls and model selection behind an opt-in.
+	{Key: "cli_daybreak", Stage: StageStable, DefaultEnabled: true},
+	// Rust (codex-rs/features/src/lib.rs 7c35e1551f #49406): explicit cyber
+	// access programs with OpenAI API keys.
+	{Key: "api_key_cyber_access_programs", Stage: StageStable, DefaultEnabled: true},
+	// Rust (codex-rs/features/src/lib.rs 2e5fea64ee #49560): opt-in model
+	// catalog in multi-agent context.
+	{Key: "model_catalog_in_context", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs 3bbf8ec3a1 #49784): requirements gate
+	// for the browser annotation API.
+	{Key: "browser_annotation_api", Stage: StageStable, DefaultEnabled: true},
+	// Rust (codex-rs/features/src/lib.rs 6996cde697 #49683): managed feature
+	// gate for in-app voice.
+	{Key: "in_app_voice", Stage: StageStable, DefaultEnabled: true},
+	// Rust (codex-rs/features/src/lib.rs 6288753b46 #49057): handoff-aware root
+	// context for Guardian reviews.
+	{Key: "guardian_root_handoff_context", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs 41ed72c32b #49036): opt-in
+	// conversation history retrieval for Guardian reviews.
+	{Key: "guardian_conversation_history_tools", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs 59f18e8133 #50099): opt-in Decisions
+	// comparison for Guardian V2.
+	{Key: "guardianv2_decisions_comparison", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs 7ac954ea24 #51253): enforce the Fast
+	// and Ultra Fast service-tier policies independently.
+	{Key: "ultrafast_mode", Stage: StageStable, DefaultEnabled: true},
+	// Rust (codex-rs/features/src/lib.rs 4eb4a65407): round-90 pin re-anchor.
+	// The eight specs below are registered surface-only, all UnderDevelopment
+	// and disabled by default in Rust; behaviour work is tracked separately.
+	{Key: "async_compaction", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "code_mode_host_grpc", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "credential_masking", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "executor_capability_discovery_v2", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "guardian_trust_orchestrator_connectors", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "output_token_replay", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "retain_client_tool_outputs", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "subagent_default_context_limits", Stage: StageUnderDevelopment, DefaultEnabled: false},
+}
+
+func preventIdleSleepStage() Stage {
+	switch runtime.GOOS {
+	case "darwin", "linux", "windows":
+		return StageExperimental
+	default:
+		return StageUnderDevelopment
+	}
+}
+
+func Known(key string) bool {
+	_, ok := CanonicalKey(key)
+	return ok
+}
+
+func Validate(key string) error {
+	if Known(key) {
+		return nil
+	}
+	return fmt.Errorf("Unknown feature flag: %s", key)
+}
+
+// StageFor returns the feature's stage, or StageStable for unknown keys.
+// Mirrors Rust's feature registry lookup used by the under-development
+// feature warning.
+func StageFor(key string) Stage {
+	if spec, ok := byKey()[key]; ok {
+		return spec.Stage
+	}
+	return StageStable
+}
+
+func Defaults() map[string]bool {
+	out := make(map[string]bool, len(Registry))
+	for _, spec := range Registry {
+		out[spec.Key] = spec.DefaultEnabled
+	}
+	return out
+}
+
+func Enabled(settings map[string]bool, key string) bool {
+	defaults := Defaults()
+	enabled := defaults[key]
+	if value, ok := settings[key]; ok {
+		enabled = value
+	}
+	return enabled
+}
+
+// PluginRecommendationsEnabled reports whether apps/plugins and either
+// plugin-suggestion surface are enabled (Rust
+// Features::plugin_recommendations_enabled, #41375).
+func PluginRecommendationsEnabled(settings map[string]bool) bool {
+	return Enabled(settings, "apps") &&
+		Enabled(settings, "plugins") &&
+		(Enabled(settings, "tool_suggest") || Enabled(settings, "recommended_plugins"))
+}
+
+func ModelClientBetaFeaturesHeader(settings map[string]bool) string {
+	effective := Defaults()
+	for key, enabled := range settings {
+		effective[key] = enabled
+	}
+	keys := []string{}
+	for _, spec := range Registry {
+		// Rust build_model_client_beta_features_header: remote compaction stays
+		// advertised unconditionally; the other entries are experimental
+		// features the user has enabled.
+		if spec.Key == remoteCompactionV2Key {
+			keys = append(keys, spec.Key)
+			continue
+		}
+		if spec.Stage != StageExperimental || !effective[spec.Key] {
+			continue
+		}
+		keys = append(keys, spec.Key)
+	}
+	return strings.Join(keys, ",")
+}
+
+func Sorted() []Spec {
+	out := append([]Spec(nil), Registry...)
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Key < out[j].Key
+	})
+	return out
+}
+
+func byKey() map[string]Spec {
+	out := make(map[string]Spec, len(Registry))
+	for _, spec := range Registry {
+		out[spec.Key] = spec
+	}
+	return out
+}

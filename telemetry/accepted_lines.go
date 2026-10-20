@@ -1,0 +1,117 @@
+package telemetry
+
+import (
+	"context"
+	"crypto/sha1"
+	"fmt"
+	"strings"
+)
+
+type AcceptedLineFingerprint struct {
+	PathHash string `json:"path_hash"`
+	LineHash string `json:"line_hash"`
+}
+
+type AcceptedLineFingerprintsEventSink interface {
+	TrackCodexAcceptedLineFingerprintsEvent(context.Context, CodexAcceptedLineFingerprintsEventRequest)
+}
+
+type AcceptedLineFingerprintSummary struct {
+	AcceptedAddedLines   uint64                    `json:"accepted_added_lines"`
+	AcceptedDeletedLines uint64                    `json:"accepted_deleted_lines"`
+	LineFingerprints     []AcceptedLineFingerprint `json:"line_fingerprints"`
+}
+
+type AcceptedLineFingerprintEventInput struct {
+	EventType            string
+	TurnID               string
+	ThreadID             string
+	ProductSurface       *string
+	ModelSlug            *string
+	CompletedAt          uint64
+	RepoHash             *string
+	AcceptedAddedLines   uint64
+	AcceptedDeletedLines uint64
+	LineFingerprints     []AcceptedLineFingerprint
+}
+
+type CodexAcceptedLineFingerprintsEventRequest struct {
+	EventType string                              `json:"event_type"`
+	Params    AcceptedLineFingerprintsEventParams `json:"event_params"`
+}
+
+type AcceptedLineFingerprintsEventParams struct {
+	EventType            string                    `json:"event_type"`
+	TurnID               string                    `json:"turn_id"`
+	ThreadID             string                    `json:"thread_id"`
+	ProductSurface       *string                   `json:"product_surface"`
+	ModelSlug            *string                   `json:"model_slug"`
+	CompletedAt          uint64                    `json:"completed_at"`
+	RepoHash             *string                   `json:"repo_hash"`
+	AcceptedAddedLines   uint64                    `json:"accepted_added_lines"`
+	AcceptedDeletedLines uint64                    `json:"accepted_deleted_lines"`
+	LineFingerprints     []AcceptedLineFingerprint `json:"line_fingerprints"`
+}
+
+// AcceptedLineFingerprintsFromUnifiedDiff counts accepted added/deleted lines
+// without generating per-line fingerprints (Rust #38473). The payload keeps a
+// statically empty line_fingerprints field for schema compatibility.
+func AcceptedLineFingerprintsFromUnifiedDiff(diff string) AcceptedLineFingerprintSummary {
+	inHunk := false
+	var summary AcceptedLineFingerprintSummary
+	for _, line := range strings.Split(strings.ReplaceAll(diff, "\r\n", "\n"), "\n") {
+		if strings.HasPrefix(line, "diff --git ") {
+			inHunk = false
+			continue
+		}
+		if strings.HasPrefix(line, "@@ ") {
+			inHunk = true
+			continue
+		}
+		if !inHunk && (strings.HasPrefix(line, "+++ ") || strings.HasPrefix(line, "--- ")) {
+			continue
+		}
+		if strings.HasPrefix(line, "+") {
+			summary.AcceptedAddedLines++
+			continue
+		}
+		if strings.HasPrefix(line, "-") {
+			summary.AcceptedDeletedLines++
+		}
+	}
+	return summary
+}
+
+func AcceptedLineFingerprintEventRequests(input *AcceptedLineFingerprintEventInput) []CodexAcceptedLineFingerprintsEventRequest {
+	if input == nil {
+		return nil
+	}
+	eventType := strings.TrimSpace(input.EventType)
+	if eventType == "" {
+		eventType = "codex.accepted_line_fingerprints"
+	}
+	return []CodexAcceptedLineFingerprintsEventRequest{{
+		EventType: "codex_accepted_line_fingerprints",
+		Params: AcceptedLineFingerprintsEventParams{
+			EventType:            eventType,
+			TurnID:               input.TurnID,
+			ThreadID:             input.ThreadID,
+			ProductSurface:       input.ProductSurface,
+			ModelSlug:            input.ModelSlug,
+			CompletedAt:          input.CompletedAt,
+			RepoHash:             input.RepoHash,
+			AcceptedAddedLines:   input.AcceptedAddedLines,
+			AcceptedDeletedLines: input.AcceptedDeletedLines,
+			LineFingerprints:     []AcceptedLineFingerprint{},
+		},
+	}}
+}
+
+func FingerprintHash(domain string, value string) string {
+	hasher := sha1.New()
+	hasher.Write([]byte("file-line-v1\x00"))
+	hasher.Write([]byte(domain))
+	hasher.Write([]byte("\x00"))
+	hasher.Write([]byte(value))
+	return fmt.Sprintf("%x", hasher.Sum(nil))
+}

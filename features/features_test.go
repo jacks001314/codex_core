@@ -1,0 +1,339 @@
+package features
+
+import "testing"
+
+func TestKnownFeature(t *testing.T) {
+	if !Known("unified_exec") {
+		t.Fatal("unified_exec should be known")
+	}
+	if !Known("experimental_use_unified_exec_tool") {
+		t.Fatal("legacy experimental_use_unified_exec_tool should be known")
+	}
+	if Known("does_not_exist") {
+		t.Fatal("does_not_exist should not be known")
+	}
+	if err := Validate("does_not_exist"); err == nil || err.Error() != "Unknown feature flag: does_not_exist" {
+		t.Fatalf("Validate unknown error = %v", err)
+	}
+}
+
+func TestPluginRecommendationsEnabledLikeRust(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		values map[string]bool
+		want   bool
+	}{
+		{name: "tool suggest", values: map[string]bool{"apps": true, "plugins": true, "tool_suggest": true}, want: true},
+		{name: "recommended plugins", values: map[string]bool{"apps": true, "plugins": true, "recommended_plugins": true}, want: true},
+		{name: "both disabled", values: map[string]bool{"apps": true, "plugins": true, "tool_suggest": false, "recommended_plugins": false}, want: false},
+		{name: "apps disabled", values: map[string]bool{"apps": false, "plugins": true, "tool_suggest": true}, want: false},
+		{name: "plugins disabled", values: map[string]bool{"apps": true, "plugins": false, "recommended_plugins": true}, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := PluginRecommendationsEnabled(test.values); got != test.want {
+				t.Fatalf("PluginRecommendationsEnabled(%#v) = %v, want %v", test.values, got, test.want)
+			}
+		})
+	}
+}
+
+func TestIncrementalToolsFeatureRegisteredLikeRust(t *testing.T) {
+	// Rust (codex-rs/features/src/lib.rs #50464): an under-development,
+	// default-disabled flag exposed for top-level and profile feature settings.
+	if !Known("incremental_tools") {
+		t.Fatal("incremental_tools should be known")
+	}
+	if got := StageFor("incremental_tools"); got != StageUnderDevelopment {
+		t.Fatalf("StageFor(incremental_tools) = %q, want %q", got, StageUnderDevelopment)
+	}
+	if Defaults()["incremental_tools"] {
+		t.Fatal("incremental_tools default = true, want false")
+	}
+}
+
+// TestCodeModeToolDescriptionFirstRegisteredLikeRust pins Rust #51690, which
+// registers an under-development, default-disabled flag for placing each tool
+// description before its namespace description in Code Mode.
+func TestCodeModeToolDescriptionFirstRegisteredLikeRust(t *testing.T) {
+	const key = "code_mode_tool_description_first"
+	if !Known(key) {
+		t.Fatalf("%s should be known", key)
+	}
+	for _, spec := range Registry {
+		if spec.Key == key {
+			if spec.Stage != StageUnderDevelopment || spec.DefaultEnabled {
+				t.Fatalf("%s spec = %#v, want under development and disabled by default", key, spec)
+			}
+			return
+		}
+	}
+	t.Fatalf("%s is missing from Registry", key)
+}
+
+func TestSorted(t *testing.T) {
+	sorted := Sorted()
+	if len(sorted) != len(Registry) {
+		t.Fatalf("len(Sorted) = %d, want %d", len(sorted), len(Registry))
+	}
+	for i := 1; i < len(sorted); i++ {
+		if sorted[i-1].Key > sorted[i].Key {
+			t.Fatalf("features not sorted at %d: %q > %q", i, sorted[i-1].Key, sorted[i].Key)
+		}
+	}
+}
+
+func TestDefaultsIncludesStableShellTool(t *testing.T) {
+	defaults := Defaults()
+	if !defaults["shell_tool"] {
+		t.Fatal("shell_tool default = false, want true")
+	}
+	if !defaults["in_app_updates"] {
+		t.Fatal("in_app_updates default = false, want true")
+	}
+	if !defaults["in_app_chat"] {
+		t.Fatal("in_app_chat default = false, want true (Rust #39045 stable gate)")
+	}
+	if !defaults["in_app_dictation"] {
+		t.Fatal("in_app_dictation default = false, want true (Rust #39045 stable gate)")
+	}
+	if defaults["recommended_plugins"] {
+		t.Fatal("recommended_plugins default = true, want false")
+	}
+	if !defaults["code_mode_host"] {
+		t.Fatal("code_mode_host default = false, want true")
+	}
+	if defaults["code_mode"] {
+		t.Fatal("code_mode default = true, want false (Rust default_enabled: false)")
+	}
+	if defaults["retain_client_developer_messages"] {
+		t.Fatal("retain_client_developer_messages default = true, want false (Rust default_enabled: false)")
+	}
+	if !defaults["unified_exec"] {
+		t.Fatal("unified_exec default = false, want true on all platforms (Rust #38625)")
+	}
+	if !defaults["unbounded_connection_retries"] {
+		t.Fatal("unbounded_connection_retries default = false, want true (Rust #38601)")
+	}
+	for _, spec := range Registry {
+		if spec.Key == "code_mode_host" && spec.Stage != StageStable {
+			t.Fatalf("code_mode_host stage = %q, want %q", spec.Stage, StageStable)
+		}
+		if spec.Key == "unbounded_connection_retries" && spec.Stage != StageStable {
+			t.Fatalf("unbounded_connection_retries stage = %q, want %q", spec.Stage, StageStable)
+		}
+	}
+}
+
+// TestRealtimeConversationFeatureIsRemovedAndOnLikeRust pins the round-90 pin
+// re-anchor: the upstream registry marks realtime_conversation as removed while
+// keeping it enabled by default (Rust features/src/lib.rs Stage::Removed,
+// default_enabled = true). Go consumes this key only through the feature
+// registry (voice RPCs stay gated by the experimental API capability), so the
+// registry metadata is the alignment.
+func TestRealtimeConversationFeatureIsRemovedAndOnLikeRust(t *testing.T) {
+	if !Known("realtime_conversation") {
+		t.Fatal("realtime_conversation should be known")
+	}
+	if !Defaults()["realtime_conversation"] {
+		t.Fatal("realtime_conversation default = false, want true (Rust #44921)")
+	}
+	for _, spec := range Registry {
+		if spec.Key == "realtime_conversation" {
+			if spec.Stage != StageRemoved || !spec.DefaultEnabled {
+				t.Fatalf("realtime_conversation spec = %#v, want removed and enabled by default", spec)
+			}
+			return
+		}
+	}
+	t.Fatal("realtime_conversation is missing from Registry")
+}
+
+func TestRetainClientDeveloperMessagesFeatureMatchesRust(t *testing.T) {
+	if !Known("retain_client_developer_messages") {
+		t.Fatal("retain_client_developer_messages should be known")
+	}
+	for _, spec := range Registry {
+		if spec.Key == "retain_client_developer_messages" {
+			if spec.Stage != StageUnderDevelopment || spec.DefaultEnabled {
+				t.Fatalf("retain_client_developer_messages spec = %#v, want under development and disabled by default", spec)
+			}
+			return
+		}
+	}
+	t.Fatal("retain_client_developer_messages is missing from Registry")
+}
+
+func TestModelClientBetaFeaturesHeader(t *testing.T) {
+	header := ModelClientBetaFeaturesHeader(map[string]bool{"memories": true, "shell_tool": true})
+	if header != "remote_compaction_v2" {
+		t.Fatalf("header = %q", header)
+	}
+
+	// Rust build_model_client_beta_features_header advertises remote compaction
+	// unconditionally, and apply_map ignores the retired toggle, so an explicit
+	// false cannot remove it.
+	header = ModelClientBetaFeaturesHeader(map[string]bool{"remote_compaction_v2": false})
+	if header != "remote_compaction_v2" {
+		t.Fatalf("header with the retired toggle cleared = %q", header)
+	}
+
+	// Enabled experimental features are advertised in registry order.
+	header = ModelClientBetaFeaturesHeader(map[string]bool{"network_proxy": true})
+	if header != "network_proxy,remote_compaction_v2" {
+		t.Fatalf("header with an enabled experiment = %q", header)
+	}
+
+	var spec *Spec
+	for i := range Registry {
+		if Registry[i].Key == "remote_compaction_v2" {
+			spec = &Registry[i]
+		}
+	}
+	if spec == nil {
+		t.Fatal("remote_compaction_v2 is missing from Registry")
+	}
+	if spec.Stage != StageRemoved || spec.DefaultEnabled {
+		t.Fatalf("remote_compaction_v2 spec = %#v, want removed and disabled by default", *spec)
+	}
+}
+
+// TestResolveSettingsIgnoresRetiredTogglesLikeRust covers Rust's `apply_map`
+// skip list: a config entry for a retired feature is recorded but never applied.
+func TestResolveSettingsIgnoresRetiredTogglesLikeRust(t *testing.T) {
+	settings, _ := ResolveSettings(map[string]any{
+		"remote_compaction_v2": true,
+		"item_ids":             false,
+		"memories":             true,
+	})
+	if _, ok := settings["remote_compaction_v2"]; ok {
+		t.Fatalf("remote_compaction_v2 toggle was applied: %#v", settings)
+	}
+	if _, ok := settings["item_ids"]; ok {
+		t.Fatalf("item_ids toggle was applied: %#v", settings)
+	}
+	if !settings["memories"] {
+		t.Fatalf("memories = %#v, want the surviving toggle applied", settings)
+	}
+}
+
+func TestResolveSettingsCanonicalizesLegacyAliases(t *testing.T) {
+	settings, usages := ResolveSettings(map[string]any{
+		"codex_hooks":           false,
+		"web_search":            true,
+		"web_search_request":    false,
+		"use_legacy_landlock":   true,
+		"remote_control":        true,
+		"code_mode_only":        true,
+		"current_time_reminder": map[string]any{"enabled": true},
+	})
+	if settings["hooks"] {
+		t.Fatalf("hooks = true, want false from codex_hooks alias: %#v", settings)
+	}
+	if settings["web_search_request"] {
+		t.Fatalf("web_search_request = true, want false from canonical override: %#v", settings)
+	}
+	if !settings["use_legacy_landlock"] {
+		t.Fatalf("use_legacy_landlock = false, want true: %#v", settings)
+	}
+	if settings["remote_control"] {
+		t.Fatalf("remote_control should be ignored: %#v", settings)
+	}
+	if !settings["code_mode"] || !settings["code_mode_only"] {
+		t.Fatalf("code mode dependency not normalized: %#v", settings)
+	}
+	if !settings["current_time_reminder"] {
+		t.Fatalf("structured enabled feature missing: %#v", settings)
+	}
+	want := []LegacyFeatureUsage{
+		{Alias: "codex_hooks", Feature: "hooks"},
+		{Alias: "features.use_legacy_landlock", Feature: "use_legacy_landlock"},
+		{Alias: "features.web_search_request", Feature: "web_search_request"},
+		{Alias: "web_search", Feature: "web_search_request"},
+	}
+	if len(usages) != len(want) {
+		t.Fatalf("usages = %#v, want %#v", usages, want)
+	}
+	for i := range want {
+		if usages[i] != want[i] {
+			t.Fatalf("usage %d = %#v, want %#v (all %#v)", i, usages[i], want[i], usages)
+		}
+	}
+}
+
+func TestNoticeForLegacyFeatureUsageMatchesRust(t *testing.T) {
+	tests := []struct {
+		name  string
+		usage LegacyFeatureUsage
+		want  LegacyFeatureNotice
+	}{
+		{
+			name:  "web search request",
+			usage: LegacyFeatureUsage{Alias: "features.web_search_request", Feature: "web_search_request"},
+			want: LegacyFeatureNotice{
+				Summary: "`[features].web_search_request` is deprecated because web search is enabled by default.",
+				Details: "Set `web_search` to `\"live\"`, `\"indexed\"`, `\"cached\"`, or `\"disabled\"` at the top level (or under a profile) in config.toml if you want to override it.",
+			},
+		},
+		{
+			name:  "legacy landlock",
+			usage: LegacyFeatureUsage{Alias: "features.use_legacy_landlock", Feature: "use_legacy_landlock"},
+			want: LegacyFeatureNotice{
+				Summary: "`[features].use_legacy_landlock` is deprecated and will be removed soon.",
+				Details: "Remove this setting to stop opting into the legacy Linux sandbox behavior.",
+			},
+		},
+		{
+			name:  "renamed feature",
+			usage: LegacyFeatureUsage{Alias: "codex_hooks", Feature: "hooks"},
+			want: LegacyFeatureNotice{
+				Summary: "`[features].codex_hooks` is deprecated. Use `[features].hooks` instead.",
+				Details: "Enable it with `--enable hooks` or `[features].hooks` in config.toml. See https://developers.openai.com/codex/config-basic#feature-flags for details.",
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := NoticeForLegacyFeatureUsage(test.usage); got != test.want {
+				t.Fatalf("notice = %#v, want %#v", got, test.want)
+			}
+			if got := test.want.Message(); got != test.want.Summary+" ("+test.want.Details+")" {
+				t.Fatalf("message = %q", got)
+			}
+		})
+	}
+}
+
+// TestRetiredWorktreeAndVoiceConfigOverridesAreIgnoredLikeRust mirrors Rust
+// #54175 (`retired_worktree_and_voice_config_overrides_are_ignored` in
+// features/src/tests.rs plus the `"tui_app_server" | "worktrees" |
+// "realtime_conversation" => continue` arm of `apply_map`): a `[features]`
+// override of either retired toggle changes nothing, so the resolved settings
+// keep matching the defaults, where both keys stay enabled.
+func TestRetiredWorktreeAndVoiceConfigOverridesAreIgnoredLikeRust(t *testing.T) {
+	retired := []string{"worktrees", "realtime_conversation"}
+	for _, key := range retired {
+		if !Known(key) {
+			t.Fatalf("%s must stay a known removed compatibility flag", key)
+		}
+		if !Defaults()[key] {
+			t.Fatalf("%s default = false, want true", key)
+		}
+	}
+	for _, enabled := range []bool{false, true} {
+		settings, usages := ResolveSettings(map[string]any{
+			"worktrees":             enabled,
+			"realtime_conversation": enabled,
+		})
+		if len(settings) != 0 {
+			t.Fatalf("ResolveSettings(retired toggles, enabled=%v) = %#v, want the override ignored", enabled, settings)
+		}
+		if len(usages) != 0 {
+			t.Fatalf("ResolveSettings(retired toggles, enabled=%v) legacy usages = %#v, want none", enabled, usages)
+		}
+		for _, key := range retired {
+			if !Enabled(Defaults(), key) {
+				t.Fatalf("%s = false once the override is ignored, want the default true", key)
+			}
+		}
+	}
+}

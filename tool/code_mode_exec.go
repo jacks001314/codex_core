@@ -1,0 +1,2232 @@
+package tool
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	contextfrag "codex_core/context"
+	"codex_core/utils"
+
+	"github.com/grafana/sobek"
+)
+
+const CodeModeExecToolName = "exec"
+
+// CodeModeWaitToolName names the wait tool Rust's code-mode analytics report for a
+// resumed cell.
+const CodeModeWaitToolName = "wait"
+
+// CodeModeToolMessage mirrors the model-catalog tool message shape used by
+// Code Mode. The type lives here so both tool and model can consume it without
+// importing each other.
+type CodeModeToolMessage struct {
+	Description *string `json:"description,omitempty"`
+	Parameters  *string `json:"parameters,omitempty"`
+}
+
+// CodeModeToolMessages carries model-catalog overrides for exec, wait, deferred
+// guidance, and the shared MCP TypeScript preamble (Rust #47118).
+type CodeModeToolMessages struct {
+	Exec                        *CodeModeToolMessage `json:"exec,omitempty"`
+	Wait                        *CodeModeToolMessage `json:"wait,omitempty"`
+	DeferredNestedToolsGuidance *string              `json:"deferred_nested_tools_guidance,omitempty"`
+	McpTypescriptPreamble       *string              `json:"mcp_typescript_preamble,omitempty"`
+}
+
+// CodeModeDefaultExecYieldTime is the `exec` default yield time. It mirrors
+// Rust's config-level default, DEFAULT_CODE_MODE_EXEC_YIELD_TIME_MS
+// (codex-rs/core/src/config/mod.rs:1204 = 30_000), which is
+// `CodeModeConfig::default_exec_yield_time_ms` (mod.rs:1223) and the value
+// Rust substitutes into the exec description (core/src/tools/spec_plan.rs:1078
+// -> code-mode-protocol/src/description.rs:31). It is NOT Rust's protocol-level
+// DEFAULT_EXEC_YIELD_TIME_MS = 10_000 (code-mode-protocol/src/runtime.rs:15),
+// which the code-mode runtime service uses as its `unwrap_or` fallback
+// (code-mode-runtime/src/service.rs:71); Go mirrors that one in
+// codemode.ProtocolDefaultExecYieldTimeMS (codemode/protocol_types.go:13).
+const CodeModeDefaultExecYieldTime = 30 * time.Second
+
+// codeModeDeferredNestedToolsGuidance mirrors Rust's
+// `DEFERRED_NESTED_TOOLS_GUIDANCE` (code-mode-protocol, #50562). It is emitted
+// unconditionally so the `exec` description stays stable as the deferred-tool
+// catalog changes. It is duplicated here (rather than imported from the
+// `codemode` package, which imports `tool`) to keep this inline description
+// self-contained.
+const codeModeDeferredNestedToolsGuidance = "Some deferred nested tools may be omitted from this description. They are still available on the global `tools` object and listed in `ALL_TOOLS`.\n" +
+	"To find one, filter `ALL_TOOLS` by `name` and `description`.\n\n" +
+	"Tool availability can change between calls."
+
+const (
+	codeModeMaxFrameBytes       = 64 * 1024 * 1024
+	codeModeMaxPendingCallbacks = 1024
+	codeModeMaxSafeInteger      = 1<<53 - 1
+)
+
+const codeModeExecGrammar = `start: pragma_source | plain_source
+pragma_source: PRAGMA_LINE NEWLINE SOURCE
+plain_source: SOURCE
+
+PRAGMA_LINE: /[ \t]*\/\/ @exec:[^\r\n]*/
+NEWLINE: /\r?\n/
+SOURCE: /[\s\S]+/
+`
+
+type codeModeExecExecutor struct {
+	bindingMu         sync.RWMutex
+	registry          *Registry
+	nestedCommandTool ToolName
+	// nextID numbers this executor's nested tool calls, i.e. the
+	// `{parent_call_id}-nested-{n}` call id. It is deliberately separate from
+	// nextCellID: an exec call runs as an observable cell whenever the host
+	// attaches a preempt signal (#48123), and Rust's
+	// `steers_yield_exec_and_wait_without_stopping_the_cell`
+	// (core/tests/suite/pending_input.rs:1514, parametrized on/off) shows the
+	// nested call is the same in both modes. Sharing one counter made the id
+	// depend on the observation mode, so a preempted exec produced
+	// `-nested-2` instead of `-nested-1`.
+	nextID atomic.Uint64
+	// nextCellID numbers this executor's observable cells (`cell-%d`); it must
+	// not consume the nested-call counter (see nextID).
+	nextCellID      atomic.Uint64
+	storeMu         sync.RWMutex
+	store           map[string]json.RawMessage
+	cellsMu         sync.Mutex
+	cells           map[string]*codeModeCell
+	remote          CodeModeRemoteSession
+	provider        CodeModeRemoteProvider
+	messages        *CodeModeToolMessages
+	disableFallback bool
+	warningEmitted  atomic.Bool
+	remoteCellsMu   sync.RWMutex
+	remoteCells     map[string]*Registry
+	// remoteCellOrigins retains the Responses item and conversation window that
+	// started each Code Mode cell (Rust `cell_originating_call`, #45409), so a
+	// nested call after a wait or a compaction still reports the cell's origin
+	// rather than the resuming invocation's.
+	remoteCellOrigins map[string]codeModeCallOrigin
+	// remoteCellReleases retains the delegate callback registration for a yielded
+	// cell so notifications and nested calls keep routing to their originating
+	// execution until the cell is cleaned up (Rust #44865).
+	remoteCellReleases map[string]func()
+	// remoteCellInvocations retains the execution context that owns each live
+	// cell. Callback call IDs are not guaranteed to encode their parent, so the
+	// cell ID is the authoritative routing key (Rust #44865).
+	remoteCellInvocations map[string]*Invocation
+	defaultYieldMS        int
+	// showCellOverhead mirrors Rust's features.code_mode.experimental_show_cell_overhead
+	// (#46288): report the code-mode host duration and harness overhead in the
+	// cell response header.
+	showCellOverhead bool
+	// toolDescriptionFirst mirrors features.code_mode_tool_description_first
+	// (#51690/#51704): order nested namespace descriptions after tool guidance.
+	toolDescriptionFirst bool
+	// excludedNamespaces mirrors features.code_mode.excluded_tool_namespaces:
+	// tools in these exact namespaces stay registered for direct model access
+	// but are omitted from the nested Code Mode surface.
+	excludedNamespaces map[string]struct{}
+	// windowID is the turn's conversation window identity (`{thread}:{n}`); it
+	// stamps a cell's retained origin when the cell starts.
+	windowID string
+	// callObserver is told about every code-mode cell and child call (Rust's
+	// CodeModeToolCallFact). The app-server correlates tool events with it; nil
+	// leaves the observation off.
+	callObserver func(observation CodeModeCallObservation)
+	// indirectPrefixes decorates nested tool and namespace descriptions for
+	// model rendering without changing registry specifications (Rust #47642).
+	indirectPrefixes *IndirectNamespacePrefixes
+}
+
+// CodeModeCallObservationKind mirrors Rust's CodeModeToolCallFact variants.
+type CodeModeCallObservationKind string
+
+const (
+	// CodeModeCallCellStarted reports the call that started a cell.
+	CodeModeCallCellStarted CodeModeCallObservationKind = "cell_started"
+	// CodeModeCallChildStarted reports a child call a cell dispatched.
+	CodeModeCallChildStarted CodeModeCallObservationKind = "child_started"
+	// CodeModeCallCellClosed reports that a cell finished.
+	CodeModeCallCellClosed CodeModeCallObservationKind = "cell_closed"
+	// CodeModeCallCompleted reports one finished code-mode call (Rust's
+	// CodeModeToolCallFact::Completed), which the analytics layer publishes as a
+	// dynamic tool-call event.
+	CodeModeCallCompleted CodeModeCallObservationKind = "completed"
+)
+
+// CodeModeCallStatus mirrors Rust's CodeModeToolCallStatus.
+type CodeModeCallStatus string
+
+const (
+	CodeModeCallStatusCompleted   CodeModeCallStatus = "completed"
+	CodeModeCallStatusFailed      CodeModeCallStatus = "failed"
+	CodeModeCallStatusInterrupted CodeModeCallStatus = "interrupted"
+)
+
+// CodeModeCallObservation is one code-mode cell or child-call fact.
+type CodeModeCallObservation struct {
+	Kind         CodeModeCallObservationKind
+	CellID       string
+	ParentCallID string
+	CallID       string
+	// The Completed fact's fields.
+	ToolName               string
+	StartedAtMS            uint64
+	CompletedAtMS          uint64
+	CodeModeHostDurationNS uint64
+	Status                 CodeModeCallStatus
+}
+
+// codeModeCallOrigin is one cell's retained origin (Rust ToolCallOrigin).
+type codeModeCallOrigin struct {
+	itemID   string
+	windowID string
+}
+
+func (o codeModeCallOrigin) isZero() bool {
+	return o.itemID == "" && o.windowID == ""
+}
+
+type CodeModeRemoteProvider interface {
+	NewSession(delegate CodeModeRemoteDelegate) CodeModeRemoteSession
+}
+
+// CodeModeRemotePrewarmer establishes the shared host connection without
+// creating a cell. Rust #40678 uses this to warm the host at session startup.
+type CodeModeRemotePrewarmer interface {
+	Prewarm(context.Context) error
+}
+
+type CodeModeRemoteAvailabilityProvider interface {
+	Availability() error
+}
+
+type CodeModeRemoteSession interface {
+	// The trailing signal is Rust #48123's optional preempt token: when it
+	// fires, the session ends the observation early while the cell keeps running.
+	// A nil signal never preempts.
+	Execute(context.Context, CodeModeRemoteExecuteRequest, *YieldSignal) (CodeModeRemoteResponse, error)
+	Wait(context.Context, string, uint64, *YieldSignal) (CodeModeRemoteResponse, error)
+	Terminate(context.Context, string) (CodeModeRemoteResponse, error)
+	Close() error
+}
+
+type CodeModeRemoteDelegate interface {
+	Invoke(context.Context, CodeModeRemoteNestedCall) (json.RawMessage, error)
+	Notify(context.Context, string, string, string) error
+	// CellClosed releases the callback registration retained for a cell that the
+	// host closed on its own, so a yielded call's delegate does not outlive it
+	// (Rust #44865).
+	CellClosed(cellID string)
+}
+
+type CodeModeRemoteNestedCall struct {
+	CellID            string
+	RuntimeToolCallID string
+	ToolName          ToolName
+	Kind              PayloadKind
+	Input             json.RawMessage
+}
+
+type CodeModeRemoteToolDefinition struct {
+	Name                string
+	ToolName            ToolName
+	Description         string
+	Kind                PayloadKind
+	InputSchema         json.RawMessage
+	InputSchemaMaxBytes int
+	OutputSchema        json.RawMessage
+}
+
+type CodeModeToolNameMetadata struct {
+	Name      string  `json:"name"`
+	Namespace *string `json:"namespace"`
+}
+
+type codeModeNestedTool struct {
+	globalName string
+	name       ToolName
+	spec       Spec
+}
+
+type CodeModeRemoteExecuteRequest struct {
+	ToolCallID      string
+	Source          string
+	EnabledTools    []CodeModeRemoteToolDefinition
+	YieldTimeMS     *uint64
+	MaxOutputTokens *int
+}
+
+type CodeModeRemoteResponse struct {
+	CellID       string
+	State        string
+	ContentItems []map[string]any
+	ErrorText    string
+	// HostDurationNS is the code-mode host's own measurement of the request
+	// (Rust #46288's `code_mode_host_duration_ns`), used for the overhead
+	// breakdown in the response header.
+	HostDurationNS uint64
+}
+
+type codeModeCell struct {
+	done      chan struct{}
+	cancel    context.CancelFunc
+	output    *Output
+	err       error
+	completed bool
+	// startedAt anchors the response header's wall time (Rust's
+	// `CodeModeToolOutput::new` takes the elapsed time from the handler).
+	startedAt  time.Time
+	mu         sync.Mutex
+	items      []map[string]any
+	texts      []string
+	cursor     int
+	terminated bool
+}
+
+type codeModeExecOptions struct {
+	YieldTimeMS     *int `json:"yield_time_ms"`
+	MaxOutputTokens *int `json:"max_output_tokens"`
+}
+
+type codeModeWaitParams struct {
+	CellID      string `json:"cell_id"`
+	YieldTimeMS int    `json:"yield_time_ms,omitempty"`
+	MaxTokens   int    `json:"max_tokens,omitempty"`
+	Terminate   bool   `json:"terminate,omitempty"`
+}
+
+type codeModeToolCompletion struct {
+	resolve  func(interface{}) error
+	reject   func(interface{}) error
+	output   *Output
+	err      error
+	payload  Payload
+	name     ToolName
+	callback sobek.Callable
+	timerID  uint64
+}
+
+func NewCodeModeExecExecutor(registry *Registry) Executor {
+	exec, _ := NewCodeModeExecutors(registry)
+	return exec
+}
+
+func NewCodeModeExecutors(registry *Registry, nestedCommandTool ...ToolName) (Executor, Executor) {
+	return NewCodeModeExecutorsWithProvider(registry, nil, false, nestedCommandTool...)
+}
+
+func NewCodeModeExecutorsWithProvider(registry *Registry, provider CodeModeRemoteProvider, disableFallback bool, nestedCommandTool ...ToolName) (Executor, Executor) {
+	runtime := NewCodeModeRuntime(provider, disableFallback)
+	return runtime.Executors(registry, nestedCommandTool...)
+}
+
+// CodeModeRuntime owns the session state shared by every turn in one thread.
+// Each turn rebinds its current registry while the remote host session, cells,
+// and store remain alive until the thread is unloaded.
+type CodeModeRuntime struct {
+	exec      *codeModeExecExecutor
+	wait      *codeModeWaitExecutor
+	provider  CodeModeRemoteProvider
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func NewCodeModeRuntime(provider CodeModeRemoteProvider, disableFallback bool) *CodeModeRuntime {
+	exec := &codeModeExecExecutor{
+		store: map[string]json.RawMessage{}, cells: map[string]*codeModeCell{}, remoteCells: map[string]*Registry{},
+		remoteCellOrigins: map[string]codeModeCallOrigin{}, remoteCellReleases: map[string]func(){},
+		remoteCellInvocations: map[string]*Invocation{},
+		provider:              provider, disableFallback: disableFallback, defaultYieldMS: int(CodeModeDefaultExecYieldTime / time.Millisecond),
+	}
+	if provider != nil {
+		exec.remote = provider.NewSession(&codeModeRemoteDelegate{exec: exec})
+	}
+	return &CodeModeRuntime{exec: exec, wait: &codeModeWaitExecutor{exec: exec}, provider: provider}
+}
+
+func (r *CodeModeRuntime) SetDefaultExecYieldTime(value time.Duration) {
+	if r == nil || r.exec == nil || value < 0 || value/time.Millisecond > codeModeMaxSafeInteger {
+		return
+	}
+	r.exec.bindingMu.Lock()
+	r.exec.defaultYieldMS = int(value / time.Millisecond)
+	r.exec.bindingMu.Unlock()
+}
+
+func (r *CodeModeRuntime) Prewarm(ctx context.Context) error {
+	if r == nil || r.provider == nil {
+		return nil
+	}
+	prewarmer, ok := r.provider.(CodeModeRemotePrewarmer)
+	if !ok {
+		return nil
+	}
+	return prewarmer.Prewarm(ctx)
+}
+
+// SetCodeModeMessages installs the active model catalog's Code Mode overrides.
+func (r *CodeModeRuntime) SetCodeModeMessages(messages *CodeModeToolMessages) {
+	if r == nil || r.exec == nil {
+		return
+	}
+	r.exec.SetCodeModeMessages(messages)
+}
+
+func (e *codeModeExecExecutor) SetCodeModeMessages(messages *CodeModeToolMessages) {
+	if e == nil {
+		return
+	}
+	e.bindingMu.Lock()
+	e.messages = messages
+	e.bindingMu.Unlock()
+}
+
+func (e *codeModeExecExecutor) codeModeMessages() *CodeModeToolMessages {
+	if e == nil {
+		return nil
+	}
+	e.bindingMu.RLock()
+	defer e.bindingMu.RUnlock()
+	return e.messages
+}
+
+// SetTurnWindowID binds the current turn's conversation window identity, which
+// a Code Mode cell retains as part of its origin (Rust #45409).
+func (r *CodeModeRuntime) SetTurnWindowID(windowID string) {
+	if r == nil || r.exec == nil {
+		return
+	}
+	r.exec.bindingMu.Lock()
+	r.exec.windowID = strings.TrimSpace(windowID)
+	r.exec.bindingMu.Unlock()
+}
+
+// SetCallObserver installs the observer told about every code-mode cell and
+// child call (Rust's CodeModeToolCallFact).
+func (r *CodeModeRuntime) SetCallObserver(observer func(observation CodeModeCallObservation)) {
+	if r == nil || r.exec == nil {
+		return
+	}
+	r.exec.bindingMu.Lock()
+	r.exec.callObserver = observer
+	r.exec.bindingMu.Unlock()
+}
+
+// SetIndirectDescriptionPrefixes applies model-owned namespace guidance to the
+// Code Mode prompt, ALL_TOOLS, and nested tool descriptions (Rust #47642).
+func (r *CodeModeRuntime) SetIndirectDescriptionPrefixes(prefixes *IndirectNamespacePrefixes) {
+	if r == nil || r.exec == nil {
+		return
+	}
+	r.exec.bindingMu.Lock()
+	r.exec.indirectPrefixes = prefixes
+	r.exec.bindingMu.Unlock()
+}
+
+func (e *codeModeExecExecutor) observeCall(observation CodeModeCallObservation) {
+	if e == nil {
+		return
+	}
+	e.bindingMu.RLock()
+	observer := e.callObserver
+	e.bindingMu.RUnlock()
+	if observer != nil {
+		observer(observation)
+	}
+}
+
+// observeCodeModeCallCompletion publishes Rust's `Completed` fact for one
+// finished exec/wait call: the call id, the cell it ran in (once known), the tool
+// name, the observed window and the terminal status.
+func (e *codeModeExecExecutor) observeCodeModeCallCompletion(callID string, toolName string, cellID *string, startedAt time.Time, hostDurationNS uint64, status CodeModeCallStatus) {
+	if e == nil {
+		return
+	}
+	callID = strings.TrimSpace(callID)
+	if callID == "" {
+		return
+	}
+	observation := CodeModeCallObservation{
+		Kind:                   CodeModeCallCompleted,
+		CallID:                 callID,
+		ToolName:               strings.TrimSpace(toolName),
+		StartedAtMS:            uint64(startedAt.UTC().UnixMilli()),
+		CompletedAtMS:          uint64(time.Now().UTC().UnixMilli()),
+		CodeModeHostDurationNS: hostDurationNS,
+		Status:                 status,
+	}
+	if cellID != nil {
+		observation.CellID = strings.TrimSpace(*cellID)
+	}
+	e.observeCall(observation)
+}
+
+// codeModeCallStatusFor classifies one finished code-mode call the way Rust's
+// CodeModeToolCallGuard does: a cancelled call is interrupted, a failed handler
+// (error or unsuccessful output) is failed, and everything else completed.
+func codeModeCallStatusFor(ctx context.Context, output *Output, err error) CodeModeCallStatus {
+	if ctx != nil && ctx.Err() != nil {
+		return CodeModeCallStatusInterrupted
+	}
+	if err != nil || output == nil || !output.Success {
+		return CodeModeCallStatusFailed
+	}
+	return CodeModeCallStatusCompleted
+}
+
+// SetShowCellOverhead mirrors Rust's
+// `features.code_mode.experimental_show_cell_overhead` (#46288): when enabled,
+// cell responses report the code-mode host duration and the harness overhead in
+// the response header.
+func (r *CodeModeRuntime) SetShowCellOverhead(enabled bool) {
+	if r == nil || r.exec == nil {
+		return
+	}
+	r.exec.bindingMu.Lock()
+	r.exec.showCellOverhead = enabled
+	r.exec.bindingMu.Unlock()
+}
+
+// SetToolDescriptionFirst orders nested Code Mode descriptions as tool text
+// followed by namespace text when enabled (Rust #51704).
+func (r *CodeModeRuntime) SetToolDescriptionFirst(enabled bool) {
+	if r == nil || r.exec == nil {
+		return
+	}
+	r.exec.bindingMu.Lock()
+	r.exec.toolDescriptionFirst = enabled
+	r.exec.bindingMu.Unlock()
+}
+
+// SetExcludedToolNamespaces omits tools in the exact namespaces from the nested
+// Code Mode surface (Rust features.code_mode.excluded_tool_namespaces).
+func (r *CodeModeRuntime) SetExcludedToolNamespaces(namespaces []string) {
+	if r == nil || r.exec == nil {
+		return
+	}
+	excluded := make(map[string]struct{}, len(namespaces))
+	for _, namespace := range namespaces {
+		if namespace = strings.TrimSpace(namespace); namespace != "" {
+			excluded[namespace] = struct{}{}
+		}
+	}
+	if len(excluded) == 0 {
+		excluded = nil
+	}
+	r.exec.bindingMu.Lock()
+	r.exec.excludedNamespaces = excluded
+	r.exec.bindingMu.Unlock()
+}
+
+func (e *codeModeExecExecutor) cellOverheadEnabled() bool {
+	if e == nil {
+		return false
+	}
+	e.bindingMu.Lock()
+	defer e.bindingMu.Unlock()
+	return e.showCellOverhead
+}
+
+func (r *CodeModeRuntime) Executors(registry *Registry, nestedCommandTool ...ToolName) (Executor, Executor) {
+	var commandTool ToolName
+	if len(nestedCommandTool) > 0 {
+		commandTool = nestedCommandTool[0]
+	}
+	if r == nil || r.exec == nil {
+		return NewCodeModeExecutorsWithProvider(registry, nil, false, nestedCommandTool...)
+	}
+	r.exec.bind(registry, commandTool)
+	return r.exec, r.wait
+}
+
+func (r *CodeModeRuntime) Close() error {
+	if r == nil {
+		return nil
+	}
+	r.closeOnce.Do(func() {
+		if r.exec == nil {
+			return
+		}
+		r.exec.cellsMu.Lock()
+		for _, cell := range r.exec.cells {
+			if cell != nil && cell.cancel != nil {
+				cell.cancel()
+			}
+		}
+		r.exec.cellsMu.Unlock()
+		if r.exec.remote != nil {
+			r.closeErr = r.exec.remote.Close()
+		}
+		remoteInvocationStates.Delete(r.exec)
+	})
+	return r.closeErr
+}
+
+// InterruptActiveCells terminates all active and background code-mode cells
+// while keeping the reusable session alive (Rust 509565820f). Active local
+// cells are cancelled; remote cells are terminated through the host session.
+func (r *CodeModeRuntime) InterruptActiveCells() {
+	if r == nil || r.exec == nil {
+		return
+	}
+	e := r.exec
+	cellIDs := make([]string, 0)
+	e.cellsMu.Lock()
+	for id, cell := range e.cells {
+		if cell != nil {
+			cellIDs = append(cellIDs, id)
+			if cell.cancel != nil {
+				cell.cancel()
+			}
+			cell.terminated = true
+		}
+	}
+	e.cellsMu.Unlock()
+	e.remoteCellsMu.RLock()
+	remoteIDs := make([]string, 0, len(e.remoteCells))
+	for id := range e.remoteCells {
+		remoteIDs = append(remoteIDs, id)
+	}
+	e.remoteCellsMu.RUnlock()
+	cellIDs = append(cellIDs, remoteIDs...)
+	if e.remote != nil {
+		for _, cellID := range cellIDs {
+			_, _ = e.remote.Terminate(context.Background(), cellID)
+		}
+	}
+	// Release retained delegates for live cells as part of cancellation cleanup
+	// (Rust #44865).
+	for _, cellID := range remoteIDs {
+		e.forgetRemoteCell(cellID)
+	}
+}
+
+func (e *codeModeExecExecutor) bind(registry *Registry, nestedCommandTool ToolName) {
+	e.bindingMu.Lock()
+	e.registry = registry
+	e.nestedCommandTool = nestedCommandTool
+	e.bindingMu.Unlock()
+}
+
+func (e *codeModeExecExecutor) binding() (*Registry, ToolName) {
+	if e == nil {
+		return nil, ToolName{}
+	}
+	e.bindingMu.RLock()
+	defer e.bindingMu.RUnlock()
+	return e.registry, e.nestedCommandTool
+}
+
+func (e *codeModeExecExecutor) defaultExecYieldTimeMS() int {
+	if e == nil {
+		return int(CodeModeDefaultExecYieldTime / time.Millisecond)
+	}
+	e.bindingMu.RLock()
+	defer e.bindingMu.RUnlock()
+	return e.defaultYieldMS
+}
+
+func (e *codeModeExecExecutor) turnWindowID() string {
+	if e == nil {
+		return ""
+	}
+	e.bindingMu.RLock()
+	defer e.bindingMu.RUnlock()
+	return e.windowID
+}
+
+// cellOrigin returns the origin retained for a cell, recording the invoking
+// invocation's origin the first time the cell is observed. A cell that starts
+// with an unknown origin keeps the window it started in, which is what makes a
+// later wait or compaction unable to retarget it (Rust #45409).
+func (e *codeModeExecExecutor) cellOrigin(cellID string, parent *Invocation) codeModeCallOrigin {
+	if e == nil {
+		return codeModeCallOrigin{}
+	}
+	cellID = strings.TrimSpace(cellID)
+	if cellID == "" {
+		return codeModeCallOrigin{itemID: invocationContextString(parent, OriginItemIDContextKey), windowID: e.turnWindowID()}
+	}
+	e.remoteCellsMu.RLock()
+	retained, ok := e.remoteCellOrigins[cellID]
+	e.remoteCellsMu.RUnlock()
+	if ok && !retained.isZero() {
+		return retained
+	}
+	origin := codeModeCallOrigin{
+		itemID:   invocationContextString(parent, OriginItemIDContextKey),
+		windowID: firstNonEmptyString(invocationContextString(parent, OriginWindowIDContextKey), e.turnWindowID()),
+	}
+	if origin.isZero() {
+		return origin
+	}
+	e.remoteCellsMu.Lock()
+	if e.remoteCellOrigins == nil {
+		e.remoteCellOrigins = map[string]codeModeCallOrigin{}
+	}
+	if existing, present := e.remoteCellOrigins[cellID]; !present || existing.isZero() {
+		e.remoteCellOrigins[cellID] = origin
+	} else {
+		origin = existing
+	}
+	e.remoteCellsMu.Unlock()
+	return origin
+}
+
+func (e *codeModeExecExecutor) Spec() Spec {
+	registry, nestedCommandTool := e.binding()
+	return Spec{
+		Name:        PlainName(CodeModeExecToolName),
+		Description: codeModeExecDescription(registry, nestedCommandTool, e.defaultExecYieldTimeMS(), e.codeModeMessages()),
+		Freeform:    &FreeformSpec{Syntax: "lark", Definition: codeModeExecGrammar},
+	}
+}
+
+func codeModeExecDescription(registry *Registry, preferredCommandTool ToolName, defaultYieldTimeMS int, messages *CodeModeToolMessages) string {
+	template := `Run JavaScript code to orchestrate/compose tool calls
+- Evaluates the provided JavaScript code in a fresh isolate as an async module.
+- All nested tools are available on the global tools object. Tool names are exposed as normalized JavaScript identifiers.
+- Nested tool methods take either a string or an object as their input argument.
+- Nested tools return either an object or a string, based on the description.
+- Runs raw JavaScript -- no Node, no file system, no network access, no console.
+- Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences.
+- You may optionally start the tool input with a first-line pragma like // @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}.
+- yield_time_ms asks exec to yield early if the script is still running. Defaults to 10000 ms.
+- max_output_tokens sets the token budget for direct exec results. Defaults to 10000 tokens.
+- When the JavaScript code is fully evaluated, the isolate's lifetime ends and unawaited promises are discarded.
+- Do not use fetch, XMLHttpRequest, require, process, or console; they are unavailable.
+- There is no nested tools.exec method. To run commands, call the enabled nested command tool and await its result.
+
+Global helpers:
+- exit(): Immediately ends the current script successfully.
+- text(value): Appends text to the exec result. Use text(result.output) to forward command output.
+- image(value), audio(value), generatedImage(value): Append supported media results.
+- store(key, value) and load(key): Persist serializable values within the code-mode session.
+- notify(value): Immediately injects an extra custom_tool_call_output.
+- setTimeout(callback, delayMs) and clearTimeout(id): Schedule or cancel timers.
+- ALL_TOOLS: Metadata for enabled nested tools as { name, description } entries.
+- yield_control(): Yields accumulated output while the script keeps running.`
+	if messages != nil && messages.Exec != nil && messages.Exec.Description != nil {
+		template = *messages.Exec.Description
+	}
+	template = strings.ReplaceAll(template, "{{ default_exec_yield_time_ms }}", strconv.Itoa(defaultYieldTimeMS))
+	template = strings.ReplaceAll(template, "{{ image_helper }}", "image(value), audio(value), generatedImage(value): Append supported media results.")
+	description := template
+	description = strings.Replace(description, "Defaults to 10000 ms.", fmt.Sprintf("Defaults to %d ms.", defaultYieldTimeMS), 1)
+	// Rust #50562: emit the discovery guidance unconditionally so the exec
+	// description does not change as the deferred-tool catalog changes.
+	if messages == nil || messages.DeferredNestedToolsGuidance == nil {
+		description += "\n\n" + codeModeDeferredNestedToolsGuidance
+	} else if *messages.DeferredNestedToolsGuidance != "" {
+		description += "\n\n" + *messages.DeferredNestedToolsGuidance
+	}
+
+	if registry == nil {
+		return description
+	}
+	commandToolName := preferredCommandTool.Key()
+	var execSpec Spec
+	var ok bool
+	if commandToolName != "" {
+		execSpec, ok = registry.Spec(preferredCommandTool)
+	} else {
+		commandToolName = DefaultExecCommandToolName
+		execSpec, ok = registry.Spec(PlainName(commandToolName))
+		if !ok || execSpec.Exposure == ExposureHidden {
+			commandToolName = DefaultShellCommandToolName
+			execSpec, ok = registry.Spec(PlainName(commandToolName))
+		}
+	}
+	if !ok {
+		return description
+	}
+	schema, err := json.Marshal(execSpec.InputSchema)
+	if err != nil {
+		return description
+	}
+	argumentName := "cmd"
+	if commandToolName == DefaultShellCommandToolName {
+		argumentName = "command"
+	}
+	return description + "\n\nEnabled nested command tool:\n## tools." + commandToolName + "\n" + strings.TrimSpace(execSpec.Description) +
+		"\nInput schema: " + string(schema) +
+		"\nExample: const r = await tools." + commandToolName + "({\"" + argumentName + "\":\"Write-Output hello\",\"timeout_ms\":10000}); text(r.output);"
+}
+
+func (e *codeModeExecExecutor) Execute(ctx context.Context, invocation *Invocation) (*Output, error) {
+	startedAt := time.Now().UTC()
+	var callCellID string
+	output, err := e.execute(ctx, invocation, &callCellID)
+	// Rust's CodeModeToolCallGuard publishes the call's Completed fact when the
+	// handler returns, with the cell it ran in and its terminal status.
+	e.observeCodeModeCallCompletion(invocation.CallID, CodeModeExecToolName, &callCellID, startedAt, codeModeHostDurationFromOutput(output), codeModeCallStatusFor(ctx, output, err))
+	return output, err
+}
+
+func (e *codeModeExecExecutor) execute(ctx context.Context, invocation *Invocation, callCellID *string) (*Output, error) {
+	if invocation == nil || invocation.Payload.Kind != PayloadCustom {
+		return nil, RespondToModel("exec expects raw JavaScript source text")
+	}
+	registry, _ := e.binding()
+	if registry == nil {
+		return nil, Fatal("code mode tool registry is unavailable")
+	}
+	source, options, err := parseCodeModeSource(invocation.Payload.Input)
+	if err != nil {
+		return nil, RespondToModel(fmt.Sprintf("invalid exec pragma: %v", err))
+	}
+	if len(invocation.Payload.Input) > codeModeMaxFrameBytes {
+		return nil, RespondToModel(fmt.Sprintf("code-mode IPC frame length %d exceeds %d bytes", len(invocation.Payload.Input), codeModeMaxFrameBytes))
+	}
+	if e.remote == nil && e.disableFallback {
+		return nil, Fatal("code-mode host is disabled and in-process fallback is disabled")
+	}
+	if e.remote != nil {
+		output, remoteErr := e.executeRemote(ctx, invocation, source, options, callCellID)
+		if remoteErr == nil {
+			return output, nil
+		}
+		var callErr *FunctionCallError
+		if AsFunctionCallError(remoteErr, &callErr) {
+			return nil, callErr
+		}
+		return nil, Fatal(fmt.Sprintf("code-mode remote host unavailable: %v", remoteErr))
+	}
+	yieldTimeMS := e.defaultExecYieldTimeMS()
+	if options.YieldTimeMS != nil {
+		yieldTimeMS = *options.YieldTimeMS
+	}
+	if yieldTimeMS < 0 {
+		return nil, RespondToModel("yield_time_ms must be non-negative")
+	}
+	preempt := YieldSignalFromInvocation(invocation)
+	// A host request carrying a preempt signal must run as an observable cell so
+	// an `operation/yield` frame can end the observation early (#48123).
+	if options.YieldTimeMS == nil && !strings.Contains(source, "yield_control") && preempt == nil {
+		invocationCopy := *invocation
+		invocationCopy.Payload.Input = source
+		started := time.Now()
+		output, runErr := e.executeScript(ctx, &invocationCopy, nil, nil)
+		output = truncateCodeModeOutput(output, codeModeTokenLimit(options.MaxOutputTokens))
+		// Rust's exec handler wraps every response in the code-mode header,
+		// after truncating the script content.
+		return applyCodeModeHeader(output, codeModeStatusForOutput(output), time.Since(started), nil, e.cellOverheadEnabled()), runErr
+	}
+	cellID := ""
+	if invocation.Context != nil {
+		cellID, _ = invocation.Context[CodeModeCellIDContextKey].(string)
+		cellID = strings.TrimSpace(cellID)
+	}
+	if cellID == "" {
+		cellID = fmt.Sprintf("cell-%d", e.nextCellID.Add(1))
+	}
+	if callCellID != nil {
+		*callCellID = cellID
+	}
+	cellCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	cell := &codeModeCell{done: make(chan struct{}), cancel: cancel, startedAt: time.Now()}
+	e.cellsMu.Lock()
+	e.cells[cellID] = cell
+	e.cellsMu.Unlock()
+	// Rust's CellStarted fact: the exec call that created the cell is its parent.
+	e.observeCall(CodeModeCallObservation{
+		Kind:         CodeModeCallCellStarted,
+		CellID:       cellID,
+		ParentCallID: strings.TrimSpace(invocation.CallID),
+	})
+	invocationCopy := *invocation
+	invocationCopy.Payload.Input = source
+	invocationCopy.Context = cloneInvocationContext(invocation.Context)
+	if invocationCopy.Context == nil {
+		invocationCopy.Context = map[string]any{}
+	}
+	invocationCopy.Context[CodeModeCellIDContextKey] = cellID
+	yield := make(chan struct{}, 1)
+	go func() {
+		output, runErr := e.executeScript(cellCtx, &invocationCopy, yield, cell)
+		e.cellsMu.Lock()
+		if cell.terminated && (errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)) {
+			output = &Output{CallID: invocation.CallID, ToolName: PlainName(CodeModeExecToolName), Success: true, Data: map[string]any{
+				"content_items": []map[string]any{}, "nested_commands": []string{}, "nested_outputs": []string{}, "nested_exit_codes": []int{}, "terminated": true,
+			}}
+			runErr = nil
+		}
+		cell.output, cell.err, cell.completed = output, runErr, true
+		close(cell.done)
+		e.cellsMu.Unlock()
+	}()
+	timer := time.NewTimer(time.Duration(yieldTimeMS) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-cell.done:
+		output, runErr := e.consumeCell(cellID, cell)
+		output = truncateCodeModeOutput(output, codeModeTokenLimit(options.MaxOutputTokens))
+		return applyCodeModeHeader(output, codeModeCellStatus(cell), time.Since(cell.startedAt), nil, e.cellOverheadEnabled()), runErr
+	case <-yield:
+	case <-timer.C:
+	case <-preempt.Done():
+		// #48123: the caller yielded the observation; the cell keeps running.
+	case <-ctx.Done():
+		cancel()
+		return nil, ctx.Err()
+	}
+	status := "Script running with cell ID " + cellID
+	output := &Output{CallID: invocation.CallID, ToolName: PlainName(CodeModeExecToolName), Success: true, Body: e.cellDelta(cell), Data: map[string]any{"cell_id": cellID, "running": true}}
+	return applyCodeModeHeader(output, status, time.Since(cell.startedAt), nil, e.cellOverheadEnabled()), nil
+}
+
+func (e *codeModeExecExecutor) executeRemote(ctx context.Context, invocation *Invocation, source string, options codeModeExecOptions, callCellID *string) (*Output, error) {
+	delegate, _ := e.remoteDelegate()
+	done := delegate.begin(invocation)
+	// A yielded cell outlives this call, so its delegate callbacks are released
+	// when the cell completes instead of when execute returns (Rust #44865).
+	releaseOnReturn := true
+	defer func() {
+		if releaseOnReturn {
+			done()
+		}
+	}()
+	definitions := make([]CodeModeRemoteToolDefinition, 0)
+	for _, nested := range e.nestedToolsWithOrderedDescriptions() {
+		name := nested.name
+		spec := nested.spec
+		kind := PayloadFunction
+		var inputSchema json.RawMessage
+		if spec.Freeform != nil {
+			kind = PayloadCustom
+			inputSchema, _ = json.Marshal(map[string]any{"type": "grammar", "syntax": spec.Freeform.Syntax, "definition": spec.Freeform.Definition})
+		} else {
+			inputSchema, _ = json.Marshal(spec.InputSchema)
+		}
+		outputSchema, _ := json.Marshal(spec.OutputSchema)
+		definitions = append(definitions, CodeModeRemoteToolDefinition{Name: nested.globalName, ToolName: name, Description: spec.Description, Kind: kind, InputSchema: inputSchema, InputSchemaMaxBytes: spec.InputSchemaMaxBytes, OutputSchema: outputSchema})
+	}
+	yieldTimeMS := e.defaultExecYieldTimeMS()
+	if options.YieldTimeMS != nil {
+		yieldTimeMS = *options.YieldTimeMS
+	}
+	yieldValue := uint64(yieldTimeMS)
+	yield := &yieldValue
+	startedAt := time.Now()
+	response, err := e.remote.Execute(ctx, CodeModeRemoteExecuteRequest{ToolCallID: invocation.CallID, Source: source, EnabledTools: definitions, YieldTimeMS: yield, MaxOutputTokens: options.MaxOutputTokens}, YieldSignalFromInvocation(invocation))
+	if err != nil {
+		return nil, err
+	}
+	if callCellID != nil && strings.TrimSpace(response.CellID) != "" {
+		*callCellID = strings.TrimSpace(response.CellID)
+	}
+	if response.State == "yielded" && strings.TrimSpace(response.CellID) != "" {
+		registry, _ := e.binding()
+		e.remoteCellsMu.Lock()
+		e.remoteCells[response.CellID] = registry
+		e.remoteCellReleases[response.CellID] = done
+		e.remoteCellInvocations[response.CellID] = invocation
+		e.remoteCellsMu.Unlock()
+		// Rust's CellStarted fact: the exec call that created the cell is its
+		// parent.
+		e.observeCall(CodeModeCallObservation{
+			Kind:         CodeModeCallCellStarted,
+			CellID:       strings.TrimSpace(response.CellID),
+			ParentCallID: strings.TrimSpace(invocation.CallID),
+		})
+		releaseOnReturn = false
+	}
+	return remoteResponseOutput(invocation.CallID, response, codeModeTokenLimit(options.MaxOutputTokens), time.Since(startedAt), e.cellOverheadEnabled())
+}
+
+func (e *codeModeExecExecutor) CodeModeToolNames() map[string]CodeModeToolNameMetadata {
+	nestedTools := e.nestedTools()
+	if len(nestedTools) == 0 {
+		return nil
+	}
+	out := make(map[string]CodeModeToolNameMetadata, len(nestedTools))
+	for _, nested := range nestedTools {
+		var namespace *string
+		if nested.name.Namespace != "" {
+			value := nested.name.Namespace
+			namespace = &value
+		}
+		out[nested.globalName] = CodeModeToolNameMetadata{Name: nested.name.Name, Namespace: namespace}
+	}
+	return out
+}
+
+func (e *codeModeExecExecutor) CodeModeToolSpecs() []Spec {
+	nestedTools := e.nestedTools()
+	if len(nestedTools) == 0 {
+		return nil
+	}
+	out := make([]Spec, 0, len(nestedTools))
+	for _, nested := range nestedTools {
+		out = append(out, nested.spec)
+	}
+	return out
+}
+
+func (e *codeModeExecExecutor) CodeModeAvailability() error {
+	if e == nil || e.provider == nil {
+		return nil
+	}
+	provider, ok := e.provider.(CodeModeRemoteAvailabilityProvider)
+	if !ok {
+		return nil
+	}
+	return provider.Availability()
+}
+
+func (e *codeModeExecExecutor) TakeCodeModeUnavailableWarning(effectiveToolMode string) string {
+	if e == nil || e.provider == nil || e.warningEmitted.Load() {
+		return ""
+	}
+	provider, ok := e.provider.(CodeModeRemoteAvailabilityProvider)
+	if !ok {
+		return ""
+	}
+	err := provider.Availability()
+	if err == nil || e.warningEmitted.Swap(true) {
+		return ""
+	}
+	behavior := "Code mode will fail closed"
+	if strings.EqualFold(strings.TrimSpace(effectiveToolMode), "direct") {
+		behavior = "Falling back to direct tools"
+	}
+	return fmt.Sprintf("Code Mode is unavailable because %v. %s; enable `features.code_mode_host` and install `codex-code-mode-host`.", err, behavior)
+}
+
+func (e *codeModeExecExecutor) nestedTools() []codeModeNestedTool {
+	return e.nestedToolsOrdered(false)
+}
+
+func (e *codeModeExecExecutor) nestedToolsWithOrderedDescriptions() []codeModeNestedTool {
+	return e.nestedToolsOrdered(true)
+}
+
+func (e *codeModeExecExecutor) nestedToolsOrdered(orderDescriptions bool) []codeModeNestedTool {
+	registry, nestedCommandTool := e.binding()
+	if registry == nil {
+		return nil
+	}
+	e.bindingMu.RLock()
+	indirectPrefixes := e.indirectPrefixes
+	toolDescriptionFirst := e.toolDescriptionFirst
+	excludedNamespaces := e.excludedNamespaces
+	e.bindingMu.RUnlock()
+	names := registry.Names()
+	out := make([]codeModeNestedTool, 0, len(names))
+	seenIdentifiers := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if name.Key() == CodeModeExecToolName || name.Key() == "wait" {
+			continue
+		}
+		spec, ok := registry.Spec(name)
+		if !ok || spec.Exposure == ExposureDirectModelOnly || spec.Exposure == ExposureDeferredModelOnly || (spec.Exposure == ExposureHidden && name.Key() != nestedCommandTool.Key()) {
+			continue
+		}
+		if _, excluded := excludedNamespaces[codeModeToolNamespace(name)]; excluded {
+			continue
+		}
+		globalName := codeModeIdentifier(ResponsesAPIName(name))
+		if _, exists := seenIdentifiers[globalName]; exists {
+			continue
+		}
+		seenIdentifiers[globalName] = struct{}{}
+		if orderDescriptions {
+			spec.Description = orderCodeModeToolDescription(spec.Description, spec.NamespaceDescription, toolDescriptionFirst)
+		}
+		if indirectPrefixes != nil {
+			spec = indirectPrefixes.ApplyToSpec(spec)
+		}
+		out = append(out, codeModeNestedTool{globalName: globalName, name: name, spec: spec})
+	}
+	return out
+}
+
+// codeModeToolNamespace applies Rust's with_default_namespace: plain built-in
+// tools use the "functions" namespace.
+func codeModeToolNamespace(name ToolName) string {
+	if namespace := strings.TrimSpace(name.Namespace); namespace != "" {
+		return namespace
+	}
+	return "functions"
+}
+
+// OrderCodeModeToolDescriptions merges namespace guidance into each Code Mode
+// tool description. The declaration suffix remains last so tool-search results,
+// remote EnabledTools, and ALL_TOOLS expose the same ordering (Rust #51704).
+func OrderCodeModeToolDescriptions(specs []Spec, toolDescriptionFirst bool) []Spec {
+	out := make([]Spec, len(specs))
+	for index, spec := range specs {
+		out[index] = cloneSpec(spec)
+		out[index].Description = orderCodeModeToolDescription(spec.Description, spec.NamespaceDescription, toolDescriptionFirst)
+	}
+	return out
+}
+
+const codeModeToolDeclarationSeparator = "\n\nexec tool declaration:\n"
+
+func orderCodeModeToolDescription(toolDescription string, namespaceDescription string, toolDescriptionFirst bool) string {
+	namespaceDescription = strings.TrimSpace(namespaceDescription)
+	if namespaceDescription == "" {
+		return toolDescription
+	}
+	toolText, declaration, hasDeclaration := strings.Cut(toolDescription, codeModeToolDeclarationSeparator)
+	toolText = strings.TrimSpace(toolText)
+	var description string
+	switch {
+	case toolText == "":
+		description = namespaceDescription
+	case toolDescriptionFirst:
+		description = toolText + "\n\n" + namespaceDescription
+	default:
+		description = namespaceDescription + "\n\n" + toolText
+	}
+	if hasDeclaration {
+		description += codeModeToolDeclarationSeparator + declaration
+	}
+	return description
+}
+
+func (e *codeModeExecExecutor) nestedToolsForInvocation(invocation *Invocation) []codeModeNestedTool {
+	nested := e.nestedToolsWithOrderedDescriptions()
+	if invocation == nil || invocation.Context == nil {
+		return nested
+	}
+	allowed, ok := invocation.Context[CodeModeEnabledToolsContextKey].(map[string]struct{})
+	if !ok {
+		return nested
+	}
+	out := make([]codeModeNestedTool, 0, len(nested))
+	for _, candidate := range nested {
+		if _, exists := allowed[candidate.name.Key()]; exists {
+			out = append(out, candidate)
+		}
+	}
+	return out
+}
+
+func (e *codeModeExecExecutor) registryForRemoteCell(cellID string) *Registry {
+	if e == nil {
+		return nil
+	}
+	if cellID = strings.TrimSpace(cellID); cellID != "" {
+		e.remoteCellsMu.RLock()
+		registry := e.remoteCells[cellID]
+		e.remoteCellsMu.RUnlock()
+		if registry != nil {
+			return registry
+		}
+	}
+	registry, _ := e.binding()
+	return registry
+}
+
+func (e *codeModeExecExecutor) forgetRemoteCell(cellID string) {
+	if e == nil || strings.TrimSpace(cellID) == "" {
+		return
+	}
+	e.remoteCellsMu.Lock()
+	delete(e.remoteCells, cellID)
+	delete(e.remoteCellOrigins, cellID)
+	delete(e.remoteCellInvocations, cellID)
+	release := e.remoteCellReleases[cellID]
+	delete(e.remoteCellReleases, cellID)
+	e.remoteCellsMu.Unlock()
+	if release != nil {
+		release()
+	}
+	// Rust's CellClosed fact: the cell is finished, so its correlation state can
+	// be dropped once the turn that closed it ends.
+	e.observeCall(CodeModeCallObservation{
+		Kind:   CodeModeCallCellClosed,
+		CellID: strings.TrimSpace(cellID),
+	})
+}
+
+func (e *codeModeExecExecutor) remoteDelegate() (*codeModeRemoteDelegate, bool) {
+	if e == nil {
+		return nil, false
+	}
+	return &codeModeRemoteDelegate{exec: e}, true
+}
+
+type codeModeRemoteDelegate struct{ exec *codeModeExecExecutor }
+
+type codeModeRemoteInvocationState struct {
+	mu     sync.Mutex
+	active map[string]*Invocation
+}
+
+var remoteInvocationStates sync.Map
+
+func remoteInvocationState(exec *codeModeExecExecutor) *codeModeRemoteInvocationState {
+	value, _ := remoteInvocationStates.LoadOrStore(exec, &codeModeRemoteInvocationState{active: map[string]*Invocation{}})
+	return value.(*codeModeRemoteInvocationState)
+}
+
+func (d *codeModeRemoteDelegate) begin(invocation *Invocation) func() {
+	state := remoteInvocationState(d.exec)
+	state.mu.Lock()
+	state.active[invocation.CallID] = invocation
+	state.mu.Unlock()
+	return func() {
+		state.mu.Lock()
+		delete(state.active, invocation.CallID)
+		state.mu.Unlock()
+	}
+}
+
+func (d *codeModeRemoteDelegate) invocation(callID string) *Invocation {
+	state := remoteInvocationState(d.exec)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if invocation := state.active[callID]; invocation != nil {
+		return invocation
+	}
+	for parentID, invocation := range state.active {
+		if strings.HasPrefix(callID, parentID) {
+			return invocation
+		}
+	}
+	if len(state.active) == 1 {
+		for _, invocation := range state.active {
+			return invocation
+		}
+	}
+	return nil
+}
+
+// invocationForCell resolves callbacks from a live cell through the execution
+// that started it. Falling back to call-id matching covers callbacks that
+// arrive before the host's execute response admits the cell.
+func (d *codeModeRemoteDelegate) invocationForCell(cellID string, callID string) *Invocation {
+	if d == nil || d.exec == nil {
+		return nil
+	}
+	if cellID = strings.TrimSpace(cellID); cellID != "" {
+		d.exec.remoteCellsMu.RLock()
+		invocation := d.exec.remoteCellInvocations[cellID]
+		d.exec.remoteCellsMu.RUnlock()
+		if invocation != nil {
+			return invocation
+		}
+	}
+	return d.invocation(callID)
+}
+
+func (d *codeModeRemoteDelegate) Invoke(ctx context.Context, call CodeModeRemoteNestedCall) (json.RawMessage, error) {
+	if d == nil || d.exec == nil {
+		return nil, fmt.Errorf("code mode tool registry is unavailable")
+	}
+	registry := d.exec.registryForRemoteCell(call.CellID)
+	if registry == nil {
+		return nil, fmt.Errorf("code mode tool registry is unavailable")
+	}
+	executor, ok := registry.Lookup(call.ToolName)
+	if !ok {
+		return nil, fmt.Errorf("tool %s not found", call.ToolName.Key())
+	}
+	payload := Payload{Kind: call.Kind}
+	if call.Kind == PayloadCustom {
+		var input string
+		if err := json.Unmarshal(call.Input, &input); err != nil {
+			input = string(call.Input)
+		}
+		payload.Input = input
+	} else {
+		payload.Arguments = string(call.Input)
+	}
+	parent := d.invocationForCell(call.CellID, call.RuntimeToolCallID)
+	invocationContext := map[string]any(nil)
+	if parent != nil {
+		invocationContext = cloneInvocationContext(parent.Context)
+	}
+	invocation := &Invocation{CallID: call.RuntimeToolCallID, ToolName: call.ToolName, Payload: payload, Source: "code_mode", Context: invocationContext}
+	if invocation.Context == nil {
+		invocation.Context = map[string]any{}
+	}
+	// Rust #45409: a nested call reports its cell's retained origin (the item and
+	// the window the cell started in), not the invocation that resumed the cell.
+	if origin := d.exec.cellOrigin(call.CellID, parent); !origin.isZero() {
+		if origin.itemID != "" {
+			invocation.Context[OriginItemIDContextKey] = origin.itemID
+		}
+		if origin.windowID != "" {
+			invocation.Context[OriginWindowIDContextKey] = origin.windowID
+		}
+	}
+	if strings.TrimSpace(call.CellID) != "" {
+		invocation.Context[CodeModeCellIDContextKey] = call.CellID
+	}
+	// Rust #45535: every dispatched child call is evidence that this call id
+	// belongs to the cell rather than to a sampled model response.
+	d.exec.observeCall(CodeModeCallObservation{
+		Kind:   CodeModeCallChildStarted,
+		CellID: strings.TrimSpace(call.CellID),
+		CallID: strings.TrimSpace(call.RuntimeToolCallID),
+	})
+	applySpecInvocationContext(invocation, executor.Spec())
+	startedAt := time.Now().UTC()
+	if parent != nil {
+		if started, ok := parent.Context["code_mode_nested_tool_started"].(CodeModeNestedToolStartedFunc); ok {
+			started(ctx, invocation, startedAt)
+		}
+	}
+	out, err := executor.Execute(ctx, invocation)
+	finishedAt := time.Now().UTC()
+	if parent != nil {
+		if completed, ok := parent.Context["code_mode_nested_tool_completed"].(CodeModeNestedToolCompletedFunc); ok {
+			completed(ctx, invocation, out, err, startedAt, finishedAt)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	if failure, failed := codeModeToolFailure(call.ToolName, out); failed {
+		return nil, fmt.Errorf("%s", failure)
+	}
+	return json.Marshal(codeModeToolResult(out))
+}
+
+func (d *codeModeRemoteDelegate) Notify(_ context.Context, callID string, cellID string, text string) error {
+	if invocation := d.invocationForCell(cellID, callID); invocation != nil {
+		if notify, ok := invocation.Context["code_mode_notify"].(CodeModeNotifyFunc); ok {
+			notify(invocation.CallID, text)
+		}
+	}
+	return nil
+}
+
+// CellClosed releases the delegate callbacks retained for a cell the host
+// closed without the client observing a terminal wait, mirroring Rust's
+// `CodeModeSessionDelegate::cell_closed` (Rust #44865).
+func (d *codeModeRemoteDelegate) CellClosed(cellID string) {
+	if d == nil || d.exec == nil {
+		return
+	}
+	d.exec.forgetRemoteCell(cellID)
+}
+
+func remoteResponseOutput(callID string, response CodeModeRemoteResponse, maxTokens int, wallTime time.Duration, showOverhead bool) (*Output, error) {
+	// The host's own measurement feeds the overhead breakdown (Rust's
+	// `code_mode_host_duration`).
+	var hostDuration *time.Duration
+	if response.HostDurationNS > 0 {
+		value := time.Duration(response.HostDurationNS)
+		hostDuration = &value
+	}
+	modelWallTime := wallTime
+	if hostDuration != nil && !showOverhead {
+		// Rust #41452: model-visible wall time is the host operation itself, not
+		// the client's response-read delay.
+		modelWallTime = *hostDuration
+	}
+	texts := make([]string, 0)
+	for _, item := range response.ContentItems {
+		if item["type"] == "input_text" {
+			texts = append(texts, fmt.Sprint(item["text"]))
+		}
+	}
+	if strings.TrimSpace(response.ErrorText) != "" {
+		// Rust's failed response: partial content, then the `Script error:`
+		// block, with the header reporting "Script failed".
+		output := codeModeScriptFailureOutput(callID, response.ErrorText, response.ContentItems, nil, nil, nil)
+		if hostDuration != nil {
+			output.Data["code_mode_host_duration_ns"] = response.HostDurationNS
+		}
+		output = truncateCodeModeOutput(output, maxTokens)
+		return applyCodeModeHeader(output, "Script failed", modelWallTime, hostDuration, showOverhead), nil
+	}
+	body := strings.Join(texts, "\n")
+	output := &Output{CallID: callID, ToolName: PlainName(CodeModeExecToolName), Success: true, Body: body, Data: map[string]any{"content_items": response.ContentItems}}
+	if hostDuration != nil {
+		output.Data["code_mode_host_duration_ns"] = response.HostDurationNS
+	}
+	if strings.TrimSpace(response.CellID) != "" {
+		output.Data["cell_id"] = response.CellID
+	}
+	status := "Script completed"
+	if response.State == "yielded" {
+		status = "Script running with cell ID " + response.CellID
+		output.Data["cell_id"] = response.CellID
+		output.Data["running"] = true
+	}
+	output = truncateCodeModeOutput(output, maxTokens)
+	return applyCodeModeHeader(output, status, modelWallTime, hostDuration, showOverhead), nil
+}
+
+func codeModeHostDurationFromOutput(output *Output) uint64 {
+	if output == nil || output.Data == nil {
+		return 0
+	}
+	switch value := output.Data["code_mode_host_duration_ns"].(type) {
+	case uint64:
+		return value
+	case int:
+		if value > 0 {
+			return uint64(value)
+		}
+	case float64:
+		if value > 0 {
+			return uint64(value)
+		}
+	}
+	return 0
+}
+
+func (e *codeModeExecExecutor) executeScript(ctx context.Context, invocation *Invocation, yield chan<- struct{}, cell *codeModeCell) (*Output, error) {
+	runtime := sobek.New()
+	registry, _ := e.binding()
+	nestedRouter := NewRouter(registry)
+	completion := make(chan codeModeToolCompletion, 32)
+	pending := 0
+	timers := map[uint64]*time.Timer{}
+	var nextTimerID uint64
+	defer func() {
+		for _, timer := range timers {
+			timer.Stop()
+		}
+	}()
+	texts := make([]string, 0)
+	contentItems := make([]map[string]any, 0)
+	commands := make([]string, 0)
+	nestedOutputs := make([]string, 0)
+	exitCodes := make([]int, 0)
+	if err := runtime.Set("text", func(call sobek.FunctionCall) sobek.Value {
+		text := renderCodeModeValue(call.Argument(0))
+		texts = append(texts, text)
+		contentItems = append(contentItems, map[string]any{"type": "input_text", "text": text})
+		if cell != nil {
+			cell.mu.Lock()
+			cell.texts = append(cell.texts, text)
+			cell.items = append(cell.items, map[string]any{"type": "input_text", "text": text})
+			cell.mu.Unlock()
+		}
+		return sobek.Undefined()
+	}); err != nil {
+		return nil, err
+	}
+	if err := e.installContentHelpers(runtime, &contentItems); err != nil {
+		return nil, err
+	}
+	if err := runtime.Set("notify", func(call sobek.FunctionCall) sobek.Value {
+		text := renderCodeModeValue(call.Argument(0))
+		if notify, ok := invocation.Context["code_mode_notify"].(CodeModeNotifyFunc); ok {
+			notify(invocation.CallID, text)
+		}
+		return sobek.Undefined()
+	}); err != nil {
+		return nil, err
+	}
+	if err := runtime.Set("store", func(call sobek.FunctionCall) sobek.Value {
+		key := call.Argument(0).String()
+		// Rust's v8_value_to_json returns no JSON value for JavaScript
+		// `undefined` (and for values JSON cannot represent), so storing them
+		// throws and leaves the previous value untouched (#43873).
+		serializeError := func() sobek.Value {
+			return runtime.ToValue(fmt.Sprintf("Unable to store %q. Only plain serializable objects can be stored.", key))
+		}
+		if sobek.IsUndefined(call.Argument(1)) {
+			panic(serializeError())
+		}
+		var value any
+		if err := runtime.ExportTo(call.Argument(1), &value); err != nil {
+			panic(serializeError())
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			panic(serializeError())
+		}
+		e.storeMu.Lock()
+		e.store[key] = append(json.RawMessage(nil), encoded...)
+		e.storeMu.Unlock()
+		return sobek.Undefined()
+	}); err != nil {
+		return nil, err
+	}
+	if err := runtime.Set("load", func(call sobek.FunctionCall) sobek.Value {
+		e.storeMu.RLock()
+		value, ok := e.store[call.Argument(0).String()]
+		e.storeMu.RUnlock()
+		if !ok {
+			return sobek.Undefined()
+		}
+		jsonObject := runtime.Get("JSON").ToObject(runtime)
+		parse, ok := sobek.AssertFunction(jsonObject.Get("parse"))
+		if !ok {
+			panic(runtime.ToValue("JSON.parse is unavailable"))
+		}
+		parsed, err := parse(jsonObject, runtime.ToValue(string(value)))
+		if err != nil {
+			panic(runtime.ToValue(err.Error()))
+		}
+		return parsed
+	}); err != nil {
+		return nil, err
+	}
+	if err := runtime.Set("exit", func() { runtime.Interrupt(codeModeExit{}) }); err != nil {
+		return nil, err
+	}
+	if err := runtime.Set("setTimeout", func(call sobek.FunctionCall) sobek.Value {
+		callback, ok := sobek.AssertFunction(call.Argument(0))
+		if !ok {
+			panic(runtime.ToValue("setTimeout callback must be a function"))
+		}
+		delay := int64(0)
+		if len(call.Arguments) > 1 {
+			delay = call.Argument(1).ToInteger()
+		}
+		if delay < 0 {
+			delay = 0
+		}
+		nextTimerID++
+		timerID := nextTimerID
+		if pending >= codeModeMaxPendingCallbacks {
+			panic(runtime.ToValue(fmt.Sprintf("code-mode host exceeded the limit of %d pending delegate calls", codeModeMaxPendingCallbacks)))
+		}
+		pending++
+		timers[timerID] = time.AfterFunc(time.Duration(delay)*time.Millisecond, func() {
+			select {
+			case completion <- codeModeToolCompletion{callback: callback, timerID: timerID}:
+			case <-ctx.Done():
+			}
+		})
+		return runtime.ToValue(timerID)
+	}); err != nil {
+		return nil, err
+	}
+	if err := runtime.Set("clearTimeout", func(call sobek.FunctionCall) sobek.Value {
+		id := uint64(call.Argument(0).ToInteger())
+		if timer := timers[id]; timer != nil {
+			if timer.Stop() {
+				pending--
+			}
+			delete(timers, id)
+		}
+		return sobek.Undefined()
+	}); err != nil {
+		return nil, err
+	}
+	if err := runtime.Set("yield_control", func() sobek.Value {
+		if yield != nil {
+			select {
+			case yield <- struct{}{}:
+			default:
+			}
+		}
+		return sobek.Undefined()
+	}); err != nil {
+		return nil, err
+	}
+	nestedTools := e.nestedToolsForInvocation(invocation)
+	toolsObject := runtime.NewObject()
+	for _, nested := range nestedTools {
+		name := nested.name
+		spec := nested.spec
+		globalName := nested.globalName
+		toolName := name
+		toolSpec := spec
+		if err := toolsObject.Set(globalName, func(call sobek.FunctionCall) sobek.Value {
+			payload, err := nestedPayload(runtime, toolSpec, call)
+			if err != nil {
+				panic(runtime.ToValue(err.Error()))
+			}
+			callID := fmt.Sprintf("%s-nested-%d", invocation.CallID, e.nextID.Add(1))
+			if pending >= codeModeMaxPendingCallbacks {
+				panic(runtime.ToValue(fmt.Sprintf("code-mode host exceeded the limit of %d pending delegate calls", codeModeMaxPendingCallbacks)))
+			}
+			promise, resolve, reject := runtime.NewPromise()
+			pending++
+			go func() {
+				nestedInvocation := &Invocation{CallID: callID, ToolName: toolName, Payload: payload, Context: cloneInvocationContext(invocation.Context), Source: "code_mode"}
+				// Rust #45535: the in-process dispatcher reports the child call
+				// with the cell it belongs to, when the invocation knows one.
+				cellID, _ := invocation.Context[CodeModeCellIDContextKey].(string)
+				e.observeCall(CodeModeCallObservation{
+					Kind:   CodeModeCallChildStarted,
+					CellID: strings.TrimSpace(cellID),
+					CallID: strings.TrimSpace(callID),
+				})
+				applySpecInvocationContext(nestedInvocation, toolSpec)
+				startedAt := time.Now().UTC()
+				if started, ok := invocation.Context["code_mode_nested_tool_started"].(CodeModeNestedToolStartedFunc); ok {
+					started(ctx, nestedInvocation, startedAt)
+				}
+				out, callErr := nestedRouter.Dispatch(ctx, nestedInvocation)
+				finishedAt := time.Now().UTC()
+				if completed, ok := invocation.Context["code_mode_nested_tool_completed"].(CodeModeNestedToolCompletedFunc); ok {
+					completed(ctx, nestedInvocation, out, callErr, startedAt, finishedAt)
+				}
+				select {
+				case completion <- codeModeToolCompletion{resolve: resolve, reject: reject, output: out, err: callErr, payload: payload, name: toolName}:
+				case <-ctx.Done():
+				}
+			}()
+			return runtime.ToValue(promise)
+		}); err != nil {
+			return nil, err
+		}
+	}
+	if err := runtime.Set("tools", toolsObject); err != nil {
+		return nil, err
+	}
+	metadata := make([]map[string]string, 0)
+	for _, nested := range nestedTools {
+		metadata = append(metadata, map[string]string{"name": nested.globalName, "description": nested.spec.Description})
+	}
+	if err := runtime.Set("ALL_TOOLS", metadata); err != nil {
+		return nil, err
+	}
+
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			runtime.Interrupt(ctx.Err())
+		case <-done:
+		}
+	}()
+	value, err := runtime.RunString("(async () => {\n" + invocation.Payload.Input + "\n})()")
+	if err != nil {
+		if _, ok := err.(*sobek.InterruptedError); ok {
+			if strings.Contains(err.Error(), "code mode exit") {
+				err = nil
+			} else if ctx.Err() != nil {
+				return nil, ctx.Err()
+			} else {
+				return codeModeScriptFailureOutput(invocation.CallID, err.Error(), nil, nil, nil, nil), nil
+			}
+		} else {
+			return codeModeScriptFailureOutput(invocation.CallID, err.Error(), nil, nil, nil, nil), nil
+		}
+	}
+	if err == nil && value == nil {
+		value = sobek.Undefined()
+	}
+	promise, hasPromise := value.Export().(*sobek.Promise)
+	for hasPromise && promise.State() == sobek.PromiseStatePending {
+		if pending == 0 {
+			return nil, RespondToModel("JavaScript execution did not settle")
+		}
+		select {
+		case <-ctx.Done():
+			runtime.Interrupt(ctx.Err())
+			return nil, ctx.Err()
+		case completed := <-completion:
+			pending--
+			if completed.callback != nil {
+				delete(timers, completed.timerID)
+				if _, err := completed.callback(sobek.Undefined()); err != nil {
+					return codeModeScriptFailureOutput(invocation.CallID, err.Error(), contentItems, commands, nestedOutputs, exitCodes), nil
+				}
+				continue
+			}
+			if completed.err != nil {
+				if err := completed.reject(completed.err.Error()); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			result := codeModeToolResult(completed.output)
+			if IsShellCommandToolName(completed.name) {
+				if cmd, ok := payloadCommand(completed.payload); ok {
+					commands = append(commands, cmd)
+				}
+				nestedOutputs = append(nestedOutputs, result["output"].(string))
+				if exitCode, ok := result["exit_code"].(int); ok {
+					exitCodes = append(exitCodes, exitCode)
+				}
+			}
+			if failure, failed := codeModeToolFailure(completed.name, completed.output); failed {
+				if err := completed.reject(failure); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			if err := completed.resolve(result); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if hasPromise && promise.State() == sobek.PromiseStateRejected {
+		// Rust appends the `Script error:` block after the script's partial
+		// output and marks the response unsuccessful.
+		return codeModeScriptFailureOutput(invocation.CallID, promise.Result().String(), contentItems, commands, nestedOutputs, exitCodes), nil
+	}
+	body := strings.Join(texts, "\n")
+	return &Output{CallID: invocation.CallID, ToolName: PlainName(CodeModeExecToolName), Success: true, Body: body, Data: map[string]any{"content_items": contentItems, "nested_commands": commands, "nested_outputs": nestedOutputs, "nested_exit_codes": exitCodes}}, nil
+}
+
+func cloneInvocationContext(source map[string]any) map[string]any {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[string]any, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func parseCodeModeSource(input string) (string, codeModeExecOptions, error) {
+	input = strings.TrimPrefix(input, "\ufeff")
+	if strings.TrimSpace(input) == "" {
+		return "", codeModeExecOptions{}, fmt.Errorf("exec expects raw JavaScript source text (non-empty)")
+	}
+	lines := strings.SplitN(input, "\n", 2)
+	if len(lines) != 2 || !strings.HasPrefix(strings.TrimSpace(lines[0]), "// @exec:") {
+		return input, codeModeExecOptions{}, nil
+	}
+	raw := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(lines[0]), "// @exec:"))
+	options := codeModeExecOptions{}
+	if raw != "" {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(raw), &fields); err != nil {
+			return "", options, err
+		}
+		for key := range fields {
+			if key != "yield_time_ms" && key != "max_output_tokens" {
+				return "", options, fmt.Errorf("exec pragma only supports yield_time_ms and max_output_tokens; got %q", key)
+			}
+		}
+		if err := json.Unmarshal([]byte(raw), &options); err != nil {
+			return "", options, err
+		}
+	}
+	if options.YieldTimeMS != nil && *options.YieldTimeMS < 0 {
+		return "", options, fmt.Errorf("yield_time_ms must be non-negative")
+	}
+	if options.MaxOutputTokens != nil && *options.MaxOutputTokens < 0 {
+		return "", options, fmt.Errorf("max_output_tokens must be non-negative")
+	}
+	if options.YieldTimeMS != nil && *options.YieldTimeMS > codeModeMaxSafeInteger {
+		return "", options, fmt.Errorf("yield_time_ms must be a non-negative safe integer")
+	}
+	if options.MaxOutputTokens != nil && *options.MaxOutputTokens > codeModeMaxSafeInteger {
+		return "", options, fmt.Errorf("max_output_tokens must be a non-negative safe integer")
+	}
+	return lines[1], options, nil
+}
+
+func codeModeTokenLimit(value *int) int {
+	if value == nil {
+		return 10000
+	}
+	return *value
+}
+
+func truncateCodeModeOutput(output *Output, maxTokens int) *Output {
+	if output == nil {
+		return nil
+	}
+	truncated := utils.FormattedTruncateText(output.Body, utils.TokensPolicy(maxTokens))
+	if truncated == output.Body {
+		return output
+	}
+	output.Body = truncated
+	if output.Data != nil {
+		output.Data["content_items"] = []map[string]any{{"type": "input_text", "text": output.Body}}
+	}
+	return output
+}
+
+func (e *codeModeExecExecutor) consumeCell(cellID string, cell *codeModeCell) (*Output, error) {
+	e.cellsMu.Lock()
+	delete(e.cells, cellID)
+	output, err := cell.output, cell.err
+	e.cellsMu.Unlock()
+	// Rust's CellClosed fact for an in-process cell.
+	e.observeCall(CodeModeCallObservation{
+		Kind:   CodeModeCallCellClosed,
+		CellID: strings.TrimSpace(cellID),
+	})
+	if output != nil {
+		output.Data["cell_id"] = cellID
+		output.Body = e.cellDelta(cell)
+		output.Data["content_items"] = e.cellContentDelta(cell)
+	}
+	return output, err
+}
+
+// codeModeResponseHeader mirrors Rust's `CodeModeToolOutput` header (#46288):
+// the script status, the wall time, and - when overhead reporting is enabled and
+// the code-mode host reported its own duration - the host measurement and the
+// harness overhead before the script output.
+//
+// The wall time keeps Rust's formats: one decimal by default, three decimals
+// with the overhead breakdown (whose difference can legitimately be negative
+// because millisecond quantization of the outer measurement rounds).
+func codeModeResponseHeader(status string, wallTime time.Duration, hostDuration *time.Duration, showOverhead bool) string {
+	if showOverhead && hostDuration != nil {
+		totalSeconds := wallTime.Seconds()
+		hostSeconds := hostDuration.Seconds()
+		return fmt.Sprintf(
+			"%s\nWall time %.3f seconds (code-mode %.3f seconds; overhead %.3f seconds)\nOutput:\n",
+			status,
+			totalSeconds,
+			hostSeconds,
+			totalSeconds-hostSeconds,
+		)
+	}
+	rounded := math.Round(wallTime.Seconds()*10) / 10
+	return fmt.Sprintf("%s\nWall time %.1f seconds\nOutput:\n", status, rounded)
+}
+
+// applyCodeModeHeader prepends Rust's code-mode response header. Rust truncates
+// the script content first and then inserts the header, so the truncation
+// warning and token accounting never count the header itself (#46288).
+func applyCodeModeHeader(output *Output, status string, wallTime time.Duration, hostDuration *time.Duration, showOverhead bool) *Output {
+	if output == nil {
+		return nil
+	}
+	output.Body = codeModeResponseHeader(status, wallTime, hostDuration, showOverhead) + output.Body
+	return output
+}
+
+// codeModeCellStatus mirrors Rust's format_script_status for a settled cell.
+func codeModeCellStatus(cell *codeModeCell) string {
+	if cell != nil && cell.output != nil && !cell.output.Success {
+		// Rust's RuntimeResponse::Result with an error reports "Script failed".
+		return "Script failed"
+	}
+	if cell != nil && cell.terminated {
+		return "Script terminated"
+	}
+	return "Script completed"
+}
+
+// codeModeScriptFailureOutput mirrors Rust's failed code-mode response: the
+// script's partial output content followed by a `Script error:` block, marked
+// unsuccessful, so clients render the same failure text instead of a generic
+// execution error.
+func codeModeScriptFailureOutput(callID string, errorText string, contentItems []map[string]any, commands []string, nestedOutputs []string, exitCodes []int) *Output {
+	items := append([]map[string]any(nil), contentItems...)
+	items = append(items, map[string]any{"type": "input_text", "text": "Script error:\n" + errorText})
+	texts := make([]string, 0, len(items))
+	for _, item := range items {
+		if item["type"] != "input_text" {
+			continue
+		}
+		if text := fmt.Sprint(item["text"]); text != "" {
+			texts = append(texts, text)
+		}
+	}
+	data := map[string]any{"content_items": items}
+	if commands != nil {
+		data["nested_commands"] = commands
+	}
+	if nestedOutputs != nil {
+		data["nested_outputs"] = nestedOutputs
+	}
+	if exitCodes != nil {
+		data["nested_exit_codes"] = exitCodes
+	}
+	return &Output{
+		CallID:   callID,
+		ToolName: PlainName(CodeModeExecToolName),
+		Success:  false,
+		Body:     strings.Join(texts, "\n"),
+		Data:     data,
+	}
+}
+
+// codeModeStatusForOutput reports Rust's status line for a settled response.
+func codeModeStatusForOutput(output *Output) string {
+	if output == nil || output.Success {
+		return "Script completed"
+	}
+	return "Script failed"
+}
+
+func (e *codeModeExecExecutor) cellDelta(cell *codeModeCell) string {
+	if cell == nil {
+		return ""
+	}
+	cell.mu.Lock()
+	defer cell.mu.Unlock()
+	if cell.cursor >= len(cell.texts) {
+		return ""
+	}
+	delta := strings.Join(cell.texts[cell.cursor:], "\n")
+	cell.cursor = len(cell.texts)
+	return delta
+}
+
+func (e *codeModeExecExecutor) cellContentDelta(cell *codeModeCell) []map[string]any {
+	if cell == nil {
+		return nil
+	}
+	cell.mu.Lock()
+	defer cell.mu.Unlock()
+	if len(cell.items) == 0 {
+		return []map[string]any{}
+	}
+	items := append([]map[string]any(nil), cell.items...)
+	cell.items = nil
+	return items
+}
+
+type codeModeWaitExecutor struct{ exec *codeModeExecExecutor }
+
+func (e *codeModeWaitExecutor) Spec() Spec {
+	description := "Waits on a yielded exec cell and returns new output or completion."
+	schema := map[string]any{"type": "object", "required": []string{"cell_id"}, "properties": map[string]any{"cell_id": map[string]any{"type": "string"}, "yield_time_ms": map[string]any{"type": "integer"}, "max_tokens": map[string]any{"type": "integer"}, "terminate": map[string]any{"type": "boolean"}}}
+	if messages := e.exec.codeModeMessages(); messages != nil && messages.Wait != nil {
+		if messages.Wait.Description != nil {
+			description = *messages.Wait.Description
+		}
+		if messages.Wait.Parameters != nil {
+			if parsed, err := ParseCatalogParameters(*messages.Wait.Parameters); err == nil {
+				schema = parsed
+			}
+		}
+	}
+	return Spec{Name: PlainName("wait"), Description: description, InputSchema: schema}
+}
+
+func (e *codeModeWaitExecutor) Execute(ctx context.Context, invocation *Invocation) (*Output, error) {
+	startedAt := time.Now().UTC()
+	output, err := e.execute(ctx, invocation)
+	// Rust's CodeModeToolCallGuard publishes the wait call's Completed fact with
+	// the cell it resumed.
+	var cellID *string
+	if invocation != nil {
+		var params codeModeWaitParams
+		if decodeErr := invocation.DecodeArguments(&params); decodeErr == nil {
+			if trimmed := strings.TrimSpace(params.CellID); trimmed != "" {
+				cellID = &trimmed
+			}
+		}
+	}
+	e.exec.observeCodeModeCallCompletion(invocation.CallID, CodeModeWaitToolName, cellID, startedAt, codeModeHostDurationFromOutput(output), codeModeCallStatusFor(ctx, output, err))
+	return output, err
+}
+
+func (e *codeModeWaitExecutor) execute(ctx context.Context, invocation *Invocation) (*Output, error) {
+	var params codeModeWaitParams
+	if err := invocation.DecodeArguments(&params); err != nil {
+		return nil, RespondToModel(err.Error())
+	}
+	if strings.TrimSpace(params.CellID) == "" {
+		return nil, RespondToModel("cell_id is required")
+	}
+	if e.exec.remote != nil {
+		var response CodeModeRemoteResponse
+		var remoteErr error
+		startedAt := time.Now()
+		if params.Terminate {
+			response, remoteErr = e.exec.remote.Terminate(ctx, params.CellID)
+		} else {
+			waitMS := params.YieldTimeMS
+			if waitMS <= 0 {
+				waitMS = 10000
+			}
+			response, remoteErr = e.exec.remote.Wait(ctx, params.CellID, uint64(waitMS), YieldSignalFromInvocation(invocation))
+		}
+		if remoteErr == nil {
+			if response.State != "yielded" {
+				e.exec.forgetRemoteCell(params.CellID)
+			}
+			return remoteResponseOutput(invocation.CallID, response, codeModeWaitTokenLimit(params.MaxTokens), time.Since(startedAt), e.exec.cellOverheadEnabled())
+		}
+		var callErr *FunctionCallError
+		if AsFunctionCallError(remoteErr, &callErr) {
+			return nil, callErr
+		}
+		return nil, Fatal(fmt.Sprintf("code-mode remote host unavailable: %v", remoteErr))
+	}
+	e.exec.cellsMu.Lock()
+	cell := e.exec.cells[params.CellID]
+	e.exec.cellsMu.Unlock()
+	if cell == nil {
+		return nil, RespondToModel(fmt.Sprintf("exec cell %s not found", params.CellID))
+	}
+	if params.Terminate {
+		e.exec.cellsMu.Lock()
+		if cell.terminated {
+			e.exec.cellsMu.Unlock()
+			return nil, RespondToModel(fmt.Sprintf("exec cell %s is already terminating", params.CellID))
+		}
+		cell.terminated = true
+		e.exec.cellsMu.Unlock()
+		cell.cancel()
+	}
+	waitMS := params.YieldTimeMS
+	if waitMS <= 0 {
+		waitMS = 10000
+	}
+	timer := time.NewTimer(time.Duration(waitMS) * time.Millisecond)
+	defer timer.Stop()
+	preempt := YieldSignalFromInvocation(invocation)
+	runningOutput := func() (*Output, error) {
+		status := "Script running with cell ID " + params.CellID
+		output := &Output{CallID: invocation.CallID, ToolName: PlainName("wait"), Success: true, Body: e.exec.cellDelta(cell), Data: map[string]any{"cell_id": params.CellID, "running": true}}
+		output = truncateCodeModeOutput(output, codeModeWaitTokenLimit(params.MaxTokens))
+		return applyCodeModeHeader(output, status, time.Since(cell.startedAt), nil, e.exec.cellOverheadEnabled()), nil
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-cell.done:
+		output, runErr := e.exec.consumeCell(params.CellID, cell)
+		if params.Terminate && output != nil {
+			output.Success = true
+			if output.Data == nil {
+				output.Data = map[string]any{}
+			}
+			output.Data["terminated"] = true
+		}
+		output = truncateCodeModeOutput(output, codeModeWaitTokenLimit(params.MaxTokens))
+		return applyCodeModeHeader(output, codeModeCellStatus(cell), time.Since(cell.startedAt), nil, e.exec.cellOverheadEnabled()), runErr
+	case <-timer.C:
+		return runningOutput()
+	case <-preempt.Done():
+		// #48123: the caller yielded the observation; the cell keeps running.
+		return runningOutput()
+	}
+}
+
+func codeModeWaitTokenLimit(value int) int {
+	if value == 0 {
+		return 10000
+	}
+	return value
+}
+
+type codeModeExit struct{}
+
+func (codeModeExit) Error() string { return "code mode exit" }
+
+func (e *codeModeExecExecutor) installContentHelpers(runtime *sobek.Runtime, items *[]map[string]any) error {
+	if err := runtime.Set("image", func(call sobek.FunctionCall) sobek.Value {
+		value := call.Argument(0)
+		url := value.String()
+		detail := "high"
+		if object, ok := value.(*sobek.Object); ok {
+			if candidate := object.Get("image_url"); candidate != nil && !sobek.IsUndefined(candidate) {
+				url = candidate.String()
+			} else if data := object.Get("data"); data != nil && !sobek.IsUndefined(data) {
+				mimeType := "image/png"
+				if candidate := object.Get("mimeType"); candidate != nil && !sobek.IsUndefined(candidate) && strings.TrimSpace(candidate.String()) != "" {
+					mimeType = candidate.String()
+				}
+				url = "data:" + mimeType + ";base64," + data.String()
+			}
+			if candidate := object.Get("detail"); candidate != nil && !sobek.IsUndefined(candidate) && !sobek.IsNull(candidate) {
+				detail = candidate.String()
+			}
+			if meta := object.Get("_meta"); meta != nil && !sobek.IsUndefined(meta) && !sobek.IsNull(meta) {
+				if metaObject, ok := meta.(*sobek.Object); ok {
+					if candidate := metaObject.Get("codex/imageDetail"); candidate != nil && !sobek.IsUndefined(candidate) && !sobek.IsNull(candidate) {
+						detail = candidate.String()
+					}
+				}
+			}
+		}
+		if len(call.Arguments) > 1 && !sobek.IsUndefined(call.Argument(1)) && !sobek.IsNull(call.Argument(1)) {
+			detail = call.Argument(1).String()
+		}
+		if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
+			panic(runtime.ToValue("remote image URLs are not supported"))
+		}
+		*items = append(*items, map[string]any{"type": "input_image", "image_url": url, "detail": detail})
+		return sobek.Undefined()
+	}); err != nil {
+		return err
+	}
+	if err := runtime.Set("audio", func(call sobek.FunctionCall) sobek.Value {
+		value := call.Argument(0)
+		url := value.String()
+		if object, ok := value.(*sobek.Object); ok {
+			if candidate := object.Get("audio_url"); candidate != nil && !sobek.IsUndefined(candidate) {
+				url = candidate.String()
+			} else if data := object.Get("data"); data != nil && !sobek.IsUndefined(data) {
+				mimeType := "audio/wav"
+				if candidate := object.Get("mimeType"); candidate != nil && !sobek.IsUndefined(candidate) && strings.TrimSpace(candidate.String()) != "" {
+					mimeType = candidate.String()
+				}
+				url = "data:" + mimeType + ";base64," + data.String()
+			}
+		}
+		*items = append(*items, map[string]any{"type": "input_audio", "audio_url": url})
+		return sobek.Undefined()
+	}); err != nil {
+		return err
+	}
+	return runtime.Set("generatedImage", func(call sobek.FunctionCall) sobek.Value {
+		object := call.Argument(0).ToObject(runtime)
+		url := object.Get("image_url").String()
+		if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
+			panic(runtime.ToValue("remote image URLs are not supported"))
+		}
+		*items = append(*items, map[string]any{"type": "input_image", "image_url": url, "detail": "high"})
+		if hint := object.Get("output_hint"); hint != nil && !sobek.IsUndefined(hint) {
+			*items = append(*items, map[string]any{"type": "input_text", "text": hint.String()})
+		}
+		return sobek.Undefined()
+	})
+}
+
+func nestedPayload(runtime *sobek.Runtime, spec Spec, call sobek.FunctionCall) (Payload, error) {
+	if spec.Freeform != nil {
+		if len(call.Arguments) == 0 {
+			return Payload{}, fmt.Errorf("%s expects a string argument", spec.Name.Key())
+		}
+		return Payload{Kind: PayloadCustom, Input: call.Argument(0).String()}, nil
+	}
+	argument := map[string]any{}
+	if len(call.Arguments) > 0 && !sobek.IsUndefined(call.Argument(0)) {
+		if err := runtime.ExportTo(call.Argument(0), &argument); err != nil {
+			return Payload{}, fmt.Errorf("invalid %s arguments: %w", spec.Name.Key(), err)
+		}
+	}
+	encoded, err := json.Marshal(argument)
+	return Payload{Kind: PayloadFunction, Arguments: string(encoded)}, err
+}
+
+func codeModeToolResult(output *Output) map[string]any {
+	result := map[string]any{"success": output != nil && output.Success, "output": ""}
+	if output == nil {
+		return result
+	}
+	result["body"] = output.Body
+	result["error"] = output.Error
+	for key, value := range output.Data {
+		// MCP result metadata is private to clients and must not reach Code
+		// Mode (Rust 51c9ed6d4f).
+		if key == "_meta" {
+			continue
+		}
+		result[key] = value
+	}
+	outputText := normalizeNestedExecOutput(output.Body)
+	if strings.TrimSpace(output.Body) == "" {
+		// Rust #54776 routes a typed tool result through the shared
+		// content-to-tool-output conversion, so code mode sees image references
+		// and audio instead of an empty string.
+		if parts, ok := codeModeContentParts(output.Data["content_items"]); ok {
+			if text := contextfrag.ToolOutputText(parts); text != "" {
+				outputText = text
+			}
+		}
+	}
+	result["output"] = outputText
+	return result
+}
+
+// codeModeContentParts accepts the two shapes Go uses for typed tool output:
+// the local []map[string]any and the dynamic-tool []any of maps.
+func codeModeContentParts(value any) ([]map[string]any, bool) {
+	switch typed := value.(type) {
+	case []map[string]any:
+		return typed, len(typed) > 0
+	case []any:
+		parts := make([]map[string]any, 0, len(typed))
+		for _, item := range typed {
+			if part, ok := item.(map[string]any); ok {
+				parts = append(parts, part)
+			}
+		}
+		return parts, len(parts) > 0
+	default:
+		return nil, false
+	}
+}
+
+func codeModeToolFailure(name ToolName, output *Output) (string, bool) {
+	if output == nil || !IsShellCommandToolName(name) {
+		return "", false
+	}
+	failed := !output.Success
+	if timedOut, _ := output.Data["timed_out"].(bool); timedOut {
+		failed = true
+	}
+	if _, running := output.Data["process_id"]; !running {
+		if exitCode, ok := codeModeInt(output.Data["exit_code"]); ok && exitCode != 0 {
+			failed = true
+		}
+	}
+	if !failed {
+		return "", false
+	}
+	if body := strings.TrimSpace(output.Body); body != "" {
+		return body, true
+	}
+	if message := strings.TrimSpace(output.Error); message != "" {
+		return message, true
+	}
+	return fmt.Sprintf("tool %s failed", name.Key()), true
+}
+
+func codeModeInt(value any) (int, bool) {
+	switch value := value.(type) {
+	case int:
+		return value, true
+	case int32:
+		return int(value), true
+	case int64:
+		return int(value), true
+	case float64:
+		return int(value), value == float64(int(value))
+	case json.Number:
+		parsed, err := value.Int64()
+		return int(parsed), err == nil
+	default:
+		return 0, false
+	}
+}
+
+func payloadCommand(payload Payload) (string, bool) {
+	var args struct {
+		Cmd     string `json:"cmd"`
+		Command string `json:"command"`
+	}
+	if json.Unmarshal([]byte(payload.Arguments), &args) != nil {
+		return "", false
+	}
+	command := firstNonEmptyString(args.Cmd, args.Command)
+	return command, command != ""
+}
+
+func renderCodeModeValue(value sobek.Value) string {
+	if sobek.IsUndefined(value) {
+		return "undefined"
+	}
+	if sobek.IsNull(value) {
+		return "null"
+	}
+	if text, ok := value.Export().(string); ok {
+		return text
+	}
+	encoded, err := json.Marshal(value.Export())
+	if err == nil {
+		return string(encoded)
+	}
+	return value.String()
+}
+
+func codeModeIdentifier(value string) string {
+	var b strings.Builder
+	for index, char := range value {
+		valid := char == '_' || char == '$' || char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || index > 0 && char >= '0' && char <= '9'
+		if valid {
+			b.WriteRune(char)
+		} else {
+			b.WriteRune('_')
+		}
+	}
+	return b.String()
+}
+
+func normalizeNestedExecOutput(value string) string {
+	if marker := strings.Index(value, "Output:\n"); marker >= 0 {
+		value = value[marker+len("Output:\n"):]
+	}
+	return strings.TrimRight(value, "\n")
+}

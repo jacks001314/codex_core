@@ -1,0 +1,1351 @@
+package network
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"log/slog"
+	"net/textproto"
+	"net/url"
+	"os"
+	"regexp"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+)
+
+const (
+	CredentialBrokerActiveEnvKey = "CODEX_NETWORK_PROXY_CREDENTIAL_BROKER_ACTIVE"
+	BrokeredCredentialsEnvKey    = "CODEX_NETWORK_PROXY_BROKERED_CREDENTIALS"
+)
+
+type ProxyCredentialBroker struct {
+	mu          sync.RWMutex
+	enabled     bool
+	providers   []*ProxyCredentialProvider
+	hints       map[string]string
+	credentials []ProxyCredentialRecord
+}
+
+type ProxyCredentialRecord struct {
+	EnvVar      string
+	Provider    *ProxyCredentialProvider
+	HostBinding ProxyCredentialHostBinding
+	RealValue   string
+	DummyValue  string
+}
+
+// CredentialMaskingFailureMode controls what happens when a prepared child
+// environment still contains recognized real credentials.
+type CredentialMaskingFailureMode string
+
+const (
+	CredentialMaskingFailureWarn  CredentialMaskingFailureMode = "warn"
+	CredentialMaskingFailureDeny  CredentialMaskingFailureMode = "deny"
+	CredentialMaskingFailureError CredentialMaskingFailureMode = "error"
+)
+
+type ProxyCredentialProvider struct {
+	ContextEnvVars []string
+	Sources        []ProxyCredentialSource
+	// Destinations are the authorized injection destinations for configured
+	// providers (#44056); built-in providers leave this nil and bind hosts
+	// directly.
+	Destinations []CredentialDestination
+	// DestinationEnvKeys holds environment variables that contribute a
+	// destination at runtime (configured url_prefix_from_env, #44068).
+	DestinationEnvKeys []string
+	// Patterns are the configured credential patterns used for embedded alias
+	// discovery (#44066). Built-in providers leave this nil.
+	Patterns           []string
+	embeddedPatterns   []embeddedCredentialPattern
+	DummyValue         func(string) string
+	RequestHeader      func(map[string][]string) (string, bool)
+	RequestHeaderValue func(string) (string, bool)
+	InsertHeader       func(map[string][]string, string)
+	// HeaderName reports the request header this provider injects credentials
+	// through, mirroring the header name Rust's
+	// BrokeredCredentialProvider::translate_request_headers resolves
+	// (network-proxy/src/credential_broker/registry.rs). It lets the broker
+	// compare a translated alias header against the headers injection would
+	// overwrite without mutating the request (#52661).
+	HeaderName func() string
+}
+
+// requestHeaderName is the nil-safe accessor for HeaderName.
+func (p *ProxyCredentialProvider) requestHeaderName() string {
+	if p == nil || p.HeaderName == nil {
+		return ""
+	}
+	return p.HeaderName()
+}
+
+// embeddedCredentialPattern pairs a configured pattern with whether it carries
+// a distinctive literal prefix, which lets shorter-than-minimum credentials be
+// discovered (Rust has_distinctive_prefix, #44066).
+type embeddedCredentialPattern struct {
+	matcher     *regexp.Regexp
+	distinctive bool
+}
+
+type ProxyCredentialSource struct {
+	EnvVars     []string
+	HostBinding func(map[string]string) (ProxyCredentialHostBinding, bool)
+}
+
+type ProxyCredentialHostBinding struct {
+	ExactHosts []string
+	Suffixes   []string
+}
+
+// CredentialBrokerEnabledForSettings mirrors Rust
+// `NetworkProxySpec::credential_broker_enabled`
+// (core/src/config/network_proxy_spec.rs:96-98): brokerage requires the
+// proxy itself to be enabled as well as the broker flag, so a disabled proxy
+// builds an inert broker even when managed constraints or the configuration
+// retained `credential_broker = true` (network_proxy_spec.rs:381-390).
+func CredentialBrokerEnabledForSettings(settings ProxySettings) bool {
+	return settings.Enabled && settings.CredentialBroker
+}
+
+func NewProxyCredentialBroker(enabled bool) *ProxyCredentialBroker {
+	return NewProxyCredentialBrokerWithProviders(enabled, nil)
+}
+
+// NewProxyCredentialBrokerWithProviders builds a broker that also serves
+// declarative, config-backed credential families (#44056).
+func NewProxyCredentialBrokerWithProviders(enabled bool, configured []*ProxyCredentialProvider) *ProxyCredentialBroker {
+	return NewProxyCredentialBrokerWithOpenAIHost(enabled, configured, "")
+}
+
+// NewProxyCredentialBrokerWithOpenAIHost builds a broker whose built-in OpenAI
+// provider also binds the trusted configured host from the top-level
+// openai_base_url (Rust's credential_broker_openai_host).
+func NewProxyCredentialBrokerWithOpenAIHost(enabled bool, configured []*ProxyCredentialProvider, configuredOpenAIHost string) *ProxyCredentialBroker {
+	providers := append([]*ProxyCredentialProvider(nil), credentialProvidersWithOpenAIHost(configuredOpenAIHost)...)
+	for _, provider := range configured {
+		if provider != nil {
+			providers = append(providers, provider)
+		}
+	}
+	return &ProxyCredentialBroker{enabled: enabled, providers: providers}
+}
+
+func (b *ProxyCredentialBroker) Enabled() bool {
+	if b == nil {
+		return false
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.enabled
+}
+
+func (b *ProxyCredentialBroker) VirtualizeChildEnv(env map[string]string) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.enabled {
+		delete(env, CredentialBrokerActiveEnvKey)
+		delete(env, BrokeredCredentialsEnvKey)
+		return
+	}
+	env[CredentialBrokerActiveEnvKey] = "1"
+	resolvedEnv := envWithHintFallbacks(env, b.hints)
+	b.pruneStaleCredentialBindings(resolvedEnv)
+	for _, provider := range b.providers {
+		for _, source := range provider.Sources {
+			hostBinding, ok := source.HostBinding(resolvedEnv)
+			if !ok {
+				continue
+			}
+			for _, envVar := range source.EnvVars {
+				b.virtualizeEnvVar(env, envVar, provider, hostBinding)
+			}
+		}
+	}
+	b.virtualizeEmbeddedCredentials(env, resolvedEnv)
+	b.updateBrokeredCredentialsMarker(env)
+}
+
+// HandleUnmaskedCredentials reports recognized credentials that remain raw in
+// a prepared command environment. Warn keeps them, Deny removes the affected
+// variables, and Error rejects execution.
+func (b *ProxyCredentialBroker) HandleUnmaskedCredentials(env map[string]string, mode CredentialMaskingFailureMode) error {
+	if b == nil {
+		return nil
+	}
+	b.mu.Lock()
+	if !b.enabled {
+		b.mu.Unlock()
+		return errors.New("credential masking requires an enabled credential broker")
+	}
+	unmasked := make([]string, 0)
+	for key, value := range env {
+		if value == "" {
+			continue
+		}
+		leftover := b.isRawProviderCredentialKey(env, key, value)
+		for _, credential := range b.credentials {
+			if credential.RealValue != "" && strings.Contains(value, credential.RealValue) {
+				leftover = true
+				break
+			}
+		}
+		if !leftover {
+			leftover = b.containsKnownCredentialPattern(value)
+		}
+		if leftover {
+			unmasked = append(unmasked, key)
+		}
+	}
+	b.mu.Unlock()
+	if len(unmasked) == 0 {
+		return nil
+	}
+	switch mode {
+	case CredentialMaskingFailureDeny:
+		for _, key := range unmasked {
+			delete(env, key)
+		}
+		slog.Warn("credential masking could not protect some environment credentials; removed those variables before execution")
+	case CredentialMaskingFailureError:
+		return errors.New("credential masking left an unmasked credential in the command environment")
+	default:
+		slog.Warn("credential masking could not protect some environment credentials; continuing with those values unmasked")
+	}
+	return nil
+}
+
+func (b *ProxyCredentialBroker) isRawProviderCredentialKey(env map[string]string, key string, value string) bool {
+	if b.isDummyValue(value) {
+		return false
+	}
+	for _, provider := range b.providers {
+		if provider == nil {
+			continue
+		}
+		for _, source := range provider.Sources {
+			for _, envVar := range source.EnvVars {
+				if key == envVar && strings.TrimSpace(env[envVar]) != "" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// RestoreAndDisableChildEnv replaces brokered placeholders with their real
+// values for this child and removes broker activation. Mappings remain
+// registered for other commands in the same executor session.
+func (b *ProxyCredentialBroker) RestoreAndDisableChildEnv(env map[string]string) {
+	if b == nil || env == nil {
+		return
+	}
+	b.mu.Lock()
+	for key, value := range env {
+		for _, credential := range b.credentials {
+			if credential.DummyValue == "" || credential.RealValue == "" {
+				continue
+			}
+			if value == credential.DummyValue {
+				value = credential.RealValue
+			} else if strings.Contains(value, credential.DummyValue) {
+				value = strings.ReplaceAll(value, credential.DummyValue, credential.RealValue)
+			}
+		}
+		env[key] = value
+	}
+	b.mu.Unlock()
+	delete(env, CredentialBrokerActiveEnvKey)
+	delete(env, BrokeredCredentialsEnvKey)
+}
+
+// containsKnownCredentialPattern reports whether value contains a complete
+// token matching a configured provider pattern. Generated dummies do not count.
+func (b *ProxyCredentialBroker) containsKnownCredentialPattern(value string) bool {
+	for _, provider := range b.providers {
+		if provider == nil {
+			continue
+		}
+		for _, pattern := range provider.embeddedPatterns {
+			for _, indices := range pattern.matcher.FindAllStringIndex(value, -1) {
+				start, end := indices[0], indices[1]
+				if end-start < minEmbeddedCredentialLength && !pattern.distinctive {
+					continue
+				}
+				if start > 0 && isCredentialTokenByte(value[start-1]) {
+					continue
+				}
+				if end < len(value) && isCredentialTokenByte(value[end]) {
+					continue
+				}
+				if !b.isDummyValue(value[start:end]) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// pruneStaleCredentialBindings drops registrations whose provider now resolves a
+// different destination, mirroring #44066's reconciliation during token/
+// destination rotation: an alias must not stay bound to a host the provider is
+// no longer authorized for. Registrations whose provider has no current binding
+// (for example because a hint was absent) are preserved.
+func (b *ProxyCredentialBroker) pruneStaleCredentialBindings(resolvedEnv map[string]string) {
+	if len(b.credentials) == 0 {
+		return
+	}
+	kept := b.credentials[:0]
+	for index := range b.credentials {
+		credential := b.credentials[index]
+		provider := credential.Provider
+		if provider == nil || len(provider.Sources) == 0 {
+			kept = append(kept, credential)
+			continue
+		}
+		if len(provider.DestinationEnvKeys) > 0 {
+			present := false
+			for _, key := range provider.DestinationEnvKeys {
+				if _, ok := resolvedEnv[key]; ok {
+					present = true
+					break
+				}
+			}
+			if !present {
+				// The destination variable is absent: preserve the existing
+				// registration instead of dropping it (Rust #44068/#44066).
+				kept = append(kept, credential)
+				continue
+			}
+		}
+		current, ok := provider.Sources[0].HostBinding(resolvedEnv)
+		if !ok || (&credential.HostBinding).Equal(current) {
+			kept = append(kept, credential)
+			continue
+		}
+	}
+	b.credentials = kept
+}
+
+// virtualizeEmbeddedCredentials mirrors Rust #44066's alias discovery for
+// configured providers: a credential-shaped token embedded in any child
+// environment value (not just the canonical variable) is replaced with a
+// matching dummy and registered for destination-scoped substitution. Only
+// complete tokens of at least MIN_EMBEDDED_CREDENTIAL_LENGTH bytes are
+// discovered, and already-generated dummies are never re-registered.
+func (b *ProxyCredentialBroker) virtualizeEmbeddedCredentials(env map[string]string, resolvedEnv map[string]string) {
+	for _, provider := range b.providers {
+		if provider == nil || len(provider.embeddedPatterns) == 0 || len(provider.Sources) == 0 {
+			continue
+		}
+		hostBinding, ok := provider.Sources[0].HostBinding(resolvedEnv)
+		if !ok {
+			continue
+		}
+		for key, value := range env {
+			if value == "" || b.isDummyValue(value) {
+				continue
+			}
+			rewritten, changed := b.virtualizeEmbeddedValue(key, value, provider, hostBinding)
+			if changed {
+				env[key] = rewritten
+			}
+		}
+	}
+}
+
+func (b *ProxyCredentialBroker) virtualizeEmbeddedValue(key string, value string, provider *ProxyCredentialProvider, hostBinding ProxyCredentialHostBinding) (string, bool) {
+	type match struct {
+		start int
+		end   int
+	}
+	matches := make([]match, 0)
+	for _, pattern := range provider.embeddedPatterns {
+		for _, indices := range pattern.matcher.FindAllStringIndex(value, -1) {
+			start, end := indices[0], indices[1]
+			if end-start < minEmbeddedCredentialLength && !pattern.distinctive {
+				continue
+			}
+			// A complete token: the following byte must not continue the token.
+			if end < len(value) && isCredentialTokenByte(value[end]) {
+				continue
+			}
+			if start > 0 && isCredentialTokenByte(value[start-1]) {
+				continue
+			}
+			realValue := value[start:end]
+			if b.isDummyValue(realValue) {
+				continue
+			}
+			matches = append(matches, match{start: start, end: end})
+		}
+	}
+	if len(matches) == 0 {
+		return value, false
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		if matches[i].start != matches[j].start {
+			return matches[i].start < matches[j].start
+		}
+		return matches[i].end > matches[j].end
+	})
+	var builder strings.Builder
+	changed := false
+	last := 0
+	for _, matched := range matches {
+		if matched.start < last {
+			continue
+		}
+		realValue := value[matched.start:matched.end]
+		dummy := b.register(key, provider, hostBinding, realValue)
+		if dummy == "" || dummy == realValue {
+			continue
+		}
+		builder.WriteString(value[last:matched.start])
+		builder.WriteString(dummy)
+		last = matched.end
+		changed = true
+	}
+	if !changed {
+		return value, false
+	}
+	builder.WriteString(value[last:])
+	return builder.String(), true
+}
+
+// minEmbeddedCredentialLength mirrors Rust MIN_EMBEDDED_CREDENTIAL_LENGTH.
+const minEmbeddedCredentialLength = 16
+
+// minDistinctiveCredentialPrefixLength mirrors Rust
+// MIN_DISTINCTIVE_CREDENTIAL_PREFIX_LENGTH.
+const minDistinctiveCredentialPrefixLength = 4
+
+func isCredentialTokenByte(value byte) bool {
+	return value >= '0' && value <= '9' ||
+		value >= 'A' && value <= 'Z' ||
+		value >= 'a' && value <= 'z' ||
+		value == '_' || value == '-'
+}
+
+func (b *ProxyCredentialBroker) HostRequiresMITM(host string) bool {
+	if b == nil {
+		return false
+	}
+	normalized := NormalizeProxyHost(host)
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if !b.enabled {
+		return false
+	}
+	for index := range b.credentials {
+		if (&b.credentials[index]).MatchesHost(normalized) {
+			return true
+		}
+	}
+	// Declarative providers require MITM for their HTTPS destinations even
+	// before any command has virtualized credentials into their env (#44056).
+	for _, provider := range b.providers {
+		for _, destination := range provider.Destinations {
+			if destination.Scheme != "https" {
+				continue
+			}
+			if destination.Wildcard {
+				if strings.HasSuffix(normalized, "."+destination.Host) {
+					return true
+				}
+				continue
+			}
+			if normalized == destination.Host {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// HostRequiresHTTPInterception mirrors Rust
+// credential_broker.rs host_protocols_for_environment's `http` bit: a
+// configured provider destination that authorizes plaintext HTTP for the
+// destination requires the tunnel to be intercepted as plaintext HTTP rather
+// than relayed opaquely (#44089).
+func (b *ProxyCredentialBroker) HostRequiresHTTPInterception(host string, port uint16) bool {
+	if b == nil {
+		return false
+	}
+	normalized := NormalizeProxyHost(host)
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if !b.enabled {
+		return false
+	}
+	matches := func(provider *ProxyCredentialProvider) bool {
+		if provider == nil {
+			return false
+		}
+		for _, destination := range provider.Destinations {
+			if destination.Scheme == "http" && destination.MatchesHost(normalized, port) {
+				return true
+			}
+		}
+		return false
+	}
+	for index := range b.credentials {
+		if matches(b.credentials[index].Provider) {
+			return true
+		}
+	}
+	for _, provider := range b.providers {
+		if matches(provider) {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *ProxyCredentialBroker) InjectRequestHeaders(host string, headers map[string][]string) {
+	b.InjectRequestHeadersForDestination("", host, 0, "", headers)
+}
+
+// InjectRequestHeadersForDestination injects the matching credential for a
+// concrete request destination. Configured providers are only authorized for
+// destinations they declared (scheme/host/port/path); built-in providers keep
+// their host-binding behavior (network-proxy/src/credential_broker.rs #44056).
+func (b *ProxyCredentialBroker) InjectRequestHeadersForDestination(scheme string, host string, port uint16, path string, headers map[string][]string) {
+	if b == nil {
+		return
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if !b.enabled {
+		return
+	}
+	credential := b.selectedCredentialLocked(scheme, host, port, path, headers)
+	if credential == nil {
+		return
+	}
+	headerValue, ok := credential.Provider.RequestHeaderValue(credential.RealValue)
+	if !ok {
+		return
+	}
+	credential.Provider.InsertHeader(headers, headerValue)
+}
+
+// matchingCredentialsLocked is the credential filter shared by injection and
+// the hooked-host alias check (#52661): credentials bound to the request host
+// whose configured provider authorizes the destination. Callers must hold at
+// least the read lock.
+func (b *ProxyCredentialBroker) matchingCredentialsLocked(scheme string, host string, port uint16, path string) []*ProxyCredentialRecord {
+	normalized := NormalizeProxyHost(host)
+	matching := make([]*ProxyCredentialRecord, 0)
+	for index := range b.credentials {
+		credential := &b.credentials[index]
+		if !credential.MatchesHost(normalized) {
+			continue
+		}
+		if credential.Provider != nil && !credential.Provider.authorizesDestination(scheme, normalized, port, path) {
+			continue
+		}
+		matching = append(matching, credential)
+	}
+	return matching
+}
+
+// selectedCredentialLocked is the selection half of injection: the credential
+// the request's own dummy header selects, or nil when none or several match.
+// Callers must hold at least the read lock.
+func (b *ProxyCredentialBroker) selectedCredentialLocked(scheme string, host string, port uint16, path string, headers map[string][]string) *ProxyCredentialRecord {
+	return selectCredential(headers, b.matchingCredentialsLocked(scheme, host, port, path))
+}
+
+// RequestMatchesHookedHostAlias mirrors
+// CredentialBroker::request_matches_hooked_host_alias
+// (network-proxy/src/credential_broker.rs:1294-1360, #52661): a request whose
+// own host has no MITM hooks is still denied when the brokered credential
+// selected for its destination is also bound to a hooked host, because
+// replacing the dummy there would hand the real credential to a host whose hook
+// policy was never enforced. It uses the same destination parsing and
+// credential-selection rules as injection.
+//
+// Rust also filters by environment_id; a Go broker already belongs to a single
+// environment (ProxyServer.environmentID), so that filter has no counterpart
+// here.
+func (b *ProxyCredentialBroker) RequestMatchesHookedHostAlias(destination string, headers map[string][]string, hookedHosts []string) bool {
+	if b == nil {
+		return false
+	}
+	scheme, host, port, path, ok := ParseBrokerCredentialDestination(destination)
+	if !ok {
+		return false
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if !b.enabled {
+		return false
+	}
+	matching := b.matchingCredentialsLocked(scheme, host, port, path)
+	selected := selectCredential(headers, matching)
+	if selected == nil {
+		return false
+	}
+	selectedHeader := selected.Provider.requestHeaderName()
+	if selectedHeader == "" {
+		return false
+	}
+	normalized := NormalizeProxyHost(host)
+	for _, credential := range matching {
+		if !credentialMatchesHookedHostname(credential, normalized, hookedHosts) {
+			continue
+		}
+		// Ambiguity removes the whole header, so every translation for a
+		// surviving header contributed through equivalent deduplication or
+		// Basic-field merging: the alias is only reachable when its dummy
+		// travels in a header that injection overwrites.
+		for _, candidate := range matching {
+			if !sameCredentialProvider(candidate.Provider, credential.Provider) {
+				continue
+			}
+			if candidate.RealValue != credential.RealValue {
+				continue
+			}
+			if candidate.Provider.requestHeaderName() == selectedHeader {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// credentialMatchesHookedHostname mirrors CredentialHostBinding::matches_hostname
+// (network-proxy/src/credential_broker/providers.rs:116-126, #52661): hooks
+// apply to the host regardless of each credential destination's port or path,
+// and a hooked host equal to the request host is handled by the ordinary hook
+// evaluation instead.
+func credentialMatchesHookedHostname(credential *ProxyCredentialRecord, normalizedHost string, hookedHosts []string) bool {
+	if credential == nil {
+		return false
+	}
+	for _, hookedHost := range hookedHosts {
+		if hookedHost == normalizedHost {
+			continue
+		}
+		if credential.matchesHostname(hookedHost) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchesHostname mirrors CredentialHostBinding::matches_hostname (#52661):
+// configured providers match through their declared destinations, built-ins
+// through their credential host binding.
+func (r *ProxyCredentialRecord) matchesHostname(host string) bool {
+	if r == nil {
+		return false
+	}
+	if r.Provider != nil && len(r.Provider.Destinations) > 0 {
+		for _, destination := range r.Provider.Destinations {
+			if destination.MatchesHostname(host) {
+				return true
+			}
+		}
+		return false
+	}
+	return r.HostBinding.MatchesHost(host)
+}
+
+// sameCredentialProvider mirrors BrokeredCredentialProvider::same_provider: the
+// broker builds one provider instance per credential family, so identity is
+// pointer equality.
+func sameCredentialProvider(candidate *ProxyCredentialProvider, credential *ProxyCredentialProvider) bool {
+	return candidate != nil && candidate == credential
+}
+
+// ParseBrokerCredentialDestination parses the credential destination string the
+// proxy hands to the broker, mirroring the parsing Rust shares between
+// select_credentials and its alias check
+// (network-proxy/src/credential_broker/registry.rs:193-206, #52661): only a
+// scheme-qualified destination carries a request URL, a destination without an
+// authority is treated as a bare host, and an unparsable destination selects no
+// credentials at all.
+func ParseBrokerCredentialDestination(destination string) (scheme string, host string, port uint16, path string, ok bool) {
+	if !strings.Contains(destination, "://") {
+		return "", destination, 0, "", true
+	}
+	parsed, err := url.Parse(destination)
+	if err != nil || parsed.Host == "" {
+		return "", "", 0, "", false
+	}
+	scheme = strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", "", 0, "", false
+	}
+	host = NormalizeProxyHost(parsed.Hostname())
+	path = parsed.Path
+	if path == "" {
+		path = "/"
+	}
+	defaultPort := uint16(80)
+	if scheme == "https" {
+		defaultPort = 443
+	}
+	port = defaultPort
+	if raw := parsed.Port(); raw != "" {
+		parsedPort, parseErr := strconv.ParseUint(raw, 10, 16)
+		if parseErr != nil {
+			return "", "", 0, "", false
+		}
+		port = uint16(parsedPort)
+	}
+	return scheme, host, port, path, true
+}
+
+// authorizesDestination reports whether a provider may substitute credentials
+// for the request destination. Providers without declared destinations are the
+// built-ins, whose credential records already carry a host binding.
+func (p *ProxyCredentialProvider) authorizesDestination(scheme string, host string, port uint16, path string) bool {
+	if p == nil || len(p.Destinations) == 0 {
+		return true
+	}
+	if scheme == "" {
+		for _, destination := range p.Destinations {
+			if destination.Wildcard && destination.MatchesHost(host, destination.Port) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, destination := range p.Destinations {
+		if destination.MatchesRequest(scheme, host, port, path) {
+			return true
+		}
+	}
+	return false
+}
+
+func ProxyBrokeredCredentialDummyEnvKeys(env map[string]string) []string {
+	marker, ok := env[BrokeredCredentialsEnvKey]
+	if !ok {
+		return nil
+	}
+	var entries [][2]string
+	if err := json.Unmarshal([]byte(marker), &entries); err != nil {
+		return nil
+	}
+	supported := map[string]bool{}
+	for _, key := range ProxyCredentialBrokerEnvKeys() {
+		supported[key] = true
+	}
+	out := []string{}
+	for _, entry := range entries {
+		key := entry[0]
+		dummyValue := entry[1]
+		if supported[key] && env[key] == dummyValue {
+			out = append(out, key)
+		}
+	}
+	return out
+}
+
+func ProxyBrokeredCredentialEnvKeys(env map[string]string) []string {
+	if env[CredentialBrokerActiveEnvKey] != "1" {
+		return nil
+	}
+	return ProxyCredentialBrokerEnvKeys()
+}
+
+func ProxyCredentialBrokerEnvKeys() []string {
+	return credentialEnvKeys(credentialProviders())
+}
+
+func credentialEnvKeys(providers []*ProxyCredentialProvider) []string {
+	seen := map[string]bool{}
+	keys := []string{}
+	for _, provider := range providers {
+		for _, key := range provider.ContextEnvVars {
+			if !seen[key] {
+				seen[key] = true
+				keys = append(keys, key)
+			}
+		}
+		for _, source := range provider.Sources {
+			for _, key := range source.EnvVars {
+				if !seen[key] {
+					seen[key] = true
+					keys = append(keys, key)
+				}
+			}
+		}
+	}
+	return keys
+}
+
+// envKeys returns every environment key the broker virtualizes, including
+// declarative providers (#44056).
+func (b *ProxyCredentialBroker) envKeys() []string {
+	if b == nil {
+		return nil
+	}
+	return credentialEnvKeys(b.providers)
+}
+
+// SetDestinationHints retains local destination context (built-in provider
+// context keys such as GH_HOST and configured url_prefix_from_env values)
+// without adding it to child environments, mirroring Rust
+// CredentialBrokerContext::capture (#44068). A value present in the supplied
+// environment wins; otherwise the process environment is consulted.
+func (b *ProxyCredentialBroker) SetDestinationHints(env map[string]string) {
+	if b == nil {
+		return
+	}
+	hints := map[string]string{}
+	add := func(key string) {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return
+		}
+		if value, ok := env[key]; ok {
+			hints[key] = value
+			return
+		}
+		if value, ok := os.LookupEnv(key); ok {
+			hints[key] = value
+		}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, provider := range b.providers {
+		for _, key := range provider.ContextEnvVars {
+			add(key)
+		}
+		for _, key := range provider.DestinationEnvKeys {
+			add(key)
+		}
+	}
+	b.hints = hints
+	if runtime.GOOS == "windows" && b.enabled && b.hasAmbiguousWindowsProviderEnv(env) {
+		slog.Warn("credential brokerage disabled because shell environment overrides contain conflicting case-insensitive provider keys")
+		b.enabled = false
+	}
+}
+
+// hasAmbiguousWindowsProviderEnv mirrors #44068: on Windows, provider overrides
+// that differ only by case with different values make brokerage ambiguous, so
+// it is disabled rather than guessing which key wins.
+func (b *ProxyCredentialBroker) hasAmbiguousWindowsProviderEnv(env map[string]string) bool {
+	providerKeys := map[string]bool{}
+	markProviderKey := func(key string) {
+		if key = strings.TrimSpace(key); key != "" {
+			providerKeys[strings.ToLower(key)] = true
+		}
+	}
+	for _, provider := range b.providers {
+		for _, key := range provider.ContextEnvVars {
+			markProviderKey(key)
+		}
+		for _, key := range provider.DestinationEnvKeys {
+			markProviderKey(key)
+		}
+		for _, source := range provider.Sources {
+			for _, key := range source.EnvVars {
+				markProviderKey(key)
+			}
+		}
+	}
+	for key, value := range env {
+		if !providerKeys[strings.ToLower(key)] {
+			continue
+		}
+		for candidate, candidateValue := range env {
+			if candidate == key || !strings.EqualFold(candidate, key) {
+				continue
+			}
+			if value != candidateValue {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// envWithHintFallbacks resolves destination hints for a child environment
+// without changing what the child sees: a present value - including an empty
+// one - overrides the fallback (Rust CredentialBrokerContext::with_fallbacks).
+func envWithHintFallbacks(env map[string]string, hints map[string]string) map[string]string {
+	if len(hints) == 0 {
+		return env
+	}
+	var resolved map[string]string
+	for key, value := range hints {
+		if _, present := env[key]; present {
+			continue
+		}
+		if resolved == nil {
+			resolved = make(map[string]string, len(env)+len(hints))
+			for envKey, envValue := range env {
+				resolved[envKey] = envValue
+			}
+		}
+		resolved[key] = value
+	}
+	if resolved == nil {
+		return env
+	}
+	return resolved
+}
+
+func (r *ProxyCredentialRecord) MatchesHost(host string) bool {
+	if r == nil {
+		return false
+	}
+	return (&r.HostBinding).MatchesHost(host)
+}
+
+func (b *ProxyCredentialBroker) virtualizeEnvVar(env map[string]string, envVar string, provider *ProxyCredentialProvider, hostBinding ProxyCredentialHostBinding) {
+	realValue, ok := brokerableCredentialValue(env, b.credentials, envVar, provider)
+	if !ok {
+		return
+	}
+	dummyValue := b.register(envVar, provider, hostBinding, realValue)
+	if dummyValue == "" {
+		return
+	}
+	env[envVar] = dummyValue
+}
+
+func (b *ProxyCredentialBroker) register(envVar string, provider *ProxyCredentialProvider, hostBinding ProxyCredentialHostBinding, realValue string) string {
+	for _, credential := range b.credentials {
+		if credential.EnvVar == envVar && credential.Provider == provider && (&credential.HostBinding).Equal(hostBinding) && credential.RealValue == realValue {
+			return credential.DummyValue
+		}
+	}
+	dummyValue := ""
+	for attempts := 0; attempts < maxCredentialDummyAttempts; attempts++ {
+		dummyValue = provider.DummyValue(realValue)
+		if dummyValue == "" || dummyValue == realValue || b.isDummyValue(dummyValue) {
+			continue
+		}
+		// Rust #44066: a dummy must not embed another provider's credential,
+		// otherwise alias discovery could attribute it to the wrong provider.
+		if b.dummyEmbedsOtherProviderCredential(dummyValue, provider) {
+			dummyValue = ""
+			continue
+		}
+		break
+	}
+	if dummyValue == "" {
+		return ""
+	}
+	b.credentials = append(b.credentials, ProxyCredentialRecord{
+		EnvVar:      envVar,
+		Provider:    provider,
+		HostBinding: hostBinding,
+		RealValue:   realValue,
+		DummyValue:  dummyValue,
+	})
+	return dummyValue
+}
+
+// dummyEmbedsOtherProviderCredential mirrors #44066's rejection of dummy values
+// that contain a complete token matching another configured provider's pattern.
+func (b *ProxyCredentialBroker) dummyEmbedsOtherProviderCredential(dummyValue string, provider *ProxyCredentialProvider) bool {
+	for _, other := range b.providers {
+		if other == nil || other == provider {
+			continue
+		}
+		for _, pattern := range other.embeddedPatterns {
+			for _, indices := range pattern.matcher.FindAllStringIndex(dummyValue, -1) {
+				start, end := indices[0], indices[1]
+				if end-start < minEmbeddedCredentialLength && !pattern.distinctive {
+					continue
+				}
+				if start > 0 && isCredentialTokenByte(dummyValue[start-1]) {
+					continue
+				}
+				if end < len(dummyValue) && isCredentialTokenByte(dummyValue[end]) {
+					continue
+				}
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (b *ProxyCredentialBroker) isDummyValue(value string) bool {
+	for _, credential := range b.credentials {
+		if credential.DummyValue == value {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *ProxyCredentialBroker) updateBrokeredCredentialsMarker(env map[string]string) {
+	entries := [][2]string{}
+	for _, key := range b.envKeys() {
+		value, ok := env[key]
+		if ok && b.isDummyValue(value) {
+			entries = append(entries, [2]string{key, value})
+		}
+	}
+	if data, err := json.Marshal(entries); err == nil {
+		env[BrokeredCredentialsEnvKey] = string(data)
+	} else {
+		delete(env, BrokeredCredentialsEnvKey)
+	}
+}
+
+func (h *ProxyCredentialHostBinding) MatchesHost(host string) bool {
+	if h == nil {
+		return false
+	}
+	normalized := NormalizeProxyHost(host)
+	for _, exact := range h.ExactHosts {
+		if normalized == NormalizeProxyHost(exact) {
+			return true
+		}
+	}
+	for _, suffix := range h.Suffixes {
+		if strings.HasSuffix(normalized, strings.ToLower(suffix)) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *ProxyCredentialHostBinding) Equal(other ProxyCredentialHostBinding) bool {
+	if h == nil {
+		return false
+	}
+	if len(h.ExactHosts) != len(other.ExactHosts) || len(h.Suffixes) != len(other.Suffixes) {
+		return false
+	}
+	for index := range h.ExactHosts {
+		if h.ExactHosts[index] != other.ExactHosts[index] {
+			return false
+		}
+	}
+	for index := range h.Suffixes {
+		if h.Suffixes[index] != other.Suffixes[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func brokerableCredentialValue(env map[string]string, credentials []ProxyCredentialRecord, envVar string, provider *ProxyCredentialProvider) (string, bool) {
+	realValue := strings.TrimSpace(env[envVar])
+	if realValue == "" {
+		return "", false
+	}
+	for _, credential := range credentials {
+		if credential.DummyValue == realValue {
+			return "", false
+		}
+	}
+	if _, ok := provider.RequestHeaderValue(realValue); !ok {
+		return "", false
+	}
+	return realValue, true
+}
+
+func selectCredential(headers map[string][]string, matching []*ProxyCredentialRecord) *ProxyCredentialRecord {
+	var selected *ProxyCredentialRecord
+	for _, credential := range matching {
+		headerValue, ok := credential.Provider.RequestHeader(headers)
+		if !ok || !strings.Contains(headerValue, credential.DummyValue) {
+			continue
+		}
+		if selected != nil {
+			return nil
+		}
+		selected = credential
+	}
+	return selected
+}
+
+func credentialProviders() []*ProxyCredentialProvider {
+	return credentialProvidersWithOpenAIHost("")
+}
+
+// credentialProvidersWithOpenAIHost builds the built-in providers, binding the
+// OpenAI credentials to the configured host as well (Rust's credential broker
+// passes state.openai_api_host to each host binding).
+func credentialProvidersWithOpenAIHost(configuredOpenAIHost string) []*ProxyCredentialProvider {
+	return []*ProxyCredentialProvider{githubCredentialProvider(), openAICredentialProvider(configuredOpenAIHost)}
+}
+
+func githubCredentialProvider() *ProxyCredentialProvider {
+	return &githubProvider
+}
+
+func openAICredentialProvider(configuredOpenAIHost string) *ProxyCredentialProvider {
+	provider := openAIProvider
+	provider.Sources = []ProxyCredentialSource{{
+		EnvVars:     []string{"OPENAI_API_KEY"},
+		HostBinding: openAIHostBinding(configuredOpenAIHost),
+	}}
+	return &provider
+}
+
+var githubProvider = ProxyCredentialProvider{
+	ContextEnvVars: []string{"GH_HOST"},
+	Sources: []ProxyCredentialSource{
+		{
+			EnvVars: []string{"GH_TOKEN", "GITHUB_TOKEN"},
+			HostBinding: func(map[string]string) (ProxyCredentialHostBinding, bool) {
+				return ProxyCredentialHostBinding{
+					ExactHosts: []string{"api.github.com", "github.com"},
+					Suffixes:   []string{".ghe.com"},
+				}, true
+			},
+		},
+		{
+			EnvVars: []string{"GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"},
+			HostBinding: func(env map[string]string) (ProxyCredentialHostBinding, bool) {
+				host := githubHostHint(env)
+				if host == "" || githubCloudHost(host) {
+					return ProxyCredentialHostBinding{}, false
+				}
+				return ProxyCredentialHostBinding{ExactHosts: []string{host}}, true
+			},
+		},
+	},
+	DummyValue:         githubDummyValue,
+	RequestHeader:      authorizationHeader,
+	RequestHeaderValue: bearerHeaderValue,
+	InsertHeader:       insertAuthorizationHeader,
+	HeaderName:         authorizationHeaderName,
+}
+
+// providerEnvValue reads a provider environment key, comparing
+// case-insensitively on Windows (Rust env_value / env_key_matches).
+func providerEnvValue(env map[string]string, key string) (string, bool) {
+	if value, ok := env[key]; ok {
+		return value, true
+	}
+	if runtime.GOOS == "windows" {
+		for candidate, value := range env {
+			if strings.EqualFold(candidate, key) {
+				return value, true
+			}
+		}
+	}
+	return "", false
+}
+
+// TrustedCredentialBrokerHost mirrors Rust's trusted_credential_broker_host: an
+// HTTPS base URL without user information contributes its normalized host.
+func TrustedCredentialBrokerHost(baseURL string) (string, bool) {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || parsed.Scheme != "https" || parsed.User != nil {
+		return "", false
+	}
+	host := strings.TrimSpace(parsed.Hostname())
+	if host == "" {
+		return "", false
+	}
+	normalized := NormalizeProxyHost(host)
+	if normalized == "" {
+		return "", false
+	}
+	return normalized, true
+}
+
+// trustedCredentialBrokerHost keeps the package-local name used by the built-in
+// provider bindings.
+func trustedCredentialBrokerHost(baseURL string) (string, bool) {
+	return TrustedCredentialBrokerHost(baseURL)
+}
+
+// openAIProvider holds the built-in OpenAI provider's non-binding fields. The
+// host binding is built per broker so it can include the configured
+// openai_base_url host (Rust's credential_broker_openai_host).
+var openAIProvider = ProxyCredentialProvider{
+	// Rust's built-in OpenAI provider binds OPENAI_BASE_URL as a destination
+	// context key (network-proxy/src/credential_broker/providers/openai.rs), so
+	// the broker treats it as a provider env key and keeps it out of child
+	// environments.
+	ContextEnvVars:     []string{"OPENAI_BASE_URL"},
+	DummyValue:         openAIDummyValue,
+	RequestHeader:      authorizationHeader,
+	RequestHeaderValue: bearerHeaderValue,
+	InsertHeader:       insertAuthorizationHeader,
+	HeaderName:         authorizationHeaderName,
+}
+
+// openAIHostBinding mirrors Rust's openai_provider::host_binding: the default
+// host, the trusted configured host, and the trusted OPENAI_BASE_URL host, in
+// that order without duplicates. An untrusted OPENAI_BASE_URL disables the
+// binding (Rust's invalidates_host_binding) instead of brokering to the default
+// host.
+func openAIHostBinding(configuredHost string) func(map[string]string) (ProxyCredentialHostBinding, bool) {
+	return func(env map[string]string) (ProxyCredentialHostBinding, bool) {
+		hosts := []string{"api.openai.com"}
+		appendHost := func(host string) {
+			if host == "" {
+				return
+			}
+			for _, existing := range hosts {
+				if existing == host {
+					return
+				}
+			}
+			hosts = append(hosts, host)
+		}
+		appendHost(NormalizeProxyHost(configuredHost))
+		if baseURL, ok := providerEnvValue(env, "OPENAI_BASE_URL"); ok && strings.TrimSpace(baseURL) != "" {
+			host, trusted := trustedCredentialBrokerHost(baseURL)
+			if !trusted {
+				return ProxyCredentialHostBinding{}, false
+			}
+			appendHost(host)
+		}
+		return ProxyCredentialHostBinding{ExactHosts: hosts}, true
+	}
+}
+
+func githubDummyValue(realValue string) string {
+	return shapedDummyValue(realValue, githubTokenPrefix(realValue), 40)
+}
+
+func openAIDummyValue(realValue string) string {
+	return shapedDummyValue(realValue, openAIAPIKeyPrefix(realValue), 51)
+}
+
+func authorizationHeader(headers map[string][]string) (string, bool) {
+	values := headers[textproto.CanonicalMIMEHeaderKey("authorization")]
+	if len(values) == 0 {
+		values = headers["authorization"]
+	}
+	if len(values) == 0 {
+		values = headers["AUTHORIZATION"]
+	}
+	if len(values) == 0 {
+		return "", false
+	}
+	return values[0], true
+}
+
+func bearerHeaderValue(value string) (string, bool) {
+	headerValue := "Bearer " + value
+	if err := validateHeaderValue(headerValue); err != nil {
+		return "", false
+	}
+	return headerValue, true
+}
+
+func insertAuthorizationHeader(headers map[string][]string, value string) {
+	headers[textproto.CanonicalMIMEHeaderKey("authorization")] = []string{value}
+}
+
+// authorizationHeaderName reports the header the built-in providers inject
+// through, mirroring BrokeredCredentialProvider::translate_request_headers
+// (network-proxy/src/credential_broker/registry.rs).
+func authorizationHeaderName() string {
+	return textproto.CanonicalMIMEHeaderKey("authorization")
+}
+
+func githubCloudHost(host string) bool {
+	normalized := NormalizeProxyHost(host)
+	if normalized == "api.github.com" || normalized == "github.com" {
+		return true
+	}
+	return strings.HasSuffix(normalized, ".ghe.com")
+}
+
+func githubTokenPrefix(value string) string {
+	prefixes := []string{"github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_"}
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(value, prefix) {
+			return prefix
+		}
+	}
+	return "ghp_"
+}
+
+func githubHostHint(env map[string]string) string {
+	return NormalizeProxyHost(env["GH_HOST"])
+}
+
+func openAIAPIKeyPrefix(value string) string {
+	if !strings.HasPrefix(value, "sk-") {
+		return "sk-"
+	}
+	suffix := strings.TrimPrefix(value, "sk-")
+	separator := strings.Index(suffix, "-")
+	if separator < 0 {
+		return "sk-"
+	}
+	return value[:separator+4]
+}
+
+func shapedDummyValue(realValue string, prefix string, minimumLen int) string {
+	targetLen := len(realValue)
+	if targetLen < minimumLen {
+		targetLen = minimumLen
+	}
+	if targetLen < len(prefix)+16 {
+		targetLen = len(prefix) + 16
+	}
+	seed := randomCredentialSeed(targetLen)
+	if seed == "" {
+		seed = hashedCredentialSeed(realValue, targetLen)
+	}
+	var builder strings.Builder
+	builder.Grow(targetLen)
+	builder.WriteString(prefix)
+	for index := len(prefix); index < targetLen; index++ {
+		template := byte(0)
+		if index < len(realValue) {
+			template = realValue[index]
+		}
+		if template != 0 && !isASCIIAlphanumeric(template) {
+			builder.WriteByte(template)
+			continue
+		}
+		builder.WriteByte(seed[index%len(seed)])
+	}
+	return builder.String()
+}
+
+func randomCredentialSeed(length int) string {
+	if length <= 0 {
+		return ""
+	}
+	buf := make([]byte, length)
+	if _, err := rand.Read(buf); err != nil {
+		return ""
+	}
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+	for index, value := range buf {
+		buf[index] = alphabet[int(value)%len(alphabet)]
+	}
+	return string(buf)
+}
+
+func hashedCredentialSeed(value string, length int) string {
+	sum := sha256.Sum256([]byte(value))
+	text := hex.EncodeToString(sum[:])
+	if length <= len(text) {
+		return text
+	}
+	var builder strings.Builder
+	for builder.Len() < length {
+		builder.WriteString(text)
+	}
+	return builder.String()[:length]
+}
+
+func isASCIIAlphanumeric(value byte) bool {
+	return value >= '0' && value <= '9' || value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z'
+}

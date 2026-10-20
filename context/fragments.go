@@ -1,0 +1,946 @@
+package context
+
+import (
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"codex_core/eventmap"
+)
+
+const (
+	RoleDeveloper = "developer"
+	RoleUser      = "user"
+)
+
+type Fragment interface {
+	Role() string
+	Markers() (string, string)
+	Body() string
+	// ContentKind returns a stable "<feature>.<name>" classification for the
+	// rendered model-visible content (mirrors Rust `content_kind()`).
+	ContentKind() string
+}
+
+type RenderedFragment struct {
+	Role        string
+	Content     string
+	ContentKind string
+	// ContentItems mirrors Rust #54776 `ContextualUserFragment::render()`
+	// returning a typed `ContentItem`: the first text item carries the
+	// fragment markers, every non-text item passes through unchanged.
+	ContentItems []eventmap.ContentItem
+}
+
+// BodyItemProvider lets a fragment emit typed content instead of a plain
+// string (Rust #54776). Fragments that do not implement it keep rendering as a
+// single InputText item built from Body().
+type BodyItemProvider interface {
+	BodyItems() []eventmap.ContentItem
+}
+
+func fragmentBodyItems(fragment Fragment) []eventmap.ContentItem {
+	if provider, ok := fragment.(BodyItemProvider); ok {
+		if items := provider.BodyItems(); len(items) > 0 {
+			return items
+		}
+	}
+	return []eventmap.ContentItem{{Kind: eventmap.ContentInputText, Text: fragment.Body()}}
+}
+
+// RenderItems applies the Rust #54776 rule: markers wrap only InputText; every
+// other content item is forwarded verbatim.
+func RenderItems(fragment Fragment) []eventmap.ContentItem {
+	if fragment == nil {
+		return nil
+	}
+	open, close := fragment.Markers()
+	items := fragmentBodyItems(fragment)
+	out := make([]eventmap.ContentItem, 0, len(items))
+	for _, item := range items {
+		if item.Kind == eventmap.ContentInputText {
+			body := item.Text
+			if open != "" || close != "" {
+				// Rust's ContextualUserFragment::render concatenates markers and
+				// the InputText body without inserting separators; bodies own
+				// their whitespace. An empty body therefore renders as
+				// `<open></close>`.
+				body = open + body + close
+			}
+			item.Text = body
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+// ToolOutputParts converts typed fragment content into model tool-output parts,
+// preserving image URLs, image detail and audio references (Rust #54776's
+// shared content-to-tool-output conversion).
+func ToolOutputParts(items []eventmap.ContentItem) []map[string]any {
+	out := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		if item.Kind == eventmap.ContentOutputText {
+			// Rust's From<ContentItem> pairs OutputText with InputText in the
+			// tool-output representation.
+			item.Kind = eventmap.ContentInputText
+		}
+		out = append(out, item.Wire())
+	}
+	return out
+}
+
+// ToolOutputText mirrors Rust's `content_items_to_code_mode_result`: non-empty
+// text parts are joined with newlines, an image contributes its URL or file id,
+// and an audio part contributes its audio URL (Rust #54776 code-mode output).
+func ToolOutputText(parts []map[string]any) string {
+	texts := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part == nil {
+			continue
+		}
+		kind, _ := part["type"].(string)
+		switch kind {
+		case "input_text", "output_text":
+			if text, _ := part["text"].(string); strings.TrimSpace(text) != "" {
+				texts = append(texts, text)
+			}
+		case "input_image":
+			if fileID, _ := part["file_id"].(string); strings.TrimSpace(fileID) != "" {
+				texts = append(texts, fileID)
+				continue
+			}
+			if imageURL, _ := part["image_url"].(string); strings.TrimSpace(imageURL) != "" {
+				texts = append(texts, imageURL)
+			}
+		case "input_audio":
+			if audioURL, _ := part["audio_url"].(string); strings.TrimSpace(audioURL) != "" {
+				texts = append(texts, audioURL)
+			}
+		}
+	}
+	return strings.Join(texts, "\n")
+}
+
+type SimpleFragment struct {
+	role        string
+	openTag     string
+	closeTag    string
+	body        string
+	contentKind string
+}
+
+func NewSimpleFragment(role string, openTag string, closeTag string, body string) *SimpleFragment {
+	return &SimpleFragment{role: role, openTag: openTag, closeTag: closeTag, body: body}
+}
+
+// NewSimpleFragmentWithKind builds a fragment with an explicit content-kind
+// classification. A kind that is empty falls back to "generic".
+func NewSimpleFragmentWithKind(role string, openTag string, closeTag string, body string, contentKind string) *SimpleFragment {
+	f := NewSimpleFragment(role, openTag, closeTag, body)
+	f.contentKind = contentKind
+	return f
+}
+
+func (f *SimpleFragment) Role() string {
+	return f.role
+}
+
+func (f *SimpleFragment) Markers() (string, string) {
+	return f.openTag, f.closeTag
+}
+
+func (f *SimpleFragment) Body() string {
+	return f.body
+}
+
+func (f *SimpleFragment) ContentKind() string {
+	if f.contentKind == "" {
+		return "generic"
+	}
+	return f.contentKind
+}
+
+func Render(fragment Fragment) *RenderedFragment {
+	if fragment == nil {
+		return nil
+	}
+	open, close := fragment.Markers()
+	body := fragment.Body()
+	content := body
+	if open != "" || close != "" {
+		content = open + body + close
+	}
+	return &RenderedFragment{
+		Role:         fragment.Role(),
+		Content:      content,
+		ContentKind:  fragment.ContentKind(),
+		ContentItems: RenderItems(fragment),
+	}
+}
+
+func RenderStandalone(fragment Fragment) *RenderedFragment {
+	if fragment == nil {
+		return nil
+	}
+	open, close := fragment.Markers()
+	return &RenderedFragment{
+		Role:         fragment.Role(),
+		Content:      open + fragment.Body() + close,
+		ContentKind:  fragment.ContentKind(),
+		ContentItems: RenderItems(fragment),
+	}
+}
+
+func RenderMany(fragments []Fragment) []RenderedFragment {
+	out := make([]RenderedFragment, 0, len(fragments))
+	for _, fragment := range fragments {
+		rendered := Render(fragment)
+		if rendered != nil && strings.TrimSpace(rendered.Content) != "" {
+			out = append(out, *rendered)
+		}
+	}
+	return out
+}
+
+type PluginSummary struct {
+	ConfigName  string
+	DisplayName string
+	HasSkills   bool
+}
+
+type AvailablePluginsInstructions struct {
+	Plugins []PluginSummary
+}
+
+func NewAvailablePluginsInstructions(plugins []PluginSummary) *AvailablePluginsInstructions {
+	if len(plugins) == 0 {
+		return nil
+	}
+	return &AvailablePluginsInstructions{Plugins: append([]PluginSummary(nil), plugins...)}
+}
+
+func (p *AvailablePluginsInstructions) Role() string {
+	return RoleDeveloper
+}
+
+func (p *AvailablePluginsInstructions) Markers() (string, string) {
+	return "<plugins_instructions>", "</plugins_instructions>"
+}
+
+func (p *AvailablePluginsInstructions) Body() string {
+	lines := []string{
+		"## Plugins",
+		"A plugin is a local bundle of skills, MCP servers, and apps.",
+		"### How to use plugins",
+		"- Skill naming: If a plugin contributes skills, those skill entries are prefixed with `plugin_name:` in the Skills list.",
+		"- MCP naming: Plugin-provided MCP tools keep standard MCP identifiers such as `mcp__server__tool`; use tool provenance to tell which plugin they come from.",
+		"- Trigger rules: If the user explicitly names a plugin, prefer capabilities associated with that plugin for that turn.",
+		"- Relationship to capabilities: Plugins are not invoked directly. Use their underlying skills, MCP tools, and app tools to help solve the task.",
+		"- Relevance: Determine what a plugin can help with from explicit user mention or from the plugin-associated skills, MCP tools, and apps exposed elsewhere in this turn.",
+		"- Missing/blocked: If the user requests a plugin that does not have relevant callable capabilities for the task, say so briefly and continue with the best fallback.",
+	}
+	return strings.Join(lines, "\n")
+}
+
+type PluginInstructions struct {
+	Text string
+}
+
+func NewPluginInstructions(text string) *PluginInstructions {
+	if strings.TrimSpace(text) == "" {
+		return nil
+	}
+	return &PluginInstructions{Text: text}
+}
+
+func (p *PluginInstructions) Role() string {
+	return RoleDeveloper
+}
+
+func (p *PluginInstructions) Markers() (string, string) {
+	return "", ""
+}
+
+func (p *PluginInstructions) Body() string {
+	return p.Text
+}
+
+type SkillInstructions struct {
+	Name                   string
+	Path                   string
+	Contents               string
+	ExecutorResourceAccess *ExecutorSkillResourceAccess
+}
+
+type ExecutorSkillResourceAccess struct {
+	AuthorityID  string
+	Package      string
+	MainResource string
+}
+
+func NewSkillInstructions(name string, path string, contents string) *SkillInstructions {
+	name = strings.TrimSpace(name)
+	path = strings.TrimSpace(path)
+	contents = strings.TrimSpace(contents)
+	if name == "" || path == "" || contents == "" {
+		return nil
+	}
+	return &SkillInstructions{Name: name, Path: path, Contents: contents}
+}
+
+func NewSkillInstructionsWithExecutorResourceAccess(name string, path string, contents string, access *ExecutorSkillResourceAccess) *SkillInstructions {
+	fragment := NewSkillInstructions(name, path, contents)
+	if fragment == nil || access == nil {
+		return fragment
+	}
+	copy := *access
+	copy.AuthorityID = strings.TrimSpace(copy.AuthorityID)
+	copy.Package = strings.TrimSpace(copy.Package)
+	copy.MainResource = strings.TrimSpace(copy.MainResource)
+	if copy.AuthorityID != "" && copy.Package != "" && copy.MainResource != "" {
+		fragment.ExecutorResourceAccess = &copy
+	}
+	return fragment
+}
+
+func (s *SkillInstructions) Role() string {
+	return RoleUser
+}
+
+func (s *SkillInstructions) Markers() (string, string) {
+	return "<skill>", "</skill>"
+}
+
+func (s *SkillInstructions) Body() string {
+	resourceAccess := ""
+	if s.ExecutorResourceAccess != nil {
+		metadata := struct {
+			Authority struct {
+				Kind string `json:"kind"`
+				ID   string `json:"id"`
+			} `json:"authority"`
+			Package      string `json:"package"`
+			MainResource string `json:"main_resource"`
+		}{Package: s.ExecutorResourceAccess.Package, MainResource: s.ExecutorResourceAccess.MainResource}
+		metadata.Authority.Kind = "executor"
+		metadata.Authority.ID = s.ExecutorResourceAccess.AuthorityID
+		if encoded, err := json.Marshal(metadata); err == nil {
+			resourceAccess = "\n<resource_access>" + string(encoded) + "</resource_access>"
+		}
+	}
+	return fmt.Sprintf("\n<name>%s</name>\n<path>%s</path>%s\n%s\n", s.Name, s.Path, resourceAccess, s.Contents)
+}
+
+type AppInstructionsData struct {
+	ID                 string
+	Name               string
+	Description        string
+	InstallURL         string
+	IsAccessible       bool
+	IsEnabled          bool
+	PluginDisplayNames []string
+}
+
+type AppInstructions struct {
+	Data AppInstructionsData
+}
+
+func NewAppInstructions(data AppInstructionsData) *AppInstructions {
+	data.ID = strings.TrimSpace(data.ID)
+	if data.ID == "" {
+		return nil
+	}
+	data.Name = strings.TrimSpace(data.Name)
+	if data.Name == "" {
+		data.Name = data.ID
+	}
+	data.Description = strings.TrimSpace(data.Description)
+	data.InstallURL = strings.TrimSpace(data.InstallURL)
+	data.PluginDisplayNames = cleanFragmentStrings(data.PluginDisplayNames)
+	return &AppInstructions{Data: data}
+}
+
+func (a *AppInstructions) Role() string {
+	return RoleUser
+}
+
+func (a *AppInstructions) Markers() (string, string) {
+	return "<app>", "</app>"
+}
+
+func (a *AppInstructions) Body() string {
+	if a == nil {
+		return ""
+	}
+	lines := []string{
+		fmt.Sprintf("<id>%s</id>", a.Data.ID),
+		fmt.Sprintf("<name>%s</name>", a.Data.Name),
+	}
+	if a.Data.Description != "" {
+		lines = append(lines, fmt.Sprintf("<description>%s</description>", a.Data.Description))
+	}
+	if a.Data.InstallURL != "" {
+		lines = append(lines, fmt.Sprintf("<install_url>%s</install_url>", a.Data.InstallURL))
+	}
+	lines = append(lines,
+		fmt.Sprintf("<is_accessible>%t</is_accessible>", a.Data.IsAccessible),
+		fmt.Sprintf("<is_enabled>%t</is_enabled>", a.Data.IsEnabled),
+	)
+	if len(a.Data.PluginDisplayNames) > 0 {
+		lines = append(lines, fmt.Sprintf("<plugin_display_names>%s</plugin_display_names>", strings.Join(a.Data.PluginDisplayNames, ", ")))
+	}
+	return "\n" + strings.Join(lines, "\n") + "\n"
+}
+
+// ImageResizeNoticeSource mirrors Rust's ImageResizeNoticeSource (fa5d5ae047,
+// #37134).
+type ImageResizeNoticeSource string
+
+const (
+	ImageResizeNoticeSourceUserMessage ImageResizeNoticeSource = "user message"
+	ImageResizeNoticeSourceToolOutput  ImageResizeNoticeSource = "tool output"
+)
+
+// ResizedImage mirrors Rust's ResizedImage: image numbering plus original and
+// prepared dimensions.
+type ResizedImage struct {
+	ImageNumber    int
+	ImageCount     int
+	SourceWidth    int
+	SourceHeight   int
+	PreparedWidth  int
+	PreparedHeight int
+}
+
+// ImageResizeNotice reports to the model when prompt images were resized,
+// mirroring Rust's image_resize_notice feature fragment.
+type ImageResizeNotice struct {
+	Source        ImageResizeNoticeSource
+	ResizedImages []ResizedImage
+}
+
+func NewImageResizeNotice(source ImageResizeNoticeSource, resized []ResizedImage) *ImageResizeNotice {
+	return &ImageResizeNotice{Source: source, ResizedImages: append([]ResizedImage(nil), resized...)}
+}
+
+func (n *ImageResizeNotice) Role() string {
+	return RoleDeveloper
+}
+
+func (n *ImageResizeNotice) Markers() (string, string) {
+	return "<image_resize_notice>", "</image_resize_notice>"
+}
+
+func (n *ImageResizeNotice) Body() string {
+	if n == nil {
+		return ""
+	}
+	source := string(n.Source)
+	if source == "" {
+		source = string(ImageResizeNoticeSourceUserMessage)
+	}
+	lines := make([]string, 0, len(n.ResizedImages))
+	for _, image := range n.ResizedImages {
+		lines = append(lines, fmt.Sprintf(
+			"Image %d of %d in the preceding %s was resized from %dx%d to %dx%d pixels.",
+			image.ImageNumber, image.ImageCount, source,
+			image.SourceWidth, image.SourceHeight, image.PreparedWidth, image.PreparedHeight,
+		))
+	}
+	return "\n" + strings.Join(lines, "\n") + "\n"
+}
+
+const maxRecommendedPlugins = 50
+
+type RecommendedPlugin struct {
+	ID   string
+	Name string
+}
+
+type RecommendedPluginsInstructions struct {
+	Plugins []RecommendedPlugin
+}
+
+func NewRecommendedPluginsInstructions(plugins []RecommendedPlugin) *RecommendedPluginsInstructions {
+	if len(plugins) == 0 {
+		return nil
+	}
+	out := append([]RecommendedPlugin(nil), plugins...)
+	if len(out) > maxRecommendedPlugins {
+		out = out[:maxRecommendedPlugins]
+	}
+	return &RecommendedPluginsInstructions{Plugins: out}
+}
+
+func (p *RecommendedPluginsInstructions) Role() string {
+	return RoleUser
+}
+
+func (p *RecommendedPluginsInstructions) Markers() (string, string) {
+	return "<recommended_plugins>", "</recommended_plugins>"
+}
+
+func (p *RecommendedPluginsInstructions) Body() string {
+	lines := []string{
+		"Here is a list of plugins that are available but not installed. If the user's query would benefit from one of these plugins, use the `request_plugin_install` tool to suggest that they install it. Pass the parenthesized ID as `plugin_id`. For example, suggest the Google Drive plugin if the query could possibly be better answered with access to Google Drive.",
+		"",
+	}
+	for _, plugin := range p.Plugins {
+		if strings.TrimSpace(plugin.ID) == "" || strings.TrimSpace(plugin.Name) == "" {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("- %s (%s)", plugin.Name, plugin.ID))
+	}
+	return strings.Join(lines, "\n")
+}
+
+type PermissionsInstructions struct {
+	SandboxMode     string
+	ApprovalPolicy  string
+	WritableRoots   []string
+	NetworkEnabled  bool
+	ExtraGuidelines []string
+}
+
+func (p *PermissionsInstructions) Role() string {
+	return RoleDeveloper
+}
+
+func (p *PermissionsInstructions) Markers() (string, string) {
+	return "<permissions>", "</permissions>"
+}
+
+func (p *PermissionsInstructions) Body() string {
+	lines := []string{
+		fmt.Sprintf("Filesystem sandbox: %s", valueOr(p.SandboxMode, "unknown")),
+		fmt.Sprintf("Approval policy: %s", valueOr(p.ApprovalPolicy, "unknown")),
+	}
+	if len(p.WritableRoots) == 0 {
+		lines = append(lines, "Writable roots: none")
+	} else {
+		roots := append([]string(nil), p.WritableRoots...)
+		sort.Strings(roots)
+		lines = append(lines, "Writable roots:")
+		for _, root := range roots {
+			lines = append(lines, "- "+root)
+		}
+	}
+	if p.NetworkEnabled {
+		lines = append(lines, "Network: enabled")
+	} else {
+		lines = append(lines, "Network: restricted")
+	}
+	lines = append(lines, p.ExtraGuidelines...)
+	return strings.Join(lines, "\n")
+}
+
+func cleanFragmentStrings(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+type CurrentTimeReminder struct {
+	Now      time.Time
+	Location string
+}
+
+func (c *CurrentTimeReminder) Role() string {
+	return RoleDeveloper
+}
+
+func (c *CurrentTimeReminder) Markers() (string, string) {
+	return "<current_time_reminder>", "</current_time_reminder>"
+}
+
+func (c *CurrentTimeReminder) Body() string {
+	now := c.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return fmt.Sprintf("It is %s.", now.UTC().Format("2006-01-02 15:04:05 UTC"))
+}
+
+// CurrentTimeUnavailableMessage mirrors Rust
+// context::CurrentTimeUnavailable::MESSAGE: the model-visible text used both by
+// the clock tools and by the nonfatal clock-read-error notice.
+const CurrentTimeUnavailableMessage = "failed to read current time"
+
+// CurrentTimeUnavailable is the developer fragment recorded when the clock
+// provider fails while the `nonfatal_clock_read_errors` feature is enabled
+// (Rust context::CurrentTimeUnavailable).
+type CurrentTimeUnavailable struct{}
+
+func (c *CurrentTimeUnavailable) Role() string {
+	return RoleDeveloper
+}
+
+func (c *CurrentTimeUnavailable) Markers() (string, string) {
+	return "<current_time_unavailable>", "</current_time_unavailable>"
+}
+
+func (c *CurrentTimeUnavailable) Body() string {
+	return CurrentTimeUnavailableMessage
+}
+
+type AdditionalContextFragment struct {
+	Key   string
+	Value string
+	role  string
+}
+
+func NewAdditionalContextFragment(role string, key string, value string) *AdditionalContextFragment {
+	key = strings.TrimSpace(key)
+	value = strings.TrimSpace(value)
+	if key == "" || value == "" {
+		return nil
+	}
+	if role == "" {
+		role = RoleUser
+	}
+	return &AdditionalContextFragment{Key: key, Value: value, role: role}
+}
+
+func (a *AdditionalContextFragment) Role() string {
+	if a == nil || a.role == "" {
+		return RoleUser
+	}
+	return a.role
+}
+
+func (a *AdditionalContextFragment) Markers() (string, string) {
+	return "<additional_context>", "</additional_context>"
+}
+
+func (a *AdditionalContextFragment) Body() string {
+	if a == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s:\n%s", a.Key, a.Value)
+}
+
+type UserInstructions struct {
+	Text string
+}
+
+func (u *UserInstructions) Role() string {
+	return RoleDeveloper
+}
+
+func (u *UserInstructions) Markers() (string, string) {
+	return "<user_instructions>", "</user_instructions>"
+}
+
+func (u *UserInstructions) Body() string {
+	return u.Text
+}
+
+type ModelSwitchInstructions struct {
+	From         string
+	To           string
+	Instructions string
+}
+
+// AnsweredQuestion mirrors Rust's context-fragments AnsweredQuestion: an
+// explicitly submitted answer uses the desktop's existing reply envelope and a
+// stable question identity (#46486), while an oversized identity falls back to
+// the previous plain-text framing so the model-authored prompt stays bounded.
+type AnsweredQuestion struct {
+	// QuestionID is nil for the plain-text fallback (an identity longer than
+	// answeredQuestionMaxBytes).
+	QuestionID *string
+	Question   string
+	Answer     string
+}
+
+// answeredQuestionMaxBytes bounds both the question framing and the accepted
+// question identity to 512 UTF-8 bytes.
+const answeredQuestionMaxBytes = 512
+
+// answeredQuestionMarkers wrap the desktop reply envelope.
+const (
+	answeredQuestionOpenMarker  = "<send_user_message_question_reply>"
+	answeredQuestionCloseMarker = "</send_user_message_question_reply>"
+)
+
+// NewAnsweredQuestion builds the answer fragment for one question identity.
+func NewAnsweredQuestion(questionID string, question string, answer string) *AnsweredQuestion {
+	end := floorCharBoundary(question, minInt(len(question), answeredQuestionMaxBytes))
+	trimmed := strings.NewReplacer("\n", " ", "\r", " ").Replace(question[:end])
+	fragment := &AnsweredQuestion{Question: trimmed, Answer: answer}
+	if len(questionID) <= answeredQuestionMaxBytes {
+		id := questionID
+		fragment.QuestionID = &id
+	}
+	return fragment
+}
+
+func (a *AnsweredQuestion) Role() string {
+	return RoleUser
+}
+
+// Markers carry the desktop reply envelope when the question identity is known;
+// the fallback framing stays unmarked so it never matches arbitrary text.
+func (a *AnsweredQuestion) Markers() (string, string) {
+	if a != nil && a.QuestionID != nil {
+		return answeredQuestionOpenMarker, answeredQuestionCloseMarker
+	}
+	return "", ""
+}
+
+func (a *AnsweredQuestion) Body() string {
+	if a == nil {
+		return ""
+	}
+	if a.QuestionID == nil {
+		return "> " + a.Question + "\n\n" + a.Answer
+	}
+	// The payload is the desktop's reply envelope; the keys are emitted in the
+	// same order Rust's serde_json map produces.
+	payload, err := json.Marshal([]map[string]string{{
+		"answer":         a.Answer,
+		"question":       a.Question,
+		"questionItemId": *a.QuestionID,
+	}})
+	if err != nil {
+		return "> " + a.Question + "\n\n" + a.Answer
+	}
+	return "\n" + string(payload) + "\n"
+}
+
+func (a *AnsweredQuestion) ContentKind() string {
+	return "user.answered_question"
+}
+
+// floorCharBoundary returns the largest index <= index that starts a UTF-8
+// rune (Rust str::floor_char_boundary).
+func floorCharBoundary(text string, index int) int {
+	if index <= 0 {
+		return 0
+	}
+	if index >= len(text) {
+		return len(text)
+	}
+	for index > 0 && !utf8.RuneStart(text[index]) {
+		index--
+	}
+	return index
+}
+
+func minInt(left int, right int) int {
+	if left < right {
+		return left
+	}
+	return right
+}
+
+func (m *ModelSwitchInstructions) Role() string {
+	return RoleDeveloper
+}
+
+func (m *ModelSwitchInstructions) Markers() (string, string) {
+	return "<model_switch>", "</model_switch>"
+}
+
+func (m *ModelSwitchInstructions) Body() string {
+	if m.Instructions != "" {
+		return fmt.Sprintf("\nThe user was previously using a different model. Please continue the conversation according to the following instructions:\n\n%s\n", m.Instructions)
+	}
+	if m.From == "" {
+		return fmt.Sprintf("The active model is `%s`.", m.To)
+	}
+	return fmt.Sprintf("The active model changed from `%s` to `%s`.", m.From, m.To)
+}
+
+type TokenBudgetContext struct {
+	Used      int
+	Limit     int
+	Remaining int
+}
+
+// UserVerificationNotice mirrors Rust's context::UserVerificationNotice: a
+// bounded realtime notice emitted in place of a user-verification elicitation
+// request, so the verification challenge and display text never reach the
+// realtime conversation.
+type UserVerificationNotice struct{}
+
+func (n *UserVerificationNotice) Role() string {
+	return RoleDeveloper
+}
+
+func (n *UserVerificationNotice) Markers() (string, string) {
+	return "<user_verification_notice>", "</user_verification_notice>"
+}
+
+func (n *UserVerificationNotice) Body() string {
+	return "User verification is required. Please respond in the app."
+}
+
+func (n *UserVerificationNotice) ContentKind() string {
+	return "user_verification.notice"
+}
+
+type ContextWindowGuidance struct {
+	Message string
+}
+
+func (c *ContextWindowGuidance) Role() string {
+	return RoleDeveloper
+}
+
+func (c *ContextWindowGuidance) Markers() (string, string) {
+	return "<context_window_guidance>", "</context_window_guidance>"
+}
+
+func (c *ContextWindowGuidance) Body() string {
+	if c == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.Message)
+}
+
+func (t *TokenBudgetContext) Role() string {
+	return RoleDeveloper
+}
+
+func (t *TokenBudgetContext) Markers() (string, string) {
+	return "<token_budget>", "</token_budget>"
+}
+
+func (t *TokenBudgetContext) Body() string {
+	remaining := t.Remaining
+	if remaining == 0 && t.Limit > 0 {
+		remaining = t.Limit - t.Used
+	}
+	return fmt.Sprintf("Token budget: %d used, %d remaining, %d limit.", t.Used, remaining, t.Limit)
+}
+
+func nonEmpty(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func valueOr(value string, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+// ContentKind implementations: each fragment supplies a stable
+// "<feature>.<name>" classification mirroring the Rust `content_kind()`
+// helpers introduced in the 2026-08-23 sync25 batch (#40174/#40177/#40180).
+
+// GuardianNodeReplPolicy mirrors Rust core::context::GuardianNodeReplPolicy:
+// the node-REPL review rules are their own unmarked developer fragment, so the
+// guardian prompt never carries them inline with the action JSON
+// (`guardian.node_repl_policy`).
+type GuardianNodeReplPolicy struct {
+	Policy string
+}
+
+// NewGuardianNodeReplPolicy returns the fragment, or nil when the resolved
+// policy is empty (Rust skips injection for an empty body).
+func NewGuardianNodeReplPolicy(policy string) *GuardianNodeReplPolicy {
+	if strings.TrimSpace(policy) == "" {
+		return nil
+	}
+	return &GuardianNodeReplPolicy{Policy: policy}
+}
+
+func (p *GuardianNodeReplPolicy) Role() string {
+	return RoleDeveloper
+}
+
+// Markers are empty: the policy is unmarked in the reviewer prompt.
+func (p *GuardianNodeReplPolicy) Markers() (string, string) {
+	return "", ""
+}
+
+func (p *GuardianNodeReplPolicy) Body() string {
+	if p == nil {
+		return ""
+	}
+	return p.Policy
+}
+
+func (p *GuardianNodeReplPolicy) ContentKind() string {
+	return "guardian.node_repl_policy"
+}
+
+func (p *AvailablePluginsInstructions) ContentKind() string {
+	return "plugins.usage_instructions"
+}
+
+func (p *PluginInstructions) ContentKind() string {
+	return "plugins.instructions"
+}
+
+func (s *SkillInstructions) ContentKind() string {
+	return "skills.selected_skill_instructions"
+}
+
+func (a *AppInstructions) ContentKind() string {
+	return "apps.instructions"
+}
+
+func (n *ImageResizeNotice) ContentKind() string {
+	return "images.resize_notice"
+}
+
+func (p *RecommendedPluginsInstructions) ContentKind() string {
+	return "plugins.recommendations"
+}
+
+func (p *PermissionsInstructions) ContentKind() string {
+	return "permissions.instructions"
+}
+
+func (c *CurrentTimeReminder) ContentKind() string {
+	return "current_time.reminder"
+}
+
+func (c *CurrentTimeUnavailable) ContentKind() string {
+	return "current_time.unavailable"
+}
+
+func (a *AdditionalContextFragment) ContentKind() string {
+	if a == nil {
+		return "generic.additional_content"
+	}
+	return "additional_content." + a.Key
+}
+
+func (u *UserInstructions) ContentKind() string {
+	return "agents_md.instructions"
+}
+
+func (m *ModelSwitchInstructions) ContentKind() string {
+	return "model_switch.instructions"
+}
+
+func (c *ContextWindowGuidance) ContentKind() string {
+	return "token_budget.context_window_guidance"
+}
+
+func (t *TokenBudgetContext) ContentKind() string {
+	return "token_budget.context_window"
+}

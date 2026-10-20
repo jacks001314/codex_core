@@ -1,0 +1,122 @@
+package tool
+
+import (
+	"context"
+	"strings"
+	"testing"
+)
+
+func TestSendUserMessageAsyncHandlerEmitsAndReturnsAccepted(t *testing.T) {
+	var emitted string
+	handler := &SendUserMessageAsyncHandler{EmitAsyncMessage: func(message string) {
+		emitted = message
+	}}
+	spec := handler.Spec()
+	if spec.Name.Key() != "send_user_message_async" {
+		t.Fatalf("tool name = %q", spec.Name.Key())
+	}
+	if spec.Exposure != ExposureDirectModelOnly {
+		t.Fatalf("exposure = %q, want direct_model_only", spec.Exposure)
+	}
+	output, err := handler.Execute(context.Background(), &Invocation{
+		Payload: Payload{Kind: PayloadFunction, Arguments: `{"message":"still working"}`},
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if emitted != "still working" {
+		t.Fatalf("emitted message = %q, want still working", emitted)
+	}
+	if !strings.Contains(output.Body, `"accepted":true`) {
+		t.Fatalf("output body = %q, want accepted", output.Body)
+	}
+	if got, _ := output.Data["async_message"].(map[string]any); got == nil || got["delivery"] != "async" {
+		t.Fatalf("async_message data = %#v", output.Data["async_message"])
+	}
+}
+
+func TestSendUserMessageAsyncHandlerRejectsEmpty(t *testing.T) {
+	handler := &SendUserMessageAsyncHandler{}
+	if _, err := handler.Execute(context.Background(), &Invocation{
+		Payload: Payload{Kind: PayloadFunction, Arguments: `{"message":"   "}`},
+	}); err == nil || !strings.Contains(err.Error(), "must not be empty") {
+		t.Fatalf("empty message error = %v", err)
+	}
+}
+
+func TestSendUserMessageAsyncHandlerDescriptionOverride(t *testing.T) {
+	// A nil description falls back to the built-in description (no catalog value).
+	if got := (&SendUserMessageAsyncHandler{}).Spec().Description; got != defaultSendUserMessageAsyncDescription {
+		t.Fatalf("default description = %q", got)
+	}
+	// A catalog description replaces the built-in.
+	override := "Ask the user a clarifying question."
+	if got := (&SendUserMessageAsyncHandler{Description: &override}).Spec().Description; got != override {
+		t.Fatalf("override description = %q, want %q", got, override)
+	}
+	// An explicit empty string is preserved (not replaced by the built-in).
+	empty := ""
+	if got := (&SendUserMessageAsyncHandler{Description: &empty}).Spec().Description; got != "" {
+		t.Fatalf("empty description = %q, want empty", got)
+	}
+}
+
+func TestSendUserMessageAsyncHandlerExplainsAttentionBoundaryLikeRust(t *testing.T) {
+	spec := (&SendUserMessageAsyncHandler{}).Spec()
+	for _, want := range []string{
+		"ask for missing information, preferences, constraints, clarification, or approval",
+		"report a critical blocker or a finding that may change the task's direction",
+		"use commentary for routine progress and intermediate context",
+		"bolding questions",
+	} {
+		if !strings.Contains(spec.Description, want) {
+			t.Fatalf("description missing %q: %q", want, spec.Description)
+		}
+	}
+	props, ok := spec.InputSchema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("input schema properties = %#v", spec.InputSchema["properties"])
+	}
+	message, ok := props["message"].(map[string]any)
+	if !ok {
+		t.Fatalf("input schema message = %#v", props["message"])
+	}
+	if got := message["description"]; got != "The concise question to send to the user." {
+		t.Fatalf("message description = %q, want question-only guidance", got)
+	}
+}
+
+func TestSendMessageToUserAsyncHandlerRegistersFreeformName(t *testing.T) {
+	var emitted string
+	handler := NewSendMessageToUserAsyncHandler(func(message string) {
+		emitted = message
+	})
+	spec := handler.Spec()
+	if spec.Name.Key() != DefaultSendMessageToUserAsyncToolName {
+		t.Fatalf("free-form tool name = %q, want %q", spec.Name.Key(), DefaultSendMessageToUserAsyncToolName)
+	}
+	if !strings.Contains(spec.Description, "report a critical blocker") {
+		t.Fatalf("free-form description missing blocker guidance: %q", spec.Description)
+	}
+	// Rust #42677 narrowed the guidance: requesting missing information is the
+	// structured request_user_input_async tool's job, not this one.
+	if strings.Contains(spec.Description, "ask for missing information") {
+		t.Fatalf("free-form description still carries the removed guidance: %q", spec.Description)
+	}
+	if spec.Description != defaultSendMessageToUserAsyncDescription {
+		t.Fatalf("free-form description = %q", spec.Description)
+	}
+	output, err := handler.Execute(context.Background(), &Invocation{
+		ToolName: PlainName(DefaultSendMessageToUserAsyncToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"message":"  blocker found  "}`},
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if emitted != "blocker found" {
+		t.Fatalf("emitted message = %q, want blocker found", emitted)
+	}
+	if !strings.Contains(output.Body, `"accepted":true`) {
+		t.Fatalf("output body = %q, want accepted", output.Body)
+	}
+}

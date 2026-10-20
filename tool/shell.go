@@ -1,0 +1,926 @@
+package tool
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+
+	"codex_core/execpolicy"
+	"codex_core/execserver"
+	"codex_core/network"
+	"codex_core/safety"
+	"codex_core/sandbox"
+	shellutil "codex_core/shell"
+	"codex_core/utils"
+)
+
+const (
+	DefaultExecYieldTimeMS  uint64 = 10000
+	DefaultWriteYieldTimeMS uint64 = 250
+)
+
+type ShellType string
+
+const (
+	ShellBash       ShellType = "bash"
+	ShellZsh        ShellType = "zsh"
+	ShellPowerShell ShellType = "powershell"
+	ShellCmd        ShellType = "cmd"
+	ShellUnknown    ShellType = "unknown"
+)
+
+type Shell struct {
+	Type ShellType
+	Path string
+}
+
+type ExecCommandArgs struct {
+	Cmd                   string                               `json:"cmd"`
+	EnvironmentID         string                               `json:"environment_id,omitempty"`
+	CWD                   string                               `json:"cwd,omitempty"`
+	Workdir               string                               `json:"workdir,omitempty"`
+	Env                   map[string]string                    `json:"env,omitempty"`
+	TimeoutMS             uint64                               `json:"timeout_ms,omitempty"`
+	Shell                 string                               `json:"shell,omitempty"`
+	Login                 *bool                                `json:"login,omitempty"`
+	TTY                   bool                                 `json:"tty,omitempty"`
+	YieldTimeMS           uint64                               `json:"yield_time_ms,omitempty"`
+	MaxOutputTokens       *int                                 `json:"max_output_tokens,omitempty"`
+	SandboxPermissions    sandbox.SandboxPermissions           `json:"sandbox_permissions,omitempty"`
+	AdditionalPermissions *sandbox.AdditionalPermissionProfile `json:"additional_permissions,omitempty"`
+	Justification         string                               `json:"justification,omitempty"`
+	PrefixRule            []string                             `json:"prefix_rule,omitempty"`
+	sandboxPermissionsSet bool
+	justificationSet      bool
+}
+
+func (a *ExecCommandArgs) UnmarshalJSON(data []byte) error {
+	if a == nil {
+		return errors.New("exec command args are required")
+	}
+	type execCommandArgsAlias ExecCommandArgs
+	var decoded execCommandArgsAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*a = ExecCommandArgs(decoded)
+	if value, ok := raw["sandbox_permissions"]; ok && strings.TrimSpace(string(value)) != "null" {
+		a.sandboxPermissionsSet = true
+	}
+	if value, ok := raw["justification"]; ok && strings.TrimSpace(string(value)) != "null" {
+		a.justificationSet = true
+	}
+	return nil
+}
+
+type ShellRequest struct {
+	Command []string
+	// Shell is the shell invocation the launch was resolved with (Rust #49360:
+	// `ExecCommandRequest.shell` / `UnifiedExecRequest.shell`). Hand-built
+	// requests may leave it empty; consumers then skip the invocation-driven
+	// behavior instead of guessing from Command.
+	Shell           ShellInvocation
+	HookCommand     string
+	CWD             string
+	TimeoutMS       uint64
+	YieldTimeMS     uint64
+	MaxOutputTokens *int
+	Env             map[string]string
+	// EnvPolicy, when set, filters the inherited environment for this command
+	// (mirroring Rust create_env with the selected turn environment's
+	// ShellEnvironmentPolicy, #38902). The command environment is built from
+	// the parent environment through this policy, then req.Env overrides are
+	// applied on top.
+	EnvPolicy *execpolicy.EnvPolicy
+	// ThreadID labels model-reachable commands as CODEX_THREAD_ID. It is
+	// exported by executor metadata and by an EnvPolicy-built environment.
+	ThreadID string
+	// ToolCallID is the originating exec_command call ID exported as
+	// CODEX_TOOL_CALL_ID. A non-nil pointer marks executor metadata as present,
+	// so an omitted thread ID clears stale thread context. The pointer also
+	// distinguishes a deliberately empty call ID from no metadata at all.
+	ToolCallID            *string
+	TTY                   bool
+	SandboxPermissions    sandbox.SandboxPermissions
+	AdditionalPermissions *sandbox.AdditionalPermissionProfile
+	// InternalPermissions are the runtime's own grants for this launch (the
+	// plugin-metrics sidecar's output directory, and Rust's shell-snapshot read
+	// grant). They are added to the command's permission profile and recorded
+	// separately so a write_stdin review does not treat them as agent-requested
+	// grants (Rust's unified-exec `internal_permissions`, #48073). The
+	// agent-requested AdditionalPermissions stay as the model sent them.
+	InternalPermissions *sandbox.AdditionalPermissionProfile
+	// RuntimePathPrepends are the Codex-owned PATH entries this launch keeps on
+	// PATH: the packaged codex-path directory and, for a zsh-fork launch, the
+	// forked shell's directory. They are prepended to the command environment and
+	// re-exported after a shell snapshot restores the user's PATH (Rust's
+	// RuntimePathPrepends).
+	RuntimePathPrepends   []string
+	SandboxProfile        *ShellSandboxProfile
+	PermissionProfileID   string
+	PermissionProfile     *sandbox.PermissionProfile
+	PermissionProfileJSON string
+	// PathConvention is the selected executor's path grammar for permission
+	// grant materialization (Rust #41928). Empty keeps the native convention.
+	PathConvention utils.PathConvention
+	// AllowedSymlinkedCodexHome is the host-resolved macOS Seatbelt opt-out
+	// (Rust #42716). Empty keeps symlinked writable roots rejected.
+	AllowedSymlinkedCodexHome       string
+	ProcessSandboxType              *sandbox.SandboxType
+	WindowsSandboxLevel             sandbox.WindowsSandboxLevel
+	WindowsSandboxPrivateDesktop    bool
+	WindowsSandboxProxySettingsMode execserver.WindowsSandboxProxySettingsMode
+	ApprovalPolicy                  sandbox.AskForApproval
+	ApprovalRequired                bool
+	ApprovalReason                  string
+	Justification                   string
+	PrefixRule                      []string
+	UnifiedExecEventSink            UnifiedExecEventSink
+	UnifiedExecThreadID             string
+	UnifiedExecTurnID               string
+	UnifiedExecRemoteURL            string
+	UnifiedExecNoiseProvider        execserver.NoiseRendezvousConnectProvider
+	// UnifiedExecInitializeTimeout bounds the Noise handshake and initialize
+	// RPC for this environment (Rust #42623). Zero keeps the client default.
+	UnifiedExecInitializeTimeout time.Duration
+	// UnifiedExecProvisioned marks the selected environment as provisioned so
+	// the initial remote dial waits out a resuming executor (Rust #48575).
+	UnifiedExecProvisioned bool
+	// UnifiedExecRemoteHTTPHeaders are sent on the remote executor's WebSocket
+	// upgrade and reconnects (Rust #47648 executor bearer tokens).
+	UnifiedExecRemoteHTTPHeaders http.Header
+	// UnifiedExecRemoteStdioCommand selects a stdio executor instead of a URL.
+	UnifiedExecRemoteStdioCommand *execserver.StdioExecServerCommand
+	// LoginShellPackagePath mirrors Rust's `Feature::LoginShellPackagePath`
+	// (#49467): when enabled, a POSIX login-shell launch restores the
+	// executor-reported PATH directories inside the shell so nested commands
+	// still find bundled tools after login startup resets PATH.
+	LoginShellPackagePath        bool
+	UnifiedExecEnvironmentID     string
+	UnifiedExecUserHomeDir       string
+	EnforceManagedNetwork        bool
+	ManagedNetwork               *network.ProxyManagedNetworkSandboxContext
+	RemoteNetworkProxy           *execserver.RemoteNetworkProxyLaunchConfig
+	RemoteShellSnapshot          *execserver.ShellSnapshotRequest
+	NetworkPolicyDecider         network.ProxyPolicyDecider
+	NetworkPolicyDecisionTimeout time.Duration
+	// WarningSink receives best-effort user-visible launch warnings. It is
+	// used when a requested protection such as credential masking is
+	// unavailable and execution falls back to unmasked credentials.
+	WarningSink func(string)
+}
+
+type UnifiedExecEnvironment struct {
+	ID         string
+	CWD        string
+	Shell      *Shell
+	PlatformOS string
+	// UserHomeDir is the executor-reported user home directory used to expand
+	// home-relative policy paths in filesystem sandbox contexts (Rust #41204).
+	UserHomeDir   string
+	ExecServerURL string
+	// ExecServerHTTPHeaders are sent on this environment's executor WebSocket
+	// upgrade and reconnects (Rust #47648 executor bearer tokens).
+	ExecServerHTTPHeaders http.Header
+	// ExecServerStdioCommand selects the stdio transport for an environment
+	// configured with a program instead of a URL (environments.toml entries).
+	ExecServerStdioCommand *execserver.StdioExecServerCommand
+	NoiseProvider          execserver.NoiseRendezvousConnectProvider
+	// ExecServerInitializeTimeout is the environments.toml
+	// `initialize_timeout_sec` value for this transport.
+	ExecServerInitializeTimeout time.Duration
+	// Provisioned marks an environment registered through the app-server's
+	// deferred (provisioned) executor flow: provisioning has completed, but the
+	// executor may still be resuming, so an initial Noise connection waits out
+	// `environment_offline` responses for a fixed five-minute window instead of
+	// the ordinary retry limits (Rust #48575
+	// `PROVISIONED_ENVIRONMENT_CONNECT_TIMEOUT`). Ordinary environments keep the
+	// default connect budget and retry limits.
+	Provisioned bool
+	// ShellEnvironmentPolicy is this environment's resolved shell environment
+	// policy table (empty when the thread-derived policy applies), mirroring
+	// Rust protocol::EnvironmentConfig shell_environment_policy (#38902).
+	ShellEnvironmentPolicy map[string]any
+	// AllowLoginShell overrides the turn-level login-shell policy for this
+	// environment when non-nil (Rust per-environment EnvironmentConfig,
+	// #38521/#38673).
+	AllowLoginShell *bool
+	// PermissionProfile overrides the turn-level permission profile for this
+	// environment when non-nil (#38673).
+	PermissionProfile     *sandbox.PermissionProfile
+	PermissionProfileID   string
+	PermissionProfileJSON string
+}
+
+// Remote reports whether this environment runs on an executor other than this
+// process (Rust `Environment::is_remote`): a WebSocket or stdio exec-server
+// transport, or a noise rendezvous provider.
+func (e UnifiedExecEnvironment) Remote() bool {
+	return strings.TrimSpace(e.ExecServerURL) != "" || e.NoiseProvider != nil || e.ExecServerStdioCommand != nil
+}
+
+// ConnectBudget returns the budget for an initial connection to this
+// environment. A provisioned environment whose executor may still be resuming
+// gets the fixed five-minute window (Rust #48575
+// `PROVISIONED_ENVIRONMENT_CONNECT_TIMEOUT`, applied by
+// `ExecServerClient::connect_for_transport`); every other environment keeps the
+// caller's ordinary budget.
+func (e UnifiedExecEnvironment) ConnectBudget(ordinary time.Duration) time.Duration {
+	if e.Provisioned {
+		return execserver.ProvisionedEnvironmentConnectTimeout()
+	}
+	return ordinary
+}
+
+// UnifiedExecEnvironmentCheck carries a turn's environment readiness so a tool
+// can mirror Rust's `resolve_tool_environment` (Rust #50741/#50962).
+//
+// Rust keeps every selected environment in `TurnEnvironmentSnapshot`
+// (`all_selections()`) and the usable subset in `turn_environments()`. Go's
+// hosts resolve the same two facts: the turn's selections and the host-resolved
+// usable executors (which the app-server derives by dropping selections whose
+// configuration is pending or failed, Rust #38684). A nil check keeps the
+// pre-#50962 behavior for hosts that do not model readiness.
+type UnifiedExecEnvironmentCheck struct {
+	// SelectedEnvironmentIDs lists every environment the turn selected,
+	// including ones whose executor is not usable yet (Rust `all_selections()`).
+	SelectedEnvironmentIDs []string
+	// ReadyEnvironmentCount is the number of usable selected environments
+	// (Rust `turn_environments().count()`); Go counts the implicit local
+	// environment when the turn selects none.
+	ReadyEnvironmentCount int
+	// StableEnvironmentTools is the default-off `stable_environment_tools`
+	// feature (Rust #50962). When it is on the tools keep advertising while an
+	// executor starts, an explicit selector only has to be a selected
+	// environment, and an unusable environment reports the shared waiting
+	// message instead of the tool's legacy message.
+	StableEnvironmentTools bool
+}
+
+// UnifiedUnavailableEnvironmentMessage is the message Rust #50741 gives a tool
+// whose environment is not usable yet when `stable_environment_tools` is on.
+const UnifiedUnavailableEnvironmentMessage = "No usable execution environment is available. Wait for an environment to become available before using this tool."
+
+// UnifiedExecUnavailableMessage is the tool-specific message Rust restores for
+// `exec_command`/`write_stdin` when `stable_environment_tools` is off
+// (Rust #50962 `legacy_unavailable_message`).
+const UnifiedExecUnavailableMessage = "unified exec is unavailable in this session"
+
+type ShellSandboxProfile struct {
+	PolicyTag             string
+	NetworkEnabled        bool
+	WritableRoots         []string
+	AdditionalPermissions *sandbox.AdditionalPermissionProfile
+}
+
+type ShellResult struct {
+	ExitCode            int
+	HasExitCode         bool
+	ProcessID           *int
+	Stdout              string
+	Stderr              string
+	Duration            time.Duration
+	TimedOut            bool
+	ChunkID             string
+	EventCallID         string
+	HookCommand         string
+	MaxOutputTokensUsed *int
+	UnifiedExecEvented  bool
+}
+
+type ShellValidationOptions struct {
+	AdditionalPermissionsAllowed bool
+	ApprovalPolicy               sandbox.AskForApproval
+	// GranularSandboxApproval / GranularRules mirror Rust's granular
+	// AskForApproval sub-config (#40024): sandbox escalation is rejected only
+	// when the shared policy check rejects prompting.
+	GranularSandboxApproval bool
+	GranularRules           bool
+	PermissionsPreapproved  bool
+	// AdditionalPermissionsPreapproved means a cached request_permissions grant
+	// already covers this profile. It must not bypass the separate escalation
+	// approval for require_escalated.
+	AdditionalPermissionsPreapproved bool
+	AllowLoginShell                  bool
+	// LoginShellPackagePath mirrors Rust's `Feature::LoginShellPackagePath`
+	// (#49467) for this turn's shell launches.
+	LoginShellPackagePath           bool
+	ShellMode                       UnifiedExecShellMode
+	ZshForkShell                    *Shell
+	CWD                             string
+	Env                             map[string]string
+	DefaultTimeoutMS                uint64
+	PermissionProfileID             string
+	PermissionProfile               *sandbox.PermissionProfile
+	PathConvention                  utils.PathConvention
+	AllowedSymlinkedCodexHome       string
+	WindowsSandboxLevel             sandbox.WindowsSandboxLevel
+	WindowsSandboxPrivateDesktop    bool
+	WindowsSandboxProxySettingsMode execserver.WindowsSandboxProxySettingsMode
+	EnforceManagedNetwork           bool
+	ManagedNetwork                  *network.ProxyManagedNetworkSandboxContext
+	RemoteNetworkProxy              *execserver.RemoteNetworkProxyLaunchConfig
+	NetworkPolicyDecider            network.ProxyPolicyDecider
+	NetworkPolicyDecisionTimeout    time.Duration
+	WarningSink                     func(string)
+}
+
+type ResolvedCommand struct {
+	Command []string
+	// Shell is the resolved shell invocation (Rust #49360:
+	// `handlers/unified_exec.rs ResolvedCommand.shell`). Downstream code - the
+	// launch, the shell snapshot and credential brokerage - reads the chosen
+	// shell and startup mode here instead of inferring them from `Command`.
+	Shell ShellInvocation
+}
+
+type UnifiedExecShellMode string
+
+const (
+	UnifiedExecShellModeDirect  UnifiedExecShellMode = "direct"
+	UnifiedExecShellModeZshFork UnifiedExecShellMode = "zsh_fork"
+)
+
+type CommandResolutionOptions struct {
+	AllowLoginShell bool
+	ShellMode       UnifiedExecShellMode
+	ZshForkShell    *Shell
+}
+
+func NewDefaultShell() *Shell {
+	if runtime.GOOS == "windows" {
+		return &Shell{Type: ShellPowerShell, Path: "powershell"}
+	}
+	if shell := strings.TrimSpace(os.Getenv("SHELL")); shell != "" {
+		return &Shell{Type: DetectShellType(shell), Path: shell}
+	}
+	return &Shell{Type: ShellBash, Path: "/bin/bash"}
+}
+
+// PathConventionForPath infers a native path or file URI's path convention.
+// An unknown convention stays empty so permission materialization fails closed.
+func PathConventionForPath(value string) utils.PathConvention {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if path, err := utils.Parse(value); err == nil {
+		if convention, ok := path.InferConvention(); ok {
+			return convention
+		}
+	}
+	legacy := utils.NewLegacyAppPathString(value)
+	convention, _ := legacy.InferAbsolutePathConvention()
+	return convention
+}
+
+func DetectShellType(path string) ShellType {
+	name := strings.ToLower(filepath.Base(path))
+	name = strings.TrimSuffix(name, ".exe")
+	switch name {
+	case "bash", "sh":
+		return ShellBash
+	case "zsh":
+		return ShellZsh
+	case "powershell", "pwsh":
+		return ShellPowerShell
+	case "cmd":
+		return ShellCmd
+	default:
+		return ShellUnknown
+	}
+}
+
+func (s *Shell) DeriveExecArgs(command string, useLoginShell bool) []string {
+	if s == nil || strings.TrimSpace(s.Path) == "" {
+		s = NewDefaultShell()
+	}
+	switch s.Type {
+	case ShellPowerShell:
+		args := []string{s.Path}
+		if !useLoginShell {
+			args = append(args, "-NoProfile")
+		}
+		return append(args, "-Command", command)
+	case ShellCmd:
+		return []string{s.Path, "/c", command}
+	case ShellZsh:
+		if useLoginShell {
+			return []string{s.Path, "-lc", command}
+		}
+		return []string{s.Path, "-c", command}
+	default:
+		if useLoginShell {
+			return []string{s.Path, "-lc", command}
+		}
+		return []string{s.Path, "-c", command}
+	}
+}
+
+// ShellInvocation mirrors Rust `ShellInvocation` (#49360): the shell and startup
+// mode Codex chose for an exec command. The launch carries it alongside the
+// derived argv so later stages (PATH restoration, shell snapshots, credential
+// brokerage) do not have to re-infer `-lc` or the shell from the arguments.
+type ShellInvocation struct {
+	Shell         *Shell
+	UseLoginShell bool
+}
+
+// IsPosixLogin mirrors Rust `ShellInvocation::is_posix_login` (#49360/#49467):
+// the launch chose login mode and the shell is a POSIX login shell.
+func (i ShellInvocation) IsPosixLogin() bool {
+	return i.Shell.IsPosixLogin(i.UseLoginShell)
+}
+
+// IsPosixLogin mirrors Rust `Shell::is_posix_login`'s shell predicate (#49467): a
+// POSIX login shell is one of bash/zsh/sh started in login mode.
+func (s *Shell) IsPosixLogin(useLoginShell bool) bool {
+	if s == nil || !useLoginShell {
+		return false
+	}
+	switch s.Type {
+	case ShellBash, ShellZsh:
+		return true
+	default:
+		return false
+	}
+}
+
+// DeriveExecArgsWithPathPrepends mirrors Rust `ShellInvocation::
+// derive_exec_args_with_path_prepends` (#49467): launch arguments that restore
+// the executor-reported `paths` to PATH inside the POSIX login shell before
+// running `command`, so `command` and its children still find bundled tools
+// when login startup resets PATH. The launch's login mode is unchanged.
+//
+// It reports ok=false when the launch cannot use the setup - not a POSIX login
+// shell, no directories, or a directory that is not a POSIX path or contains a
+// colon - and the caller must keep the original arguments then.
+func (s *Shell) DeriveExecArgsWithPathPrepends(command string, paths []string, useLoginShell bool) ([]string, bool) {
+	if !s.IsPosixLogin(useLoginShell) || len(paths) == 0 {
+		return nil, false
+	}
+	setup := make([]string, 0, len(paths))
+	// Prepend backwards so newly added directories retain the executor's order.
+	for index := len(paths) - 1; index >= 0; index-- {
+		path, ok := posixNativePathFromURI(paths[index])
+		if !ok {
+			return nil, false
+		}
+		// POSIX PATH has no way to escape a colon inside a single directory.
+		if strings.Contains(path, ":") {
+			return nil, false
+		}
+		quoted := shlexTryQuote(path)
+		// Padding ${PATH-} with colons makes `case` match whole entries, even at
+		// the ends; `-` also handles an unset PATH. Re-export a match so child
+		// commands inherit it; otherwise probe in a subshell, because assigning a
+		// read-only PATH can exit the login shell before the user's command runs.
+		// ${PATH:+...} adds `:` only when PATH is nonempty, so we never make the
+		// shell search the current directory.
+		setup = append(setup, `case ":${PATH-}:" in *:`+quoted+`:*) export PATH ;; `+
+			`*) if (export PATH=) 2>/dev/null; then `+
+			`export PATH=`+quoted+`${PATH:+:"$PATH"}; fi ;; esac`)
+	}
+	joined := strings.Join(setup, "; ")
+	// Keep setup on the first input line so shell diagnostics and `$LINENO` still
+	// refer to the original script. If the quoted path contains literal newlines,
+	// decode only the setup with eval in the current shell; the trailing `esac`
+	// keeps command substitution from trimming newlines in the path.
+	if strings.Contains(joined, "\n") {
+		escaped := strings.ReplaceAll(joined, "\\", "\\\\")
+		escaped = strings.ReplaceAll(escaped, "\n", "\\n")
+		joined = `eval "$(command -p printf '%b' ` + shlexTryQuote(escaped) + `)"`
+	}
+	return s.DeriveExecArgs(joined+"; "+command, useLoginShell), true
+}
+
+// posixNativePathFromURI renders a file URI as a POSIX native path, mirroring
+// Rust's `PathUri::infer_path_convention` + `inferred_native_path_string` in
+// `derive_exec_args_with_path_prepends`.
+func posixNativePathFromURI(raw string) (string, bool) {
+	uri, err := utils.Parse(strings.TrimSpace(raw))
+	if err != nil || uri == nil {
+		return "", false
+	}
+	convention, ok := uri.InferConvention()
+	if !ok || convention != utils.ConventionPosix {
+		return "", false
+	}
+	return uri.NativePathString(), true
+}
+
+// shlexTryQuote quotes a directory the way Rust's `shlex::try_quote` does: a
+// string of shell-safe characters is returned unchanged, anything else is
+// wrapped in single quotes with embedded quotes escaped.
+func shlexTryQuote(value string) string {
+	if value != "" && isShellSafeWord(value) {
+		return value
+	}
+	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
+}
+
+// isShellSafeWord reports whether every character is in shlex's safe set:
+// alphanumerics plus the punctuation that needs no quoting in POSIX shells.
+func isShellSafeWord(value string) bool {
+	for _, character := range value {
+		switch {
+		case character >= 'a' && character <= 'z',
+			character >= 'A' && character <= 'Z',
+			character >= '0' && character <= '9':
+		case strings.ContainsRune("%+,-./:=@_", character):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func ResolveCommand(args *ExecCommandArgs, sessionShell *Shell, allowLoginShell bool) (*ResolvedCommand, error) {
+	return ResolveCommandWithOptions(args, sessionShell, CommandResolutionOptions{AllowLoginShell: allowLoginShell})
+}
+
+func ResolveCommandWithOptions(args *ExecCommandArgs, sessionShell *Shell, opts CommandResolutionOptions) (*ResolvedCommand, error) {
+	if args == nil {
+		return nil, errors.New("exec command args are required")
+	}
+	if strings.TrimSpace(args.Cmd) == "" {
+		return nil, errors.New("cmd must not be empty")
+	}
+	useLoginShell := opts.AllowLoginShell
+	if args.Login != nil {
+		if *args.Login && !opts.AllowLoginShell {
+			return nil, errors.New("login shell is disabled by config; omit login or set it to false")
+		}
+		useLoginShell = *args.Login
+	}
+	if opts.ShellMode == UnifiedExecShellModeZshFork {
+		if strings.TrimSpace(args.Shell) != "" {
+			return nil, errors.New("`shell` is not supported for local zsh-fork exec; omit `shell` to use zsh-fork, or target a remote environment where `shell` is supported.")
+		}
+		shell := opts.ZshForkShell
+		if shell == nil {
+			shell = sessionShell
+		}
+		if shell == nil || shell.Type != ShellZsh || strings.TrimSpace(shell.Path) == "" {
+			shell = &Shell{Type: ShellZsh, Path: "zsh"}
+		}
+		return &ResolvedCommand{
+			Command: shell.DeriveExecArgs(args.Cmd, useLoginShell),
+			Shell:   ShellInvocation{Shell: shell, UseLoginShell: useLoginShell},
+		}, nil
+	}
+	shell := sessionShell
+	if strings.TrimSpace(args.Shell) != "" {
+		// A model-provided shell path only selects the shell type; the local
+		// executable is resolved through normal discovery (Rust #39607).
+		if shellType := DetectShellType(args.Shell); shellType != ShellUnknown {
+			shell = ResolveShellByType(shellType)
+		} else {
+			shell = nil
+		}
+	}
+	if shell == nil {
+		shell = NewDefaultShell()
+	}
+	return &ResolvedCommand{
+		Command: shell.DeriveExecArgs(args.Cmd, useLoginShell),
+		Shell:   ShellInvocation{Shell: shell, UseLoginShell: useLoginShell},
+	}, nil
+}
+
+// ResolveShellByType discovers the local executable for a shell type
+// (shell/command.go GetShell) and rejects unresolvable types.
+func ResolveShellByType(shellType ShellType) *Shell {
+	if detected := shellutil.GetShell(shellutil.ShellType(shellType)); detected != nil {
+		return &Shell{Type: shellType, Path: detected.ShellPath}
+	}
+	return nil
+}
+
+func BuildShellRequest(args *ExecCommandArgs, sessionShell *Shell, opts ShellValidationOptions) (*ShellRequest, error) {
+	if args == nil {
+		return nil, errors.New("exec command args are required")
+	}
+	justificationPresent := args.justificationSet || args.Justification != ""
+	sandboxPermissionsPresent := args.sandboxPermissionsSet || args.SandboxPermissions != ""
+	if justificationPresent && !sandboxPermissionsPresent {
+		return nil, errors.New("`justification` requires an explicit `sandbox_permissions`; use `sandbox_permissions: \"require_escalated\"` for unsandboxed execution, or omit `justification`.")
+	}
+	cwd, err := resolveShellRequestCWD(opts.CWD, firstNonEmptyString(args.CWD, args.Workdir))
+	if err != nil {
+		return nil, err
+	}
+	resolved, err := ResolveCommandWithOptions(args, sessionShell, CommandResolutionOptions{
+		AllowLoginShell: opts.AllowLoginShell,
+		ShellMode:       opts.ShellMode,
+		ZshForkShell:    opts.ZshForkShell,
+	})
+	if err != nil {
+		return nil, err
+	}
+	resolvedShellType := ShellUnknown
+	if resolved.Shell.Shell != nil {
+		resolvedShellType = resolved.Shell.Shell.Type
+	}
+	if err := validateWindowsShellSafety(args.Cmd, resolvedShellType, cwd); err != nil {
+		return nil, err
+	}
+	if resolvedShellType == ShellPowerShell {
+		resolved.Command = shellutil.PrefixPowerShellScriptWithUTF8(resolved.Command)
+	}
+	sandboxPermissions := args.SandboxPermissions
+	if sandboxPermissions == "" {
+		sandboxPermissions = sandbox.SandboxPermissionsUseDefault
+	}
+	sandboxPermissions = sandbox.SandboxPermissionsPreservingDeniedReads(sandboxPermissions, opts.PermissionProfile)
+	additionalPermissions, err := sandbox.NormalizeAndValidateAdditionalPermissions(
+		opts.AdditionalPermissionsAllowed,
+		opts.ApprovalPolicy,
+		sandboxPermissions,
+		args.AdditionalPermissions,
+		opts.PermissionsPreapproved || opts.AdditionalPermissionsPreapproved,
+		cwd,
+	)
+	if err != nil {
+		return nil, err
+	}
+	permissionProfileID, permissionProfile, err := effectiveShellPermissionProfile(
+		opts.PermissionProfileID,
+		opts.PermissionProfile,
+		sandboxPermissions,
+		additionalPermissions,
+		opts.PermissionsPreapproved,
+		opts.PathConvention,
+	)
+	if err != nil {
+		return nil, err
+	}
+	sandboxProfile := buildShellSandboxProfile(permissionProfile, additionalPermissions, cwd)
+	sandboxOverrideRequiresApproval := sandboxPermissions == sandbox.SandboxPermissionsRequireEscalated ||
+		(sandboxPermissions == sandbox.SandboxPermissionsWithAdditionalPermissions && !opts.AdditionalPermissionsPreapproved)
+	escalationApprovalRequired := sandboxOverrideRequiresApproval && !opts.PermissionsPreapproved
+	if escalationApprovalRequired {
+		// Rust #40024: use the shared policy rejection check so granular
+		// sandbox_approval controls whether escalation may prompt.
+		if _, rejected := safety.PromptRejectedByPolicy(shellApprovalPolicy(&opts) /*promptIsRule*/, false); rejected {
+			return nil, fmt.Errorf("approval policy is %s; reject command - you cannot ask for escalated permissions if the approval policy is %s", opts.ApprovalPolicy, opts.ApprovalPolicy)
+		}
+	}
+	// Rust #39159: commands with dynamic shell words (brace expansion, globs,
+	// escapes, expansions) require approval under unless-trusted even when a
+	// policy allow rule matches the unexpanded source text.
+	policyApprovalRequired := opts.ApprovalPolicy == sandbox.ApprovalUnlessTrusted &&
+		(!opts.PermissionsPreapproved || shellutil.ShellCommandHasDynamicWords(args.Cmd))
+	approvalRequired := escalationApprovalRequired || policyApprovalRequired
+	approvalReason := shellApprovalReason(args)
+	if policyApprovalRequired && strings.TrimSpace(approvalReason) == "" {
+		approvalReason = "approval required by policy"
+	}
+	yieldTimeMS := args.YieldTimeMS
+	if yieldTimeMS == 0 {
+		yieldTimeMS = DefaultExecYieldTimeMS
+	}
+	timeoutMS := opts.DefaultTimeoutMS
+	if args.TimeoutMS != 0 {
+		timeoutMS = args.TimeoutMS
+	}
+	return &ShellRequest{
+		Command:                         resolved.Command,
+		Shell:                           resolved.Shell,
+		HookCommand:                     args.Cmd,
+		CWD:                             cwd,
+		TimeoutMS:                       timeoutMS,
+		YieldTimeMS:                     yieldTimeMS,
+		MaxOutputTokens:                 args.MaxOutputTokens,
+		Env:                             mergeEnv(opts.Env, args.Env),
+		TTY:                             args.TTY,
+		SandboxPermissions:              sandboxPermissions,
+		AdditionalPermissions:           additionalPermissions,
+		SandboxProfile:                  sandboxProfile,
+		PermissionProfileID:             permissionProfileID,
+		PermissionProfile:               permissionProfile,
+		PathConvention:                  opts.PathConvention,
+		AllowedSymlinkedCodexHome:       opts.AllowedSymlinkedCodexHome,
+		WindowsSandboxLevel:             opts.WindowsSandboxLevel,
+		WindowsSandboxPrivateDesktop:    opts.WindowsSandboxPrivateDesktop,
+		WindowsSandboxProxySettingsMode: opts.WindowsSandboxProxySettingsMode,
+		ApprovalPolicy:                  opts.ApprovalPolicy,
+		EnforceManagedNetwork:           opts.EnforceManagedNetwork,
+		ManagedNetwork:                  cloneManagedNetworkSandboxContext(opts.ManagedNetwork),
+		RemoteNetworkProxy:              opts.RemoteNetworkProxy,
+		NetworkPolicyDecider:            opts.NetworkPolicyDecider,
+		NetworkPolicyDecisionTimeout:    opts.NetworkPolicyDecisionTimeout,
+		WarningSink:                     opts.WarningSink,
+		LoginShellPackagePath:           opts.LoginShellPackagePath,
+		ApprovalRequired:                approvalRequired,
+		ApprovalReason:                  approvalReason,
+		Justification:                   args.Justification,
+		PrefixRule:                      cloneStrings(args.PrefixRule),
+	}, nil
+}
+
+// shellApprovalPolicy maps the shell validation approval policy + granular
+// sub-config into a safety.ApprovalPolicy for the shared rejection check.
+func shellApprovalPolicy(opts *ShellValidationOptions) safety.ApprovalPolicy {
+	mode := safety.ApprovalMode("")
+	if opts != nil {
+		switch opts.ApprovalPolicy {
+		case sandbox.ApprovalNever:
+			mode = safety.ApprovalNever
+		case sandbox.ApprovalOnRequest:
+			mode = safety.ApprovalOnRequest
+		case sandbox.ApprovalUnlessTrusted:
+			mode = safety.ApprovalUnlessTrusted
+		case sandbox.ApprovalGranular:
+			mode = safety.ApprovalGranular
+		}
+	}
+	if opts == nil {
+		return safety.ApprovalPolicy{Mode: mode}
+	}
+	return safety.ApprovalPolicy{Mode: mode, Rules: opts.GranularRules, SandboxApproval: opts.GranularSandboxApproval}
+}
+
+func cloneManagedNetworkSandboxContext(value *network.ProxyManagedNetworkSandboxContext) *network.ProxyManagedNetworkSandboxContext {
+	if value == nil {
+		return nil
+	}
+	return &network.ProxyManagedNetworkSandboxContext{
+		LoopbackPorts:     append([]uint16(nil), value.LoopbackPorts...),
+		AllowLocalBinding: value.AllowLocalBinding,
+	}
+}
+
+func effectiveShellPermissionProfile(profileID string, profile *sandbox.PermissionProfile, permissions sandbox.SandboxPermissions, additional *sandbox.AdditionalPermissionProfile, preapproved bool, convention utils.PathConvention) (string, *sandbox.PermissionProfile, error) {
+	if permissions == sandbox.SandboxPermissionsRequireEscalated && preapproved {
+		fullAccess := sandbox.FullAccessPermissionProfile()
+		return sandbox.BuiltInPermissionProfileDangerFullAccess, &fullAccess, nil
+	}
+	if profile == nil && additional == nil {
+		return "", nil, nil
+	}
+	effective, err := sandbox.PermissionProfileWithAdditionalPermissionsForConvention(profile, additional, convention)
+	if err != nil {
+		return "", nil, err
+	}
+	if strings.TrimSpace(profileID) == "" {
+		profileID = "resolved"
+	}
+	return strings.TrimSpace(profileID), effective, nil
+}
+
+func RequestsSandboxOverride(permissions sandbox.SandboxPermissions) bool {
+	return permissions == sandbox.SandboxPermissionsRequireEscalated ||
+		permissions == sandbox.SandboxPermissionsWithAdditionalPermissions
+}
+
+func shellApprovalReason(args *ExecCommandArgs) string {
+	if args == nil {
+		return ""
+	}
+	if strings.TrimSpace(args.Justification) != "" {
+		return strings.TrimSpace(args.Justification)
+	}
+	switch args.SandboxPermissions {
+	case sandbox.SandboxPermissionsRequireEscalated:
+		return "command requested escalated sandbox permissions"
+	case sandbox.SandboxPermissionsWithAdditionalPermissions:
+		return "command requested additional sandbox permissions"
+	default:
+		return ""
+	}
+}
+
+func buildShellSandboxProfile(profile *sandbox.PermissionProfile, additional *sandbox.AdditionalPermissionProfile, cwd string) *ShellSandboxProfile {
+	if profile == nil && additional == nil {
+		return nil
+	}
+	if profile == nil {
+		profile = &sandbox.PermissionProfile{SandboxPolicy: sandbox.NewWorkspaceWritePolicy()}
+	}
+	policy := profile.LegacySandboxPolicy()
+	out := &ShellSandboxProfile{
+		PolicyTag:             sandbox.SandboxPolicyTag(policy, cwd),
+		NetworkEnabled:        profile.AllowsNetwork(),
+		AdditionalPermissions: cloneAdditionalPermissions(additional),
+	}
+	if policy != nil {
+		for _, root := range policy.GetWritableRootsWithCWD(cwd) {
+			out.WritableRoots = append(out.WritableRoots, root.Root)
+		}
+	}
+	if additional != nil {
+		if additional.Network != nil && *additional.Network {
+			out.NetworkEnabled = true
+		}
+		out.WritableRoots = mergeStringSet(out.WritableRoots, additional.FileSystem)
+	}
+	return out
+}
+
+func resolveShellRequestCWD(base string, override string) (string, error) {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		return "", errors.New("cwd must not be empty")
+	}
+	cwd, err := filepath.Abs(base)
+	if err != nil {
+		return "", err
+	}
+	override = strings.TrimSpace(override)
+	if override != "" {
+		cwd = override
+		if !filepath.IsAbs(cwd) {
+			cwd = filepath.Join(base, cwd)
+		}
+		cwd, err = filepath.Abs(cwd)
+		if err != nil {
+			return "", err
+		}
+	}
+	return filepath.Clean(cwd), nil
+}
+
+func cloneEnv(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
+func mergeEnv(base map[string]string, overrides map[string]string) map[string]string {
+	if base == nil && overrides == nil {
+		return nil
+	}
+	out := make(map[string]string, len(base)+len(overrides))
+	for key, value := range base {
+		out[key] = value
+	}
+	for key, value := range overrides {
+		out[key] = value
+	}
+	return out
+}
+
+func cloneAdditionalPermissions(in *sandbox.AdditionalPermissionProfile) *sandbox.AdditionalPermissionProfile {
+	if in == nil {
+		return nil
+	}
+	out := &sandbox.AdditionalPermissionProfile{
+		FileSystem:     append([]string(nil), in.FileSystem...),
+		ReadFileSystem: append([]string(nil), in.ReadFileSystem...),
+	}
+	if in.Network != nil {
+		value := *in.Network
+		out.Network = &value
+	}
+	return out
+}
+
+func mergeStringSet(base []string, extra []string) []string {
+	if len(base) == 0 && len(extra) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(base)+len(extra))
+	seen := map[string]bool{}
+	for _, value := range base {
+		value = filepath.Clean(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	for _, value := range extra {
+		value = filepath.Clean(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func cloneStrings(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	out := make([]string, len(in))
+	copy(out, in)
+	return out
+}

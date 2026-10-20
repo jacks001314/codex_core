@@ -1,0 +1,750 @@
+package compact
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+
+	"codex_core/audioutil"
+)
+
+func TestEvaluatePolicy(t *testing.T) {
+	status := Evaluate(Policy{Enabled: true, TokenLimit: 100, Scope: ScopeTotal}, 120)
+	if !status.ShouldCompact || status.Reason != ReasonTokenLimit {
+		t.Fatalf("expected token compaction: %+v", status)
+	}
+	if status.TokensUntilCompaction == nil || *status.TokensUntilCompaction != -20 {
+		t.Fatalf("remaining = %+v", status.TokensUntilCompaction)
+	}
+
+	status = Evaluate(Policy{Enabled: true, TokenLimit: 80, WindowTokens: 150, PrefillTokens: 50, Scope: ScopeBodyAfterPrefix}, 120)
+	if status.ShouldCompact {
+		t.Fatalf("should not compact yet: %+v", status)
+	}
+	if status.AutoCompactScopeTokens != 70 {
+		t.Fatalf("scope tokens = %d", status.AutoCompactScopeTokens)
+	}
+
+	status = Evaluate(Policy{Enabled: true, TokenLimit: 1000, WindowTokens: 100}, 101)
+	if !status.NewContextWindowRequired || status.Reason != ReasonContextWindowExceeded {
+		t.Fatalf("window overflow not detected: %+v", status)
+	}
+}
+
+func TestEvaluatePolicyReservesFallbackBuffer(t *testing.T) {
+	status := Evaluate(Policy{Enabled: true, TokenLimit: 100, WindowTokens: 500, FallbackBufferTokens: 40}, 110)
+	if status.ShouldCompact || status.BaseWindowTokensRemaining == nil || *status.BaseWindowTokensRemaining != 0 || status.TokensUntilCompaction == nil || *status.TokensUntilCompaction != 30 {
+		t.Fatalf("status = %+v", status)
+	}
+	status = Evaluate(Policy{Enabled: true, TokenLimit: 100, WindowTokens: 500, FallbackBufferTokens: 40}, 140)
+	if !status.ShouldCompact || status.Reason != ReasonTokenLimit {
+		t.Fatalf("buffer exhaustion status = %+v", status)
+	}
+}
+
+func TestEvaluateBaseWindowRemainingUsesTighterLimitLikeRust(t *testing.T) {
+	// Rust context_window_token_status reports the minimum of the auto-compact
+	// scope remaining and the full context window remaining.
+	status := Evaluate(Policy{Enabled: true, TokenLimit: 200, WindowTokens: 150}, 120)
+	if status.BaseWindowTokensRemaining == nil || *status.BaseWindowTokensRemaining != 30 {
+		t.Fatalf("window remaining should win: %+v", status)
+	}
+	status = Evaluate(Policy{Enabled: true, TokenLimit: 130, WindowTokens: 500}, 120)
+	if status.BaseWindowTokensRemaining == nil || *status.BaseWindowTokensRemaining != 10 {
+		t.Fatalf("scope remaining should win: %+v", status)
+	}
+	status = Evaluate(Policy{Enabled: true, TokenLimit: 130, WindowTokens: 500}, 520)
+	if status.BaseWindowTokensRemaining == nil || *status.BaseWindowTokensRemaining != 0 || !status.ShouldCompact || status.Reason != ReasonContextWindowExceeded {
+		t.Fatalf("window overflow status = %+v", status)
+	}
+}
+
+func TestEstimateActiveContextTokensIncludesItemsAfterLastModelItem(t *testing.T) {
+	items := []Item{
+		{ID: "u1", Type: "message", Role: "user", Text: "first question"},
+		{ID: "a1", Type: "message", Role: "assistant", Text: "an answer"},
+		{ID: "u2", Type: "message", Role: "user", Text: "trailing prompt from an interrupted turn"},
+	}
+	if !IsModelGeneratedItem(&items[1]) {
+		t.Fatalf("assistant message should be model generated")
+	}
+	if IsModelGeneratedItem(&items[0]) || IsModelGeneratedItem(&items[2]) {
+		t.Fatalf("user messages should not be model generated")
+	}
+	after := ItemsAfterLastModelGeneratedItem(items)
+	if len(after) != 1 || after[0].ID != "u2" {
+		t.Fatalf("items after last model item = %+v", after)
+	}
+	active := EstimateActiveContextTokens(items, 500)
+	if active <= 500 {
+		t.Fatalf("active context tokens = %d, want > 500", active)
+	}
+	if got := EstimateActiveContextTokens(items, 0); got != EstimateTokens(after) {
+		t.Fatalf("estimate without stored usage = %d, want %d", got, EstimateTokens(after))
+	}
+	if got := ItemsAfterLastModelGeneratedItem(nil); len(got) != 0 {
+		t.Fatalf("nil items after = %+v", got)
+	}
+}
+
+func TestWindowLifecycle(t *testing.T) {
+	window := NewWindowWithIDs(WindowIDs{FirstWindowID: "first", WindowID: "current"})
+	next := "next"
+	window.SetIDGenerator(func() string { return next })
+	if window.Number() != 0 {
+		t.Fatalf("number = %d", window.Number())
+	}
+	if !window.ClaimTokenBudgetReminder() || window.ClaimTokenBudgetReminder() {
+		t.Fatal("reminder claim should only succeed once")
+	}
+	if !window.ClaimAutoCompactFallback() || window.ClaimAutoCompactFallback() {
+		t.Fatal("fallback claim should only succeed once")
+	}
+	window.RequestNewContextWindow()
+	if !window.TakeNewContextWindowRequest() || window.TakeNewContextWindowRequest() {
+		t.Fatal("request should be consumed once")
+	}
+	window.SetEstimatedPrefill(150)
+	snapshot := window.Snapshot()
+	if snapshot.PrefillInputTokens == nil || *snapshot.PrefillInputTokens != 150 {
+		t.Fatalf("snapshot = %+v", snapshot)
+	}
+	window.EnsureServerObservedPrefill(120)
+	window.SetEstimatedPrefill(90)
+	snapshot = window.Snapshot()
+	if snapshot.PrefillInputTokens == nil || *snapshot.PrefillInputTokens != 120 {
+		t.Fatalf("server observed prefill not retained: %+v", snapshot)
+	}
+	number, ids := window.Advance()
+	if number != 1 || ids.PreviousWindowID != "current" || ids.WindowID != "next" {
+		t.Fatalf("advance = %d %+v", number, ids)
+	}
+	if !window.ClaimTokenBudgetReminder() {
+		t.Fatal("advance should reset reminder")
+	}
+}
+
+func TestBuildAndValidateRequest(t *testing.T) {
+	window := NewWindowWithIDs(WindowIDs{FirstWindowID: "first", WindowID: "current"})
+	request, err := BuildRequest("thread-a", "turn-a", TriggerAuto, ReasonTokenLimit, PhasePreTurn, "", nil, window)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	if request.Prompt == "" || request.WindowIDs.WindowID != "current" {
+		t.Fatalf("request = %+v", request)
+	}
+	_, err = BuildRequest("", "turn-a", TriggerAuto, ReasonTokenLimit, PhasePreTurn, "", nil, window)
+	if !errors.Is(err, ErrInvalidCompaction) {
+		t.Fatalf("expected invalid request, got %v", err)
+	}
+}
+
+func TestBuildCompactedHistory(t *testing.T) {
+	history := BuildCompactedHistory(
+		[]Item{{ID: "dev", Type: "message", Role: "developer", Text: "context"}},
+		[]Item{{ID: "user", Type: "message", Role: "user", Kind: "user_message", Text: "please fix"}},
+		"summary",
+	)
+	if len(history) != 3 {
+		t.Fatalf("history len = %d", len(history))
+	}
+	if !strings.Contains(history[2].Text, SummaryPrefix) || !strings.Contains(history[2].Text, "summary") {
+		t.Fatalf("summary item = %+v", history[2])
+	}
+	passthrough, _ := history[2].Data["internal_chat_message_metadata_passthrough"].(map[string]any)
+	kinds, _ := passthrough["content_item_kinds"].([]any)
+	if len(kinds) != 1 || kinds[0] != "compaction.summary" {
+		t.Fatalf("summary content kinds = %#v", passthrough["content_item_kinds"])
+	}
+}
+
+func TestCompactLocallyInjectsInitialContext(t *testing.T) {
+	request := &Request{
+		ThreadID: "thread-a",
+		Trigger:  TriggerAuto,
+		Reason:   ReasonTokenLimit,
+		Phase:    PhaseMidTurn,
+		History: []Item{
+			{ID: "u1", Type: "message", Role: "user", Kind: "user_message", Text: "first"},
+			{ID: "a1", Type: "message", Role: "assistant", Text: "answer"},
+			{ID: "u2", Type: "message", Role: "user", Kind: "user_message", Text: "second"},
+		},
+	}
+	result, err := CompactLocally(request, 1000, []Item{{ID: "ctx", Type: "message", Role: "developer", Text: "context"}}, true)
+	if err != nil {
+		t.Fatalf("compact locally: %v", err)
+	}
+	if !result.Succeeded() {
+		t.Fatalf("result = %+v", result)
+	}
+	// Rust keeps every user message that fits the shared budget (#48115), so both
+	// prompts are retained and the initial context lands above the last one.
+	if len(result.NewHistory) != 4 {
+		t.Fatalf("new history = %+v", result.NewHistory)
+	}
+	if result.NewHistory[0].ID != "u1" || result.NewHistory[1].ID != "ctx" || result.NewHistory[2].ID != "u2" {
+		t.Fatalf("initial context not inserted before last user: %+v", result.NewHistory)
+	}
+}
+
+func TestShouldKeepCompactedHistoryItem(t *testing.T) {
+	kept := []Item{
+		{Type: "message", Role: "assistant"},
+		{Type: "message", Role: "user", Kind: "user_message"},
+		{Type: "message", Role: "user", Kind: "hook_prompt"},
+		{Type: "message", Role: "user", Kind: "compaction_summary"},
+		{Type: "agent_message"},
+		{Type: "context_compaction"},
+	}
+	for _, item := range kept {
+		if !ShouldKeepCompactedHistoryItem(item) {
+			t.Fatalf("should keep %+v", item)
+		}
+	}
+	dropped := []Item{
+		{Type: "message", Role: "developer"},
+		{Type: "message", Role: "system"},
+		{Type: "message", Role: "user", Kind: "context_update"},
+		{Type: "function_call"},
+		{Type: "compaction_trigger"},
+	}
+	for _, item := range dropped {
+		if ShouldKeepCompactedHistoryItem(item) {
+			t.Fatalf("should drop %+v", item)
+		}
+	}
+}
+
+func TestProcessRemoteHistory(t *testing.T) {
+	remote := []Item{
+		{ID: "dev", Type: "message", Role: "developer"},
+		{ID: "summary", Type: "message", Role: "user", Kind: "compaction_summary", Text: "summary"},
+		{ID: "call", Type: "function_call"},
+	}
+	processed := ProcessRemoteHistory(remote, []Item{{ID: "ctx", Type: "message", Role: "developer"}}, true)
+	if len(processed) != 2 {
+		t.Fatalf("processed = %+v", processed)
+	}
+	if processed[0].ID != "ctx" || processed[1].ID != "summary" {
+		t.Fatalf("unexpected order: %+v", processed)
+	}
+}
+
+func TestItemTextFromContentAndData(t *testing.T) {
+	item := Item{Content: []ContentPart{{Type: "input_text", Text: "first"}, {Type: "input_text", Text: "second"}}}
+	if got := ItemText(&item); got != "first\nsecond" {
+		t.Fatalf("ItemText(content) = %q", got)
+	}
+	item = Item{Data: map[string]any{"output": "done"}}
+	if got := ItemText(&item); got != "done" {
+		t.Fatalf("ItemText(data) = %q", got)
+	}
+}
+
+func TestTrimHistoryToTokenBudgetKeepsRecentItems(t *testing.T) {
+	items := []Item{
+		{ID: "old", Text: "one two three"},
+		{ID: "mid", Text: "four five"},
+		{ID: "new", Text: "six seven"},
+	}
+	trimmed := TrimHistoryToTokenBudget(items, 4)
+	if len(trimmed) != 2 || trimmed[0].ID != "mid" || trimmed[1].ID != "new" {
+		t.Fatalf("trimmed = %+v", trimmed)
+	}
+}
+
+func TestTrimHistoryToTokenBudgetPreservesMessageMetadataLikeRust(t *testing.T) {
+	image := ContentPart{Type: "input_image", ImageURL: "data:image/png;base64,AAAA"}
+	longText := strings.Repeat("a", 40)
+	item := Item{
+		ID:   "message-1",
+		Type: "message",
+		Role: "user",
+		Text: longText,
+		Content: []ContentPart{
+			{Type: "input_text", Text: longText},
+			image,
+		},
+		Data: map[string]any{
+			"turn_id":            "turn-1",
+			"content_item_kinds": []string{"user.text", "user.image"},
+		},
+		Raw: json.RawMessage(`{"type":"message","role":"user","content":[]}`),
+	}
+	trimmed := TrimHistoryToTokenBudget([]Item{item}, 1)
+	if len(trimmed) != 1 {
+		t.Fatalf("trimmed = %#v", trimmed)
+	}
+	got := trimmed[0]
+	if got.Data["turn_id"] != "turn-1" {
+		t.Fatalf("passthrough metadata = %#v", got.Data)
+	}
+	if len(got.Raw) != 0 {
+		t.Fatalf("stale raw message survived truncation: %q", got.Raw)
+	}
+	if len(got.Content) < 2 || got.Content[len(got.Content)-1] != image {
+		t.Fatalf("content = %#v, want the image retained", got.Content)
+	}
+	kinds, _ := got.Data["content_item_kinds"].([]string)
+	if len(kinds) != len(got.Content) {
+		t.Fatalf("kinds = %#v, content = %#v", kinds, got.Content)
+	}
+	if kinds[0] != "user.text" || kinds[1] != unknownContentKind || kinds[len(kinds)-1] != "user.image" {
+		t.Fatalf("kinds = %#v, want source/unknown/source image classifications", kinds)
+	}
+	if got.Text == item.Text || !strings.Contains(got.Text, "tokens truncated") {
+		t.Fatalf("text = %q, want a truncation notice", got.Text)
+	}
+
+	legacy := TrimHistoryToTokenBudget([]Item{{
+		ID:   "legacy",
+		Type: "message",
+		Role: "user",
+		Text: "one two three",
+	}}, 1)
+	if len(legacy) != 1 {
+		t.Fatalf("legacy trimmed = %#v", legacy)
+	}
+	legacyKinds, _ := legacy[0].Data["content_item_kinds"].([]string)
+	if len(legacyKinds) != 1 || legacyKinds[0] != unknownContentKind {
+		t.Fatalf("legacy kinds = %#v, want [unknown]", legacyKinds)
+	}
+}
+
+func TestCompactLocallyHonorsHistoryTokenBudget(t *testing.T) {
+	request := &Request{
+		ThreadID:         "thread-a",
+		Trigger:          TriggerAuto,
+		Reason:           ReasonTokenLimit,
+		Phase:            PhaseMidTurn,
+		MaxHistoryTokens: 3,
+		History: []Item{
+			{ID: "old", Type: "message", Role: "user", Kind: "user_message", Text: "old words should drop"},
+			{ID: "new", Type: "message", Role: "user", Kind: "user_message", Text: "keep this"},
+		},
+	}
+	result, err := CompactLocally(request, 1000, nil, false)
+	if err != nil {
+		t.Fatalf("compact locally: %v", err)
+	}
+	if strings.Contains(result.Summary, "old words") || !strings.Contains(result.Summary, "keep this") {
+		t.Fatalf("summary = %q", result.Summary)
+	}
+}
+
+func TestEstimateTextTokensCountsCJKWithoutWhitespace(t *testing.T) {
+	text := strings.Repeat("这是一个很长的中文上下文", 100)
+	if got := EstimateTextTokens(text); got < 1000 {
+		t.Fatalf("EstimateTextTokens() = %d, want a CJK-aware estimate", got)
+	}
+}
+
+func TestEstimateTextTokensPreservesWordBasedEstimate(t *testing.T) {
+	if got := EstimateTextTokens("one two three four"); got != 4 {
+		t.Fatalf("EstimateTextTokens() = %d, want 4", got)
+	}
+}
+
+func TestEstimateTextTokensCountsLongUnbrokenText(t *testing.T) {
+	text := strings.Repeat("a", 100)
+	if got := EstimateTextTokens(text); got != 25 {
+		t.Fatalf("EstimateTextTokens() = %d, want 25", got)
+	}
+	if got := truncateTextToTokens(text, 5); EstimateTextTokens(got) > 5 || len(got) >= len(text) {
+		t.Fatalf("truncateTextToTokens() kept %d bytes with estimate %d", len(got), EstimateTextTokens(got))
+	}
+}
+
+func TestCompactRemotelyUsesRunnerAndProcessesHistory(t *testing.T) {
+	runner := remoteRunnerFunc(func(ctx context.Context, request *Request) (*Result, error) {
+		return &Result{
+			Status:  StatusCompleted,
+			Summary: "remote summary",
+			NewHistory: []Item{
+				{ID: "dev", Type: "message", Role: "developer", Text: "drop"},
+				{ID: "summary", Type: "message", Role: "user", Kind: "compaction_summary", Text: SummaryPrefix + "\nremote summary"},
+			},
+		}, nil
+	})
+	result, err := CompactRemotely(context.Background(), &Request{
+		ThreadID: "thread-a",
+		Trigger:  TriggerManual,
+		Reason:   ReasonUserRequested,
+		Phase:    PhaseStandaloneTurn,
+		History:  []Item{{ID: "u1", Type: "message", Role: "user", Kind: "user_message", Text: "hello"}},
+	}, &RemoteOptions{
+		Runner:               runner,
+		InitialContext:       []Item{{ID: "ctx", Type: "message", Role: "developer", Text: "context"}},
+		InjectBeforeLastUser: true,
+	})
+	if err != nil {
+		t.Fatalf("CompactRemotely() error = %v", err)
+	}
+	if result.Summary != "remote summary" {
+		t.Fatalf("summary = %q", result.Summary)
+	}
+	if len(result.NewHistory) != 3 || result.NewHistory[0].ID != "ctx" || result.NewHistory[1].ID != "u1" || result.NewHistory[2].ID != "summary" {
+		t.Fatalf("new history = %+v", result.NewHistory)
+	}
+}
+
+func TestCompactRemotelyRetainsClientAuthoredDeveloperMessagesWhenEnabled(t *testing.T) {
+	clientDeveloper := Item{
+		ID:   "client-developer",
+		Type: "message",
+		Role: "developer",
+		Text: "keep this client instruction",
+		Data: map[string]any{
+			"harness_metadata": map[string]any{"client_authored": true},
+		},
+	}
+	generatedDeveloper := Item{
+		ID:   "generated-developer",
+		Type: "message",
+		Role: "developer",
+		Text: "drop generated instruction",
+	}
+	user := Item{
+		ID:   "user",
+		Type: "message",
+		Role: "user",
+		Kind: "user_message",
+		Text: "hello",
+	}
+	runner := remoteRunnerFunc(func(context.Context, *Request) (*Result, error) {
+		return &Result{
+			Status:  StatusCompleted,
+			Summary: "remote summary",
+			NewHistory: []Item{
+				{ID: "summary", Type: "message", Role: "user", Kind: "compaction_summary", Text: SummaryPrefix + "\nremote summary"},
+			},
+		}, nil
+	})
+
+	for _, enabled := range []bool{false, true} {
+		result, err := CompactRemotely(context.Background(), &Request{
+			ThreadID: "thread-client-developer",
+			Trigger:  TriggerManual,
+			Reason:   ReasonUserRequested,
+			Phase:    PhaseStandaloneTurn,
+			History:  []Item{clientDeveloper, generatedDeveloper, user},
+		}, &RemoteOptions{
+			Runner:                        runner,
+			InitialContext:                []Item{{ID: "ctx", Type: "message", Role: "developer", Text: "context"}},
+			InjectBeforeLastUser:          true,
+			RetainClientDeveloperMessages: enabled,
+		})
+		if err != nil {
+			t.Fatalf("CompactRemotely(enabled=%v) error = %v", enabled, err)
+		}
+		ids := make([]string, 0, len(result.NewHistory))
+		for _, item := range result.NewHistory {
+			ids = append(ids, item.ID)
+		}
+		want := "client-developer,ctx,user,summary"
+		if !enabled {
+			want = "ctx,user,summary"
+		}
+		if strings.Join(ids, ",") != want {
+			t.Fatalf("CompactRemotely(enabled=%v) history ids = %v, want %v", enabled, ids, want)
+		}
+	}
+}
+
+func TestCompactRemotelyRetainsBoundedDelegatedTasksAndDropsCompletions(t *testing.T) {
+	delegated := structuredAgentMessageItem(t, "task", "Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\n", strings.Repeat("x", 40_000))
+	completion := structuredAgentMessageItem(t, "completion", "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/worker\nPayload:\ndone", "")
+	oversized := structuredAgentMessageItem(t, "oversized", "Message Type: NEW_TASK\nTask name: /root/large\nSender: /root\nPayload:\n", strings.Repeat("y", 80_000))
+	runner := remoteRunnerFunc(func(context.Context, *Request) (*Result, error) {
+		return &Result{Status: StatusCompleted, Summary: "remote summary", NewHistory: []Item{{ID: "summary", Type: "message", Role: "user", Kind: "compaction_summary", Text: SummaryPrefix + "\nremote summary"}}}, nil
+	})
+	result, err := CompactRemotely(context.Background(), &Request{
+		ThreadID: "thread-agent", Trigger: TriggerManual, Reason: ReasonUserRequested, Phase: PhaseStandaloneTurn,
+		History: []Item{
+			{ID: "user", Type: "message", Role: "user", Kind: "user_message", Text: "delegate work"},
+			completion,
+			delegated,
+			oversized,
+		},
+	}, &RemoteOptions{Runner: runner, InitialContext: []Item{{ID: "ctx", Type: "message", Role: "developer", Text: "context"}}, InjectBeforeLastUser: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]string, 0, len(result.NewHistory))
+	for _, item := range result.NewHistory {
+		ids = append(ids, item.ID)
+	}
+	if strings.Join(ids, ",") != "user,ctx,task,summary" {
+		t.Fatalf("retained history ids = %v", ids)
+	}
+	if string(result.NewHistory[2].Raw) != string(delegated.Raw) {
+		t.Fatal("delegated task raw payload was not preserved")
+	}
+	if EstimateItemTokens(&delegated) > MaxRetainedAgentMessageTokens || EstimateItemTokens(&oversized) <= MaxRetainedAgentMessageTokens {
+		t.Fatalf("agent token estimates delegated=%d oversized=%d", EstimateItemTokens(&delegated), EstimateItemTokens(&oversized))
+	}
+}
+
+func TestEncryptedAgentMessageTokenEstimateUsesPlaintextApproximation(t *testing.T) {
+	encrypted := strings.Repeat("z", 160)
+	item := structuredAgentMessageItem(t, "task", "Message Type: NEW_TASK\n", encrypted)
+	// Rust #45094 estimates the model-visible content (author, recipient, text)
+	// rather than the serialized envelope, charging encrypted content through
+	// its plaintext-length approximation.
+	visibleBytes := len("/root") + len("/root/worker") + len("Message Type: NEW_TASK\n") + (len(encrypted)*9+15)/16
+	want := (visibleBytes + 3) / 4
+	if got := EstimateItemTokens(&item); got != want {
+		t.Fatalf("EstimateItemTokens() = %d, want %d", got, want)
+	}
+}
+
+// TestAgentMessageTokenEstimateIgnoresEnvelopeMetadataLikeRust pins the point of
+// Rust #45094 for the compact path: transport metadata (an id, extra fields,
+// JSON escaping) must not inflate the estimate, because the estimate charges
+// only model-visible content.
+func TestAgentMessageTokenEstimateIgnoresEnvelopeMetadataLikeRust(t *testing.T) {
+	plain := structuredAgentMessageItem(t, "task", "Message Type: NEW_TASK\n", "")
+	raw, err := json.Marshal(map[string]any{
+		"type":      "agent_message",
+		"id":        "msg_0123456789abcdef0123456789abcdef",
+		"author":    "/root",
+		"recipient": "/root/worker",
+		"metadata":  map[string]any{"sequence": 42, "note": "caf\u00e9 \u2014 escaped \"quotes\""},
+		"content":   []any{map[string]any{"type": "input_text", "text": "Message Type: NEW_TASK\n"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	noisy := Item{ID: "task", Type: "agent_message", Raw: raw}
+	if len(raw) <= len(plain.Raw) {
+		t.Fatalf("noisy envelope should be longer: noisy=%d plain=%d", len(raw), len(plain.Raw))
+	}
+	if got, want := EstimateItemTokens(&noisy), EstimateItemTokens(&plain); got != want {
+		t.Fatalf("estimate inflated by envelope metadata: got %d want %d", got, want)
+	}
+}
+
+func TestShouldKeepCompactedHistoryItemDropsDescendantProgressLikeRust(t *testing.T) {
+	descendantProgress := Item{
+		ID:   "desc-progress",
+		Type: "agent_message",
+		Raw:  mustAgentMessageRaw(t, "/root/child", "/root", "Message Type: MESSAGE\nTask name: /root\nSender: /root/child\nPayload:\nchild progress"),
+	}
+	if ShouldKeepCompactedHistoryItem(descendantProgress) {
+		t.Fatal("descendant MESSAGE progress must not be retained")
+	}
+	rootProgress := Item{
+		ID:   "root-progress",
+		Type: "agent_message",
+		Raw:  mustAgentMessageRaw(t, "/root", "/root/child", "Message Type: MESSAGE\nTask name: /root/child\nSender: /root\nPayload:\nparent progress"),
+	}
+	if !ShouldKeepCompactedHistoryItem(rootProgress) {
+		t.Fatal("root-authored progress must be retained")
+	}
+	descendantTask := Item{
+		ID:   "desc-task",
+		Type: "agent_message",
+		Raw:  mustAgentMessageRaw(t, "/root/child", "/root", "Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root/child\nPayload:\ntask"),
+	}
+	if !ShouldKeepCompactedHistoryItem(descendantTask) {
+		t.Fatal("descendant-authored tasks must be retained")
+	}
+}
+
+func mustAgentMessageRaw(t *testing.T, author string, recipient string, text string) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{
+		"type":      "agent_message",
+		"author":    author,
+		"recipient": recipient,
+		"content":   []any{map[string]any{"type": "input_text", "text": text}},
+	})
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	return raw
+}
+
+func structuredAgentMessageItem(t *testing.T, id string, envelope string, encrypted string) Item {
+	t.Helper()
+	content := []any{map[string]any{"type": "input_text", "text": envelope}}
+	if encrypted != "" {
+		content = append(content, map[string]any{"type": "encrypted_content", "encrypted_content": encrypted})
+	}
+	raw, err := json.Marshal(map[string]any{"type": "agent_message", "author": "/root", "recipient": "/root/worker", "content": content})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Item{ID: id, Type: "agent_message", Raw: raw}
+}
+
+func TestCompactRemotelyFallsBackToLocal(t *testing.T) {
+	result, err := CompactRemotely(context.Background(), &Request{
+		ThreadID: "thread-a",
+		Trigger:  TriggerManual,
+		Reason:   ReasonUserRequested,
+		Phase:    PhaseStandaloneTurn,
+		History:  []Item{{ID: "u1", Type: "message", Role: "user", Kind: "user_message", Text: "local words"}},
+	}, &RemoteOptions{FallbackToLocal: true, MaxSummaryChars: 1000})
+	if err != nil {
+		t.Fatalf("CompactRemotely() error = %v", err)
+	}
+	if !strings.Contains(result.Summary, "local words") {
+		t.Fatalf("summary = %q", result.Summary)
+	}
+}
+
+func TestResultCarriesCompactionModelHash(t *testing.T) {
+	result := &Result{Status: StatusCompleted, CompactionModelHash: "abc123"}
+	if result.CompactionModelHash != "abc123" {
+		t.Fatalf("CompactionModelHash = %q", result.CompactionModelHash)
+	}
+}
+
+type remoteRunnerFunc func(context.Context, *Request) (*Result, error)
+
+func (f remoteRunnerFunc) Compact(ctx context.Context, request *Request) (*Result, error) {
+	return f(ctx, request)
+}
+
+// TestEstimateToolItemTokensLikeRust pins Rust #45094's function-call/output
+// arms: the tool name, namespace (default "functions" for calls only), call id,
+// and the payload content (text or image blocks) are all model-visible.
+func TestEstimateToolItemTokensLikeRust(t *testing.T) {
+	call := Item{Type: "function_call", Name: "exec_command", Data: map[string]any{"arguments": `{"cmd":"ls"}`}}
+	wantCall := len("exec_command") + len("functions") + len(`{"cmd":"ls"}`)
+	if got := EstimateItemTokens(&call); got != (wantCall+3)/4 {
+		t.Fatalf("function call estimate = %d, want %d", got, (wantCall+3)/4)
+	}
+
+	namespaced := Item{Type: "custom_tool_call", Name: "search", Namespace: "drive", Data: map[string]any{"input": "hello"}}
+	wantNamespaced := len("search") + len("drive") + len("hello")
+	if got := EstimateItemTokens(&namespaced); got != (wantNamespaced+3)/4 {
+		t.Fatalf("namespaced call estimate = %d, want %d", got, (wantNamespaced+3)/4)
+	}
+
+	output := Item{Type: "function_call_output", CallID: "call-abc", Name: "read", Text: "Screenshot captured"}
+	wantOutput := len("call-abc") + len("read") + len("Screenshot captured")
+	if got := EstimateItemTokens(&output); got != (wantOutput+3)/4 {
+		t.Fatalf("function output estimate = %d, want %d", got, (wantOutput+3)/4)
+	}
+
+	imageOutput := Item{Type: "function_call_output", CallID: "call-abc", Content: []ContentPart{
+		{Type: "input_text", Text: "Screenshot captured"},
+		{Type: "input_image", ImageURL: "data:image/png;base64,AAAA"},
+	}}
+	wantImage := len("call-abc") + len("Screenshot captured") + compactResizedImageBytes
+	if got := EstimateItemTokens(&imageOutput); got != (wantImage+3)/4 {
+		t.Fatalf("image output estimate = %d, want %d", got, (wantImage+3)/4)
+	}
+
+	custom := Item{Type: "custom_tool_call_output", CallID: "call-js-repl", Name: "repl", Content: []ContentPart{
+		{Type: "input_text", Text: "Screenshot captured"},
+		{Type: "input_image", ImageURL: "data:image/png;base64,AAAA"},
+	}}
+	wantCustom := len("call-js-repl") + len("repl") + len("Screenshot captured") + compactResizedImageBytes
+	if got := EstimateItemTokens(&custom); got != (wantCustom+3)/4 {
+		t.Fatalf("custom output estimate = %d, want %d", got, (wantCustom+3)/4)
+	}
+}
+
+// TestEstimateAudioOutputTokensLikeRust pins Rust #45094's audio arm: an audio
+// content block contributes approx_bytes_for_tokens over its duration-derived
+// token count (20 tokens for 2 s at 10 tokens/s => 80 bytes).
+func TestEstimateAudioOutputTokensLikeRust(t *testing.T) {
+	audioURL := compactWavDataURL(t)
+	if tokens := audioutil.EstimateAudioTokenCount(audioURL); tokens != 20 {
+		t.Fatalf("audio token estimate = %d, want 20", tokens)
+	}
+	item := Item{Type: "function_call_output", CallID: "call-audio", Content: []ContentPart{
+		{Type: "input_audio", AudioURL: audioURL},
+	}}
+	wantBytes := len("call-audio") + audioutil.EstimateAudioTokenCount(audioURL)*4
+	if got := EstimateItemTokens(&item); got != (wantBytes+3)/4 {
+		t.Fatalf("audio output estimate = %d, want %d", got, (wantBytes+3)/4)
+	}
+}
+
+// compactWavDataURL builds 2 s of 8 kHz mono 16-bit PCM as a data URL, matching
+// the audioutil duration estimate (10 tokens/s).
+func compactWavDataURL(t *testing.T) string {
+	t.Helper()
+	dataSize := uint32(32000)
+	buffer := make([]byte, 0, 44+int(dataSize))
+	buffer = append(buffer, "RIFF"...)
+	buffer = appendCompactUint32LE(buffer, 36+dataSize)
+	buffer = append(buffer, "WAVE"...)
+	buffer = append(buffer, "fmt "...)
+	buffer = appendCompactUint32LE(buffer, 16)
+	buffer = appendCompactUint16LE(buffer, 1)
+	buffer = appendCompactUint16LE(buffer, 1)
+	buffer = appendCompactUint32LE(buffer, 8000)
+	buffer = appendCompactUint32LE(buffer, 16000)
+	buffer = appendCompactUint16LE(buffer, 2)
+	buffer = appendCompactUint16LE(buffer, 16)
+	buffer = append(buffer, "data"...)
+	buffer = appendCompactUint32LE(buffer, dataSize)
+	buffer = append(buffer, make([]byte, dataSize)...)
+	return "data:audio/wav;base64," + base64.StdEncoding.EncodeToString(buffer)
+}
+
+func appendCompactUint32LE(buffer []byte, value uint32) []byte {
+	return append(buffer, byte(value), byte(value>>8), byte(value>>16), byte(value>>24))
+}
+
+func appendCompactUint16LE(buffer []byte, value uint16) []byte {
+	return append(buffer, byte(value), byte(value>>8))
+}
+
+// Mirrors Rust #46072's estimate_image_reference_bytes and the message-content
+// estimate: an image in a message is charged instead of contributing zero, and a
+// file-backed reference with `original` detail costs the maximum patch count
+// because the reference exposes no dimensions.
+func TestEstimateItemTokensChargesMessageImagesLikeRust(t *testing.T) {
+	original := "original"
+	auto := "auto"
+	cases := []struct {
+		name string
+		part ContentPart
+		want int
+	}{
+		{name: "inline image", part: ContentPart{Type: "input_image", ImageURL: "data:image/png;base64,AAAA"}, want: (compactResizedImageBytes + 3) / 4},
+		{name: "file image", part: ContentPart{Type: "input_image", FileID: "file-1"}, want: (compactResizedImageBytes + 3) / 4},
+		{name: "file image auto detail", part: ContentPart{Type: "input_image", FileID: "file-1", Detail: &auto}, want: (compactResizedImageBytes + 3) / 4},
+		{name: "file image original detail", part: ContentPart{Type: "input_image", FileID: "file-1", Detail: &original}, want: compactOriginalImageMaxPatches},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			item := Item{Type: "message", Role: "user", Content: []ContentPart{tc.part}}
+			if got := EstimateItemTokens(&item); got != tc.want {
+				t.Fatalf("EstimateItemTokens() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+
+	// Text and image bytes add up inside one message.
+	mixed := Item{Type: "message", Role: "user", Content: []ContentPart{
+		{Type: "input_text", Text: strings.Repeat("x", 40)},
+		{Type: "input_image", FileID: "file-1", Detail: &original},
+	}}
+	if got, want := EstimateItemTokens(&mixed), (40+compactOriginalImageMaxPatches*4+3)/4; got != want {
+		t.Fatalf("mixed message tokens = %d, want %d", got, want)
+	}
+
+	// A text-only message keeps the plain text estimate.
+	textOnly := Item{Type: "message", Role: "user", Text: strings.Repeat("y", 40)}
+	if got, want := EstimateItemTokens(&textOnly), EstimateTextTokens(textOnly.Text); got != want {
+		t.Fatalf("text-only message tokens = %d, want %d", got, want)
+	}
+
+	// Tool outputs charge file images through the same reference rule.
+	output := Item{Type: "function_call_output", CallID: "call-1", Name: "tool", Content: []ContentPart{
+		{Type: "input_image", FileID: "file-1", Detail: &original},
+	}}
+	if got := EstimateItemTokens(&output); got < compactOriginalImageMaxPatches {
+		t.Fatalf("tool output tokens = %d, want at least the maximum patch count", got)
+	}
+}

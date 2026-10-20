@@ -1,0 +1,1052 @@
+package prompt
+
+import (
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+
+	codexshell "codex_core/shell"
+	"codex_core/utils"
+)
+
+const (
+	InstructionsDefaultAgentsMDFilename = "AGENTS.md"
+	InstructionsLocalAgentsMDFilename   = "AGENTS.override.md"
+	InstructionsAgentsMDSeparator       = "\n\n--- project-doc ---\n\n"
+)
+
+type InstructionsProvenanceKind string
+
+const (
+	InstructionsProvenanceUser     InstructionsProvenanceKind = "user"
+	InstructionsProvenanceProject  InstructionsProvenanceKind = "project"
+	InstructionsProvenanceInternal InstructionsProvenanceKind = "internal"
+)
+
+type InstructionsEntry struct {
+	Contents      string
+	Provenance    InstructionsProvenanceKind
+	SourcePath    string
+	EnvironmentID string
+	CWD           string
+}
+
+type LoadedInstructions struct {
+	UserInstructions string
+	Entries          []InstructionsEntry
+}
+
+func NewLoadedUserInstructions(contents string, path string) *LoadedInstructions {
+	if strings.TrimSpace(contents) == "" {
+		return &LoadedInstructions{}
+	}
+	return &LoadedInstructions{
+		UserInstructions: contents,
+		Entries:          []InstructionsEntry{{Contents: contents, Provenance: InstructionsProvenanceUser, SourcePath: path}},
+	}
+}
+
+func InstructionsFromText(contents string) *LoadedInstructions {
+	if strings.TrimSpace(contents) == "" {
+		return &LoadedInstructions{}
+	}
+	return &LoadedInstructions{Entries: []InstructionsEntry{{Contents: contents, Provenance: InstructionsProvenanceInternal}}}
+}
+
+func (l *LoadedInstructions) IsEmpty() bool {
+	if l == nil {
+		return true
+	}
+	if strings.TrimSpace(l.UserInstructions) != "" {
+		return false
+	}
+	for _, entry := range l.Entries {
+		if strings.TrimSpace(entry.Contents) != "" {
+			return false
+		}
+	}
+	return true
+}
+
+func (l *LoadedInstructions) Text() string {
+	if l == nil {
+		return ""
+	}
+	if l.hasMultipleProjectEnvironments() {
+		return l.environmentLabeledText()
+	}
+	return l.legacyText()
+}
+
+func (l *LoadedInstructions) legacyText() string {
+	var b strings.Builder
+	hasPrevious := false
+	previousWasProject := false
+	if strings.TrimSpace(l.UserInstructions) != "" {
+		b.WriteString(l.UserInstructions)
+		hasPrevious = true
+	}
+	for _, entry := range l.Entries {
+		if strings.TrimSpace(entry.Contents) == "" || entry.Provenance == InstructionsProvenanceUser {
+			continue
+		}
+		isProject := entry.Provenance == InstructionsProvenanceProject
+		if hasPrevious {
+			if isProject && !previousWasProject {
+				b.WriteString(InstructionsAgentsMDSeparator)
+			} else {
+				b.WriteString("\n\n")
+			}
+		}
+		b.WriteString(entry.Contents)
+		hasPrevious = true
+		previousWasProject = isProject
+	}
+	return b.String()
+}
+
+func (l *LoadedInstructions) environmentLabeledText() string {
+	var b strings.Builder
+	if strings.TrimSpace(l.UserInstructions) != "" {
+		b.WriteString(l.UserInstructions)
+	}
+	for _, entry := range l.Entries {
+		if strings.TrimSpace(entry.Contents) == "" || entry.Provenance != InstructionsProvenanceProject {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString(InstructionsAgentsMDSeparator)
+		}
+		b.WriteString("Environment: ")
+		b.WriteString(entry.EnvironmentID)
+		if entry.CWD != "" {
+			b.WriteString(" (cwd: ")
+			b.WriteString(entry.CWD)
+			b.WriteString(")")
+		}
+		b.WriteString("\n")
+		b.WriteString(entry.Contents)
+	}
+	return b.String()
+}
+
+func (l *LoadedInstructions) hasMultipleProjectEnvironments() bool {
+	seen := map[string]bool{}
+	for _, entry := range l.Entries {
+		if entry.Provenance == InstructionsProvenanceProject && entry.EnvironmentID != "" {
+			seen[entry.EnvironmentID] = true
+		}
+	}
+	return len(seen) > 1
+}
+
+type InstructionsLoadConfig struct {
+	CWD              string
+	MaxBytes         int
+	RootMarkers      []string
+	FallbackNames    []string
+	EnvironmentID    string
+	UserInstructions string
+	// DenyRead, when set, reports whether the active filesystem permissions
+	// reject reading a discovered instruction path. A denied instruction file
+	// fails loading instead of silently omitting it (Rust #39653).
+	DenyRead func(path string) bool
+	// UntrustedProject, when set, skips project-scoped AGENTS.md discovery
+	// while preserving user-level instructions (Rust #39837).
+	UntrustedProject bool
+}
+
+func LoadProjectInstructions(config InstructionsLoadConfig) (*LoadedInstructions, error) {
+	loaded := &LoadedInstructions{UserInstructions: config.UserInstructions}
+	if config.MaxBytes == 0 {
+		if loaded.IsEmpty() {
+			return nil, nil
+		}
+		return loaded, nil
+	}
+	if config.UntrustedProject {
+		if loaded.IsEmpty() {
+			return nil, nil
+		}
+		return loaded, nil
+	}
+	paths, err := InstructionsAgentsMDPaths(config.CWD, config.RootMarkers, config.FallbackNames)
+	if err != nil {
+		return nil, err
+	}
+	remaining := config.MaxBytes
+	if remaining < 0 {
+		remaining = 1 << 30
+	}
+	for _, path := range paths {
+		if remaining == 0 {
+			break
+		}
+		if config.DenyRead != nil && config.DenyRead(path) {
+			return nil, fmt.Errorf("failed to load AGENTS.md instructions: %s is not readable under the active filesystem permissions", path)
+		}
+		data, err := os.ReadFile(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if len(data) > remaining {
+			data = data[:remaining]
+		}
+		text := string(data)
+		if strings.TrimSpace(text) != "" {
+			loaded.Entries = append(loaded.Entries, InstructionsEntry{
+				Contents:      text,
+				Provenance:    InstructionsProvenanceProject,
+				SourcePath:    path,
+				EnvironmentID: config.EnvironmentID,
+				CWD:           config.CWD,
+			})
+			remaining -= len(data)
+		}
+	}
+	if loaded.IsEmpty() {
+		return nil, nil
+	}
+	return loaded, nil
+}
+
+func InstructionsAgentsMDPaths(cwd string, rootMarkers []string, fallbackNames []string) ([]string, error) {
+	if cwd == "" {
+		return nil, nil
+	}
+	root := FindInstructionsProjectRoot(cwd, rootMarkers)
+	dirs := instructionsPathFromRoot(root, cwd)
+	names := InstructionsCandidateFilenames(fallbackNames, instructionsPathConvention(cwd))
+	var paths []string
+	for _, dir := range dirs {
+		for _, name := range names {
+			path := filepath.Join(dir, name)
+			info, err := os.Stat(path)
+			if err == nil && !info.IsDir() {
+				paths = append(paths, path)
+				break
+			}
+			if err != nil && !os.IsNotExist(err) {
+				return nil, err
+			}
+		}
+	}
+	return paths, nil
+}
+
+func FindInstructionsProjectRoot(cwd string, markers []string) string {
+	if len(markers) == 0 {
+		markers = []string{".git"}
+	}
+	dir := filepath.Clean(cwd)
+	for {
+		for _, marker := range markers {
+			if marker == "" {
+				continue
+			}
+			if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
+				return dir
+			}
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return filepath.Clean(cwd)
+		}
+		dir = parent
+	}
+}
+
+// InstructionsCandidateFilenames builds the ordered candidate filenames:
+// AGENTS.override.md, AGENTS.md, then each configured fallback. Rust #45865:
+// entries containing path syntax for the executor's convention are ignored
+// before any filesystem probe, because probing a Windows network path can send
+// ambient credentials even during a metadata check. `.` and `..`, slashes, and
+// NUL characters are rejected for every convention; backslashes and colons are
+// ordinary filename characters on POSIX executors and only rejected on Windows.
+func InstructionsCandidateFilenames(fallbackNames []string, convention utils.PathConvention) []string {
+	names := []string{InstructionsLocalAgentsMDFilename, InstructionsDefaultAgentsMDFilename}
+	seen := map[string]bool{InstructionsLocalAgentsMDFilename: true, InstructionsDefaultAgentsMDFilename: true}
+	for _, name := range fallbackNames {
+		if name == "" {
+			continue
+		}
+		if name == "." || name == ".." || strings.ContainsAny(name, "/\x00") ||
+			(convention == utils.ConventionWindows && strings.ContainsAny(name, "\\:")) {
+			slog.Warn("ignoring project_doc_fallback_filenames entry that is not a filename")
+			continue
+		}
+		if seen[name] {
+			continue
+		}
+		names = append(names, name)
+		seen[name] = true
+	}
+	return names
+}
+
+// instructionsPathConvention infers the executor's path convention from a cwd,
+// mirroring Rust's `cwd.infer_path_convention()`. A path URI carries its own
+// convention (a remote Windows executor reports a Windows URI even from a POSIX
+// host); a Windows-native path is recognized by shape; anything else uses the
+// host convention.
+func instructionsPathConvention(cwd string) utils.PathConvention {
+	trimmed := strings.TrimSpace(cwd)
+	if uri, err := utils.Parse(trimmed); err == nil && uri != nil {
+		if convention, ok := uri.InferConvention(); ok {
+			return convention
+		}
+	}
+	if looksLikeWindowsNativePath(trimmed) {
+		return utils.ConventionWindows
+	}
+	if runtime.GOOS == "windows" {
+		return utils.ConventionWindows
+	}
+	return utils.ConventionPosix
+}
+
+// looksLikeWindowsNativePath reports whether value is a Windows absolute path
+// (a drive-letter path or a UNC share).
+func looksLikeWindowsNativePath(value string) bool {
+	if strings.HasPrefix(value, `\\`) {
+		return true
+	}
+	if len(value) < 3 || value[1] != ':' {
+		return false
+	}
+	drive := value[0]
+	if !((drive >= 'A' && drive <= 'Z') || (drive >= 'a' && drive <= 'z')) {
+		return false
+	}
+	return value[2] == '\\' || value[2] == '/'
+}
+
+type InstructionsManager struct {
+	mu               sync.Mutex
+	userInstructions string
+	lastKey          string
+	loaded           *LoadedInstructions
+}
+
+func NewInstructionsManager(userInstructions string) *InstructionsManager {
+	return &InstructionsManager{userInstructions: strings.TrimSpace(userInstructions)}
+}
+
+func (m *InstructionsManager) Refresh(config InstructionsLoadConfig) error {
+	config.UserInstructions = m.userInstructions
+	// Rust #39837: the active project trust level is part of the instruction
+	// cache key so runtime trust changes reload the applicable instructions.
+	untrusted := ""
+	if config.UntrustedProject {
+		untrusted = "untrusted"
+	}
+	key := config.CWD + "\x00" + strings.Join(config.RootMarkers, "\x00") + "\x00" + strings.Join(config.FallbackNames, "\x00") + "\x00" + config.EnvironmentID + "\x00" + untrusted
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.lastKey == key {
+		return nil
+	}
+	loaded, err := LoadProjectInstructions(config)
+	if err != nil {
+		return err
+	}
+	m.lastKey = key
+	m.loaded = loaded
+	return nil
+}
+
+func (m *InstructionsManager) Loaded() *LoadedInstructions {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.loaded == nil {
+		return nil
+	}
+	copied := *m.loaded
+	copied.Entries = append([]InstructionsEntry(nil), m.loaded.Entries...)
+	return &copied
+}
+
+type InstructionsSkillMetadata struct {
+	Name                    string
+	Scope                   string
+	Path                    string
+	LocatorPath             string
+	LocatorKind             string
+	Root                    string
+	RootOrder               int
+	HasRootOrder            bool
+	Description             string
+	ShortDescription        string
+	RoutingMetadata         string
+	PluginID                string
+	RemotePluginID          string
+	Contents                string
+	AllowImplicitInvocation *bool
+	AuthorityKind           string
+	AuthorityID             string
+	PackageID               string
+	ResourceID              string
+	Dependencies            []InstructionsSkillDependency
+}
+
+type InstructionsSkillDependency struct {
+	Type        string
+	Value       string
+	Description string
+	Transport   string
+	Command     string
+	URL         string
+}
+
+func (s *InstructionsSkillMetadata) AllowsImplicitInvocation() bool {
+	if s == nil || s.AllowImplicitInvocation == nil {
+		return true
+	}
+	return *s.AllowImplicitInvocation
+}
+
+func BuildInstructionsSkillNameCounts(skills []InstructionsSkillMetadata) map[string]int {
+	counts := make(map[string]int, len(skills))
+	for _, skill := range skills {
+		counts[skill.Name]++
+	}
+	return counts
+}
+
+type SkillMentionInput struct {
+	Type string
+	Text string
+	Name string
+	Path string
+}
+
+type ExplicitSkillMentionOptions struct {
+	Inputs              []SkillMentionInput
+	Skills              []InstructionsSkillMetadata
+	ConnectorSlugCounts map[string]int
+}
+
+func CollectExplicitSkillMentions(options *ExplicitSkillMentionOptions) []InstructionsSkillMetadata {
+	if options == nil || len(options.Inputs) == 0 || len(options.Skills) == 0 {
+		return nil
+	}
+	skillNameCounts := BuildInstructionsSkillNameCounts(options.Skills)
+	selected := make([]InstructionsSkillMetadata, 0)
+	seenNames := map[string]bool{}
+	seenPaths := map[string]bool{}
+	blockedPlainNames := map[string]bool{}
+
+	for i := range options.Inputs {
+		input := options.Inputs[i]
+		if input.Type != "skill" {
+			continue
+		}
+		blockedPlainNames[input.Name] = true
+		paths := skillMentionPathIdentities(input.Path)
+		if len(paths) == 0 || skillMentionPathsSeen(paths, seenPaths) {
+			continue
+		}
+		for _, skill := range options.Skills {
+			if skillMentionPathSeen(skill, seenPaths) || !skillMatchesAnyIdentity(skill, paths) {
+				continue
+			}
+			selected = append(selected, skill)
+			markSkillMentionPaths(skill, seenPaths)
+			for _, path := range paths {
+				seenPaths[path] = true
+			}
+			seenNames[skill.Name] = true
+			break
+		}
+	}
+
+	for i := range options.Inputs {
+		input := options.Inputs[i]
+		if input.Text == "" {
+			continue
+		}
+		mentions := extractToolMentions(input.Text)
+		if mentions.isEmpty() {
+			continue
+		}
+		for _, skill := range options.Skills {
+			if skillMentionPathSeen(skill, seenPaths) {
+				continue
+			}
+			if skillMatchesAnyMentionPath(skill, mentions.skillPaths) {
+				selected = append(selected, skill)
+				markSkillMentionPaths(skill, seenPaths)
+				seenNames[skill.Name] = true
+			}
+		}
+		for _, skill := range options.Skills {
+			if strings.TrimSpace(skill.Name) == "" || blockedPlainNames[skill.Name] || seenNames[skill.Name] {
+				continue
+			}
+			if skillMentionPathSeen(skill, seenPaths) {
+				continue
+			}
+			if !mentions.plainNames[skill.Name] {
+				continue
+			}
+			if skillNameCounts[skill.Name] != 1 {
+				continue
+			}
+			if options.ConnectorSlugCounts[strings.ToLower(skill.Name)] != 0 {
+				continue
+			}
+			selected = append(selected, skill)
+			markSkillMentionPaths(skill, seenPaths)
+			seenNames[skill.Name] = true
+		}
+	}
+	return selected
+}
+
+// skillMentionPaths returns the path identities that identify one skill.
+// Rust #51482 matches links and loaded skills by parsed path identity, so the
+// SKILL.md document path and the locator the app-server exposes are both
+// reduced to their identity key.
+func skillMentionPaths(skill InstructionsSkillMetadata) []string {
+	values := []string{
+		skillPathIdentity(skill.Path),
+		skillPathIdentity(skill.LocatorPath),
+	}
+	out := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func skillMatchesMentionPath(skill InstructionsSkillMetadata, identity string) bool {
+	if identity == "" {
+		return false
+	}
+	for _, candidate := range skillMentionPaths(skill) {
+		if candidate == identity {
+			return true
+		}
+	}
+	return false
+}
+
+// skillMatchesAnyIdentity reports whether the skill owns any of the mention's
+// candidate identities.
+func skillMatchesAnyIdentity(skill InstructionsSkillMetadata, identities []string) bool {
+	for _, identity := range identities {
+		if skillMatchesMentionPath(skill, identity) {
+			return true
+		}
+	}
+	return false
+}
+
+// skillMentionPathsSeen reports whether any candidate identity of one mention was
+// already consumed.
+func skillMentionPathsSeen(identities []string, seen map[string]bool) bool {
+	for _, identity := range identities {
+		if seen[identity] {
+			return true
+		}
+	}
+	return false
+}
+
+func skillMatchesAnyMentionPath(skill InstructionsSkillMetadata, paths map[string]bool) bool {
+	if len(paths) == 0 {
+		return false
+	}
+	for _, candidate := range skillMentionPaths(skill) {
+		if paths[candidate] {
+			return true
+		}
+	}
+	return false
+}
+
+func skillMentionPathSeen(skill InstructionsSkillMetadata, seen map[string]bool) bool {
+	if len(seen) == 0 {
+		return false
+	}
+	for _, candidate := range skillMentionPaths(skill) {
+		if seen[candidate] {
+			return true
+		}
+	}
+	return false
+}
+
+func markSkillMentionPaths(skill InstructionsSkillMetadata, seen map[string]bool) {
+	for _, candidate := range skillMentionPaths(skill) {
+		seen[candidate] = true
+	}
+}
+
+func DetectImplicitSkillInvocationForCommand(skills []InstructionsSkillMetadata, command string, workdir string) *InstructionsSkillMetadata {
+	workdir = canonicalizeImplicitSkillPath(workdir)
+	splitCommand := command
+	if runtime.GOOS == "windows" && strings.Contains(command, `:\`) {
+		// shlex treats backslashes as escapes; normalize a host Windows
+		// absolute path first so its separators survive tokenization.
+		splitCommand = strings.ReplaceAll(command, `\`, `/`)
+	}
+	tokens := codexshell.SplitCommandLine(splitCommand)
+	if codexshell.IsPowerShellReadCommand(splitCommand) {
+		if powerShellTokens := codexshell.TokenizePowerShellCommand(splitCommand); len(powerShellTokens) > 0 {
+			tokens = powerShellTokens
+		}
+	}
+
+	// Rust #51482 keys these implicit-skill maps by PathUri
+	// (SkillLoadOutcome::implicit_skills_by_doc_path / implicit_skills_by_scripts_dir
+	// in ext/skills/src/host_outcome.rs): equivalent Windows case and separator
+	// spellings must resolve the same skill, while POSIX case stays significant.
+	byScriptsDir := make(map[string]InstructionsSkillMetadata, len(skills))
+	bySkillDocPath := make(map[string]InstructionsSkillMetadata, len(skills))
+	for _, skill := range skills {
+		if skill.Path == "" || strings.Contains(skill.Path, "://") {
+			continue
+		}
+		docKey := implicitSkillIdentityKey(skill.Path)
+		if docKey == "" {
+			continue
+		}
+		bySkillDocPath[docKey] = skill
+		if scriptsKey := implicitSkillIdentityKey(filepath.Join(filepath.Dir(skill.Path), "scripts")); scriptsKey != "" {
+			byScriptsDir[scriptsKey] = skill
+		}
+	}
+
+	if scriptToken := implicitSkillScriptToken(tokens); scriptToken != "" {
+		for path := resolveImplicitSkillPath(workdir, scriptToken); ; path = filepath.Dir(path) {
+			if key := implicitSkillIdentityKey(path); key != "" {
+				if skill, ok := byScriptsDir[key]; ok {
+					copied := skill
+					return &copied
+				}
+			}
+			parent := filepath.Dir(path)
+			if parent == path {
+				break
+			}
+		}
+	}
+
+	docPathMatches := func(candidate string) *InstructionsSkillMetadata {
+		key := implicitSkillIdentityKey(candidate)
+		if key == "" {
+			return nil
+		}
+		skill, ok := bySkillDocPath[key]
+		if !ok {
+			return nil
+		}
+		copied := skill
+		return &copied
+	}
+
+	for _, path := range codexshell.ReadPaths(tokens) {
+		if skill := docPathMatches(resolveImplicitSkillPath(workdir, path)); skill != nil {
+			return skill
+		}
+	}
+	if path := powershellGetContentSkillPath(command); path != "" {
+		if skill := docPathMatches(resolveImplicitSkillPath(workdir, path)); skill != nil {
+			return skill
+		}
+	}
+	return nil
+}
+
+// implicitSkillIdentityKey reduces an implicit-invocation candidate path to the
+// path identity used as its map key.
+//
+// Rust #51482 stores SkillLoadOutcome's implicit skill maps as
+// HashMap<PathUri, SkillMetadata> and keys them with
+// PathUri::from_abs_path(&canonicalize_if_exists(path)): a path without a
+// host-absolute form never enters the maps (the `let Ok(path) = ...to_abs_path()
+// else { continue }` gate), host paths resolve through symlinks first, and
+// equality is PathUri identity so equivalent Windows case and separator
+// spellings agree.
+func implicitSkillIdentityKey(path string) string {
+	hostPath, ok := implicitSkillHostPath(path)
+	if !ok {
+		return ""
+	}
+	return skillPathIdentity(hostPath)
+}
+
+// implicitSkillHostPath returns the host-resolvable absolute spelling of a
+// candidate path, or ok=false when it has none (a foreign convention such as
+// Windows text observed on a POSIX host).
+func implicitSkillHostPath(path string) (string, bool) {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return "", false
+	}
+	if resolved, err := filepath.EvalSymlinks(trimmed); err == nil {
+		trimmed = resolved
+	}
+	if uri, ok := utils.InferredPathURI(trimmed); ok && uri != nil {
+		if _, err := uri.HostNativePath(); err != nil {
+			return "", false
+		}
+		return filepath.Clean(trimmed), true
+	}
+	absolute, err := filepath.Abs(trimmed)
+	if err != nil {
+		return "", false
+	}
+	return filepath.Clean(absolute), true
+}
+
+// powershellGetContentSkillPath recognizes the PowerShell `Get-Content`
+// forms added by Rust #38228 without requiring POSIX shlex tokenization:
+// `Get-Content <path>`, `Get-Content -Raw <path>`, and quoted paths containing
+// spaces. Windows backslashes are preserved.
+func powershellGetContentSkillPath(command string) string {
+	arguments := strings.TrimSpace(command)
+	if !strings.HasPrefix(arguments, "Get-Content ") {
+		return ""
+	}
+	arguments = strings.TrimSpace(strings.TrimPrefix(arguments, "Get-Content "))
+	if rest, ok := strings.CutPrefix(arguments, "-Raw "); ok {
+		arguments = strings.TrimSpace(rest)
+	}
+	if arguments == "" || strings.HasPrefix(arguments, "-") {
+		return ""
+	}
+	if strings.HasPrefix(arguments, `"`) {
+		rest := strings.TrimPrefix(arguments, `"`)
+		end := strings.IndexByte(rest, '"')
+		if end < 0 {
+			return ""
+		}
+		path := rest[:end]
+		trailing := rest[end+1:]
+		if path == "" || strings.TrimSpace(trailing) != "" {
+			return ""
+		}
+		return path
+	}
+	path := arguments
+	if index := strings.IndexFunc(arguments, func(r rune) bool { return r == ' ' || r == '\t' || r == '\r' || r == '\n' }); index >= 0 {
+		path = arguments[:index]
+		trailing := arguments[index:]
+		if strings.TrimSpace(trailing) != "" {
+			return ""
+		}
+	}
+	if path == "" {
+		return ""
+	}
+	return path
+}
+
+func implicitSkillScriptToken(tokens []string) string {
+	if len(tokens) == 0 {
+		return ""
+	}
+	runner := strings.ToLower(filepath.Base(tokens[0]))
+	runner = strings.TrimSuffix(runner, ".exe")
+	switch runner {
+	case "python", "python3", "bash", "zsh", "sh", "node", "deno", "ruby", "perl", "pwsh":
+	default:
+		return ""
+	}
+	for _, token := range tokens[1:] {
+		if token == "--" || strings.HasPrefix(token, "-") {
+			continue
+		}
+		lower := strings.ToLower(token)
+		for _, extension := range []string{".py", ".sh", ".js", ".ts", ".rb", ".pl", ".ps1"} {
+			if strings.HasSuffix(lower, extension) {
+				return token
+			}
+		}
+		return ""
+	}
+	return ""
+}
+
+func resolveImplicitSkillPath(workdir string, path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(workdir, path)
+}
+
+func canonicalizeImplicitSkillPath(path string) string {
+	if absolute, err := filepath.Abs(path); err == nil {
+		path = absolute
+	}
+	path = filepath.Clean(path)
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return filepath.Clean(resolved)
+	}
+	return path
+}
+
+type toolMentions struct {
+	skillPaths map[string]bool
+	plainNames map[string]bool
+}
+
+func (m *toolMentions) isEmpty() bool {
+	return m == nil || len(m.skillPaths) == 0 && len(m.plainNames) == 0
+}
+
+func extractToolMentions(text string) *toolMentions {
+	mentions := &toolMentions{skillPaths: map[string]bool{}, plainNames: map[string]bool{}}
+	bytes := []byte(text)
+	for index := 0; index < len(bytes); {
+		if bytes[index] == '[' {
+			name, path, end, ok := parseLinkedToolMention(text, bytes, index)
+			if ok {
+				if !isCommonEnvVarMention(name) && !isNonSkillResourcePath(path) {
+					if identity := skillPathIdentity(path); identity != "" {
+						mentions.skillPaths[identity] = true
+					}
+				}
+				index = end
+				continue
+			}
+		}
+		if bytes[index] != '$' {
+			index++
+			continue
+		}
+		nameStart := index + 1
+		if nameStart >= len(bytes) || !isMentionNameChar(bytes[nameStart]) {
+			index++
+			continue
+		}
+		nameEnd := nameStart + 1
+		for nameEnd < len(bytes) && isMentionNameChar(bytes[nameEnd]) {
+			nameEnd++
+		}
+		name := text[nameStart:nameEnd]
+		if !isCommonEnvVarMention(name) {
+			mentions.plainNames[name] = true
+		}
+		index = nameEnd
+	}
+	return mentions
+}
+
+func parseLinkedToolMention(text string, bytes []byte, start int) (string, string, int, bool) {
+	if start+1 >= len(bytes) || bytes[start] != '[' || bytes[start+1] != '$' {
+		return "", "", start + 1, false
+	}
+	nameStart := start + 2
+	if nameStart >= len(bytes) || !isMentionNameChar(bytes[nameStart]) {
+		return "", "", start + 1, false
+	}
+	nameEnd := nameStart + 1
+	for nameEnd < len(bytes) && isMentionNameChar(bytes[nameEnd]) {
+		nameEnd++
+	}
+	if nameEnd >= len(bytes) || bytes[nameEnd] != ']' {
+		return "", "", start + 1, false
+	}
+	pathStart := nameEnd + 1
+	for pathStart < len(bytes) && isASCIIWhitespace(bytes[pathStart]) {
+		pathStart++
+	}
+	if pathStart >= len(bytes) || bytes[pathStart] != '(' {
+		return "", "", start + 1, false
+	}
+	pathEnd := pathStart + 1
+	for pathEnd < len(bytes) && bytes[pathEnd] != ')' {
+		pathEnd++
+	}
+	if pathEnd >= len(bytes) || bytes[pathEnd] != ')' {
+		return "", "", start + 1, false
+	}
+	path := strings.TrimSpace(text[pathStart+1 : pathEnd])
+	if path == "" {
+		return "", "", start + 1, false
+	}
+	return text[nameStart:nameEnd], path, pathEnd + 1, true
+}
+
+func isMentionNameChar(value byte) bool {
+	return value >= 'a' && value <= 'z' ||
+		value >= 'A' && value <= 'Z' ||
+		value >= '0' && value <= '9' ||
+		value == '_' || value == '-' || value == ':'
+}
+
+func isCommonEnvVarMention(name string) bool {
+	switch strings.ToUpper(name) {
+	case "PATH", "HOME", "USER", "SHELL", "PWD", "TMPDIR", "TEMP", "TMP", "LANG", "TERM", "XDG_CONFIG_HOME":
+		return true
+	default:
+		return false
+	}
+}
+
+func isNonSkillResourcePath(path string) bool {
+	return strings.HasPrefix(path, "app://") || strings.HasPrefix(path, "mcp://") || strings.HasPrefix(path, "plugin://")
+}
+
+func normalizeMentionSkillPath(path string) string {
+	path = strings.TrimPrefix(path, "skill://")
+	return path
+}
+
+// skillPathIdentity returns the identity used to compare skill paths.
+//
+// Rust #51482: linked skill mentions, loaded skill metadata, and disabled-path
+// sets are compared by parsed path identity, so equivalent Windows spellings
+// (case and separator differences) match while literal spaces, `%`, and `#` in
+// native filenames stay distinct. An explicit `file:` URI wins, then a host
+// absolute path, then an absolute foreign spelling (for example Windows text
+// observed on Linux). Text with no URI representation — such as the
+// `environment://…` locators the executor catalog exposes — keeps its
+// normalized text as its identity so those spellings still match exactly.
+func skillPathIdentity(path string) string {
+	path = normalizeMentionSkillPath(path)
+	if path == "" {
+		return ""
+	}
+	if identity, ok := utils.PathIdentityKey(path); ok {
+		return identity
+	}
+	return "text\x00" + path
+}
+
+// skillMentionPathIdentities returns the identity keys under which one
+// structured skill mention may match a loaded skill.
+//
+// Rust #37177 (`codex-rs/skills/src/selection.rs`): the selected mention path is
+// first run through `AbsolutePathBuf::relative_to_current_dir`, which expands a
+// leading `~` and resolves a relative path against the process working
+// directory; that absolute path is then compared as a `PathUri`. Go therefore
+// also offers the host-resolved identity for a bare host spelling.
+//
+// The text identity is always offered as well, because Go shares this helper
+// between the two upstream selection layers: the extension layer
+// (`codex-rs/ext/skills/src/selection.rs`) matches skill packages by their
+// normalized text after `normalize_skill_path`, so `skill://…` locators and
+// package-relative resources such as `private/visible/SKILL.md` must keep
+// matching by text and are never resolved against the working directory.
+func skillMentionPathIdentities(path string) []string {
+	normalized := normalizeMentionSkillPath(path)
+	if normalized == "" {
+		return nil
+	}
+	identity := skillPathIdentity(path)
+	if identity == "" {
+		return nil
+	}
+	identities := []string{identity}
+	_, hasURIIdentity := utils.PathIdentityKey(normalized)
+	if normalized == path && !hasURIIdentity && !hasMentionURIScheme(normalized) {
+		if resolved, ok := resolveMentionHostPath(normalized); ok {
+			resolvedIdentity := "text\x00" + resolved
+			if parsed, ok := utils.PathIdentityKey(resolved); ok {
+				resolvedIdentity = parsed
+			}
+			if resolvedIdentity != identity {
+				identities = append(identities, resolvedIdentity)
+			}
+		}
+	}
+	return identities
+}
+
+// hasMentionURIScheme reports whether text carries a `scheme://` prefix.
+func hasMentionURIScheme(value string) bool {
+	for index := 0; index < len(value); index++ {
+		char := value[index]
+		switch {
+		case char >= 'a' && char <= 'z', char >= 'A' && char <= 'Z':
+			continue
+		case char >= '0' && char <= '9', char == '+', char == '.', char == '-':
+			if index == 0 {
+				return false
+			}
+			continue
+		case char == ':':
+			return strings.HasPrefix(value[index:], "://")
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+// resolveMentionHostPath mirrors `AbsolutePathBuf::relative_to_current_dir`:
+// expand a leading `~`, then absolutize against the process working directory.
+// ok is false only when the working directory is unavailable, which callers
+// treat like Rust's `Err` branch (the mention is skipped).
+func resolveMentionHostPath(path string) (string, bool) {
+	expanded := expandMentionHomeDirectory(path)
+	if filepath.IsAbs(expanded) {
+		return filepath.Clean(expanded), true
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", false
+	}
+	return filepath.Join(cwd, expanded), true
+}
+
+// expandMentionHomeDirectory mirrors `maybe_expand_home_directory`: only a bare
+// `~` or a `~/` (`~\` on Windows) prefix is expanded.
+func expandMentionHomeDirectory(path string) string {
+	if !strings.HasPrefix(path, "~") {
+		return path
+	}
+	rest := path[1:]
+	if rest != "" && !strings.HasPrefix(rest, "/") && !strings.HasPrefix(rest, `\`) {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return path
+	}
+	if rest == "" {
+		return home
+	}
+	return filepath.Join(home, strings.TrimLeft(rest, `\/`))
+}
+
+func isASCIIWhitespace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == '\v' || b == '\f'
+}
+
+func instructionsPathFromRoot(root string, cwd string) []string {
+	root = filepath.Clean(root)
+	cwd = filepath.Clean(cwd)
+	var dirs []string
+	for cursor := cwd; ; cursor = filepath.Dir(cursor) {
+		dirs = append(dirs, cursor)
+		if cursor == root {
+			break
+		}
+		parent := filepath.Dir(cursor)
+		if parent == cursor {
+			break
+		}
+	}
+	for i, j := 0, len(dirs)-1; i < j; i, j = i+1, j-1 {
+		dirs[i], dirs[j] = dirs[j], dirs[i]
+	}
+	return dirs
+}

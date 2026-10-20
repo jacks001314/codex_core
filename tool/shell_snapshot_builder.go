@@ -1,0 +1,515 @@
+package tool
+
+// The session's shell-snapshot producer.
+//
+// Rust parity: codex-rs/core/src/shell_snapshot.rs. A session captures the
+// user's shell state once, keeps the snapshot file for as long as the session
+// lives, and removes it when the session ends; the file is written to a
+// temporary path and only renamed into place after sourcing it succeeded, so a
+// half-written snapshot can never be replayed.
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"codex_core/envutil"
+	"codex_core/execpolicy"
+	execserverclient "codex_core/execserver"
+	"codex_core/sandbox"
+	"codex_core/shell"
+)
+
+// DefaultSnapshotTimeout bounds a capture or validation run, mirroring Rust's
+// SNAPSHOT_TIMEOUT.
+const DefaultSnapshotTimeout = 10 * time.Second
+
+// SnapshotCaptureRunner runs one capture command and returns its standard
+// output. The permission profile is the one the snapshot is captured under, so
+// the captured state reflects what the launch itself can read.
+type SnapshotCaptureRunner func(
+	ctx context.Context,
+	command []string,
+	cwd string,
+	env map[string]string,
+	profile *sandbox.PermissionProfile,
+	profileID string,
+) ([]byte, error)
+
+// SnapshotBuilderOptions configures one session's snapshot producer.
+type SnapshotBuilderOptions struct {
+	CodexHome string
+	SessionID string
+	// Runner runs the capture and validation commands. It defaults to
+	// RunSandboxedSnapshotCommand.
+	Runner SnapshotCaptureRunner
+	// Prune reports the rollout age of a session, so snapshots left behind by
+	// sessions that are gone are removed (Rust's state-db lookup). Nil keeps
+	// only the unattributable files pruned.
+	Prune shell.SnapshotPruneLookup
+	// Timeout bounds each capture run; DefaultSnapshotTimeout when zero.
+	Timeout time.Duration
+}
+
+// SnapshotFailureReason reports why a session has no snapshot, mirroring the
+// static reasons Rust's try_create returns so telemetry can group them.
+type SnapshotFailureReason string
+
+const (
+	// SnapshotReasonWriteFailed means the capture could not run, decode or be
+	// written (Rust maps every write_shell_snapshot error to this reason).
+	SnapshotReasonWriteFailed SnapshotFailureReason = "write_failed"
+	// SnapshotReasonValidationFailed means the written snapshot could not be
+	// sourced, so it was discarded.
+	SnapshotReasonValidationFailed SnapshotFailureReason = "validation_failed"
+)
+
+// SnapshotCaptureRequest describes the launch whose shell state is needed.
+type SnapshotCaptureRequest struct {
+	ShellType       ShellType
+	ShellPath       string
+	CWD             string
+	AllowLoginShell bool
+	// EnvironmentPolicy is the resolved `shell_environment_policy` table of the
+	// environment the snapshot belongs to. It decides which captured exports the
+	// snapshot may persist (Rust #48099), and it is part of the cache key so a
+	// snapshot captured under another policy is never replayed.
+	EnvironmentPolicy   map[string]any
+	PermissionProfile   *sandbox.PermissionProfile
+	PermissionProfileID string
+}
+
+// SnapshotProviderRequest describes a launch asking for its session's snapshot.
+// The provider decides whether this launch is one Rust would replay a snapshot
+// for (feature enabled, the session's own shell and directory, a local
+// environment, Direct shell mode), and returns "" when it is not.
+type SnapshotProviderRequest struct {
+	ShellType       ShellType
+	ShellPath       string
+	CWD             string
+	AllowLoginShell bool
+	// EnvironmentPolicy is the resolved shell environment policy of the
+	// environment this launch runs in.
+	EnvironmentPolicy   map[string]any
+	PermissionProfile   *sandbox.PermissionProfile
+	PermissionProfileID string
+	EnvironmentID       string
+	Remote              bool
+	// ShellMode is the launch's unified-exec shell mode. Rust #51347 keeps only
+	// `Direct` launches inside the command-level snapshot metric denominator
+	// (core/src/tools/runtimes/unified_exec/snapshot_metrics.rs), so the provider
+	// reads it to decide whether to observe; it never changes replay.
+	ShellMode UnifiedExecShellMode
+}
+
+// SnapshotProviderResult is one launch's snapshot answer: the path the launch
+// replays (empty when the session has no snapshot for it) plus the command-level
+// observation hook (Rust #51347 `SnapshotMetrics`).
+type SnapshotProviderResult struct {
+	// Path is the snapshot to replay in front of the launch's command, or "".
+	Path string
+	// Remote asks the selected executor to capture and replay its own shell
+	// snapshot. Path is used for local environments.
+	Remote *execserverclient.ShellSnapshotRequest
+	// ObserveCommandOutcome, when non-nil, is called exactly once after the
+	// launch decides whether it replayed the snapshot. used is Rust's
+	// `snapshot_used = wrapped != command`: true when the command was rewritten
+	// to replay the snapshot, false when normal shell startup was used.
+	ObserveCommandOutcome func(used bool)
+}
+
+// snapshotExplicitOverrides returns the policy-driven environment overrides that
+// must win after a snapshot is sourced (Rust passes `explicit_env_overrides`).
+func snapshotExplicitOverrides(req *ShellRequest) map[string]string {
+	if req == nil || req.EnvPolicy == nil {
+		return nil
+	}
+	return req.EnvPolicy.Set
+}
+
+// SnapshotBuilder captures snapshots for one session and keeps them alive until
+// Close. It is safe for concurrent use: a launch that needs a missing snapshot
+// captures it, and other launches wait for that capture instead of starting a
+// second one.
+type SnapshotBuilder struct {
+	mu        sync.Mutex
+	options   SnapshotBuilderOptions
+	snapshots map[string]*ShellSnapshotFile
+	cleaned   bool
+}
+
+// ShellSnapshotFile is a captured snapshot on disk. Closing it removes the file,
+// mirroring Rust's `Drop for ShellSnapshotFile`.
+type ShellSnapshotFile struct {
+	path string
+}
+
+// Path returns the snapshot's location, or "" for no snapshot.
+func (f *ShellSnapshotFile) Path() string {
+	if f == nil {
+		return ""
+	}
+	return f.path
+}
+
+// Close removes the snapshot file.
+func (f *ShellSnapshotFile) Close() error {
+	if f == nil || strings.TrimSpace(f.path) == "" {
+		return nil
+	}
+	if err := os.Remove(f.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// NewSnapshotBuilder returns a builder for one session, or nil when the session
+// cannot hold a snapshot (no codex home).
+func NewSnapshotBuilder(options SnapshotBuilderOptions) *SnapshotBuilder {
+	if strings.TrimSpace(options.CodexHome) == "" || strings.TrimSpace(options.SessionID) == "" {
+		return nil
+	}
+	if options.Runner == nil {
+		options.Runner = RunSandboxedSnapshotCommand
+	}
+	if options.Timeout <= 0 {
+		options.Timeout = DefaultSnapshotTimeout
+	}
+	return &SnapshotBuilder{options: options, snapshots: map[string]*ShellSnapshotFile{}}
+}
+
+// Snapshot returns the session's snapshot for the request, capturing it on first
+// use. A nil snapshot with an empty reason means the shell has no snapshot
+// support; otherwise the reason reports why the capture was discarded. Callers
+// run the command without a snapshot either way, exactly like Rust's fail-open
+// capture.
+func (b *SnapshotBuilder) Snapshot(ctx context.Context, request SnapshotCaptureRequest) (*ShellSnapshotFile, SnapshotFailureReason) {
+	if b == nil {
+		return nil, ""
+	}
+	key := snapshotCaptureKey(request)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.cleanupStaleSnapshotsLocked()
+	if existing := b.snapshots[key]; existing != nil {
+		if _, err := os.Stat(existing.path); err == nil {
+			return existing, ""
+		}
+		delete(b.snapshots, key)
+	}
+	created, reason := b.captureLocked(ctx, request)
+	if created == nil {
+		return nil, reason
+	}
+	b.snapshots[key] = created
+	return created, ""
+}
+
+// PrewarmedSnapshot reports whether a snapshot captured under this request's
+// environment policy is already cached and on disk, i.e. whether the session's
+// background prewarm has produced it (Rust core's `shell_snapshot.peek()` being
+// `Some(Some(Ok))` with a matching policy). It never captures, so the
+// command-level observation can tag `prewarm_ready` instead of `prewarm_pending`.
+func (b *SnapshotBuilder) PrewarmedSnapshot(request SnapshotCaptureRequest) bool {
+	if b == nil {
+		return false
+	}
+	key := snapshotCaptureKey(request)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	existing := b.snapshots[key]
+	if existing == nil {
+		return false
+	}
+	if _, err := os.Stat(existing.path); err != nil {
+		delete(b.snapshots, key)
+		return false
+	}
+	return true
+}
+
+// Close removes every snapshot this session captured.
+func (b *SnapshotBuilder) Close() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	snapshots := b.snapshots
+	b.snapshots = map[string]*ShellSnapshotFile{}
+	b.mu.Unlock()
+	for _, snapshot := range snapshots {
+		_ = snapshot.Close()
+	}
+}
+
+// cleanupStaleSnapshotsLocked prunes leaked snapshots once per builder, mirroring
+// Rust's `cleanup_stale_snapshots`: sessions with no rollout, rollouts past the
+// retention window, and files with no session id are removed; the active session
+// keeps its files.
+func (b *SnapshotBuilder) cleanupStaleSnapshotsLocked() {
+	if b.cleaned {
+		return
+	}
+	b.cleaned = true
+	_, _ = shell.CleanupSnapshots(b.options.CodexHome, b.options.SessionID, time.Now(), b.options.Prune)
+}
+
+func (b *SnapshotBuilder) captureLocked(ctx context.Context, request SnapshotCaptureRequest) (*ShellSnapshotFile, SnapshotFailureReason) {
+	startup := shell.SnapshotStartupInteractive
+	if !request.AllowLoginShell {
+		startup = shell.SnapshotStartupNonInteractive
+	}
+	captureType := snapshotShellType(request)
+	script, ok := shell.SnapshotCaptureScript(captureType, shell.SnapshotCaptureOptions{
+		Startup:      startup,
+		Declarations: true,
+	})
+	if !ok {
+		return nil, ""
+	}
+	runCtx, cancel := context.WithTimeout(ctx, b.options.Timeout)
+	defer cancel()
+	env := snapshotCaptureEnv()
+	captured, err := b.options.Runner(runCtx, snapshotExecArgs(request, script), request.CWD, env, request.PermissionProfile, request.PermissionProfileID)
+	if err != nil {
+		return nil, SnapshotReasonWriteFailed
+	}
+	decoded := shell.ParseCapturedSnapshot(captureType, captured)
+	if decoded == nil {
+		return nil, SnapshotReasonWriteFailed
+	}
+	return b.writeSnapshot(runCtx, request, env, decoded)
+}
+
+// writeSnapshot writes the rendered replay text beside its temporary file,
+// sources it to prove it is usable, and only then renames it into place
+// (Rust's write_shell_snapshot plus validate_snapshot).
+func (b *SnapshotBuilder) writeSnapshot(
+	ctx context.Context,
+	request SnapshotCaptureRequest,
+	env map[string]string,
+	decoded *shell.CapturedSnapshot,
+) (*ShellSnapshotFile, SnapshotFailureReason) {
+	path, tempPath := shell.SnapshotPath(
+		b.options.CodexHome,
+		b.options.SessionID,
+		snapshotShellType(request),
+		time.Now().UnixNano(),
+	)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, SnapshotReasonWriteFailed
+	}
+	policy := shellSnapshotEnvironmentPolicy(request)
+	if err := os.WriteFile(tempPath, []byte(decoded.RenderScript(policy)), 0o600); err != nil {
+		return nil, SnapshotReasonWriteFailed
+	}
+	validation := "set -e; . \"" + tempPath + "\""
+	if _, err := b.options.Runner(ctx, snapshotExecArgs(request, validation), request.CWD, env, request.PermissionProfile, request.PermissionProfileID); err != nil {
+		_ = os.Remove(tempPath)
+		return nil, SnapshotReasonValidationFailed
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		_ = os.Remove(tempPath)
+		return nil, SnapshotReasonWriteFailed
+	}
+	return &ShellSnapshotFile{path: path}, ""
+}
+
+// snapshotShellType resolves the capture dialect for a launch. Go's tool-level
+// type folds `sh` into bash, while a POSIX sh needs its own capture script
+// (Rust's ShellType::Sh, which already adapts when the sh is bash-backed), so
+// the shell's own name decides.
+func snapshotShellType(request SnapshotCaptureRequest) shell.ShellType {
+	base := strings.ToLower(filepath.Base(strings.TrimSpace(request.ShellPath)))
+	base = strings.TrimSuffix(base, ".exe")
+	switch {
+	case base == "sh", base == "dash", base == "ash", strings.HasPrefix(base, "dash-"), strings.HasPrefix(base, "ash-"):
+		return shell.ShellSh
+	default:
+		return shell.ShellType(request.ShellType)
+	}
+}
+
+// snapshotExecArgs mirrors Rust's Shell::derive_exec_args for snapshot work: a
+// login run asks the shell for its login startup, a non-login run does not.
+func snapshotExecArgs(request SnapshotCaptureRequest, script string) []string {
+	flag := "-c"
+	if request.AllowLoginShell {
+		flag = "-lc"
+	}
+	return []string{request.ShellPath, flag, script}
+}
+
+// snapshotCaptureKey identifies a captured snapshot, mirroring Rust's
+// ShellSnapshotCacheKey: the shell, its startup mode, the launch directory and
+// the policy the capture ran under.
+// shellSnapshotEnvironmentPolicy builds the shell environment policy the
+// snapshot render uses: the environment's resolved table, applied to the
+// launch's directory (Rust's resolved environment policy, #48099).
+func shellSnapshotEnvironmentPolicy(request SnapshotCaptureRequest) *execpolicy.EnvPolicy {
+	return execpolicy.EnvPolicyFromShellEnvironmentPolicy(request.EnvironmentPolicy, request.CWD)
+}
+
+// snapshotEnvironmentPolicyKey is the canonical identity of an environment
+// policy table, so a snapshot captured under one policy is never reused under
+// another (Rust's `ShellSnapshotFile::shell_environment_policy` filter).
+func snapshotEnvironmentPolicyKey(table map[string]any) string {
+	if len(table) == 0 {
+		return ""
+	}
+	encoded, err := json.Marshal(table)
+	if err != nil {
+		return ""
+	}
+	return string(encoded)
+}
+
+func snapshotCaptureKey(request SnapshotCaptureRequest) string {
+	policy := request.PermissionProfileID
+	if request.PermissionProfile != nil {
+		if encoded, err := sandbox.RuntimePermissionProfileJSON(*request.PermissionProfile); err == nil {
+			policy = request.PermissionProfileID + "\x00" + encoded
+		}
+	}
+	return strings.Join([]string{
+		string(request.ShellType),
+		request.ShellPath,
+		request.CWD,
+		boolKey(request.AllowLoginShell),
+		snapshotEnvironmentPolicyKey(request.EnvironmentPolicy),
+		policy,
+	}, "\x01")
+}
+
+func boolKey(value bool) string {
+	if value {
+		return "login"
+	}
+	return "non-login"
+}
+
+// snapshotCaptureEnv is the environment a capture starts from: the parent
+// process environment without the launch-context variables Rust scrubs.
+// Execution IDs are per launch and must never be captured or reused by a
+// snapshot.
+func snapshotCaptureEnv() map[string]string {
+	env := map[string]string{}
+	for _, entry := range os.Environ() {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok || key == "" {
+			continue
+		}
+		env[key] = value
+	}
+	envutil.SetThreadIDEnv(env, nil)
+	envutil.SetToolCallIDEnv(env, nil)
+	return envutil.ScrubMap(env)
+}
+
+// RunSandboxedSnapshotCommand is the default capture runner: it applies the
+// launch's permission profile to the capture command, so a shell that may not
+// read its own configuration cannot capture it either (Rust's
+// ShellSnapshotSandbox::run).
+func RunSandboxedSnapshotCommand(
+	ctx context.Context,
+	command []string,
+	cwd string,
+	env map[string]string,
+	profile *sandbox.PermissionProfile,
+	profileID string,
+) ([]byte, error) {
+	if len(command) == 0 {
+		return nil, errors.New("snapshot command is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// A launch without a permission profile (the user-shell command path, which
+	// is the explicit full-access escape hatch) captures without a sandbox,
+	// mirroring Rust's ShellSnapshotSandbox::run(None).
+	if profile == nil {
+		return runSnapshotCommandDirect(ctx, command, cwd, env)
+	}
+	plan, planErr := sandbox.BuildCommandRunPlan(&sandbox.CommandRunRequest{
+		ResolvedPermissionProfile:   profile,
+		ResolvedPermissionProfileID: profileID,
+		CWD:                         cwd,
+		Command:                     append([]string(nil), command...),
+	})
+	if planErr != nil {
+		return nil, planErr
+	}
+	if err := plan.UnsupportedError(); err != nil {
+		return nil, err
+	}
+	runCommand := plan.Command
+	if len(runCommand) == 0 {
+		runCommand = command
+	}
+	process := exec.CommandContext(ctx, runCommand[0], runCommand[1:]...)
+	process.Dir = plan.CWD
+	if process.Dir == "" {
+		process.Dir = cwd
+	}
+	if plan.PermissionProfileID != "" {
+		env = cloneEnvMap(env)
+		env["CODEX_PERMISSION_PROFILE"] = plan.PermissionProfileID
+	}
+	process.Env = envSlice(env)
+	// Rust #48483: the snapshot capture is piped, so it must not allocate a
+	// console window when the runner itself has no console.
+	envutil.SuppressConsoleWindow(process)
+	var stdout, stderr strings.Builder
+	process.Stdout = &stdout
+	process.Stderr = &stderr
+	// The capture runs with its process group owned, so a failed capture
+	// takes the helpers its startup files spawned down with it (#49782).
+	if err := runSnapshotCaptureProcess(process); err != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			return nil, err
+		}
+		return nil, errors.New("snapshot command failed: " + strings.TrimSpace(stderr.String()))
+	}
+	return []byte(stdout.String()), nil
+}
+
+// runSnapshotCommandDirect runs a capture command with no sandbox.
+func runSnapshotCommandDirect(ctx context.Context, command []string, cwd string, env map[string]string) ([]byte, error) {
+	process := exec.CommandContext(ctx, command[0], command[1:]...)
+	process.Dir = cwd
+	process.Env = envSlice(env)
+	// Rust #48483: the snapshot capture is piped, so it must not allocate a
+	// console window when the runner itself has no console.
+	envutil.SuppressConsoleWindow(process)
+	var stdout, stderr strings.Builder
+	process.Stdout = &stdout
+	process.Stderr = &stderr
+	// The capture runs with its process group owned, so a failed capture
+	// takes the helpers its startup files spawned down with it (#49782).
+	if err := runSnapshotCaptureProcess(process); err != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			return nil, err
+		}
+		return nil, errors.New("snapshot command failed: " + strings.TrimSpace(stderr.String()))
+	}
+	return []byte(stdout.String()), nil
+}
+
+func cloneEnvMap(values map[string]string) map[string]string {
+	if values == nil {
+		return map[string]string{}
+	}
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
+}

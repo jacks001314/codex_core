@@ -1,0 +1,544 @@
+package model
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Rust parity: codex-rs/core/src/client.rs's RequestTelemetry::on_request ->
+// SessionTelemetry::record_api_request (codex-rs/otel/src/events/session_telemetry.rs).
+// The model package cannot import codex_core/telemetry - telemetry reaches back
+// here through memories - so the sink and the two metric names are declared
+// locally; telemetry.TurnMetricSink and state.TaskMetrics satisfy MetricsSink
+// structurally.
+
+// MetricsSink receives the model client's request metrics.
+type MetricsSink interface {
+	Counter(name string, inc int, tags map[string]string)
+	RecordDuration(name string, duration time.Duration, tags map[string]string)
+}
+
+// AuthRecoveryRecord carries the values of one unauthorized-recovery attempt
+// (Rust's SessionTelemetry::record_auth_recovery).
+type AuthRecoveryRecord struct {
+	// Mode and Step name the recovery plan position (codex-login's vocabulary).
+	Mode string
+	Step string
+	// Outcome is one of auth.AuthRecoveryOutcome*.
+	Outcome string
+	// RequestID, CFRay, AuthError, and AuthErrorCode come from the failed
+	// response's debug context.
+	RequestID     string
+	CFRay         string
+	AuthError     string
+	AuthErrorCode string
+	// RecoveryReason explains why no step ran.
+	RecoveryReason string
+	// AuthStateChanged reports whether the step changed the cached credentials.
+	AuthStateChanged *bool
+}
+
+// WebsocketConnectRecord carries the values of one websocket handshake attempt
+// (Rust's SessionTelemetry::record_websocket_connect).
+type WebsocketConnectRecord struct {
+	Duration time.Duration
+	// Status is absent when the handshake failed without an HTTP response.
+	Status *int
+	// ErrorMessage is absent when the handshake succeeded.
+	ErrorMessage           string
+	Endpoint               string
+	AuthHeaderAttached     bool
+	AuthHeaderName         string
+	RetryAfterUnauthorized bool
+	RecoveryMode           string
+	RecoveryPhase          string
+	ConnectionReused       bool
+	RequestID              string
+	CFRay                  string
+	AuthError              string
+	AuthErrorCode          string
+	AgentID                string
+	TaskID                 string
+}
+
+// SSECompletedRecord carries the values of a completed model response for the
+// `codex.sse_event` record (Rust's SessionTelemetry::sse_event_completed).
+type SSECompletedRecord struct {
+	Usage AgentUsage
+	// TTFTMillis is absent when the stream never reported an output item.
+	TTFTMillis      *int64
+	ServiceTier     string
+	ReasoningEffort string
+}
+
+// WebsocketRequestRecord carries the values of one websocket request send
+// (Rust's SessionTelemetry::record_websocket_request).
+type WebsocketRequestRecord struct {
+	Duration time.Duration
+	// ErrorMessage is absent when the send succeeded.
+	ErrorMessage     string
+	ConnectionReused bool
+	AgentID          string
+	TaskID           string
+}
+
+// APIRequestRecord carries the per-attempt values of one model HTTP request
+// (Rust's RequestTelemetry::on_request).
+type APIRequestRecord struct {
+	Attempt  uint64
+	Duration time.Duration
+	// Status is absent when the attempt failed before a response arrived.
+	Status *int
+	// ErrorMessage is absent when the attempt succeeded.
+	ErrorMessage string
+	// Endpoint is the provider-relative route (e.g. "/responses").
+	Endpoint               string
+	AuthHeaderAttached     bool
+	AuthHeaderName         string
+	RetryAfterUnauthorized bool
+	RecoveryMode           string
+	RecoveryPhase          string
+	RequestID              string
+	CFRay                  string
+	AuthError              string
+	AuthErrorCode          string
+	AgentID                string
+	TaskID                 string
+}
+
+// SessionTelemetrySink receives the diagnostic records for the model client's
+// events: Rust's log_event! / trace_event! macros, whose session metadata the
+// sink owns, plus the spans the client instrumentation opens. The model package
+// cannot import codex_core/telemetry (telemetry reaches back here), so the sink is
+// declared locally and telemetry's SessionTelemetry satisfies it.
+type SessionTelemetrySink interface {
+	LogEvent(ctx context.Context, eventName string, fields map[string]string, logOnly map[string]string)
+	TraceEvent(ctx context.Context, eventName string, fields map[string]string, traceOnly map[string]string)
+	LogAndTraceEvent(ctx context.Context, eventName string, fields map[string]string, logOnly map[string]string, traceOnly map[string]string)
+	// StartSpan opens one of the client's spans (stream_request,
+	// receiving_stream, handle_responses, receiving) and returns the context
+	// carrying it, so records emitted while it is open attach to it.
+	StartSpan(ctx context.Context, parent TelemetrySpan, name string, attributes map[string]string) (context.Context, TelemetrySpan)
+	// RecordAPIRequest reports one model HTTP attempt.
+	RecordAPIRequest(ctx context.Context, record APIRequestRecord)
+	// RecordWebsocketRequest reports one websocket request send.
+	RecordWebsocketRequest(ctx context.Context, record WebsocketRequestRecord)
+	// RecordSSEEventCompleted reports a completed model response's usage.
+	RecordSSEEventCompleted(ctx context.Context, record SSECompletedRecord)
+	// RecordSSEEventCompletedFailed reports the streaming consumer's error arm.
+	RecordSSEEventCompletedFailed(ctx context.Context, errorMessage string)
+	// RecordWebsocketConnect reports one websocket handshake attempt.
+	RecordWebsocketConnect(ctx context.Context, record WebsocketConnectRecord)
+	// RecordAuthRecovery reports one unauthorized-recovery attempt.
+	RecordAuthRecovery(ctx context.Context, record AuthRecoveryRecord)
+}
+
+// Metric names mirror codex-rs/otel/src/metrics/names.rs.
+const (
+	apiCallCountMetric                          = "codex.api_request"
+	apiCallDurationMetric                       = "codex.api_request.duration_ms"
+	sseEventCountMetric                         = "codex.sse_event"
+	sseEventDurationMetric                      = "codex.sse_event.duration_ms"
+	websocketEventCountMetric                   = "codex.websocket.event"
+	websocketEventDurationMetric                = "codex.websocket.event.duration_ms"
+	websocketRequestCountMetric                 = "codex.websocket.request"
+	websocketContinuationCountMetric            = "codex.websocket.continuation"
+	websocketRequestDurationMetric              = "codex.websocket.request.duration_ms"
+	responsesAPIOverheadDurationMetric          = "codex.responses_api_overhead.duration_ms"
+	responsesAPIInferenceTimeDurationMetric     = "codex.responses_api_inference_time.duration_ms"
+	responsesAPIEngineIAPITTFTDurationMetric    = "codex.responses_api_engine_iapi_ttft.duration_ms"
+	responsesAPIEngineServiceTTFTDurationMetric = "codex.responses_api_engine_service_ttft.duration_ms"
+	responsesAPIEngineIAPITBTDurationMetric     = "codex.responses_api_engine_iapi_tbt.duration_ms"
+	responsesAPIEngineServiceTBTDurationMetric  = "codex.responses_api_engine_service_tbt.duration_ms"
+)
+
+// sseUnknownKind / websocketUnknownKind mirror SSE_UNKNOWN_KIND /
+// WEBSOCKET_UNKNOWN_KIND.
+const (
+	sseUnknownKind       = "unknown"
+	websocketUnknownKind = "unknown"
+)
+
+// responsesWebsocketTimingKind mirrors RESPONSES_WEBSOCKET_TIMING_KIND.
+const responsesWebsocketTimingKind = "responsesapi.websocket_timing"
+
+// recordAPIRequest mirrors record_api_request's metric half: one counter and one
+// millisecond duration histogram per HTTP attempt, tagged by the response status
+// ("none" for a transport failure) and success.
+func (r *ResponsesAgentRunner) recordAPIRequest(status int, err error, duration time.Duration) {
+	if r == nil || r.Metrics == nil {
+		return
+	}
+	success := err == nil && status >= 200 && status <= 299
+	statusTag := "none"
+	if status != 0 {
+		statusTag = strconv.Itoa(status)
+	}
+	tags := map[string]string{"status": statusTag, "success": strconv.FormatBool(success)}
+	r.Metrics.Counter(apiCallCountMetric, 1, tags)
+	r.Metrics.RecordDuration(apiCallDurationMetric, duration, tags)
+}
+
+// sseEventTelemetry describes one processed SSE event for the telemetry sinks.
+type sseEventTelemetry struct {
+	// Kind is the event kind; KindKnown reports whether the event name was
+	// available (Rust's `Option<&String>`).
+	Kind      string
+	KindKnown bool
+	Success   bool
+	Duration  time.Duration
+	Err       error
+	// Message overrides the error text the failure record reports (Rust's
+	// log_sse_event passes the parsed payload for a response.failed event and a
+	// fixed message for an unparsable response.output_item.done item).
+	Message string
+}
+
+// recordAPIRequestRecord mirrors the record half of
+// SessionTelemetry::record_api_request, which Rust's RequestTelemetry::on_request
+// reports for every HTTP attempt (the metric half stays in recordAPIRequest).
+func (r *ResponsesAgentRunner) recordAPIRequestRecord(ctx context.Context, request *AgentRequest, apiRequest *responsesAgentRequest, httpRequest *http.Request, httpResponse *http.Response, attempt uint64, transportErr error, duration time.Duration, retryAfterUnauthorized bool, recoveryMode string, recoveryPhase string) {
+	if r == nil || r.Telemetry == nil || apiRequest == nil {
+		return
+	}
+	endpoint := ResponsesEndpointResponses
+	if request != nil {
+		endpoint = request.Endpoint
+	}
+	record := APIRequestRecord{
+		Attempt:                attempt,
+		Duration:               duration,
+		Endpoint:               endpoint.Path(),
+		RetryAfterUnauthorized: retryAfterUnauthorized,
+		RecoveryMode:           recoveryMode,
+		RecoveryPhase:          recoveryPhase,
+	}
+	if httpRequest != nil {
+		// Rust reports the auth header the provider attached
+		// (codex-api's auth_header_telemetry): only `authorization` counts.
+		if strings.TrimSpace(httpRequest.Header.Get("Authorization")) != "" {
+			record.AuthHeaderAttached = true
+			record.AuthHeaderName = "authorization"
+		}
+	}
+	if httpResponse != nil {
+		status := httpResponse.StatusCode
+		record.Status = &status
+		record.RequestID = responseHeaderValue(httpResponse.Header, responsesRequestIDHeader, responsesOAIRequestIDHeader)
+		record.CFRay = responseHeaderValue(httpResponse.Header, "cf-ray")
+		record.AuthError = responseHeaderValue(httpResponse.Header, "x-openai-authorization-error")
+		record.AuthErrorCode = responseAuthorizationErrorCode(httpResponse.Header)
+	}
+	if transportErr != nil {
+		record.ErrorMessage = transportErr.Error()
+	}
+	if r.AgentIdentityTelemetry != nil {
+		record.AgentID = r.AgentIdentityTelemetry.AgentID
+		record.TaskID = r.AgentIdentityTelemetry.TaskID
+	}
+	r.Telemetry.RecordAPIRequest(ctx, record)
+}
+
+// recordSSEEvent mirrors SessionTelemetry's sse_event/sse_event_failed: one
+// counter and one millisecond duration histogram tagged by the event kind and
+// success, plus the diagnostic records - a successful event logs only, a failed
+// event logs and records a trace-safe event carrying the error message.
+func recordSSEEvent(metrics MetricsSink, sink SessionTelemetrySink, ctx context.Context, event sseEventTelemetry) {
+	kind := event.Kind
+	if kind == "" {
+		kind = sseUnknownKind
+	}
+	if metrics != nil {
+		tags := map[string]string{"kind": kind, "success": strconv.FormatBool(event.Success)}
+		metrics.Counter(sseEventCountMetric, 1, tags)
+		metrics.RecordDuration(sseEventDurationMetric, event.Duration, tags)
+	}
+	if sink == nil {
+		return
+	}
+	fields := map[string]string{"duration_ms": strconv.FormatInt(event.Duration.Milliseconds(), 10)}
+	errorMessage := ""
+	if event.Message != "" {
+		errorMessage = event.Message
+	} else if event.Err != nil {
+		errorMessage = event.Err.Error()
+	}
+	if errorMessage != "" {
+		fields["error.message"] = errorMessage
+	}
+	if event.Success {
+		sink.LogEvent(ctx, sseEventName, sseEventKindField(kind, event.KindKnown, fields), nil)
+		return
+	}
+	sink.LogEvent(ctx, sseEventName, sseEventKindField(kind, event.KindKnown, fields), nil)
+	traceFields := map[string]string{"duration_ms": fields["duration_ms"]}
+	traceFields["event.kind"] = kind
+	if errorMessage != "" {
+		traceFields["error.message"] = errorMessage
+	}
+	sink.TraceEvent(ctx, sseEventName, traceFields, nil)
+}
+
+// sseEventName is the `event.name` of Rust's SSE diagnostic records.
+const sseEventName = "codex.sse_event"
+
+// sseEventKindField adds the event kind unless the event never carried a name
+// (Rust records nothing for an absent Option).
+func sseEventKindField(kind string, known bool, fields map[string]string) map[string]string {
+	merged := make(map[string]string, len(fields)+1)
+	for key, value := range fields {
+		merged[key] = value
+	}
+	if known {
+		merged["event.kind"] = kind
+	}
+	return merged
+}
+
+// sseEventRecordKind mirrors Rust's parsed SSE frame: the event name, or the
+// SSE spec's "message" default when the frame carries no event field
+// (eventsource_stream applies the same default). A frame that never parsed
+// reports Rust's unknown kind without an event.kind field.
+func sseEventRecordKind(sse *responsesSSEEvent) (string, bool) {
+	if sse == nil {
+		return sseUnknownKind, false
+	}
+	if kind := strings.TrimSpace(sse.Event); kind != "" {
+		return kind, true
+	}
+	return "message", true
+}
+
+// rustSSEEventFailureMessage applies log_sse_event's content routing to a parsed
+// frame: a response.failed payload is reported as the failure message (Rust
+// passes the parsed payload), and a response.output_item.done frame whose item
+// does not parse reports Rust's fixed message. It returns "" when Rust would
+// report the handler's own error instead.
+func rustSSEEventFailureMessage(sse *responsesSSEEvent, err error) string {
+	if sse == nil {
+		return ""
+	}
+	switch strings.TrimSpace(sse.Event) {
+	case "response.failed":
+		if payload, ok := compactSSEPayload(sse.Data); ok {
+			return payload
+		}
+	case "response.output_item.done":
+		if err != nil && json.Valid(sse.Data) {
+			return "failed to parse response.output_item.done"
+		}
+	}
+	return ""
+}
+
+// compactSSEPayload re-serializes a parsed payload the way Rust's
+// serde_json::Value Display does (compact JSON, sorted object keys).
+func compactSSEPayload(data []byte) (string, bool) {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return "", false
+	}
+	var value any
+	if json.Unmarshal(data, &value) != nil {
+		return "", false
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "", false
+	}
+	return string(encoded), true
+}
+
+// sseEventKind resolves the kind tag: the SSE event name, else the JSON type,
+// else "unknown" (Rust passes the parsed event name and falls back to
+// SSE_UNKNOWN_KIND only for events that never parsed).
+func sseEventKind(sse *responsesSSEEvent) string {
+	if sse == nil {
+		return sseUnknownKind
+	}
+	if kind := strings.TrimSpace(sse.Event); kind != "" {
+		return kind
+	}
+	if kind := strings.TrimSpace(jsonStringField(sse.Data, "type")); kind != "" {
+		return kind
+	}
+	return sseUnknownKind
+}
+
+// recordWebsocketEvent mirrors SessionTelemetry's websocket event metric half
+// (log_websocket_event -> codex.websocket.event): one counter and one duration
+// sample per received websocket message, tagged by kind and success.
+func recordWebsocketEvent(metrics MetricsSink, kind string, success bool, duration time.Duration) {
+	if metrics == nil {
+		return
+	}
+	if kind == "" {
+		kind = websocketUnknownKind
+	}
+	tags := map[string]string{"kind": kind, "success": strconv.FormatBool(success)}
+	metrics.Counter(websocketEventCountMetric, 1, tags)
+	metrics.RecordDuration(websocketEventDurationMetric, duration, tags)
+}
+
+// recordWebsocketRequest mirrors SessionTelemetry::record_websocket_request:
+// one counter and one duration sample per websocket request send, tagged by
+// success (Rust's on_ws_request reports the send latency and its error).
+func (r *ResponsesAgentRunner) recordWebsocketRequest(err error, duration time.Duration) {
+	if r == nil || r.Metrics == nil {
+		return
+	}
+	if duration < 0 {
+		duration = 0
+	}
+	tags := map[string]string{"success": strconv.FormatBool(err == nil)}
+	r.Metrics.Counter(websocketRequestCountMetric, 1, tags)
+	r.Metrics.RecordDuration(websocketRequestDurationMetric, duration, tags)
+}
+
+// recordWebsocketContinuation mirrors Rust #46051's
+// `codex.websocket.continuation` counter for every response.create attempt.
+func (r *ResponsesAgentRunner) recordWebsocketContinuation(mode, reason, phase string) {
+	if r == nil || r.Metrics == nil {
+		return
+	}
+	r.Metrics.Counter(websocketContinuationCountMetric, 1, map[string]string{
+		"mode":   mode,
+		"reason": reason,
+		"phase":  phase,
+	})
+}
+
+// websocketContinuationTags classifies a generation request from the
+// caller-provided continuation state. Go's previous_response_id is resolved by
+// the turn runtime, so an incremental send is exactly a non-empty id.
+func websocketContinuationTags(previousResponseID string, connectionReused bool) (mode string, reason string) {
+	if strings.TrimSpace(previousResponseID) != "" {
+		return "incremental", "previous_response"
+	}
+	if connectionReused {
+		return "full", "connection_reused"
+	}
+	return "full", "initial"
+}
+
+// recordWebsocketConnectRecord mirrors the record half of
+// SessionTelemetry::record_websocket_connect, which Rust reports around the
+// handshake attempt (the connect telemetry always describes a fresh connection).
+func (r *ResponsesAgentRunner) recordWebsocketConnectRecord(ctx context.Context, request *AgentRequest, apiRequest *responsesAgentRequest, httpRequest *http.Request, handshakeResponse *http.Response, dialErr error, duration time.Duration, recoveryMode string, recoveryPhase string) {
+	if r == nil || r.Telemetry == nil {
+		return
+	}
+	record := WebsocketConnectRecord{
+		Duration:               duration,
+		Endpoint:               ResponsesEndpointResponses.Path(),
+		RetryAfterUnauthorized: strings.TrimSpace(recoveryMode) != "" || strings.TrimSpace(recoveryPhase) != "",
+		RecoveryMode:           recoveryMode,
+		RecoveryPhase:          recoveryPhase,
+	}
+	if httpRequest != nil && strings.TrimSpace(httpRequest.Header.Get("Authorization")) != "" {
+		record.AuthHeaderAttached = true
+		record.AuthHeaderName = "authorization"
+	}
+	if dialErr != nil {
+		record.ErrorMessage = dialErr.Error()
+	}
+	// Rust reports the handshake status and the response debug context only for a
+	// failed attempt (the error carries them); a successful dial has neither.
+	if dialErr != nil && handshakeResponse != nil {
+		status := handshakeResponse.StatusCode
+		record.Status = &status
+		record.RequestID = responseHeaderValue(handshakeResponse.Header, responsesRequestIDHeader, responsesOAIRequestIDHeader)
+		record.CFRay = responseHeaderValue(handshakeResponse.Header, "cf-ray")
+		record.AuthError = responseHeaderValue(handshakeResponse.Header, "x-openai-authorization-error")
+		record.AuthErrorCode = responseAuthorizationErrorCode(handshakeResponse.Header)
+	}
+	if r.AgentIdentityTelemetry != nil {
+		record.AgentID = r.AgentIdentityTelemetry.AgentID
+		record.TaskID = r.AgentIdentityTelemetry.TaskID
+	}
+	r.Telemetry.RecordWebsocketConnect(ctx, record)
+}
+
+// apiRequestModel reports the model of a built request, or "" when absent.
+func apiRequestModel(apiRequest *responsesAgentRequest) string {
+	if apiRequest == nil {
+		return ""
+	}
+	return apiRequest.Model
+}
+
+// recordWebsocketRequestRecord mirrors the record half of
+// SessionTelemetry::record_websocket_request (the metric half stays in
+// recordWebsocketRequest).
+func (r *ResponsesAgentRunner) recordWebsocketRequestRecord(ctx context.Context, err error, duration time.Duration, connectionReused bool) {
+	if r == nil || r.Telemetry == nil {
+		return
+	}
+	record := WebsocketRequestRecord{Duration: duration, ConnectionReused: connectionReused}
+	if err != nil {
+		record.ErrorMessage = err.Error()
+	}
+	if r.AgentIdentityTelemetry != nil {
+		record.AgentID = r.AgentIdentityTelemetry.AgentID
+		record.TaskID = r.AgentIdentityTelemetry.TaskID
+	}
+	r.Telemetry.RecordWebsocketRequest(ctx, record)
+}
+
+// recordResponsesTimingMetrics mirrors
+// SessionTelemetry::record_responses_websocket_timing_metrics: the six
+// responses_api_* durations carried by a responsesapi.websocket_timing message.
+func recordResponsesTimingMetrics(metrics MetricsSink, data []byte) {
+	if metrics == nil {
+		return
+	}
+	timing := responsesTimingMetricsFromEventData(data)
+	if len(timing) == 0 {
+		return
+	}
+	for _, field := range []struct {
+		metric     string
+		key        string
+		fractional bool
+	}{
+		{responsesAPIOverheadDurationMetric, "responses_duration_excl_engine_and_client_tool_time_ms", false},
+		{responsesAPIInferenceTimeDurationMetric, "engine_service_total_ms", false},
+		{responsesAPIEngineIAPITTFTDurationMetric, "engine_iapi_ttft_total_ms", false},
+		{responsesAPIEngineServiceTTFTDurationMetric, "engine_service_ttft_total_ms", false},
+		{responsesAPIEngineIAPITBTDurationMetric, "engine_iapi_tbt_across_engine_calls_ms", true},
+		{responsesAPIEngineServiceTBTDurationMetric, "engine_service_tbt_across_engine_calls_ms", true},
+	} {
+		milliseconds, ok := timingMetricMilliseconds(timing, field.key)
+		if !ok {
+			continue
+		}
+		if field.fractional {
+			metrics.RecordDuration(field.metric, time.Duration(milliseconds*float64(time.Millisecond)), nil)
+			continue
+		}
+		// Rust's duration_from_ms_value truncates to whole milliseconds.
+		metrics.RecordDuration(field.metric, time.Duration(int64(milliseconds))*time.Millisecond, nil)
+	}
+}
+
+// timingMetricMilliseconds reads one timing-metric value as milliseconds.
+func timingMetricMilliseconds(timing map[string]any, key string) (float64, bool) {
+	switch typed := timing[key].(type) {
+	case float64:
+		return typed, true
+	case float32:
+		return float64(typed), true
+	case int:
+		return float64(typed), true
+	case int64:
+		return float64(typed), true
+	case json.Number:
+		value, err := typed.Float64()
+		return value, err == nil
+	}
+	return 0, false
+}

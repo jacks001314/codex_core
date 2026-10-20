@@ -1,0 +1,668 @@
+package codemode
+
+import (
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+)
+
+const MaxPendingDelegateCalls = 1024
+
+// DualWebSocketCapability is the optional host capability that pairs the
+// control WebSocket with a second bulk WebSocket carrying delegate callbacks
+// and their responses (Rust 60c722e075).
+const DualWebSocketCapability = "dual-websocket-v1"
+
+// SessionCellExecutionResourceLimitsCapability is the optional host
+// capability advertising per-session cell execution limits (Rust 9d00bb01c0,
+// #37114).
+const SessionCellExecutionResourceLimitsCapability = "session-cell-execution-resource-limits"
+
+// YieldObservationCapability is the optional host capability advertising that an
+// in-flight execute or wait observation can be yielded without cancelling its
+// cell (Rust #48123).
+const YieldObservationCapability = "yield-observation"
+
+type RequestID int64
+
+type DelegateRequestID int64
+
+type ProtocolVersion uint32
+
+const ProtocolV1 ProtocolVersion = 1
+
+func NewProtocolVersion(value uint32) (ProtocolVersion, bool) {
+	if value == 0 {
+		return 0, false
+	}
+	return ProtocolVersion(value), true
+}
+
+type Capability string
+
+func NewCapability(value string) (Capability, error) {
+	if strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("identifier must not be empty")
+	}
+	return Capability(value), nil
+}
+
+type SessionID string
+
+func NewSessionID(value string) (SessionID, error) {
+	if strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("identifier must not be empty")
+	}
+	return SessionID(value), nil
+}
+
+type CapabilitySet []Capability
+
+func NewCapabilitySet(capabilities ...Capability) (CapabilitySet, error) {
+	seen := map[Capability]bool{}
+	out := append([]Capability(nil), capabilities...)
+	sort.Slice(out, func(i int, j int) bool { return out[i] < out[j] })
+	for _, capability := range out {
+		if seen[capability] {
+			return nil, fmt.Errorf("duplicate capability `%s`", capability)
+		}
+		seen[capability] = true
+	}
+	return CapabilitySet(out), nil
+}
+
+func (s *CapabilitySet) Contains(capability Capability) bool {
+	if s == nil {
+		return false
+	}
+	for _, existing := range *s {
+		if existing == capability {
+			return true
+		}
+	}
+	return false
+}
+
+type SupportedProtocolVersions []ProtocolVersion
+
+func NewSupportedProtocolVersions(versions ...ProtocolVersion) (SupportedProtocolVersions, error) {
+	if len(versions) == 0 {
+		return nil, fmt.Errorf("at least one protocol version is required")
+	}
+	seen := map[ProtocolVersion]bool{}
+	out := append([]ProtocolVersion(nil), versions...)
+	sort.Slice(out, func(i int, j int) bool { return out[i] < out[j] })
+	for _, version := range out {
+		if version == 0 {
+			return nil, fmt.Errorf("protocol version must be non-zero")
+		}
+		if seen[version] {
+			return nil, fmt.Errorf("duplicate protocol version %d", version)
+		}
+		seen[version] = true
+	}
+	return SupportedProtocolVersions(out), nil
+}
+
+func (v *SupportedProtocolVersions) Contains(version ProtocolVersion) bool {
+	if v == nil {
+		return false
+	}
+	for _, existing := range *v {
+		if existing == version {
+			return true
+		}
+	}
+	return false
+}
+
+type ClientHello struct {
+	SupportedVersions    SupportedProtocolVersions `json:"supportedVersions"`
+	RequiredCapabilities CapabilitySet             `json:"requiredCapabilities"`
+	OptionalCapabilities CapabilitySet             `json:"optionalCapabilities"`
+}
+
+func NewClientHello(versions SupportedProtocolVersions, required CapabilitySet, optional CapabilitySet) (ClientHello, error) {
+	for _, capability := range required {
+		if (&optional).Contains(capability) {
+			return ClientHello{}, fmt.Errorf("capability `%s` cannot be both required and optional", capability)
+		}
+	}
+	return ClientHello{SupportedVersions: versions, RequiredCapabilities: required, OptionalCapabilities: optional}, nil
+}
+
+type HostHello struct {
+	SelectedVersion     ProtocolVersion `json:"selectedVersion"`
+	Capabilities        CapabilitySet   `json:"capabilities"`
+	BulkConnectionToken *string         `json:"bulkConnectionToken,omitempty"`
+}
+
+type HandshakeRejectReason struct {
+	Type              string                    `json:"type"`
+	SupportedVersions SupportedProtocolVersions `json:"supportedVersions,omitempty"`
+	Capability        Capability                `json:"capability,omitempty"`
+	Message           string                    `json:"message,omitempty"`
+}
+
+func NoCompatibleVersion(versions SupportedProtocolVersions) HandshakeRejectReason {
+	return HandshakeRejectReason{Type: "noCompatibleVersion", SupportedVersions: versions}
+}
+
+func MissingRequiredCapability(capability Capability) HandshakeRejectReason {
+	return HandshakeRejectReason{Type: "missingRequiredCapability", Capability: capability}
+}
+
+func InvalidHello(message string) HandshakeRejectReason {
+	return HandshakeRejectReason{Type: "invalidHello", Message: message}
+}
+
+type WireResult[T any] struct {
+	Status  string `json:"status"`
+	Value   T      `json:"value,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+func ResultOK[T any](value T) WireResult[T] {
+	return WireResult[T]{Status: "ok", Value: value}
+}
+
+func ResultErr[T any](message string) WireResult[T] {
+	return WireResult[T]{Status: "error", Message: message}
+}
+
+func (r *WireResult[T]) IntoResult() (T, error) {
+	var zero T
+	if r == nil {
+		return zero, fmt.Errorf("wire result is nil")
+	}
+	if r.Status == "ok" {
+		return r.Value, nil
+	}
+	if r.Message == "" {
+		return zero, fmt.Errorf("operation failed")
+	}
+	return zero, fmt.Errorf("%s", r.Message)
+}
+
+type ClientToHost struct {
+	Type             string                        `json:"type"`
+	ID               RequestID                     `json:"id,omitempty"`
+	Hello            *ClientHello                  `json:"-"`
+	Request          *HostRequest                  `json:"request,omitempty"`
+	DelegateID       DelegateRequestID             `json:"-"`
+	DelegateResponse *WireResult[DelegateResponse] `json:"result,omitempty"`
+}
+
+// TransportLane selects one socket of a negotiated dual-WebSocket connection.
+type TransportLane string
+
+const (
+	TransportLaneControl TransportLane = "control"
+	TransportLaneBulk    TransportLane = "bulk"
+)
+
+// transportLane mirrors Rust ClientToHost::transport_lane: delegate tool
+// results travel on the bulk socket while notification acknowledgments and
+// control traffic stay on the control socket.
+func (m ClientToHost) transportLane() TransportLane {
+	if m.Type == "delegate/response" && m.DelegateResponse != nil {
+		if result, err := m.DelegateResponse.IntoResult(); err == nil && result.Type == "notification/delivered" {
+			return TransportLaneControl
+		}
+		return TransportLaneBulk
+	}
+	return TransportLaneControl
+}
+
+// transportLane mirrors Rust HostToClient::transport_lane: nested tool
+// invocations and delegate cancellations arrive on the bulk socket; everything
+// else stays on the control socket.
+func (m *HostToClient) transportLane() TransportLane {
+	if m == nil {
+		return TransportLaneControl
+	}
+	switch m.Type {
+	case "delegate/cancel":
+		return TransportLaneBulk
+	case "delegate/request":
+		if m.Request != nil && m.Request.Type == "tool/invoke" {
+			return TransportLaneBulk
+		}
+		return TransportLaneControl
+	default:
+		return TransportLaneControl
+	}
+}
+
+func ClientHelloMessage(hello ClientHello) ClientToHost {
+	return ClientToHost{Type: "connection/hello", Hello: &hello}
+}
+
+func OperationRequest(id RequestID, request HostRequest) ClientToHost {
+	return ClientToHost{Type: "operation/request", ID: id, Request: &request}
+}
+
+func CancelRequest(id RequestID) ClientToHost {
+	return ClientToHost{Type: "operation/cancel", ID: id}
+}
+
+// YieldRequest ends the active observation for id without cancelling its cell
+// (Rust ClientToHost::YieldRequest, `operation/yield`).
+func YieldRequest(id RequestID) ClientToHost {
+	return ClientToHost{Type: "operation/yield", ID: id}
+}
+
+func DelegateResponseMessage(id DelegateRequestID, result WireResult[DelegateResponse]) ClientToHost {
+	return ClientToHost{Type: "delegate/response", DelegateID: id, DelegateResponse: &result}
+}
+
+func (m ClientToHost) MarshalJSON() ([]byte, error) {
+	switch m.Type {
+	case "connection/hello":
+		type hello ClientHello
+		if m.Hello == nil {
+			return nil, fmt.Errorf("client hello is nil")
+		}
+		body, err := json.Marshal((*hello)(m.Hello))
+		if err != nil {
+			return nil, err
+		}
+		var object map[string]any
+		if err := json.Unmarshal(body, &object); err != nil {
+			return nil, err
+		}
+		object["type"] = m.Type
+		return json.Marshal(object)
+	case "operation/request":
+		return json.Marshal(struct {
+			Type    string       `json:"type"`
+			ID      RequestID    `json:"id"`
+			Request *HostRequest `json:"request"`
+		}{Type: m.Type, ID: m.ID, Request: m.Request})
+	case "operation/cancel":
+		return json.Marshal(struct {
+			Type string    `json:"type"`
+			ID   RequestID `json:"id"`
+		}{Type: m.Type, ID: m.ID})
+	case "operation/yield":
+		return json.Marshal(struct {
+			Type string    `json:"type"`
+			ID   RequestID `json:"id"`
+		}{Type: m.Type, ID: m.ID})
+	case "delegate/response":
+		return json.Marshal(struct {
+			Type   string                        `json:"type"`
+			ID     DelegateRequestID             `json:"id"`
+			Result *WireResult[DelegateResponse] `json:"result"`
+		}{Type: m.Type, ID: m.DelegateID, Result: m.DelegateResponse})
+	default:
+		return nil, fmt.Errorf("unknown client-to-host type %q", m.Type)
+	}
+}
+
+func (m *ClientToHost) UnmarshalJSON(data []byte) error {
+	if m == nil {
+		return fmt.Errorf("client-to-host message is nil")
+	}
+	var envelope struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return err
+	}
+	*m = ClientToHost{Type: envelope.Type}
+	switch envelope.Type {
+	case "connection/hello":
+		var hello ClientHello
+		if err := json.Unmarshal(data, &hello); err != nil {
+			return err
+		}
+		m.Hello = &hello
+	case "operation/request":
+		var value struct {
+			ID      RequestID   `json:"id"`
+			Request HostRequest `json:"request"`
+		}
+		if err := json.Unmarshal(data, &value); err != nil {
+			return err
+		}
+		m.ID, m.Request = value.ID, &value.Request
+	case "operation/cancel", "operation/yield":
+		if err := json.Unmarshal(data, &struct {
+			ID *RequestID `json:"id"`
+		}{ID: &m.ID}); err != nil {
+			return err
+		}
+	case "delegate/response":
+		var value struct {
+			ID     DelegateRequestID            `json:"id"`
+			Result WireResult[DelegateResponse] `json:"result"`
+		}
+		if err := json.Unmarshal(data, &value); err != nil {
+			return err
+		}
+		m.DelegateID, m.DelegateResponse = value.ID, &value.Result
+	default:
+		return fmt.Errorf("unknown client-to-host type %q", envelope.Type)
+	}
+	return nil
+}
+
+type HostToClient struct {
+	Type       string
+	ID         RequestID
+	DelegateID DelegateRequestID
+	SessionID  SessionID
+	CellID     CellID
+	Hello      *HostHello
+	Reason     *HandshakeRejectReason
+	Result     *WireResult[HostResponse]
+	Initial    *WireResult[RuntimeResponse]
+	Request    *DelegateRequest
+}
+
+func (m *HostToClient) UnmarshalJSON(data []byte) error {
+	if m == nil {
+		return fmt.Errorf("host-to-client message is nil")
+	}
+	var envelope struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return err
+	}
+	*m = HostToClient{Type: envelope.Type}
+	switch envelope.Type {
+	case "connection/ready":
+		var value struct {
+			Type                string          `json:"type"`
+			SelectedVersion     ProtocolVersion `json:"selectedVersion"`
+			Capabilities        CapabilitySet   `json:"capabilities"`
+			BulkConnectionToken *string         `json:"bulkConnectionToken,omitempty"`
+		}
+		if err := json.Unmarshal(data, &value); err != nil {
+			return err
+		}
+		m.Hello = &HostHello{SelectedVersion: value.SelectedVersion, Capabilities: value.Capabilities, BulkConnectionToken: value.BulkConnectionToken}
+	case "connection/rejected":
+		var value struct {
+			Reason HandshakeRejectReason `json:"reason"`
+		}
+		if err := json.Unmarshal(data, &value); err != nil {
+			return err
+		}
+		m.Reason = &value.Reason
+	case "operation/response":
+		var value struct {
+			ID     RequestID                `json:"id"`
+			Result WireResult[HostResponse] `json:"result"`
+		}
+		if err := json.Unmarshal(data, &value); err != nil {
+			return err
+		}
+		m.ID, m.Result = value.ID, &value.Result
+	case "execute/initialResponse":
+		var value struct {
+			ID     RequestID                   `json:"id"`
+			Result WireResult[RuntimeResponse] `json:"result"`
+		}
+		if err := json.Unmarshal(data, &value); err != nil {
+			return err
+		}
+		m.ID, m.Initial = value.ID, &value.Result
+	case "delegate/request":
+		var value struct {
+			ID        DelegateRequestID `json:"id"`
+			SessionID SessionID         `json:"sessionId"`
+			Request   DelegateRequest   `json:"request"`
+		}
+		if err := json.Unmarshal(data, &value); err != nil {
+			return err
+		}
+		m.DelegateID, m.SessionID, m.Request = value.ID, value.SessionID, &value.Request
+	case "delegate/cancel":
+		var value struct {
+			ID DelegateRequestID `json:"id"`
+		}
+		if err := json.Unmarshal(data, &value); err != nil {
+			return err
+		}
+		m.DelegateID = value.ID
+	case "cell/closed":
+		var value struct {
+			SessionID SessionID `json:"sessionId"`
+			CellID    CellID    `json:"cellId"`
+		}
+		if err := json.Unmarshal(data, &value); err != nil {
+			return err
+		}
+		m.SessionID, m.CellID = value.SessionID, value.CellID
+	default:
+		return fmt.Errorf("unknown host-to-client type %q", envelope.Type)
+	}
+	return nil
+}
+
+func HostHelloMessage(hello HostHello) HostToClient {
+	return HostToClient{Type: "connection/ready", Hello: &hello}
+}
+
+func HandshakeRejected(reason HandshakeRejectReason) HostToClient {
+	return HostToClient{Type: "connection/rejected", Reason: &reason}
+}
+
+func HostOperationResponse(id RequestID, result WireResult[HostResponse]) HostToClient {
+	return HostToClient{Type: "operation/response", ID: id, Result: &result}
+}
+
+func InitialResponse(id RequestID, result WireResult[RuntimeResponse]) HostToClient {
+	return HostToClient{Type: "execute/initialResponse", ID: id, Initial: &result}
+}
+
+func DelegateRequestMessage(id DelegateRequestID, sessionID SessionID, request DelegateRequest) HostToClient {
+	return HostToClient{Type: "delegate/request", DelegateID: id, SessionID: sessionID, Request: &request}
+}
+
+func CancelDelegateRequest(id DelegateRequestID) HostToClient {
+	return HostToClient{Type: "delegate/cancel", DelegateID: id}
+}
+
+func CellClosed(sessionID SessionID, cellID CellID) HostToClient {
+	return HostToClient{Type: "cell/closed", SessionID: sessionID, CellID: cellID}
+}
+
+func (m HostToClient) MarshalJSON() ([]byte, error) {
+	switch m.Type {
+	case "connection/ready":
+		type hello HostHello
+		body, err := json.Marshal((*hello)(m.Hello))
+		if err != nil {
+			return nil, err
+		}
+		var object map[string]any
+		if err := json.Unmarshal(body, &object); err != nil {
+			return nil, err
+		}
+		object["type"] = m.Type
+		return json.Marshal(object)
+	case "connection/rejected":
+		return json.Marshal(struct {
+			Type   string                 `json:"type"`
+			Reason *HandshakeRejectReason `json:"reason"`
+		}{Type: m.Type, Reason: m.Reason})
+	case "operation/response":
+		return json.Marshal(struct {
+			Type   string                    `json:"type"`
+			ID     RequestID                 `json:"id"`
+			Result *WireResult[HostResponse] `json:"result"`
+		}{Type: m.Type, ID: m.ID, Result: m.Result})
+	case "execute/initialResponse":
+		return json.Marshal(struct {
+			Type   string                       `json:"type"`
+			ID     RequestID                    `json:"id"`
+			Result *WireResult[RuntimeResponse] `json:"result"`
+		}{Type: m.Type, ID: m.ID, Result: m.Initial})
+	case "delegate/request":
+		return json.Marshal(struct {
+			Type      string            `json:"type"`
+			ID        DelegateRequestID `json:"id"`
+			SessionID SessionID         `json:"sessionId"`
+			Request   *DelegateRequest  `json:"request"`
+		}{Type: m.Type, ID: m.DelegateID, SessionID: m.SessionID, Request: m.Request})
+	case "delegate/cancel":
+		return json.Marshal(struct {
+			Type string            `json:"type"`
+			ID   DelegateRequestID `json:"id"`
+		}{Type: m.Type, ID: m.DelegateID})
+	case "cell/closed":
+		return json.Marshal(struct {
+			Type      string    `json:"type"`
+			SessionID SessionID `json:"sessionId"`
+			CellID    CellID    `json:"cellId"`
+		}{Type: m.Type, SessionID: m.SessionID, CellID: m.CellID})
+	default:
+		return nil, fmt.Errorf("unknown host-to-client type %q", m.Type)
+	}
+}
+
+type HostRequest struct {
+	Method              string               `json:"method"`
+	SessionID           SessionID            `json:"sessionId,omitempty"`
+	Request             *ExecuteRequest      `json:"request,omitempty"`
+	Wait                *WaitRequest         `json:"-"`
+	CellID              CellID               `json:"cellId,omitempty"`
+	CellExecutionLimits *CellExecutionLimits `json:"cellExecutionLimits,omitempty"`
+}
+
+func (r *HostRequest) UnmarshalJSON(data []byte) error {
+	if r == nil {
+		return fmt.Errorf("host request is nil")
+	}
+	var envelope struct {
+		Method              string               `json:"method"`
+		SessionID           SessionID            `json:"sessionId"`
+		Request             json.RawMessage      `json:"request"`
+		CellID              CellID               `json:"cellId"`
+		CellExecutionLimits *CellExecutionLimits `json:"cellExecutionLimits"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return err
+	}
+	*r = HostRequest{Method: envelope.Method, SessionID: envelope.SessionID, CellID: envelope.CellID, CellExecutionLimits: envelope.CellExecutionLimits}
+	if len(envelope.Request) == 0 || string(envelope.Request) == "null" {
+		return nil
+	}
+	if envelope.Method == "session/wait" {
+		var request WaitRequest
+		if err := json.Unmarshal(envelope.Request, &request); err != nil {
+			return err
+		}
+		r.Wait = &request
+		return nil
+	}
+	var request ExecuteRequest
+	if err := json.Unmarshal(envelope.Request, &request); err != nil {
+		return err
+	}
+	r.Request = &request
+	return nil
+}
+
+func OpenSessionRequest(sessionID SessionID) HostRequest {
+	return HostRequest{Method: "session/open", SessionID: sessionID}
+}
+
+// OpenSessionRequestWithLimits mirrors Rust HostRequest::OpenSession: non
+// default cell execution limits are only included when the session carries
+// them, keeping unlimited sessions wire-compatible with hosts that do not
+// advertise the resource-limits capability.
+func OpenSessionRequestWithLimits(sessionID SessionID, limits *CellExecutionLimits) HostRequest {
+	request := HostRequest{Method: "session/open", SessionID: sessionID}
+	if limits != nil && !limits.IsZero() {
+		request.CellExecutionLimits = limits
+	}
+	return request
+}
+
+func ExecuteSessionRequest(sessionID SessionID, request ExecuteRequest) HostRequest {
+	return HostRequest{Method: "session/execute", SessionID: sessionID, Request: &request}
+}
+
+func WaitSessionRequest(sessionID SessionID, request WaitRequest) HostRequest {
+	return HostRequest{Method: "session/wait", SessionID: sessionID, Wait: &request}
+}
+
+func TerminateSessionRequest(sessionID SessionID, cellID CellID) HostRequest {
+	return HostRequest{Method: "session/terminate", SessionID: sessionID, CellID: cellID}
+}
+
+func ShutdownSessionRequest(sessionID SessionID) HostRequest {
+	return HostRequest{Method: "session/shutdown", SessionID: sessionID}
+}
+
+func (r HostRequest) MarshalJSON() ([]byte, error) {
+	switch r.Method {
+	case "session/wait":
+		return json.Marshal(struct {
+			Method    string       `json:"method"`
+			SessionID SessionID    `json:"sessionId"`
+			Request   *WaitRequest `json:"request"`
+		}{Method: r.Method, SessionID: r.SessionID, Request: r.Wait})
+	default:
+		type alias HostRequest
+		return json.Marshal(alias(r))
+	}
+}
+
+type HostResponse struct {
+	Type      string       `json:"type"`
+	SessionID SessionID    `json:"sessionId,omitempty"`
+	CellID    CellID       `json:"cellId,omitempty"`
+	Outcome   *WaitOutcome `json:"outcome,omitempty"`
+}
+
+func SessionReady(sessionID SessionID) HostResponse {
+	return HostResponse{Type: "session/ready", SessionID: sessionID}
+}
+
+func ExecutionStarted(cellID CellID) HostResponse {
+	return HostResponse{Type: "execution/started", CellID: cellID}
+}
+
+func WaitCompleted(outcome WaitOutcome) HostResponse {
+	return HostResponse{Type: "wait/completed", Outcome: &outcome}
+}
+
+func SessionClosed(sessionID SessionID) HostResponse {
+	return HostResponse{Type: "session/closed", SessionID: sessionID}
+}
+
+type DelegateRequest struct {
+	Type       string          `json:"type"`
+	Invocation *NestedToolCall `json:"invocation,omitempty"`
+	CallID     string          `json:"callId,omitempty"`
+	CellID     CellID          `json:"cellId,omitempty"`
+	Text       string          `json:"text,omitempty"`
+}
+
+func InvokeToolRequest(invocation NestedToolCall) DelegateRequest {
+	return DelegateRequest{Type: "tool/invoke", Invocation: &invocation}
+}
+
+func NotifyRequest(callID string, cellID CellID, text string) DelegateRequest {
+	return DelegateRequest{Type: "notification/send", CallID: callID, CellID: cellID, Text: text}
+}
+
+type DelegateResponse struct {
+	Type   string          `json:"type"`
+	Result json.RawMessage `json:"result,omitempty"`
+}
+
+func ToolResultResponse(result json.RawMessage) DelegateResponse {
+	return DelegateResponse{Type: "tool/result", Result: result}
+}
+
+func NotificationDeliveredResponse() DelegateResponse {
+	return DelegateResponse{Type: "notification/delivered"}
+}

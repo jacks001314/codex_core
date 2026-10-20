@@ -1,0 +1,962 @@
+package mcp
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/oauth2"
+)
+
+const (
+	mcpOAuthAuthorizationServerWellKnownPath = "/.well-known/oauth-authorization-server"
+	mcpOAuthProtectedResourceWellKnownPath   = "/.well-known/oauth-protected-resource"
+	mcpOAuthMetadataMaxBytes                 = 1 << 20
+	mcpOAuthLoginDiscoveryMaxTimeout         = 5 * time.Second
+	// mcpOAuthOfflineAccessScope is the one authorization-server scope the
+	// initial selection honors (#54653): it is added to the discovered scopes
+	// when the authorization server advertises it.
+	mcpOAuthOfflineAccessScope = "offline_access"
+)
+
+type StreamableHTTPOAuthDiscovery struct {
+	AuthorizationEndpoint string
+	TokenEndpoint         string
+	RegistrationEndpoint  string
+	// ScopesSupported carries the discovered resource scopes: the initial
+	// `WWW-Authenticate` challenge's scopes, or the protected-resource
+	// metadata's `scopes_supported` list as the fallback, plus `offline_access`
+	// when the authorization server supports it (Rust #54653).
+	ScopesSupported []string
+	// AuthorizationServerScopesSupported is the authorization server's general
+	// `scopes_supported` list. It is never used as the discovered resource
+	// scopes, because it can advertise scopes unrelated to the MCP resource;
+	// only `offline_access` is honored from it.
+	AuthorizationServerScopesSupported []string
+	Resource                           string
+	AuthorizationServer                string
+	// Issuer is the authorization server issuer discovered for the MCP
+	// server (Rust #39615): refresh tokens are bound to this issuer.
+	Issuer                            string
+	ClientIDMetadataDocumentSupported bool
+	PublicClientTokenAuthSupported    bool
+	// CallbackMode is the OAuth mix-up defense advertised by the authorization
+	// server (Rust #40691).
+	CallbackMode MCPOAuthCallbackMode
+}
+
+type oauthAuthorizationServerMetadata struct {
+	Issuer                                     string   `json:"issuer"`
+	AuthorizationEndpoint                      string   `json:"authorization_endpoint"`
+	TokenEndpoint                              string   `json:"token_endpoint"`
+	RegistrationEndpoint                       string   `json:"registration_endpoint"`
+	ScopesSupported                            []string `json:"scopes_supported"`
+	ClientIDMetadataDocumentSupported          bool     `json:"client_id_metadata_document_supported"`
+	TokenEndpointAuthMethodsSupported          []string `json:"token_endpoint_auth_methods_supported"`
+	AuthorizationResponseIssParameterSupported bool     `json:"authorization_response_iss_parameter_supported"`
+}
+
+type oauthProtectedResourceMetadata struct {
+	Resource             string   `json:"resource"`
+	AuthorizationServers []string `json:"authorization_servers"`
+	ScopesSupported      []string `json:"scopes_supported"`
+}
+
+func DiscoverStreamableHTTPOAuth(ctx context.Context, serverURL string, client *http.Client) (*StreamableHTTPOAuthDiscovery, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if client == nil {
+		client = http.DefaultClient
+	}
+	client = mcpOAuthDiscoveryHTTPClient(mcpHTTPClientWithDefaultHeaders(client, nil))
+	raw := strings.TrimSpace(serverURL)
+	if raw == "" {
+		return nil, errors.New("MCP OAuth discovery URL is required")
+	}
+	if _, err := parseMCPHTTPURL(raw); err != nil {
+		return nil, err
+	}
+	challenge := &mcpOAuthChallengeProbe{ctx: ctx, client: client, serverURL: raw}
+	if discovery, found, err := discoverMCPOAuthAuthorizationServer(ctx, client, raw); found || err != nil {
+		if discovery != nil {
+			// Rust #54653 selects the discovered scopes from the initial
+			// challenge, falling back to the protected-resource metadata, so this
+			// shortcut resolves that metadata as well. Both lookups are best
+			// effort here: the authorization server was already resolved from its
+			// own metadata, so an unreachable resource only leaves the selection
+			// without resource scopes instead of failing the discovery.
+			metadataURL, challengeScopes, _ := challenge.resolve()
+			discovery.ScopesSupported = mcpOAuthInitialScopes(
+				challengeScopes,
+				mcpOAuthProtectedResourceScopes(ctx, client, raw, metadataURL),
+				discovery.AuthorizationServerScopesSupported,
+			)
+		}
+		return discovery, err
+	}
+	challengeMetadataURL, challengeScopes, err := challenge.resolve()
+	if err != nil {
+		return nil, err
+	}
+	resourceMetadata, err := discoverMCPOAuthProtectedResource(ctx, client, raw, challengeMetadataURL)
+	if err != nil {
+		return nil, err
+	}
+	if resourceMetadata == nil {
+		return nil, nil
+	}
+	for _, authorizationServer := range resourceMetadata.AuthorizationServers {
+		discovery, found, err := discoverMCPOAuthAuthorizationServer(ctx, client, authorizationServer)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			continue
+		}
+		if discovery.Resource == "" {
+			discovery.Resource = strings.TrimSpace(resourceMetadata.Resource)
+		}
+		if discovery.Resource == "" {
+			discovery.Resource = raw
+		}
+		discovery.ScopesSupported = mcpOAuthInitialScopes(challengeScopes, resourceMetadata.ScopesSupported, discovery.AuthorizationServerScopesSupported)
+		return discovery, nil
+	}
+	return nil, nil
+}
+
+// mcpOAuthChallengeProbe resolves the MCP resource URL's initial
+// `WWW-Authenticate` challenge once, so the authorization-server shortcut and
+// the protected-resource path share a single request.
+type mcpOAuthChallengeProbe struct {
+	ctx       context.Context
+	client    *http.Client
+	serverURL string
+
+	once        sync.Once
+	metadataURL string
+	scopes      []string
+	err         error
+}
+
+func (p *mcpOAuthChallengeProbe) resolve() (string, []string, error) {
+	if p == nil {
+		return "", nil, nil
+	}
+	p.once.Do(func() {
+		p.metadataURL, p.scopes, p.err = mcpOAuthProbeChallenge(p.ctx, p.client, p.serverURL)
+	})
+	return p.metadataURL, p.scopes, p.err
+}
+
+// mcpOAuthInitialScopes mirrors the initial scope selection of rmcp's
+// AuthorizationManager (#54653): the initial challenge's scopes win, the
+// protected-resource metadata's `scopes_supported` list is the fallback, and
+// `offline_access` is added when the authorization server supports it. The
+// authorization server's general scope list never becomes a resource scope.
+func mcpOAuthInitialScopes(challengeScopes []string, resourceScopes []string, authorizationServerScopes []string) []string {
+	scopes := normalizeMCPOAuthScopes(challengeScopes)
+	if len(scopes) == 0 {
+		scopes = normalizeMCPOAuthScopes(resourceScopes)
+	}
+	if containsMCPOAuthScope(authorizationServerScopes, mcpOAuthOfflineAccessScope) {
+		scopes = append(scopes, mcpOAuthOfflineAccessScope)
+	}
+	return normalizeMCPOAuthScopes(scopes)
+}
+
+func containsMCPOAuthScope(scopes []string, scope string) bool {
+	for _, candidate := range scopes {
+		if strings.TrimSpace(candidate) == scope {
+			return true
+		}
+	}
+	return false
+}
+
+func mcpOAuthDiscoveryHTTPClient(client *http.Client) *http.Client {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	cloned := *client
+	originalCheckRedirect := client.CheckRedirect
+	cloned.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+		if len(via) > 0 && !sameHTTPOrigin(via[len(via)-1].URL, request.URL) {
+			return fmt.Errorf("OAuth discovery redirect to non-same-origin URL rejected: %s", request.URL)
+		}
+		if originalCheckRedirect != nil {
+			return originalCheckRedirect(request, via)
+		}
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		return nil
+	}
+	return &cloned
+}
+
+func sameHTTPOrigin(left *url.URL, right *url.URL) bool {
+	if left == nil || right == nil || !strings.EqualFold(left.Scheme, right.Scheme) || !strings.EqualFold(left.Hostname(), right.Hostname()) {
+		return false
+	}
+	port := func(value *url.URL) string {
+		if explicit := value.Port(); explicit != "" {
+			return explicit
+		}
+		switch strings.ToLower(value.Scheme) {
+		case "http":
+			return "80"
+		case "https":
+			return "443"
+		default:
+			return ""
+		}
+	}
+	return port(left) == port(right)
+}
+
+func SupportsStreamableHTTPOAuthLogin(ctx context.Context, serverURL string, client *http.Client) (bool, error) {
+	discovery, err := DiscoverStreamableHTTPOAuth(ctx, serverURL, client)
+	if err != nil {
+		return false, err
+	}
+	return discovery != nil, nil
+}
+
+func buildMCPOAuthURLForLogin(config *ServerConfig, scopes []string, timeoutSecs *uint64, client *http.Client) (string, error) {
+	if timeoutSecs == nil || *timeoutSecs == 0 {
+		return buildMCPOAuthURL(config, scopes), nil
+	}
+	timeout := time.Duration(*timeoutSecs) * time.Second
+	if timeout > mcpOAuthLoginDiscoveryMaxTimeout {
+		timeout = mcpOAuthLoginDiscoveryMaxTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if client == nil {
+		client = &http.Client{}
+	} else {
+		cloned := *client
+		client = &cloned
+	}
+	client.Timeout = timeout
+	return buildMCPOAuthURLWithDiscovery(ctx, config, scopes, client)
+}
+
+func mcpOAuthLoginDiscoveryTimeout(timeoutSecs *uint64) time.Duration {
+	if timeoutSecs == nil || *timeoutSecs == 0 {
+		return 0
+	}
+	timeout := time.Duration(*timeoutSecs) * time.Second
+	if timeout > mcpOAuthLoginDiscoveryMaxTimeout {
+		return mcpOAuthLoginDiscoveryMaxTimeout
+	}
+	return timeout
+}
+
+func buildMCPOAuthURLWithDiscovery(ctx context.Context, config *ServerConfig, scopes []string, client *http.Client) (string, error) {
+	discovery, err := DiscoverStreamableHTTPOAuth(ctx, config.URL, client)
+	if mcpOAuthIssuerBindingRejected(err) {
+		// The authorization server answered with metadata that this client
+		// refuses to bind, so there is nothing safe to hand off to; Rust fails
+		// the login instead of guessing an endpoint.
+		return "", err
+	}
+	if err != nil || discovery == nil || strings.TrimSpace(discovery.AuthorizationEndpoint) == "" {
+		return buildMCPOAuthURL(config, scopes), nil
+	}
+	return buildMCPOAuthAuthorizeURL(discovery.AuthorizationEndpoint, config, scopes, discovery.Resource), nil
+}
+
+func buildMCPOAuthURL(config *ServerConfig, scopes []string) string {
+	if config == nil {
+		return "http://localhost/oauth"
+	}
+	raw := strings.TrimSpace(config.URL)
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "http://localhost/oauth"
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/oauth/authorize"
+	parsed.RawPath = ""
+	return buildMCPOAuthAuthorizeURL(parsed.String(), config, scopes, config.OAuthResource)
+}
+
+func buildMCPOAuthAuthorizeURL(endpoint string, config *ServerConfig, scopes []string, resource string) string {
+	endpoint = strings.TrimSpace(endpoint)
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return "http://localhost/oauth"
+	}
+	clientID := ""
+	if config != nil {
+		clientID = strings.TrimSpace(config.OAuthClientID)
+	}
+	oauthConfig := &oauth2.Config{
+		ClientID: clientID,
+		Endpoint: oauth2.Endpoint{
+			AuthURL: parsed.String(),
+		},
+		Scopes: normalizeMCPOAuthScopes(scopes),
+	}
+	options := []oauth2.AuthCodeOption{}
+	resource = strings.TrimSpace(resource)
+	if config != nil && strings.TrimSpace(config.OAuthResource) != "" {
+		resource = strings.TrimSpace(config.OAuthResource)
+	}
+	if resource != "" {
+		options = append(options, oauth2.SetAuthURLParam("resource", resource))
+	}
+	return oauthConfig.AuthCodeURL("", options...)
+}
+
+func discoverMCPOAuthAuthorizationServer(ctx context.Context, client *http.Client, serverURL string) (*StreamableHTTPOAuthDiscovery, bool, error) {
+	candidates, err := mcpOAuthAuthorizationServerMetadataURLs(serverURL)
+	if err != nil {
+		return nil, false, err
+	}
+	var lastErr error
+	for _, candidate := range candidates {
+		metadata, ok, err := fetchMCPOAuthAuthorizationServerMetadata(ctx, client, candidate)
+		if err != nil {
+			// Rust #44636: a candidate-local 503 may still be recoverable
+			// through the same issuer's OIDC discovery endpoints.
+			fallback, fallbackOK, fallbackErr := fetchMCPOAuthOIDCDiscoveryFallback(ctx, client, candidate, err)
+			if fallbackErr != nil {
+				return nil, false, fallbackErr
+			}
+			if fallbackOK {
+				if err := validateMCPOAuthAuthorizationServerEndpoints(fallback); err != nil {
+					return nil, false, err
+				}
+				return discoveryFromMCPOAuthAuthorizationMetadata(serverURL, fallback), true, nil
+			}
+			lastErr = err
+			continue
+		}
+		if ok {
+			// Rust #39935 rejects endpoints that cannot be bound to their issuer
+			// right after `resolve_metadata()`; this loop is Go's equivalent
+			// multi-authorization-server resolution, so the check runs here
+			// before any discovery result can reach the browser hand-off.
+			if err := validateMCPOAuthAuthorizationServerEndpoints(metadata); err != nil {
+				return nil, false, err
+			}
+			return discoveryFromMCPOAuthAuthorizationMetadata(serverURL, metadata), true, nil
+		}
+	}
+	if lastErr != nil {
+		return nil, false, lastErr
+	}
+	return nil, false, nil
+}
+
+// mcpOAuthMetadataHTTPStatusError carries the HTTP status of a failed metadata
+// request so callers can distinguish a recoverable 503 (Rust #44636).
+type mcpOAuthMetadataHTTPStatusError struct {
+	URL        string
+	StatusCode int
+	Status     string
+	Detail     string
+}
+
+func (e *mcpOAuthMetadataHTTPStatusError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Detail != "" {
+		return fmt.Sprintf("MCP OAuth metadata %s failed: %s: %s", e.URL, e.Status, e.Detail)
+	}
+	return fmt.Sprintf("MCP OAuth metadata %s failed: %s", e.URL, e.Status)
+}
+
+// mcpOAuthOIDCFallbackURLs returns the same issuer's OIDC discovery endpoints in
+// RMCP's order (Rust #44636): the well-known-prefixed candidate first, then the
+// path-suffixed one when the issuer has a path component.
+func mcpOAuthOIDCFallbackURLs(candidateURL string) []string {
+	parsed, err := url.Parse(strings.TrimSpace(candidateURL))
+	if err != nil {
+		return nil
+	}
+	issuerPath, ok := strings.CutPrefix(parsed.Path, mcpOAuthAuthorizationServerWellKnownPath)
+	if !ok || (issuerPath != "" && !strings.HasPrefix(issuerPath, "/")) {
+		return nil
+	}
+	base := *parsed
+	base.RawQuery = ""
+	base.Fragment = ""
+	candidates := make([]string, 0, 2)
+	prefixed := base
+	prefixed.Path = "/.well-known/openid-configuration" + issuerPath
+	prefixed.RawPath = ""
+	candidates = append(candidates, prefixed.String())
+	if issuerPath != "" {
+		suffixed := base
+		suffixed.Path = issuerPath + "/.well-known/openid-configuration"
+		suffixed.RawPath = ""
+		candidates = append(candidates, suffixed.String())
+	}
+	return uniqueNonEmptyStrings(candidates)
+}
+
+// fetchMCPOAuthOIDCDiscoveryFallback tries the issuer's OIDC endpoints after a
+// 503 on its OAuth authorization-server metadata, keeping the original error as
+// the discovery failure when no candidate is usable (Rust #44636).
+func fetchMCPOAuthOIDCDiscoveryFallback(ctx context.Context, client *http.Client, candidateURL string, originalErr error) (*oauthAuthorizationServerMetadata, bool, error) {
+	var statusErr *mcpOAuthMetadataHTTPStatusError
+	if !errors.As(originalErr, &statusErr) || statusErr.StatusCode != http.StatusServiceUnavailable {
+		return nil, false, nil
+	}
+	fallbackURLs := mcpOAuthOIDCFallbackURLs(candidateURL)
+	if len(fallbackURLs) == 0 {
+		return nil, false, nil
+	}
+	// Do not follow fallback redirects: RMCP owns discovery redirect policy.
+	fallbackClient := mcpOAuthNoRedirectClient(client)
+	for _, fallbackURL := range fallbackURLs {
+		metadata, ok, err := fetchMCPOAuthAuthorizationServerMetadata(ctx, fallbackClient, fallbackURL)
+		if err == nil {
+			if ok {
+				return metadata, true, nil
+			}
+			continue
+		}
+		var fallbackStatus *mcpOAuthMetadataHTTPStatusError
+		if !errors.As(err, &fallbackStatus) {
+			return nil, false, err
+		}
+		switch fallbackStatus.StatusCode {
+		case http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusServiceUnavailable:
+			continue
+		case http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests:
+			return nil, false, err
+		default:
+			if fallbackStatus.StatusCode >= 500 {
+				return nil, false, err
+			}
+			// Any other response keeps the original discovery error instead of
+			// enabling a lower-priority endpoint fallback.
+			return nil, false, nil
+		}
+	}
+	return nil, false, nil
+}
+
+func mcpOAuthNoRedirectClient(client *http.Client) *http.Client {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	clone := *client
+	clone.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &clone
+}
+
+func discoverMCPOAuthProtectedResource(ctx context.Context, client *http.Client, serverURL string, challengeMetadataURL string) (*oauthProtectedResourceMetadata, error) {
+	if metadataURL := strings.TrimSpace(challengeMetadataURL); metadataURL != "" {
+		metadata, ok, err := fetchMCPOAuthProtectedResourceMetadata(ctx, client, metadataURL)
+		if err != nil || !ok {
+			return nil, err
+		}
+		return metadata, nil
+	}
+	candidates, err := mcpOAuthProtectedResourceMetadataURLs(serverURL)
+	if err != nil {
+		return nil, err
+	}
+	var lastErr error
+	for _, candidate := range candidates {
+		metadata, ok, err := fetchMCPOAuthProtectedResourceMetadata(ctx, client, candidate)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if ok {
+			return metadata, nil
+		}
+	}
+	return nil, lastErr
+}
+
+// mcpOAuthProtectedResourceScopes resolves the protected-resource metadata's
+// `scopes_supported` list for the scope selection, tolerating a failed lookup:
+// only the fallback list is needed, so an unreachable resource metadata
+// document leaves the selection without resource scopes (Rust #54653).
+func mcpOAuthProtectedResourceScopes(ctx context.Context, client *http.Client, serverURL string, challengeMetadataURL string) []string {
+	metadata, err := discoverMCPOAuthProtectedResource(ctx, client, serverURL, challengeMetadataURL)
+	if err != nil || metadata == nil {
+		return nil
+	}
+	return metadata.ScopesSupported
+}
+
+func mcpOAuthAuthorizationServerMetadataURLs(raw string) ([]string, error) {
+	parsed, err := parseMCPHTTPURL(raw)
+	if err != nil {
+		return nil, err
+	}
+	path := strings.Trim(parsed.Path, "/")
+	candidates := []string{}
+	if path != "" {
+		withPath := *parsed
+		withPath.Path = mcpOAuthAuthorizationServerWellKnownPath + "/" + path
+		withPath.RawPath = ""
+		withPath.RawQuery = ""
+		withPath.Fragment = ""
+		candidates = append(candidates, withPath.String())
+	}
+	root := *parsed
+	root.Path = mcpOAuthAuthorizationServerWellKnownPath
+	root.RawPath = ""
+	root.RawQuery = ""
+	root.Fragment = ""
+	candidates = append(candidates, root.String())
+	return uniqueNonEmptyStrings(candidates), nil
+}
+
+func mcpOAuthProtectedResourceMetadataURLs(raw string) ([]string, error) {
+	parsed, err := parseMCPHTTPURL(raw)
+	if err != nil {
+		return nil, err
+	}
+	path := strings.Trim(parsed.Path, "/")
+	candidates := []string{}
+	if path != "" {
+		withPath := *parsed
+		withPath.Path = mcpOAuthProtectedResourceWellKnownPath + "/" + path
+		withPath.RawPath = ""
+		withPath.RawQuery = ""
+		withPath.Fragment = ""
+		candidates = append(candidates, withPath.String())
+	}
+	root := *parsed
+	root.Path = mcpOAuthProtectedResourceWellKnownPath
+	root.RawPath = ""
+	root.RawQuery = ""
+	root.Fragment = ""
+	candidates = append(candidates, root.String())
+	return uniqueNonEmptyStrings(candidates), nil
+}
+
+// mcpOAuthProbeChallenge performs the initial request to the MCP resource URL
+// and reports the challenge's `resource_metadata` URL and `scope` list (RFC
+// 9728 / RFC 6749 space-delimited scopes). A response without a challenge
+// yields empty values.
+func mcpOAuthProbeChallenge(ctx context.Context, client *http.Client, serverURL string) (string, []string, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSpace(serverURL), nil)
+	if err != nil {
+		return "", nil, err
+	}
+	request.Header.Set("Accept", "application/json")
+	response, err := client.Do(request)
+	if err != nil {
+		return "", nil, err
+	}
+	defer response.Body.Close()
+	if response.Body != nil {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1024))
+	}
+	metadataURL := ""
+	var scopes []string
+	for _, challenge := range response.Header.Values("WWW-Authenticate") {
+		if metadataURL == "" {
+			metadataURL = authChallengeParam(challenge, "resource_metadata")
+		}
+		if len(scopes) == 0 {
+			scopes = normalizeMCPOAuthScopes(strings.Fields(authChallengeParam(challenge, "scope")))
+		}
+	}
+	return metadataURL, scopes, nil
+}
+
+func fetchMCPOAuthAuthorizationServerMetadata(ctx context.Context, client *http.Client, metadataURL string) (*oauthAuthorizationServerMetadata, bool, error) {
+	var metadata oauthAuthorizationServerMetadata
+	ok, err := fetchMCPOAuthMetadata(ctx, client, metadataURL, &metadata)
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	if strings.TrimSpace(metadata.AuthorizationEndpoint) == "" || strings.TrimSpace(metadata.TokenEndpoint) == "" {
+		return nil, false, nil
+	}
+	// Rust #47326 (rmcp-client oauth/issuer_binding.rs): reject non-web
+	// authorization endpoints before client registration or the authorization
+	// URL is returned, so a `file://`, `custom://` or malformed endpoint never
+	// reaches the browser handoff.
+	if !mcpOAuthWebEndpoint(metadata.AuthorizationEndpoint) {
+		return nil, false, nil
+	}
+	return &metadata, true, nil
+}
+
+// mcpOAuthWebEndpoint reports whether raw is a parseable URL whose scheme is
+// http or https (Rust's `matches!(scheme, "http" | "https")`).
+func mcpOAuthWebEndpoint(raw string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+		return true
+	default:
+		return false
+	}
+}
+
+func fetchMCPOAuthProtectedResourceMetadata(ctx context.Context, client *http.Client, metadataURL string) (*oauthProtectedResourceMetadata, bool, error) {
+	var metadata oauthProtectedResourceMetadata
+	ok, err := fetchMCPOAuthMetadata(ctx, client, metadataURL, &metadata)
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	metadata.AuthorizationServers = uniqueNonEmptyStrings(metadata.AuthorizationServers)
+	if len(metadata.AuthorizationServers) == 0 {
+		return nil, false, nil
+	}
+	return &metadata, true, nil
+}
+
+func fetchMCPOAuthMetadata(ctx context.Context, client *http.Client, metadataURL string, out any) (bool, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSpace(metadataURL), nil)
+	if err != nil {
+		return false, err
+	}
+	request.Header.Set("Accept", "application/json")
+	response, err := client.Do(request)
+	if err != nil {
+		return false, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		return false, nil
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		detail := strings.TrimSpace(string(body))
+		return false, &mcpOAuthMetadataHTTPStatusError{
+			URL:        metadataURL,
+			StatusCode: response.StatusCode,
+			Status:     response.Status,
+			Detail:     detail,
+		}
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, mcpOAuthMetadataMaxBytes)).Decode(out); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func discoveryFromMCPOAuthAuthorizationMetadata(serverURL string, metadata *oauthAuthorizationServerMetadata) *StreamableHTTPOAuthDiscovery {
+	if metadata == nil {
+		return nil
+	}
+	authorizationServer := strings.TrimSpace(metadata.Issuer)
+	if authorizationServer == "" {
+		authorizationServer = strings.TrimSpace(serverURL)
+	}
+	callbackMode, err := MCPOAuthCallbackModeForDiscovery(metadata.AuthorizationResponseIssParameterSupported, metadata.Issuer)
+	if err != nil {
+		// Rust maps a missing metadata issuer to the callback-specific fallback
+		// (`callback_mode(..).unwrap_or(CallbackSpecific)`).
+		callbackMode = MCPOAuthCallbackSpecific
+	}
+	return &StreamableHTTPOAuthDiscovery{
+		AuthorizationEndpoint: strings.TrimSpace(metadata.AuthorizationEndpoint),
+		TokenEndpoint:         strings.TrimSpace(metadata.TokenEndpoint),
+		RegistrationEndpoint:  strings.TrimSpace(metadata.RegistrationEndpoint),
+		// Rust #54653 stops using the authorization server's general scope list
+		// as the discovered resource scopes; it is carried separately and only
+		// `offline_access` is honored from it.
+		AuthorizationServerScopesSupported: normalizeMCPOAuthScopes(metadata.ScopesSupported),
+		AuthorizationServer:                authorizationServer,
+		Issuer:                             authorizationServer,
+		ClientIDMetadataDocumentSupported:  metadata.ClientIDMetadataDocumentSupported,
+		PublicClientTokenAuthSupported:     metadataHasPublicClientTokenAuth(metadata.TokenEndpointAuthMethodsSupported),
+		CallbackMode:                       callbackMode,
+	}
+}
+
+// mcpOAuthIssuerBindingException mirrors one entry of Rust's narrow
+// compatibility exception table in
+// codex-rs/rmcp-client/src/oauth/issuer_binding.rs (#39935).
+type mcpOAuthIssuerBindingException struct {
+	issuer              string
+	authorizationOrigin string
+	tokenOrigin         string
+}
+
+// mcpOAuthIssuerBindingExceptions is ported verbatim from Rust
+// `validate_authorization_server_endpoints` (#39935), including the comment that
+// accompanies it. Do not add providers here without the same change upstream.
+//
+// "Remove these narrow compatibility exceptions once both providers support RFC 9207."
+var mcpOAuthIssuerBindingExceptions = []mcpOAuthIssuerBindingException{
+	{
+		issuer:              "https://mcp.mercadopago.com/mcp",
+		authorizationOrigin: "https://auth.mercadopago.com",
+		tokenOrigin:         "https://mcp.mercadopago.com",
+	},
+	{
+		issuer:              "https://agent.robinhood.com/mcp/trading",
+		authorizationOrigin: "https://robinhood.com",
+		tokenOrigin:         "https://api.robinhood.com",
+	},
+}
+
+// mcpOAuthIssuerBindingRejection marks a metadata document that parsed but was
+// rejected by validateMCPOAuthAuthorizationServerEndpoints (#39935). Rust
+// propagates that failure straight out of `perform_oauth_login`, so the
+// interactive login hand-off treats it as fatal instead of falling back to the
+// guessed `<server>/oauth/authorize` URL.
+type mcpOAuthIssuerBindingRejection struct{ err error }
+
+func (e *mcpOAuthIssuerBindingRejection) Error() string { return e.err.Error() }
+
+func (e *mcpOAuthIssuerBindingRejection) Unwrap() error { return e.err }
+
+// newMCPOAuthIssuerBindingRejection builds a rejection carrying Rust's exact
+// message.
+func newMCPOAuthIssuerBindingRejection(message string) error {
+	return &mcpOAuthIssuerBindingRejection{err: errors.New(message)}
+}
+
+// mcpOAuthIssuerBindingRejected reports whether err is a binding rejection, i.e.
+// a metadata document that was successfully fetched and decoded but refused by
+// the issuer/origin binding rules.
+func mcpOAuthIssuerBindingRejected(err error) bool {
+	var rejection *mcpOAuthIssuerBindingRejection
+	return errors.As(err, &rejection)
+}
+
+// validateMCPOAuthAuthorizationServerEndpoints ports the origin-binding half of
+// Rust's `validate_authorization_server_endpoints` (#39935): an authorization
+// endpoint must be web-scheme and, when the metadata advertises an issuer, must
+// be bound to that issuer, either because the server advertises RFC 9207
+// issuer-bound callbacks or because the authorization endpoint shares its origin
+// with the issuer (or with the token endpoint). Without this check a discovered
+// authorization server could point the browser hand-off at a different origin
+// than the issuer it claims.
+//
+// Go discovers authorization servers by iterating the protected-resource
+// metadata's `authorization_servers` list (see DiscoverStreamableHTTPOAuth), so
+// the same check applies to every candidate the loop resolves.
+//
+// When the metadata carries no issuer at all, the token endpoint must still
+// share the authorization endpoint's origin: Rust enforces the same fallback in
+// `validate_authorization_server_endpoints` (#39935), so an issuer-less
+// authorization server cannot silently hand tokens to a foreign origin.
+func validateMCPOAuthAuthorizationServerEndpoints(metadata *oauthAuthorizationServerMetadata) error {
+	if metadata == nil {
+		return nil
+	}
+
+	authorizationEndpoint, err := url.Parse(strings.TrimSpace(metadata.AuthorizationEndpoint))
+	if err != nil {
+		return newMCPOAuthIssuerBindingRejection("OAuth authorization endpoint must be a valid URL")
+	}
+	if !mcpOAuthWebEndpoint(metadata.AuthorizationEndpoint) {
+		// Rust bails with the same message; Go's discovery already drops non-web
+		// authorization endpoints in fetchMCPOAuthAuthorizationServerMetadata
+		// (#47326), so this arm is a faithful mirror rather than a new gate.
+		return newMCPOAuthIssuerBindingRejection("OAuth authorization endpoint must use HTTP or HTTPS")
+	}
+
+	var issuer *url.URL
+	if rawIssuer := strings.TrimSpace(metadata.Issuer); rawIssuer != "" {
+		issuer, err = url.Parse(rawIssuer)
+		if err != nil {
+			return newMCPOAuthIssuerBindingRejection("OAuth authorization server issuer must be a valid URL")
+		}
+	}
+
+	if metadata.AuthorizationResponseIssParameterSupported {
+		if issuer == nil {
+			return newMCPOAuthIssuerBindingRejection("OAuth issuer-bound callbacks require an authorization server issuer")
+		}
+		return nil
+	}
+
+	tokenEndpoint, err := url.Parse(strings.TrimSpace(metadata.TokenEndpoint))
+	if err != nil {
+		return newMCPOAuthIssuerBindingRejection("OAuth token endpoint must be a valid URL")
+	}
+
+	if issuer != nil {
+		authorizationOrigin := mcpOAuthOriginSerialization(authorizationEndpoint)
+		tokenOrigin := mcpOAuthOriginSerialization(tokenEndpoint)
+		if sameHTTPOrigin(authorizationEndpoint, issuer) ||
+			sameHTTPOrigin(authorizationEndpoint, tokenEndpoint) ||
+			mcpOAuthIssuerBindingExceptionMatches(issuer.String(), authorizationOrigin, tokenOrigin) {
+			return nil
+		}
+		return newMCPOAuthIssuerBindingRejection("OAuth authorization endpoint origin does not match the authorization server origin without issuer-bound callbacks")
+	}
+
+	// Issuer-less metadata: Rust still requires the token endpoint to share the
+	// authorization endpoint's origin, so the browser hand-off and the token
+	// exchange cannot straddle two different authorization servers.
+	if !sameHTTPOrigin(authorizationEndpoint, tokenEndpoint) {
+		return newMCPOAuthIssuerBindingRejection("OAuth token endpoint origin does not match the authorization server origin without issuer-bound callbacks")
+	}
+	return nil
+}
+
+// mcpOAuthIssuerBindingExceptionMatches reports whether the (issuer,
+// authorization origin, token origin) triple is one of the ported compatibility
+// exceptions. Rust compares the parsed issuer's serialization against the
+// literal pair, so the caller passes the parsed issuer URL's String().
+func mcpOAuthIssuerBindingExceptionMatches(issuer string, authorizationOrigin string, tokenOrigin string) bool {
+	for _, exception := range mcpOAuthIssuerBindingExceptions {
+		if exception.issuer == issuer &&
+			exception.authorizationOrigin == authorizationOrigin &&
+			exception.tokenOrigin == tokenOrigin {
+			return true
+		}
+	}
+	return false
+}
+
+// mcpOAuthOriginSerialization mirrors Rust's `Url::origin().ascii_serialization()`:
+// `<scheme>://<host>[:<port>]` with the scheme and host lowercased and the
+// default port for the scheme omitted.
+func mcpOAuthOriginSerialization(parsed *url.URL) string {
+	if parsed == nil || parsed.Scheme == "" || parsed.Hostname() == "" {
+		return ""
+	}
+	origin := strings.ToLower(parsed.Scheme) + "://" + strings.ToLower(parsed.Hostname())
+	if port := parsed.Port(); port != "" && port != mcpOAuthDefaultPort(parsed.Scheme) {
+		origin += ":" + port
+	}
+	return origin
+}
+
+// mcpOAuthDefaultPort returns the implicit port for a web scheme, matching the
+// port normalization used by sameHTTPOrigin.
+func mcpOAuthDefaultPort(scheme string) string {
+	switch strings.ToLower(scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
+}
+
+func metadataHasPublicClientTokenAuth(methods []string) bool {
+	for _, method := range methods {
+		if method == "none" {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeMCPOAuthScopes(scopes []string) []string {
+	normalized := make([]string, 0, len(scopes))
+	seen := map[string]bool{}
+	for _, scope := range scopes {
+		scope = strings.TrimSpace(scope)
+		if scope == "" || seen[scope] {
+			continue
+		}
+		seen[scope] = true
+		normalized = append(normalized, scope)
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
+}
+
+func parseMCPHTTPURL(raw string) (*url.URL, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return nil, err
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, fmt.Errorf("MCP OAuth discovery requires http or https URL: %s", raw)
+	}
+	if strings.TrimSpace(parsed.Host) == "" {
+		return nil, fmt.Errorf("MCP OAuth discovery URL is missing host: %s", raw)
+	}
+	return parsed, nil
+}
+
+func authChallengeParam(challenge string, name string) string {
+	target := strings.ToLower(strings.TrimSpace(name))
+	lower := strings.ToLower(challenge)
+	offset := 0
+	for {
+		idx := strings.Index(lower[offset:], target)
+		if idx < 0 {
+			return ""
+		}
+		idx += offset
+		if idx > 0 && !isAuthChallengeSeparator(challenge[idx-1]) {
+			offset = idx + len(target)
+			continue
+		}
+		pos := idx + len(target)
+		for pos < len(challenge) && challenge[pos] == ' ' {
+			pos++
+		}
+		if pos >= len(challenge) || challenge[pos] != '=' {
+			offset = idx + len(target)
+			continue
+		}
+		pos++
+		for pos < len(challenge) && challenge[pos] == ' ' {
+			pos++
+		}
+		if pos >= len(challenge) {
+			return ""
+		}
+		if challenge[pos] == '"' {
+			pos++
+			start := pos
+			for pos < len(challenge) {
+				if challenge[pos] == '"' && challenge[pos-1] != '\\' {
+					return strings.TrimSpace(strings.ReplaceAll(challenge[start:pos], `\"`, `"`))
+				}
+				pos++
+			}
+			return ""
+		}
+		start := pos
+		for pos < len(challenge) && challenge[pos] != ',' && challenge[pos] != ' ' {
+			pos++
+		}
+		return strings.TrimSpace(challenge[start:pos])
+	}
+}
+
+func isAuthChallengeSeparator(value byte) bool {
+	return value == ' ' || value == ',' || value == '\t'
+}
+
+func uniqueNonEmptyStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}

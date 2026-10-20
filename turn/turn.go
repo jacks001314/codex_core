@@ -1,0 +1,762 @@
+package turn
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"codex_core/codexapi"
+)
+
+type Profile struct {
+	BeforeFirstSamplingMS      uint64
+	SamplingMS                 uint64
+	BetweenSamplingOverheadMS  uint64
+	ToolBlockingMS             uint64
+	PendingIdleAfterSamplingMS uint64
+	SamplingRequestCount       uint32
+	SamplingRetryCount         uint32
+	// ToolsChangeCount counts sampling requests whose full model-visible tool
+	// list differed from the previous request's list (Rust #50964
+	// `TurnProfile::tools_change_count`).
+	ToolsChangeCount uint32
+	TotalMS          uint64
+}
+
+type profilePhase string
+
+const (
+	phaseSampling     profilePhase = "sampling"
+	phaseToolBlocking profilePhase = "tool_blocking"
+)
+
+type TimingState struct {
+	mu             sync.Mutex
+	startedAt      time.Time
+	startedUnixMS  int64
+	firstTokenAt   time.Time
+	firstMessageAt time.Time
+	profile        profileState
+}
+
+type profileState struct {
+	startedAt                time.Time
+	lastTransitionAt         time.Time
+	activePhase              profilePhase
+	seenSampling             bool
+	beforeFirstSampling      time.Duration
+	sampling                 time.Duration
+	betweenSamplingOverhead  time.Duration
+	toolBlocking             time.Duration
+	pendingIdleAfterSampling time.Duration
+	samplingRequestCount     uint32
+	samplingRetryCount       uint32
+	toolsChangeCount         uint32
+	completed                *Profile
+}
+
+type TimingGuard struct {
+	timing *TimingState
+	phase  profilePhase
+	active bool
+}
+
+func NewTimingState() *TimingState {
+	return &TimingState{}
+}
+
+func (t *TimingState) MarkTurnStarted(now time.Time) int64 {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.startedAt = now
+	t.startedUnixMS = now.UnixMilli()
+	t.firstTokenAt = time.Time{}
+	t.firstMessageAt = time.Time{}
+	t.profile = profileState{startedAt: now, lastTransitionAt: now}
+	return t.startedUnixMS
+}
+
+func (t *TimingState) StartedAtUnixSecs() (int64, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.startedUnixMS == 0 {
+		return 0, false
+	}
+	return t.startedUnixMS / 1000, true
+}
+
+func (t *TimingState) CompletedAtAndDuration(now time.Time) (int64, int64, bool) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.startedAt.IsZero() {
+		return now.Unix(), 0, false
+	}
+	return now.Unix(), now.Sub(t.startedAt).Milliseconds(), true
+}
+
+func (t *TimingState) RecordTTFT(now time.Time) (time.Duration, bool) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.startedAt.IsZero() || !t.firstTokenAt.IsZero() {
+		return 0, false
+	}
+	t.firstTokenAt = now
+	return now.Sub(t.startedAt), true
+}
+
+func (t *TimingState) RecordTTFM(now time.Time) (time.Duration, bool) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.startedAt.IsZero() || !t.firstMessageAt.IsZero() {
+		return 0, false
+	}
+	t.firstMessageAt = now
+	return now.Sub(t.startedAt), true
+}
+
+func (t *TimingState) TimeToFirstToken() (time.Duration, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.startedAt.IsZero() || t.firstTokenAt.IsZero() {
+		return 0, false
+	}
+	return t.firstTokenAt.Sub(t.startedAt), true
+}
+
+func (t *TimingState) BeginSampling(now time.Time) *TimingGuard {
+	return t.beginPhase(phaseSampling, now)
+}
+
+func (t *TimingState) BeginToolBlocking(now time.Time) *TimingGuard {
+	return t.beginPhase(phaseToolBlocking, now)
+}
+
+func (t *TimingState) RecordSamplingRetry() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.profile.completed == nil && !t.profile.startedAt.IsZero() {
+		t.profile.samplingRetryCount++
+	}
+}
+
+// RecordToolsChange counts one inference whose model-visible tool list changed.
+// Rust #50964 `TurnTimingState::record_tools_change` only counts while the
+// profile is active (started and not yet completed).
+func (t *TimingState) RecordToolsChange() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.profile.completed == nil && !t.profile.startedAt.IsZero() {
+		t.profile.toolsChangeCount++
+	}
+}
+
+func (t *TimingState) CompleteProfile(now time.Time) Profile {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.profile.complete(now)
+}
+
+func (t *TimingState) beginPhase(phase profilePhase, now time.Time) *TimingGuard {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	active := t.profile.beginPhase(phase, now)
+	return &TimingGuard{timing: t, phase: phase, active: active}
+}
+
+func (g *TimingGuard) Close() {
+	g.CloseAt(time.Now())
+}
+
+func (g *TimingGuard) CloseAt(now time.Time) {
+	if g == nil || !g.active {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	g.timing.mu.Lock()
+	defer g.timing.mu.Unlock()
+	g.timing.profile.endPhase(now, g.phase)
+	g.active = false
+}
+
+func (p *profileState) beginPhase(phase profilePhase, now time.Time) bool {
+	if p.completed != nil || p.startedAt.IsZero() || p.activePhase != "" {
+		return false
+	}
+	p.advance(now)
+	if phase == phaseSampling {
+		if p.seenSampling {
+			p.betweenSamplingOverhead += p.pendingIdleAfterSampling
+			p.pendingIdleAfterSampling = 0
+		}
+		p.seenSampling = true
+		p.samplingRequestCount++
+	}
+	p.activePhase = phase
+	return true
+}
+
+func (p *profileState) endPhase(now time.Time, phase profilePhase) {
+	if p.completed != nil || p.activePhase != phase {
+		return
+	}
+	p.advance(now)
+	p.activePhase = ""
+}
+
+func (p *profileState) advance(now time.Time) {
+	if p.lastTransitionAt.IsZero() {
+		p.lastTransitionAt = now
+		return
+	}
+	elapsed := now.Sub(p.lastTransitionAt)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	switch p.activePhase {
+	case phaseSampling:
+		p.sampling += elapsed
+	case phaseToolBlocking:
+		p.toolBlocking += elapsed
+	default:
+		if p.seenSampling {
+			p.pendingIdleAfterSampling += elapsed
+		} else {
+			p.beforeFirstSampling += elapsed
+		}
+	}
+	p.lastTransitionAt = now
+}
+
+func (p *profileState) complete(now time.Time) Profile {
+	if p.completed != nil {
+		return *p.completed
+	}
+	p.advance(now)
+	profile := Profile{
+		BeforeFirstSamplingMS:      durationMS(p.beforeFirstSampling),
+		SamplingMS:                 durationMS(p.sampling),
+		BetweenSamplingOverheadMS:  durationMS(p.betweenSamplingOverhead),
+		ToolBlockingMS:             durationMS(p.toolBlocking),
+		PendingIdleAfterSamplingMS: durationMS(p.pendingIdleAfterSampling),
+		SamplingRequestCount:       p.samplingRequestCount,
+		SamplingRetryCount:         p.samplingRetryCount,
+		ToolsChangeCount:           p.toolsChangeCount,
+		TotalMS:                    durationMS(now.Sub(p.startedAt)),
+	}
+	p.completed = &profile
+	return profile
+}
+
+func durationMS(duration time.Duration) uint64 {
+	if duration <= 0 {
+		return 0
+	}
+	return uint64(duration.Milliseconds())
+}
+
+func cloneBoolPtr(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+type MetadataState struct {
+	mu                         sync.RWMutex
+	SessionID                  string
+	ThreadID                   string
+	ForkedFromThreadID         string
+	ForkedFromOrdinalExclusive *uint64
+	ParentThreadID             string
+	ParentTurnID               string
+	RootTurnID                 string
+	SubagentHeader             string
+	SubagentKind               string
+	ThreadSource               string
+	TurnID                     string
+	Sandbox                    string
+	SandboxMode                string
+	Workspaces                 map[string]WorkspaceMetadata
+	TurnStartedAtUnixMS        int64
+	// AnalyticsEnabled reports the selected session analytics client's
+	// collection state (Rust #44628); nil omits the key.
+	AnalyticsEnabled             *bool
+	Extra                        map[string]string
+	UserInputRequestedDuringTurn bool
+}
+
+type WorkspaceMetadata struct {
+	AssociatedRemoteURLs map[string]string `json:"associated_remote_urls,omitempty"`
+	LatestGitCommitHash  string            `json:"latest_git_commit_hash,omitempty"`
+	HasChanges           *bool             `json:"has_changes,omitempty"`
+}
+
+func NewMetadataState(sessionID string, threadID string, turnID string) *MetadataState {
+	return &MetadataState{
+		SessionID:  sessionID,
+		ThreadID:   threadID,
+		TurnID:     turnID,
+		Workspaces: map[string]WorkspaceMetadata{},
+		Extra:      map[string]string{},
+	}
+}
+
+func (m *MetadataState) SetTurnStartedAtUnixMS(value int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.TurnStartedAtUnixMS = value
+}
+
+func (m *MetadataState) SetAnalyticsEnabled(value *bool) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if value == nil {
+		m.AnalyticsEnabled = nil
+		return
+	}
+	clone := *value
+	m.AnalyticsEnabled = &clone
+}
+
+func (m *MetadataState) MarkUserInputRequestedDuringTurn() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.UserInputRequestedDuringTurn = true
+}
+
+func (m *MetadataState) SetClientMetadata(values map[string]string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.Extra = FilterClientMetadata(values)
+}
+
+func (m *MetadataState) WorkspaceKind() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.Extra["workspace_kind"]
+}
+
+func (m *MetadataState) AddWorkspace(path string, metadata WorkspaceMetadata) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.Workspaces == nil {
+		m.Workspaces = map[string]WorkspaceMetadata{}
+	}
+	m.Workspaces[path] = metadata
+}
+
+func (m *MetadataState) MetadataValue(model string, reasoningEffort string) map[string]any {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	value := map[string]any{
+		"session_id": m.SessionID,
+		"thread_id":  m.ThreadID,
+		"turn_id":    m.TurnID,
+		"model":      model,
+	}
+	if reasoningEffort != "" {
+		value["reasoning_effort"] = reasoningEffort
+	}
+	if m.ForkedFromThreadID != "" {
+		value["forked_from_thread_id"] = m.ForkedFromThreadID
+	}
+	if m.ForkedFromOrdinalExclusive != nil {
+		value[codexapi.ForkedFromOrdinalExclusiveKey] = *m.ForkedFromOrdinalExclusive
+	}
+	if m.ParentThreadID != "" {
+		value["parent_thread_id"] = m.ParentThreadID
+	}
+	if m.ParentTurnID != "" {
+		value["parent_turn_id"] = m.ParentTurnID
+	}
+	if m.SubagentHeader != "" {
+		value["subagent_header"] = m.SubagentHeader
+	}
+	if m.SubagentKind != "" {
+		value["subagent_kind"] = m.SubagentKind
+	}
+	if m.ThreadSource != "" {
+		value["thread_source"] = m.ThreadSource
+	}
+	if m.Sandbox != "" {
+		value["sandbox"] = m.Sandbox
+	}
+	if m.SandboxMode != "" {
+		value["sandbox_mode"] = m.SandboxMode
+	}
+	if m.TurnStartedAtUnixMS != 0 {
+		value["turn_started_at_unix_ms"] = m.TurnStartedAtUnixMS
+	}
+	if m.AnalyticsEnabled != nil {
+		value[codexapi.AnalyticsEnabledKey] = *m.AnalyticsEnabled
+	}
+	if m.UserInputRequestedDuringTurn {
+		value["user_input_requested_during_turn"] = true
+	}
+	if len(m.Workspaces) > 0 {
+		value["workspaces"] = m.Workspaces
+	}
+	for key, extra := range m.Extra {
+		value[key] = extra
+	}
+	return value
+}
+
+type ResponsesClientMetadataOptions struct {
+	InstallationID  string
+	SessionID       string
+	ThreadID        string
+	TurnID          string
+	WindowID        string
+	ContextWindowID string
+	// WindowNumber is the zero-based current context window number included in
+	// Responses turn metadata (Rust #40987).
+	WindowNumber               *uint64
+	RequestKind                codexapi.ClientRequestKind
+	ForkedFromThreadID         string
+	ForkedFromOrdinalExclusive *uint64
+	ParentThreadID             string
+	ParentTurnID               string
+	RootTurnID                 string
+	SubagentHeader             string
+	SubagentKind               string
+	ThreadSource               string
+	TurnTrigger                string
+	CodexVersion               string
+	Sandbox                    string
+	SandboxMode                string
+	AgentName                  string
+	// Model and ReasoningEffort are the settings that issued the request (Rust
+	// `ExecutionMetadata::from_settings`); empty values omit the keys.
+	Model           string
+	ReasoningEffort string
+	// Compaction describes a remote compaction request's dispatch operation
+	// (Rust `CompactionTurnMetadata`); it is serialized as the
+	// `request_kind: "compaction"` payload's `compaction` object and is only
+	// set when the request kind is compaction.
+	Compaction *codexapi.ClientCompactionMetadata
+	// HistoryIngestRequested mirrors Rust's with_window_and_fork_metadata: the
+	// session's token-budget history-notes extension asks the backend to ingest
+	// the request. Only the true value is serialized.
+	HistoryIngestRequested     bool
+	HistoryInitialization      string
+	AutoReviewEnabled          *bool
+	NodeReplAutoReviewRequired *bool
+	NodeReplDisabled           *bool
+	AnalyticsEnabled           *bool
+	Extra                      map[string]string
+	ResponsesAPIMetadata       map[string]string
+	StartedAtMS                int64
+	UseResponsesLite           bool
+}
+
+// ConversationWindowID builds Rust's conversation window identity
+// `{thread_id}:{window_number}` (Session::current_window_id). The window number
+// is zero-based and advances once per compaction window, so a thread's first
+// window is `{thread_id}:0`.
+func ConversationWindowID(threadID string, windowNumber uint64) string {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s:%d", threadID, windowNumber)
+}
+
+func BuildResponsesClientMetadata(options *ResponsesClientMetadataOptions) map[string]string {
+	if options == nil {
+		return nil
+	}
+	threadID := strings.TrimSpace(options.ThreadID)
+	sessionID := strings.TrimSpace(options.SessionID)
+	if sessionID == "" {
+		sessionID = threadID
+	}
+	windowID := strings.TrimSpace(options.WindowID)
+	if windowID == "" {
+		var windowNumber uint64
+		if options.WindowNumber != nil {
+			windowNumber = *options.WindowNumber
+		}
+		windowID = ConversationWindowID(threadID, windowNumber)
+	}
+	metadata := codexapi.NewClientMetadata(
+		strings.TrimSpace(options.InstallationID),
+		sessionID,
+		threadID,
+		windowID,
+	)
+	metadata.TurnID = strings.TrimSpace(options.TurnID)
+	metadata.ContextWindowID = strings.TrimSpace(options.ContextWindowID)
+	metadata.WindowNumber = options.WindowNumber
+	metadata.RequestKind = options.RequestKind
+	if metadata.RequestKind == "" {
+		metadata.RequestKind = codexapi.ClientRequestTurn
+	}
+	metadata.ForkedFromThreadID = strings.TrimSpace(options.ForkedFromThreadID)
+	if metadata.ForkedFromThreadID != "" {
+		metadata.ForkedFromOrdinalExclusive = options.ForkedFromOrdinalExclusive
+	}
+	metadata.ParentThreadID = strings.TrimSpace(options.ParentThreadID)
+	metadata.ParentTurnID = strings.TrimSpace(options.ParentTurnID)
+	metadata.RootTurnID = strings.TrimSpace(options.RootTurnID)
+	metadata.SubagentHeader = strings.TrimSpace(options.SubagentHeader)
+	metadata.SubagentKind = strings.TrimSpace(options.SubagentKind)
+	metadata.ThreadSource = strings.TrimSpace(options.ThreadSource)
+	metadata.TurnTrigger = strings.TrimSpace(options.TurnTrigger)
+	metadata.CodexVersion = strings.TrimSpace(options.CodexVersion)
+	metadata.Sandbox = strings.TrimSpace(options.Sandbox)
+	metadata.SandboxMode = strings.TrimSpace(options.SandboxMode)
+	metadata.AgentName = strings.TrimSpace(options.AgentName)
+	metadata.Model = strings.TrimSpace(options.Model)
+	metadata.ReasoningEffort = strings.TrimSpace(options.ReasoningEffort)
+	if options.Compaction != nil {
+		compaction := *options.Compaction
+		// Rust's CompactionTurnMetadata always serializes the strategy.
+		compaction.EnsureDefaults()
+		metadata.Compaction = &compaction
+	}
+	metadata.HistoryIngestRequested = options.HistoryIngestRequested
+	metadata.HistoryInitialization = strings.TrimSpace(options.HistoryInitialization)
+	metadata.AutoReviewEnabled = cloneBoolPtr(options.AutoReviewEnabled)
+	metadata.NodeReplAutoReviewRequired = cloneBoolPtr(options.NodeReplAutoReviewRequired)
+	metadata.NodeReplDisabled = cloneBoolPtr(options.NodeReplDisabled)
+	metadata.AnalyticsEnabled = cloneBoolPtr(options.AnalyticsEnabled)
+	metadata.TurnStartedAtUnixMS = options.StartedAtMS
+	metadata.Extra = FilterClientMetadata(options.Extra)
+	metadata.ResponsesAPIMetadata = cloneStringMap(options.ResponsesAPIMetadata)
+	clientMetadata := metadata.ClientMetadata()
+	if options.UseResponsesLite {
+		clientMetadata["ws_request_header_x_openai_internal_codex_responses_lite"] = "true"
+	}
+	return compactStringMap(clientMetadata)
+}
+
+// MCPTurnMetadataFromResponsesMetadata derives the turn-metadata document an
+// external MCP server receives in `_meta` from a built Responses turn-metadata
+// document (Rust TurnMetadataState::current_meta_value_for_mcp_request): the
+// request identity and the harness-owned agent/parent/root turn fields are
+// dropped, and the per-turn user-input flag is added when the model asked for
+// input. It returns nil when there is no document to report.
+func MCPTurnMetadataFromResponsesMetadata(raw string, userInputRequested bool, codexVersion string) map[string]any {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var document map[string]any
+	if err := json.Unmarshal([]byte(raw), &document); err != nil || len(document) == 0 {
+		return nil
+	}
+	for _, key := range []string{
+		codexapi.InstallationIDKey,
+		codexapi.WindowIDKey,
+		codexapi.ContextWindowIDKey,
+		codexapi.RequestKindKey,
+		codexapi.CompactionKey,
+		codexapi.AgentNameKey,
+		codexapi.ParentTurnIDKey,
+		codexapi.RootTurnIDKey,
+		// Rust never serializes the harness-owned tool inventory for external
+		// MCP servers (turn_metadata.rs's `tool_namespaces_info = None`).
+		codexapi.ToolNamespacesInfoKey,
+	} {
+		delete(document, key)
+	}
+	delete(document, "window_number")
+	// Rust #42395: the reserved `codex_version` field always reports the running
+	// harness version, replacing any client-supplied value.
+	if version := strings.TrimSpace(codexVersion); version != "" {
+		document["codex_version"] = version
+	} else {
+		delete(document, "codex_version")
+	}
+	if userInputRequested {
+		document[codexapi.UserInputRequestedDuringTurnKey] = true
+	}
+	return document
+}
+
+// RootTurnIDFromResponsesMetadata extracts the turn's root turn id from the
+// Responses request metadata document (Rust #51421). The MCP turn-metadata
+// document deliberately omits the root, so host-owned Apps calls read it from
+// the raw document instead. It returns "" when absent or malformed.
+func RootTurnIDFromResponsesMetadata(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	var document map[string]any
+	if err := json.Unmarshal([]byte(raw), &document); err != nil {
+		return ""
+	}
+	value, _ := document[codexapi.RootTurnIDKey].(string)
+	return strings.TrimSpace(value)
+}
+
+// ResponsesAPIClientMetadataUpdate mirrors Rust's
+// `ResponsesApiClientMetadataUpdate` (codex-rs/protocol/src/turn_input.rs,
+// #54053): an optional replacement followed by a patch.
+type ResponsesAPIClientMetadataUpdate struct {
+	// Replacement replaces the current client metadata, including every
+	// unprotected entry when it is an empty map.
+	Replacement map[string]string
+	// HasReplacement distinguishes an empty replacement from an absent one, the
+	// way Rust's `Option<HashMap<_, _>>` does.
+	HasReplacement bool
+	// Patch adds or overwrites individual entries while keeping the others.
+	Patch map[string]string
+}
+
+// Empty reports whether the update carries neither a replacement nor a patch.
+func (u ResponsesAPIClientMetadataUpdate) Empty() bool {
+	return !u.HasReplacement && len(u.Patch) == 0
+}
+
+// ApplyResponsesAPIClientMetadataUpdate applies an update the way Rust's
+// `TurnMetadataState::update_responsesapi_client_metadata` does (#54053): the
+// replacement replaces the current map, then the patch overwrites and adds
+// individual entries. Reserved keys are dropped by the same filter every other
+// client-metadata entry passes through, and an empty update returns the current
+// map untouched.
+func ApplyResponsesAPIClientMetadataUpdate(current map[string]string, update ResponsesAPIClientMetadataUpdate) map[string]string {
+	patch := FilterClientMetadata(update.Patch)
+	if update.Empty() {
+		return current
+	}
+	out := make(map[string]string, len(current)+len(update.Replacement)+len(patch))
+	if update.HasReplacement {
+		for key, value := range FilterClientMetadata(update.Replacement) {
+			out[key] = value
+		}
+	} else {
+		for key, value := range current {
+			out[key] = value
+		}
+	}
+	for key, value := range patch {
+		out[key] = value
+	}
+	return out
+}
+
+func MergeClientMetadata(base map[string]string, overlay map[string]string) map[string]string {
+	if len(base) == 0 && len(overlay) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(base)+len(overlay))
+	for key, value := range FilterClientMetadata(base) {
+		out[key] = value
+	}
+	for key, value := range FilterClientMetadata(overlay) {
+		out[key] = value
+	}
+	return out
+}
+
+type BudgetReminderConfig struct {
+	ThresholdTokens int64
+	Template        string
+}
+
+type BudgetState struct {
+	mu              sync.Mutex
+	reminderClaimed bool
+}
+
+func NewBudgetState() *BudgetState {
+	return &BudgetState{}
+}
+
+func (b *BudgetState) MaybeReminder(tokensUntilCompaction *int64, config *BudgetReminderConfig) (string, bool) {
+	if b == nil || config == nil || tokensUntilCompaction == nil {
+		return "", false
+	}
+	if *tokensUntilCompaction > config.ThresholdTokens {
+		return "", false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.reminderClaimed {
+		return "", false
+	}
+	b.reminderClaimed = true
+	template := config.Template
+	if template == "" {
+		template = "Token budget remaining: {tokens_until_compaction}"
+	}
+	return stringsReplaceToken(template, *tokensUntilCompaction), true
+}
+
+func FilterClientMetadata(values map[string]string) map[string]string {
+	out := make(map[string]string, len(values))
+	reserved := codexapi.ClientReservedMetadataKeys()
+	for key, value := range values {
+		if key == "" || reserved[strings.ToLower(key)] || len(key) > 64 || len(value) > 512 {
+			continue
+		}
+		out[key] = value
+	}
+	return out
+}
+
+func compactStringMap(values map[string]string) map[string]string {
+	out := make(map[string]string, len(values))
+	for key, value := range values {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key != "" && value != "" {
+			out[key] = value
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func stringsReplaceToken(template string, tokens int64) string {
+	return fmt.Sprintf("%s", replaceAll(template, "{tokens_until_compaction}", fmt.Sprintf("%d", tokens)))
+}
+
+func replaceAll(value string, old string, new string) string {
+	for {
+		next := ""
+		index := -1
+		for i := 0; i+len(old) <= len(value); i++ {
+			if value[i:i+len(old)] == old {
+				index = i
+				break
+			}
+		}
+		if index < 0 {
+			return value
+		}
+		next = value[:index] + new + value[index+len(old):]
+		value = next
+	}
+}

@@ -1,0 +1,414 @@
+package sandbox
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+
+	"codex_core/sandbox/sandboxpath"
+	"codex_core/utils"
+)
+
+type AskForApproval string
+
+const (
+	ApprovalUnlessTrusted AskForApproval = "untrusted"
+	ApprovalOnRequest     AskForApproval = "on-request"
+	ApprovalGranular      AskForApproval = "granular"
+	ApprovalNever         AskForApproval = "never"
+)
+
+type GranularApprovalConfig struct {
+	SandboxApproval    bool
+	Rules              bool
+	SkillApproval      bool
+	RequestPermissions bool
+	MCPElicitations    bool
+}
+
+func (c *GranularApprovalConfig) AllowsSandboxApproval() bool {
+	return c != nil && c.SandboxApproval
+}
+
+func (c *GranularApprovalConfig) AllowsRulesApproval() bool {
+	return c != nil && c.Rules
+}
+
+func (c *GranularApprovalConfig) AllowsSkillApproval() bool {
+	return c != nil && c.SkillApproval
+}
+
+func (c *GranularApprovalConfig) AllowsRequestPermissions() bool {
+	return c != nil && c.RequestPermissions
+}
+
+func (c *GranularApprovalConfig) AllowsMCPElicitations() bool {
+	return c != nil && c.MCPElicitations
+}
+
+type NetworkAccess string
+
+const (
+	NetworkRestricted NetworkAccess = "restricted"
+	NetworkEnabled    NetworkAccess = "enabled"
+)
+
+func (n *NetworkAccess) IsEnabled() bool {
+	return n != nil && *n == NetworkEnabled
+}
+
+type SandboxMode string
+
+const (
+	SandboxReadOnly         SandboxMode = "read-only"
+	SandboxWorkspaceWrite   SandboxMode = "workspace-write"
+	SandboxDangerFullAccess SandboxMode = "danger-full-access"
+	// SandboxModeExternalSandbox is an executor-managed sandbox: the platform
+	// provides the isolation, so the CLI never needs bubblewrap for it
+	// (Rust FileSystemSandboxKind::ExternalSandbox).
+	SandboxModeExternalSandbox SandboxMode = "external-sandbox"
+)
+
+func ParseSandboxMode(value string) (SandboxMode, error) {
+	switch strings.TrimSpace(value) {
+	case string(SandboxReadOnly):
+		return SandboxReadOnly, nil
+	case string(SandboxWorkspaceWrite):
+		return SandboxWorkspaceWrite, nil
+	case string(SandboxDangerFullAccess):
+		return SandboxDangerFullAccess, nil
+	default:
+		return "", fmt.Errorf("unknown sandbox mode %q", value)
+	}
+}
+
+type SandboxPolicy struct {
+	Kind                SandboxMode
+	ExternalNetwork     NetworkAccess
+	WritableRoots       []string
+	NetworkAccess       bool
+	ExcludeTmpdirEnvVar bool
+	ExcludeSlashTmp     bool
+
+	fullDiskWriteAccess    bool
+	fullDiskWriteAccessSet bool
+}
+
+func (p *SandboxPolicy) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Type                string          `json:"type"`
+		NetworkAccess       any             `json:"networkAccess"`
+		WritableRoots       []string        `json:"writableRoots"`
+		ExcludeTmpdirEnvVar bool            `json:"excludeTmpdirEnvVar"`
+		ExcludeSlashTmp     bool            `json:"excludeSlashTmp"`
+		Access              json.RawMessage `json:"access"`
+		ReadOnlyAccess      json.RawMessage `json:"readOnlyAccess"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	switch strings.TrimSpace(raw.Type) {
+	case "dangerFullAccess", string(SandboxDangerFullAccess):
+		*p = *NewDangerFullAccessPolicy()
+		return nil
+	case "readOnly", string(SandboxReadOnly):
+		if legacyRestrictedAccess(raw.Access) {
+			return fmt.Errorf("readOnly.access is no longer supported; use permissionProfile for restricted reads")
+		}
+		*p = SandboxPolicy{
+			Kind:          SandboxReadOnly,
+			NetworkAccess: sandboxPolicyBool(raw.NetworkAccess),
+		}
+		return nil
+	case "externalSandbox", "external-sandbox":
+		*p = SandboxPolicy{
+			Kind:            "external-sandbox",
+			ExternalNetwork: sandboxPolicyNetworkAccess(raw.NetworkAccess),
+		}
+		return nil
+	case "workspaceWrite", string(SandboxWorkspaceWrite), "":
+		if legacyRestrictedAccess(raw.ReadOnlyAccess) {
+			return fmt.Errorf("workspaceWrite.readOnlyAccess is no longer supported; use permissionProfile for restricted reads")
+		}
+		*p = SandboxPolicy{
+			Kind:                SandboxWorkspaceWrite,
+			WritableRoots:       append([]string(nil), raw.WritableRoots...),
+			NetworkAccess:       sandboxPolicyBool(raw.NetworkAccess),
+			ExcludeTmpdirEnvVar: raw.ExcludeTmpdirEnvVar,
+			ExcludeSlashTmp:     raw.ExcludeSlashTmp,
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown sandbox policy type %q", raw.Type)
+	}
+}
+
+func (p *SandboxPolicy) MarshalJSON() ([]byte, error) {
+	switch p.Kind {
+	case SandboxDangerFullAccess:
+		return json.Marshal(struct {
+			Type string `json:"type"`
+		}{Type: "dangerFullAccess"})
+	case SandboxReadOnly:
+		return json.Marshal(struct {
+			Type          string `json:"type"`
+			NetworkAccess bool   `json:"networkAccess"`
+		}{
+			Type:          "readOnly",
+			NetworkAccess: p.NetworkAccess,
+		})
+	case "external-sandbox":
+		networkAccess := p.ExternalNetwork
+		if networkAccess == "" {
+			networkAccess = NetworkRestricted
+		}
+		return json.Marshal(struct {
+			Type          string        `json:"type"`
+			NetworkAccess NetworkAccess `json:"networkAccess"`
+		}{
+			Type:          "externalSandbox",
+			NetworkAccess: networkAccess,
+		})
+	case SandboxWorkspaceWrite, "":
+		writableRoots := append([]string(nil), p.WritableRoots...)
+		if writableRoots == nil {
+			writableRoots = []string{}
+		}
+		return json.Marshal(struct {
+			Type                string   `json:"type"`
+			WritableRoots       []string `json:"writableRoots"`
+			NetworkAccess       bool     `json:"networkAccess"`
+			ExcludeTmpdirEnvVar bool     `json:"excludeTmpdirEnvVar"`
+			ExcludeSlashTmp     bool     `json:"excludeSlashTmp"`
+		}{
+			Type:                "workspaceWrite",
+			WritableRoots:       writableRoots,
+			NetworkAccess:       p.NetworkAccess,
+			ExcludeTmpdirEnvVar: p.ExcludeTmpdirEnvVar,
+			ExcludeSlashTmp:     p.ExcludeSlashTmp,
+		})
+	default:
+		type sandboxPolicyAlias SandboxPolicy
+		return json.Marshal(sandboxPolicyAlias(*p))
+	}
+}
+
+// WritableRoot mirrors Rust `protocol::WritableRoot`: a writable root with the
+// subpaths that stay read-only even when the root is writable. The type lives in
+// the leaf package `sandboxpath` because the Linux sandbox helper shares it and
+// cannot import this package.
+type WritableRoot = sandboxpath.WritableRoot
+
+func NewReadOnlyPolicy() *SandboxPolicy {
+	return &SandboxPolicy{Kind: SandboxReadOnly}
+}
+
+func NewWorkspaceWritePolicy() *SandboxPolicy {
+	return &SandboxPolicy{
+		Kind:                SandboxWorkspaceWrite,
+		ExcludeTmpdirEnvVar: false,
+		ExcludeSlashTmp:     false,
+	}
+}
+
+func NewDangerFullAccessPolicy() *SandboxPolicy {
+	return &SandboxPolicy{Kind: SandboxDangerFullAccess, NetworkAccess: true}
+}
+
+func NewExternalSandboxPolicy(network NetworkAccess) *SandboxPolicy {
+	return &SandboxPolicy{Kind: SandboxModeExternalSandbox, ExternalNetwork: network}
+}
+
+func SandboxPolicyFromMode(mode SandboxMode) (*SandboxPolicy, error) {
+	switch mode {
+	case SandboxReadOnly:
+		return NewReadOnlyPolicy(), nil
+	case SandboxWorkspaceWrite:
+		return NewWorkspaceWritePolicy(), nil
+	case SandboxDangerFullAccess:
+		return NewDangerFullAccessPolicy(), nil
+	default:
+		return nil, fmt.Errorf("unknown sandbox mode %q", mode)
+	}
+}
+
+func sandboxPolicyBool(value any) bool {
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		return strings.EqualFold(strings.TrimSpace(typed), "enabled") || strings.EqualFold(strings.TrimSpace(typed), "true")
+	default:
+		return false
+	}
+}
+
+func sandboxPolicyNetworkAccess(value any) NetworkAccess {
+	switch typed := value.(type) {
+	case string:
+		switch NetworkAccess(strings.TrimSpace(typed)) {
+		case NetworkEnabled:
+			return NetworkEnabled
+		default:
+			return NetworkRestricted
+		}
+	case bool:
+		if typed {
+			return NetworkEnabled
+		}
+		return NetworkRestricted
+	default:
+		return NetworkRestricted
+	}
+}
+
+func legacyRestrictedAccess(data json.RawMessage) bool {
+	if len(data) == 0 || string(data) == "null" {
+		return false
+	}
+	var raw struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(raw.Type), "restricted")
+}
+
+func (p *SandboxPolicy) HasFullDiskReadAccess() bool {
+	return true
+}
+
+func (p *SandboxPolicy) HasFullDiskWriteAccess() bool {
+	if p == nil {
+		return false
+	}
+	if p.Kind == SandboxDangerFullAccess || p.Kind == "external-sandbox" {
+		return true
+	}
+	return p.fullDiskWriteAccessSet && p.fullDiskWriteAccess
+}
+
+func (p *SandboxPolicy) HasFullNetworkAccess() bool {
+	if p == nil {
+		return false
+	}
+	switch p.Kind {
+	case SandboxDangerFullAccess:
+		return true
+	case "external-sandbox":
+		return (&p.ExternalNetwork).IsEnabled()
+	case SandboxReadOnly, SandboxWorkspaceWrite:
+		return p.NetworkAccess
+	default:
+		return false
+	}
+}
+
+func (p *SandboxPolicy) GetWritableRootsWithCWD(cwd string) []WritableRoot {
+	if p == nil || p.Kind != SandboxWorkspaceWrite {
+		return nil
+	}
+	if p.HasFullDiskWriteAccess() {
+		return nil
+	}
+	var roots []string
+	roots = append(roots, p.WritableRoots...)
+	if cwd != "" {
+		roots = append(roots, cwd)
+	}
+	if !p.ExcludeSlashTmp {
+		if slashTmp := slashTmpPath(); slashTmp != "" {
+			roots = append(roots, slashTmp)
+		}
+	}
+	if !p.ExcludeTmpdirEnvVar {
+		if tmpdir := strings.TrimSpace(os.TempDir()); tmpdir != "" {
+			roots = append(roots, tmpdir)
+		}
+	}
+	return buildWritableRoots(roots)
+}
+
+// buildWritableRoots mirrors the writable-root set the sandbox mounts.
+func buildWritableRoots(paths []string) []WritableRoot {
+	return sandboxpath.WritableRootsWithProtectedSubpaths(paths)
+}
+
+func cleanAbs(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return ""
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		return filepath.Clean(abs)
+	}
+	return filepath.Clean(path)
+}
+
+func sameOrWithin(path, root string) bool {
+	if path == "" || root == "" {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		// Rust #41209: Windows path identity is case-insensitive.
+		path = strings.ToLower(path)
+		root = strings.ToLower(root)
+	}
+	if path == root {
+		return true
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// pathWithinForConvention reports whether path is root or below it using the
+// executor's path convention rather than the Go host's convention. Windows
+// matching folds case and accepts either separator; POSIX matching remains
+// case-sensitive and slash-delimited (Rust #41209).
+func pathWithinForConvention(path, root string, convention utils.PathConvention) bool {
+	if convention == "" {
+		return sameOrWithin(path, root)
+	}
+	if convention == utils.ConventionWindows {
+		path = strings.ToLower(utils.LexicalClean(path, convention))
+		root = strings.ToLower(utils.LexicalClean(root, convention))
+		if path == root {
+			return true
+		}
+		root = strings.TrimRight(root, `\/`)
+		if root == "" {
+			return strings.HasPrefix(path, `\`)
+		}
+		return strings.HasPrefix(path, root+`\`)
+	}
+	path = utils.LexicalClean(path, convention)
+	root = utils.LexicalClean(root, convention)
+	if path == root {
+		return true
+	}
+	if root == "/" {
+		return strings.HasPrefix(path, "/")
+	}
+	return strings.HasPrefix(path, strings.TrimRight(root, "/")+"/")
+}
+
+func slashTmpPath() string {
+	if !supportsSymbolicSlashTmp() {
+		return ""
+	}
+	return "/tmp"
+}
+
+func requireNonEmpty(value, name string) error {
+	if strings.TrimSpace(value) == "" {
+		return errors.New(name + " must not be empty")
+	}
+	return nil
+}

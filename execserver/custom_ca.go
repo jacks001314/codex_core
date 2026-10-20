@@ -1,0 +1,69 @@
+package execserver
+
+import (
+	"bytes"
+	"crypto/tls"
+	"fmt"
+	"net/http"
+	"os"
+	"strings"
+
+	"codex_core/network"
+)
+
+const customCAHint = "If you set CODEX_CA_CERTIFICATE or SSL_CERT_FILE, ensure it points to a PEM file containing one or more CERTIFICATE blocks, or unset it to use system roots."
+
+func newExecServerHTTPClient(configured ...*http.Client) (*http.Client, error) {
+	client := &http.Client{}
+	if len(configured) > 0 && configured[0] != nil {
+		*client = *configured[0]
+	}
+	client.Jar = network.SharedChatGPTCookieJar()
+	sourceEnv, path := configuredCustomCA()
+	if path == "" {
+		return client, nil
+	}
+	pemData, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to read CA certificate file %s selected by %s: %v. %s", path, sourceEnv, err, customCAHint)
+	}
+	pemData = normalizeTrustedCertificatePEM(pemData)
+	// Rust #54056 (http-client/src/native_roots.rs): the platform anchors are
+	// read into a clone, so appending the custom bundle below cannot mutate the
+	// process-wide pool or leak into another client.
+	rootCAs := network.PlatformRootPoolClone()
+	if !rootCAs.AppendCertsFromPEM(pemData) {
+		return nil, fmt.Errorf("Failed to load CA certificates from %s selected by %s: no usable CERTIFICATE blocks found. %s", path, sourceEnv, customCAHint)
+	}
+	baseTransport := client.Transport
+	if baseTransport == nil {
+		baseTransport = http.DefaultTransport
+	}
+	transport, ok := baseTransport.(*http.Transport)
+	if !ok {
+		return nil, fmt.Errorf("Failed to build HTTP client while using CA bundle from %s (%s): default HTTP transport is not configurable", sourceEnv, path)
+	}
+	transport = transport.Clone()
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{RootCAs: rootCAs, MinVersion: tls.VersionTLS12}
+	} else {
+		transport.TLSClientConfig = transport.TLSClientConfig.Clone()
+		transport.TLSClientConfig.RootCAs = rootCAs
+	}
+	client.Transport = transport
+	return client, nil
+}
+
+func configuredCustomCA() (string, string) {
+	for _, name := range []string{"CODEX_CA_CERTIFICATE", "SSL_CERT_FILE"} {
+		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+			return name, value
+		}
+	}
+	return "", ""
+}
+
+func normalizeTrustedCertificatePEM(data []byte) []byte {
+	normalized := bytes.ReplaceAll(data, []byte("-----BEGIN TRUSTED CERTIFICATE-----"), []byte("-----BEGIN CERTIFICATE-----"))
+	return bytes.ReplaceAll(normalized, []byte("-----END TRUSTED CERTIFICATE-----"), []byte("-----END CERTIFICATE-----"))
+}

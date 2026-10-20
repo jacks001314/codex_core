@@ -1,0 +1,380 @@
+package auth
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestStoreSaveLoadDelete(t *testing.T) {
+	store := NewStore(t.TempDir())
+	if err := store.Save(FromAPIKey(" sk-test ")); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("Load returned nil auth")
+	}
+	if loaded.OpenAIAPIKey != "sk-test" {
+		t.Fatalf("OpenAIAPIKey = %q", loaded.OpenAIAPIKey)
+	}
+	if loaded.Mode() != "api-key" {
+		t.Fatalf("Mode = %q", loaded.Mode())
+	}
+	data, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("ReadFile auth.json returned error: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("Unmarshal auth.json returned error: %v", err)
+	}
+	if raw["auth_mode"] != "apikey" {
+		t.Fatalf("auth_mode = %#v, want Rust storage value apikey", raw["auth_mode"])
+	}
+	removed, err := store.Delete()
+	if err != nil {
+		t.Fatalf("Delete returned error: %v", err)
+	}
+	if !removed {
+		t.Fatal("Delete removed = false, want true")
+	}
+	loaded, err = store.Load()
+	if err != nil {
+		t.Fatalf("Load after delete returned error: %v", err)
+	}
+	if loaded != nil {
+		t.Fatalf("Load after delete = %#v, want nil", loaded)
+	}
+}
+
+func TestDefaultCodexHomeUsesEnv(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CODEX_HOME", dir)
+	if got := DefaultCodexHome(); got != dir {
+		t.Fatalf("DefaultCodexHome = %q, want %q", got, dir)
+	}
+}
+
+func TestDefaultCodexHomePrefersGCODEHome(t *testing.T) {
+	gcode := t.TempDir()
+	codex := t.TempDir()
+	t.Setenv("GCODE_HOME", gcode)
+	t.Setenv("CODEX_HOME", codex)
+	if got := DefaultCodexHome(); got != gcode {
+		t.Fatalf("DefaultCodexHome = %q, want GCODE_HOME %q", got, gcode)
+	}
+}
+
+func TestSaveCreatesAuthJSON(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	if err := store.Save(FromAccessToken("pat-test")); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "auth.json"))
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	if len(data) == 0 || data[len(data)-1] != '\n' {
+		t.Fatalf("auth.json should end with newline: %q", string(data))
+	}
+}
+
+func TestKeyringStoreModePersistsOutsideAuthJSON(t *testing.T) {
+	dir := t.TempDir()
+	keyring := NewKeyringStore(KeyringBackendDirect)
+	store := NewStoreWithOptions(dir, &StoreOptions{
+		Mode:         AuthCredentialsStoreKeyring,
+		KeyringStore: keyring,
+	})
+	if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte("stale"), 0o600); err != nil {
+		t.Fatalf("WriteFile stale auth returned error: %v", err)
+	}
+	if err := store.Save(FromAPIKey("sk-keyring")); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "auth.json")); !os.IsNotExist(err) {
+		t.Fatalf("auth.json should be removed after keyring save: %v", err)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if loaded == nil || loaded.OpenAIAPIKey != "sk-keyring" {
+		t.Fatalf("loaded auth = %+v", loaded)
+	}
+	resolved, err := store.Resolve()
+	if err != nil {
+		t.Fatalf("Resolve returned error: %v", err)
+	}
+	if resolved == nil || resolved.Source != "keyring" {
+		t.Fatalf("resolved = %+v", resolved)
+	}
+	removed, err := store.Delete()
+	if err != nil {
+		t.Fatalf("Delete returned error: %v", err)
+	}
+	if !removed {
+		t.Fatal("Delete removed = false, want true")
+	}
+}
+
+func TestAutoStoreModeFallsBackToFileWhenKeyringEmpty(t *testing.T) {
+	dir := t.TempDir()
+	fileStore := NewStore(dir)
+	if err := fileStore.Save(FromAPIKey("sk-file")); err != nil {
+		t.Fatalf("file Save returned error: %v", err)
+	}
+	autoStore := NewStoreWithOptions(dir, &StoreOptions{Mode: AuthCredentialsStoreAuto})
+	loaded, err := autoStore.Load()
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if loaded == nil || loaded.OpenAIAPIKey != "sk-file" {
+		t.Fatalf("loaded auth = %+v", loaded)
+	}
+}
+
+// TestKeyringStoreModeFailsWithoutAnOSKeyringLikeRust pins Rust's "keyring when
+// available, otherwise fail": this build has no OS keyring, so requiring it
+// must surface an error instead of silently keeping credentials in memory.
+func TestKeyringStoreModeFailsWithoutAnOSKeyringLikeRust(t *testing.T) {
+	withoutOSKeyring(t)
+	dir := t.TempDir()
+	store := NewStoreWithOptions(dir, &StoreOptions{Mode: AuthCredentialsStoreKeyring})
+	if err := store.Save(FromAPIKey("sk-keyring")); err == nil || !strings.Contains(err.Error(), KeyringUnavailableError) {
+		t.Fatalf("Save() error = %v, want the keyring-unavailable error", err)
+	}
+	if _, err := store.Load(); err == nil || !strings.Contains(err.Error(), KeyringUnavailableError) {
+		t.Fatalf("Load() error = %v, want the keyring-unavailable error", err)
+	}
+	if _, err := store.Delete(); err == nil || !strings.Contains(err.Error(), KeyringUnavailableError) {
+		t.Fatalf("Delete() error = %v, want the keyring-unavailable error", err)
+	}
+}
+
+// TestAutoStoreModePersistsToFileWithoutAnOSKeyringLikeRust covers Rust's
+// documented auto fallback: without keyring storage the credentials file is the
+// durable store, so a save must reach it.
+func TestAutoStoreModePersistsToFileWithoutAnOSKeyringLikeRust(t *testing.T) {
+	withoutOSKeyring(t)
+	dir := t.TempDir()
+	store := NewStoreWithOptions(dir, &StoreOptions{Mode: AuthCredentialsStoreAuto})
+	if err := store.Save(FromAPIKey("sk-auto")); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "auth.json")); err != nil {
+		t.Fatalf("auto mode did not persist to auth.json: %v", err)
+	}
+	reloaded := NewStoreWithOptions(dir, &StoreOptions{Mode: AuthCredentialsStoreAuto})
+	loaded, err := reloaded.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if loaded == nil || loaded.OpenAIAPIKey != "sk-auto" {
+		t.Fatalf("loaded auth = %+v", loaded)
+	}
+}
+
+func TestEphemeralStoreModeIsInMemoryOnly(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStoreWithOptions(dir, &StoreOptions{Mode: AuthCredentialsStoreEphemeral})
+	if err := store.Save(FromAPIKey("sk-ephemeral")); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "auth.json")); !os.IsNotExist(err) {
+		t.Fatalf("auth.json should not exist for ephemeral store: %v", err)
+	}
+	loaded, err := NewStoreWithOptions(dir, &StoreOptions{Mode: AuthCredentialsStoreEphemeral}).Load()
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if loaded == nil || loaded.OpenAIAPIKey != "sk-ephemeral" {
+		t.Fatalf("loaded auth = %+v", loaded)
+	}
+	removed, err := store.Delete()
+	if err != nil {
+		t.Fatalf("Delete returned error: %v", err)
+	}
+	if !removed {
+		t.Fatal("Delete removed = false, want true")
+	}
+}
+
+func TestResolvePrefersEnv(t *testing.T) {
+	store := NewStore(t.TempDir())
+	if err := store.Save(FromAPIKey("sk-file")); err != nil {
+		t.Fatalf("Save returned error: %v", err)
+	}
+	t.Setenv(OpenAIAPIKeyEnv, " sk-env ")
+	resolved, err := store.Resolve()
+	if err != nil {
+		t.Fatalf("Resolve returned error: %v", err)
+	}
+	if resolved == nil {
+		t.Fatal("Resolve returned nil")
+	}
+	if resolved.Source != OpenAIAPIKeyEnv {
+		t.Fatalf("Source = %q", resolved.Source)
+	}
+	if resolved.Auth.OpenAIAPIKey != "sk-env" {
+		t.Fatalf("OpenAIAPIKey = %q", resolved.Auth.OpenAIAPIKey)
+	}
+}
+
+func TestResolveReadsRustAPIKeyAuthModeAlias(t *testing.T) {
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"auth_mode":"apikey","OPENAI_API_KEY":"sk-rust"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile auth.json returned error: %v", err)
+	}
+	resolved, err := NewStore(home).Resolve()
+	if err != nil {
+		t.Fatalf("Resolve returned error: %v", err)
+	}
+	if resolved == nil || resolved.Auth.Mode() != "api-key" || resolved.Auth.OpenAIAPIKey != "sk-rust" {
+		t.Fatalf("resolved = %+v", resolved)
+	}
+}
+
+func TestAuthModeAliasesMatchRustStorage(t *testing.T) {
+	tests := map[string]string{
+		"apikey":                "api-key",
+		"api-key":               "api-key",
+		"apiKey":                "api-key",
+		"chatgpt":               "chatgpt",
+		"chatgptAuthTokens":     "chatgptAuthTokens",
+		"chatgpt-auth-tokens":   "chatgptAuthTokens",
+		"agentIdentity":         "agent-identity",
+		"agent-identity":        "agent-identity",
+		"personalAccessToken":   "personal-access-token",
+		"personal-access-token": "personal-access-token",
+		"bedrockApiKey":         "bedrock-api-key",
+		"bedrock-api-key":       "bedrock-api-key",
+	}
+	for raw, want := range tests {
+		if got := (&AuthDotJSON{AuthMode: raw}).Mode(); got != want {
+			t.Fatalf("Mode(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
+func TestResolveClassifiesCodexAccessTokenEnv(t *testing.T) {
+	store := NewStore(t.TempDir())
+	t.Setenv(CodexAccessTokenEnv, "at-env-token")
+	resolved, err := store.Resolve()
+	if err != nil {
+		t.Fatalf("Resolve PAT returned error: %v", err)
+	}
+	if resolved == nil || resolved.Auth.Mode() != "personal-access-token" || resolved.Auth.PersonalAccessToken != "at-env-token" {
+		t.Fatalf("resolved PAT = %+v", resolved)
+	}
+
+	t.Setenv(CodexAccessTokenEnv, "header.payload.sig")
+	resolved, err = store.Resolve()
+	if err != nil {
+		t.Fatalf("Resolve JWT returned error: %v", err)
+	}
+	if resolved == nil || resolved.Auth.Mode() != "agent-identity" || resolved.Auth.AgentIdentity != "header.payload.sig" {
+		t.Fatalf("resolved JWT = %+v", resolved)
+	}
+}
+
+func TestFromBedrockAPIKeyUsesRustAuthShape(t *testing.T) {
+	snapshot := FromBedrockAPIKey(" bedrock-key ", " us-east-2 ")
+	if snapshot.Mode() != "bedrock-api-key" {
+		t.Fatalf("Mode = %q", snapshot.Mode())
+	}
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("Marshal returned error: %v", err)
+	}
+	var decoded struct {
+		AuthMode      string            `json:"auth_mode"`
+		BedrockAPIKey BedrockAPIKeyAuth `json:"bedrock_api_key"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if decoded.AuthMode != "bedrockApiKey" || decoded.BedrockAPIKey.APIKey != "bedrock-key" || decoded.BedrockAPIKey.Region != "us-east-2" {
+		t.Fatalf("decoded = %+v", decoded)
+	}
+}
+
+func TestSafeFormatSecret(t *testing.T) {
+	if got := SafeFormatSecret("sk-1234567890"); got != "sk-1...7890" {
+		t.Fatalf("SafeFormatSecret = %q", got)
+	}
+	if got := SafeFormatSecret("short"); got != "****" {
+		t.Fatalf("SafeFormatSecret(short) = %q", got)
+	}
+}
+
+// TestBedrockAPIKeyAuthDebugRedactsSecretLikeRust pins #40706: derived debug
+// formatting of BedrockAPIKeyAuth must never expose the API key, while the
+// region is retained.
+func TestBedrockAPIKeyAuthDebugRedactsSecretLikeRust(t *testing.T) {
+	auth := &BedrockAPIKeyAuth{APIKey: "super-secret-bedrock-key", Region: "us-east-1"}
+	for _, verb := range []string{"%v", "%+v", "%#v"} {
+		got := fmt.Sprintf(verb, auth)
+		if strings.Contains(got, "super-secret-bedrock-key") {
+			t.Fatalf("%s exposed the Bedrock API key: %s", verb, got)
+		}
+		if !strings.Contains(got, "<redacted>") {
+			t.Fatalf("%s did not mark the key redacted: %s", verb, got)
+		}
+		if !strings.Contains(got, "us-east-1") {
+			t.Fatalf("%s did not retain the region: %s", verb, got)
+		}
+	}
+}
+
+// withoutOSKeyring pins the keyring-unavailable behavior for a test, restoring
+// the platform value afterward.
+func withoutOSKeyring(t *testing.T) {
+	t.Helper()
+	previous := OSKeyringAvailable
+	OSKeyringAvailable = false
+	t.Cleanup(func() { OSKeyringAvailable = previous })
+}
+
+// TestKeyringStoreModeUsesTheOSKeyringWhenAvailable covers the durable backend:
+// keyring mode persists through the OS keyring and does not leave an auth.json
+// behind. It skips on hosts without a keyring.
+func TestKeyringStoreModeUsesTheOSKeyringWhenAvailable(t *testing.T) {
+	if !OSKeyringAvailable {
+		t.Skip("no durable OS keyring backend on this host")
+	}
+	dir := t.TempDir()
+	store := NewStoreWithOptions(dir, &StoreOptions{Mode: AuthCredentialsStoreKeyring})
+	if err := store.Save(FromAPIKey("sk-keyring")); err != nil {
+		if strings.Contains(err.Error(), KeyringUnavailableError) {
+			t.Skipf("keyring unavailable: %v", err)
+		}
+		t.Fatalf("Save() error = %v", err)
+	}
+	t.Cleanup(func() { _, _ = store.Delete() })
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if loaded == nil || loaded.OpenAIAPIKey != "sk-keyring" {
+		t.Fatalf("loaded auth = %+v", loaded)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "auth.json")); !os.IsNotExist(err) {
+		t.Fatalf("keyring save must not keep auth.json, stat err = %v", err)
+	}
+	removed, err := store.Delete()
+	if err != nil || !removed {
+		t.Fatalf("Delete = %v, %v", removed, err)
+	}
+	if _, err := store.Load(); err != nil {
+		t.Fatalf("Load after Delete error = %v", err)
+	}
+}

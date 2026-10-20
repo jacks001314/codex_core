@@ -1,0 +1,4431 @@
+package model
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"math/rand/v2"
+	"net/http"
+	"net/url"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	"codex_core/attachmentstore"
+	"codex_core/auth"
+	"codex_core/codexapi"
+	contextfrag "codex_core/context"
+	"codex_core/envutil"
+	"codex_core/eventmap"
+	"codex_core/network"
+	"codex_core/protocol"
+
+	"github.com/coder/websocket"
+	"github.com/google/uuid"
+	"github.com/klauspost/compress/zstd"
+)
+
+const defaultResponsesEndpoint = "https://api.openai.com/v1"
+const defaultResponsesRetryBaseDelay = 200 * time.Millisecond
+const responsesLiteHeader = "x-openai-internal-codex-responses-lite"
+
+// ResidencyHeaderName is the managed residency header applied to model
+// requests (Rust default_client.rs RESIDENCY_HEADER_NAME, #39645).
+const ResidencyHeaderName = "x-openai-internal-codex-residency"
+const responsesIncludeTimingMetricsHeader = codexapi.ClientResponsesAPIIncludeTimingMetricsHeader
+
+// ResponsesEndpoint selects the Responses-compatible backend route used for an
+// inference request. Rust #40892 re-added opt-in Guardian routes; requests keep
+// using the standard route unless the caller selects a dedicated endpoint.
+type ResponsesEndpoint int
+
+const (
+	// ResponsesEndpointResponses is the standard user-owned model inference route.
+	ResponsesEndpointResponses ResponsesEndpoint = iota
+	// ResponsesEndpointGuardian is the full Guardian approval-review inference route.
+	ResponsesEndpointGuardian
+	// ResponsesEndpointGuardianClassifier is the lightweight Guardian risk-classifier route.
+	ResponsesEndpointGuardianClassifier
+)
+
+// Path returns the provider-relative path for this inference surface.
+func (e ResponsesEndpoint) Path() string {
+	switch e {
+	case ResponsesEndpointGuardian:
+		return "/guardian"
+	case ResponsesEndpointGuardianClassifier:
+		return "/guardian-classifier"
+	default:
+		return "/responses"
+	}
+}
+
+type HTTPDoer interface {
+	Do(request *http.Request) (*http.Response, error)
+}
+
+func responsesRequestedRetryDelay(headers http.Header, now time.Time) (time.Duration, bool) {
+	retryAfter, ok := responsesRequestedRetryAfter(headers, now)
+	if !ok {
+		return 0, false
+	}
+	delay := retryAfter.Deadline().Sub(now)
+	if delay < 0 {
+		delay = 0
+	}
+	return delay, true
+}
+
+func responsesRequestedRetryAfter(headers http.Header, now time.Time) (codexapi.RetryAfter, bool) {
+	retryAfter := strings.TrimSpace(headers.Get("Retry-After"))
+	if retryAfter == "" {
+		return codexapi.RetryAfter{}, false
+	}
+	delay, ok := responsesRetryAfterFromHeaderValue(retryAfter, now)
+	if !ok {
+		return codexapi.RetryAfter{}, false
+	}
+	return codexapi.NewRetryAfterAt(now.Add(delay)), true
+}
+
+func (e *ResponsesAPIError) RequestedRetryDelay() (time.Duration, bool) {
+	retryAfter, ok := e.RequestedRetryAfter()
+	if !ok {
+		return 0, false
+	}
+	return retryAfter.RemainingDelay(), true
+}
+
+func (e *ResponsesAPIError) RequestedRetryAfter() (codexapi.RetryAfter, bool) {
+	if e == nil || !e.hasRetryAfter {
+		return codexapi.RetryAfter{}, false
+	}
+	return e.retryAfter, true
+}
+
+type ResponsesAgentOptions struct {
+	Provider                   *APIProvider
+	Auth                       *AuthHeaders
+	HTTPClient                 HTTPDoer
+	ProviderID                 string
+	ProviderCapabilities       *ProviderCapabilities
+	ProviderRequiresOpenAIAuth bool
+	ProviderUsesOwnCredentials bool
+	Stream                     bool
+	StreamHandler              ResponsesStreamHandler
+	// AuthRecoveryHandler receives the turn-scoped progress of a
+	// provider-owned authentication recovery (Rust #41239).
+	AuthRecoveryHandler ProviderAuthRecoveryHandler
+	CodexHome           string
+	AuthSnapshot        *auth.AuthDotJSON
+	AuthIssuer          string
+	StoreOptions        *auth.StoreOptions
+	ExternalAuthRefresh ExternalAuthRefreshFunc
+	// WorkloadIdentityRefresh refreshes process-scoped workload identity
+	// after a downstream 401 (Rust WorkloadIdentityExternalAuth::refresh,
+	// #38188). When nil, the runner lazily builds one from StoreOptions.
+	WorkloadIdentityRefresh  WorkloadIdentityRefreshFunc
+	AgentIdentity            *AgentIdentityOptions
+	ModelsManager            ModelsManager
+	EnableRequestCompression bool
+	// ContentItemKindsEnabled mirrors Rust's content_item_kinds feature gate:
+	// when disabled, content_item_kinds is cleared from every response item
+	// carried to the provider (Rust client.rs prepare_response_items_for_request).
+	// nil means enabled (the feature default is on), matching the Stable
+	// default_enabled: true registration.
+	ContentItemKindsEnabled *bool
+	IncludeAttestation      bool
+	AttestationProvider     codexapi.AttestationProvider
+	SupportsWebsockets      bool
+	WebsocketConnectTimeout time.Duration
+	// RejectRedirects mirrors Rust ClientRedirectPolicy::Reject: set when the
+	// provider was rewritten to a discovered workspace backend so a redirect
+	// can never forward the credential to another origin.
+	RejectRedirects bool
+	// OutputTokenReplayEnabled mirrors Feature::OutputTokenReplay. It requests
+	// output.encrypted_content only from OpenAI providers so sampled output can
+	// be replayed without changing its tokenization.
+	OutputTokenReplayEnabled bool
+	// UnboundedConnectionRetries keeps active sampling turns alive until a
+	// failed network connection recovers (Rust Feature::UnboundedConnectionRetries,
+	// default enabled). nil means the feature default (enabled).
+	UnboundedConnectionRetries *bool
+	// AWS carries the Amazon Bedrock SDK credential configuration when the
+	// provider uses the AWS credential chain (Rust #39410).
+	AWS *ProviderAWSAuthInfo
+	// Metrics, when set, receives the per-attempt API request metrics (Rust's
+	// SessionTelemetry::record_api_request).
+	Metrics MetricsSink
+	// ImageStore is the attachment store image preparation uploads prepared
+	// images to (Rust `Session::image_store`, #51517). nil keeps images inline.
+	ImageStore attachmentstore.Store
+	// ApiKeyCyberAccessPrograms is the resolved Rust
+	// `ApiKeyCyberAccessPrograms` policy for this runner
+	// (ApiKeyCyberAccessProgramsFromConfig). The zero value drops an API-key
+	// session's explicit program, matching the feature's default-off behavior
+	// without failing the turn.
+	ApiKeyCyberAccessPrograms ApiKeyCyberAccessPrograms
+}
+
+type ResponsesAgentRunner struct {
+	Provider                   *APIProvider
+	Auth                       *AuthHeaders
+	HTTPClient                 HTTPDoer
+	ProviderID                 string
+	ProviderCapabilities       ProviderCapabilities
+	ProviderRequiresOpenAIAuth bool
+	ProviderUsesOwnCredentials bool
+	Stream                     bool
+	StreamHandler              ResponsesStreamHandler
+	// AuthRecoveryHandler receives the turn-scoped progress of a
+	// provider-owned authentication recovery (Rust #41239).
+	AuthRecoveryHandler        ProviderAuthRecoveryHandler
+	CodexHome                  string
+	AuthSnapshot               *auth.AuthDotJSON
+	AuthIssuer                 string
+	StoreOptions               *auth.StoreOptions
+	ExternalAuthRefresh        ExternalAuthRefreshFunc
+	WorkloadIdentityRefresh    WorkloadIdentityRefreshFunc
+	AgentIdentity              *AgentIdentityOptions
+	AgentIdentityTelemetry     *codexapi.AgentIdentityTelemetry
+	ModelsManager              ModelsManager
+	EnableRequestCompression   bool
+	ContentItemKindsEnabled    *bool
+	IncludeAttestation         bool
+	AttestationProvider        codexapi.AttestationProvider
+	SupportsWebsockets         bool
+	WebsocketConnectTimeout    time.Duration
+	RejectRedirects            bool
+	UnboundedConnectionRetries *bool
+	OutputTokenReplayEnabled   bool
+	// AWS carries the Amazon Bedrock SDK credential configuration (Rust
+	// #39410) so expired SDK credentials can be refreshed on 401 failures.
+	AWS *ProviderAWSAuthInfo
+	// Residency, when set, is the managed residency requirement enforced as an
+	// authoritative header on model requests (Rust #39645).
+	Residency             string
+	providerAuthFetchedAt time.Time
+	turnState             *responsesTurnStateCache
+	websocketSessions     *responsesWebsocketSessionCache
+	agentIdentityTried    bool
+	agentIdentityBypass   bool
+	// AWSRefreshMu and AWSRefreshInFlight share Bedrock AWS credential
+	// refresh state across concurrent failures (Rust shared_state, #39410).
+	AWSRefreshMu       *sync.Mutex
+	AWSRefreshInFlight chan struct{}
+	// bedrockAuthRecoveryAttempted bounds provider-owned Bedrock auth recovery
+	// to one attempt per request (Rust #39274).
+	bedrockAuthRecoveryAttempted bool
+	// Metrics receives the per-attempt API request metrics when the app layer
+	// installs a sink (Rust's SessionTelemetry).
+	Metrics MetricsSink
+	// Telemetry receives the diagnostic records for the client's events (the
+	// log-only and trace-safe halves of Rust's SessionTelemetry) when the app
+	// layer installs a sink.
+	Telemetry SessionTelemetrySink
+	// ImageStore is the attachment store image preparation hands prepared
+	// images to (Rust `Session::image_store`). A nil store keeps images inline,
+	// mirroring Rust's `passthrough_image_store()` default; a host with a
+	// durable backend installs its own store (Rust #51517).
+	ImageStore attachmentstore.Store
+	// ApiKeyCyberAccessPrograms carries the resolved API-key cyber-access
+	// program policy handed in through ResponsesAgentOptions.
+	ApiKeyCyberAccessPrograms ApiKeyCyberAccessPrograms
+	// inferenceTools retains the last model-visible tool list per conversation so
+	// each sampling request can count a catalog change on the turn profile
+	// (Rust #50964 `ModelClientState::last_inference_tools`). The pointer is
+	// shared by WithStreamHandler clones.
+	inferenceTools *responsesInferenceToolCache
+}
+
+// imageStore returns the configured attachment store, defaulting to the inline
+// store like Rust's `ThreadManager::passthrough_image_store()`.
+func (r *ResponsesAgentRunner) imageStore() attachmentstore.Store {
+	if r == nil {
+		return attachmentstore.StoreOrDefault(nil)
+	}
+	return attachmentstore.StoreOrDefault(r.ImageStore)
+}
+
+type responsesTurnStateCache struct {
+	mu     sync.Mutex
+	turnID string
+	value  string
+}
+
+type responsesWebsocketSessionCache struct {
+	mu       sync.Mutex
+	sessions map[string]*responsesWebsocketSession
+	disabled bool
+}
+
+type responsesWebsocketSession struct {
+	mu   sync.Mutex
+	conn *websocket.Conn
+}
+
+type AgentIdentityOptions struct {
+	Enabled                   bool
+	ChatGPTBaseURL            string
+	AuthAPIBaseURL            string
+	ForcedChatGPTWorkspaceIDs []string
+	SessionSource             string
+	AgentVersion              string
+}
+
+type ExternalAuthRefreshReason string
+
+const ExternalAuthRefreshUnauthorized ExternalAuthRefreshReason = "unauthorized"
+
+type ExternalAuthRefreshRequest struct {
+	Reason            ExternalAuthRefreshReason
+	PreviousAccountID string
+}
+
+type ExternalAuthRefreshResponse struct {
+	AccessToken      string
+	ChatGPTAccountID string
+	ChatGPTPlanType  *string
+}
+
+// Format redacts the refreshed access token from diagnostic output.
+func (r ExternalAuthRefreshResponse) Format(f fmt.State, verb rune) {
+	fmt.Fprintf(f, "model.ExternalAuthRefreshResponse{AccessToken:%s, ChatGPTAccountID:%q, ChatGPTPlanType:%v}",
+		redactedFormatValue, r.ChatGPTAccountID, r.ChatGPTPlanType)
+}
+
+type ExternalAuthRefreshFunc func(ctx context.Context, request *ExternalAuthRefreshRequest) (*ExternalAuthRefreshResponse, error)
+
+// WorkloadIdentityRefreshFunc re-exchanges workload identity tokens preserving
+// the previously authenticated account.
+type WorkloadIdentityRefreshFunc func(ctx context.Context, previousAccountID string) (*auth.AuthDotJSON, error)
+
+// MaxResponseMessageBytes mirrors Rust's client_tool_metadata
+// `MAX_RESPONSE_MESSAGE_BYTES`: the soft cap on one serialized outgoing message.
+const MaxResponseMessageBytes = 15 * 1024 * 1024
+
+// boundedInputForResponseMessage mirrors Rust's
+// `client_tool_metadata::bounded_input`: a message whose serialized form exceeds
+// the soft cap is bounded by the overage, and only its optional
+// executed-tool-call metadata changes. Model-visible input, ordinary content and
+// the WebSocket continuation history stay intact.
+func boundedInputForResponseMessage(apiRequest *responsesAgentRequest, request *AgentRequest, metrics MetricsSink) []any {
+	if apiRequest == nil {
+		return nil
+	}
+	input := apiRequest.Input
+	if len(input) == 0 || request == nil {
+		return input
+	}
+	before := ExecutedToolCallMetadataTotalBytes(input)
+	if before == 0 {
+		return input
+	}
+	encoded, err := json.Marshal(apiRequest)
+	if err != nil || len(encoded) <= MaxResponseMessageBytes {
+		return input
+	}
+	budget := before - (len(encoded) - MaxResponseMessageBytes)
+	if budget < 0 {
+		budget = 0
+	}
+	bounded := BoundExecutedToolCallsForMessage(input, budget)
+	after := ExecutedToolCallMetadataTotalBytes(bounded)
+	if after == before {
+		return input
+	}
+	if sink, ok := metrics.(ToolMetadataMetricSink); ok {
+		RecordToolMetadataShedding(sink, "message", before, after)
+	}
+	if request.OnWireInputBounded != nil {
+		request.OnWireInputBounded(input, bounded)
+	}
+	return bounded
+}
+
+type responsesAgentRequest struct {
+	// Rust #49675: keep the routing fields first. encoding/json serializes
+	// struct fields in declaration order, and gateways may inspect a request
+	// body incrementally before buffering a potentially multi-megabyte input.
+	Model                string                  `json:"model"`
+	Stream               bool                    `json:"stream"`
+	ServiceTier          string                  `json:"service_tier,omitempty"`
+	Instructions         string                  `json:"instructions,omitempty"`
+	Input                []any                   `json:"input"`
+	Tools                []any                   `json:"tools,omitempty"`
+	ToolChoice           string                  `json:"tool_choice,omitempty"`
+	ParallelToolCalls    bool                    `json:"parallel_tool_calls"`
+	Reasoning            *responsesReasoning     `json:"reasoning,omitempty"`
+	Store                bool                    `json:"store"`
+	StreamOptions        *responsesStreamOptions `json:"stream_options,omitempty"`
+	Include              []string                `json:"include,omitempty"`
+	PromptCacheKey       string                  `json:"prompt_cache_key,omitempty"`
+	Text                 *responsesTextParam     `json:"text,omitempty"`
+	ClientMetadata       map[string]string       `json:"client_metadata,omitempty"`
+	AccessPrograms       *AccessPrograms         `json:"access_programs,omitempty"`
+	UseResponsesLite     bool                    `json:"-"`
+	IncludeTimingMetrics bool                    `json:"-"`
+	BetaFeaturesHeader   string                  `json:"-"`
+}
+
+type responsesReasoning struct {
+	Effort  string `json:"effort,omitempty"`
+	Summary string `json:"summary,omitempty"`
+	Context string `json:"context,omitempty"`
+}
+
+// MarshalJSON mirrors Rust's `serialize_reasoning_effort`
+// (codex-rs/codex-api/src/common.rs, #47590). Named reasoning levels stay JSON
+// strings, but a custom effort that parses as an unsigned integer is sent as a
+// JSON number, so `model_reasoning_effort = "64"` reaches the API as
+// `"effort": 64`. Named levels keep the struct's field order and omitempty
+// behavior, so their wire form is unchanged.
+func (r responsesReasoning) MarshalJSON() ([]byte, error) {
+	effort, err := reasoningEffortJSONValue(r.Effort)
+	if err != nil {
+		return nil, err
+	}
+	type wireReasoning struct {
+		Effort  json.RawMessage `json:"effort,omitempty"`
+		Summary string          `json:"summary,omitempty"`
+		Context string          `json:"context,omitempty"`
+	}
+	return json.Marshal(wireReasoning{Effort: effort, Summary: r.Summary, Context: r.Context})
+}
+
+// reasoningEffortJSONValue renders one reasoning effort the way Rust's
+// `ReasoningEffortConfig` serializer does (#47590): an empty effort stays
+// omitted, a custom value that `parse::<u64>()` accepts becomes the decimal
+// JSON number `serialize_u64` would emit (so `+007` collapses to `7`), and
+// everything else, including named levels and out-of-range or non-numeric
+// custom values, stays a JSON string.
+func reasoningEffortJSONValue(effort string) (json.RawMessage, error) {
+	if effort == "" {
+		return nil, nil
+	}
+	if !IsKnownReasoningEffort(effort) {
+		// Rust's `u64::from_str` accepts one optional leading '+'.
+		if value, err := strconv.ParseUint(strings.TrimPrefix(effort, "+"), 10, 64); err == nil {
+			return json.RawMessage(strconv.FormatUint(value, 10)), nil
+		}
+	}
+	return json.Marshal(effort)
+}
+
+type responsesStreamOptions struct {
+	ReasoningSummaryDelivery string `json:"reasoning_summary_delivery"`
+}
+
+type responsesTextParam struct {
+	Verbosity string               `json:"verbosity,omitempty"`
+	Format    *responsesTextFormat `json:"format,omitempty"`
+}
+
+type responsesTextFormat struct {
+	Name   string `json:"name"`
+	Type   string `json:"type"`
+	Strict bool   `json:"strict"`
+	Schema any    `json:"schema"`
+}
+
+type responsesInputMessage struct {
+	ID       string                         `json:"id,omitempty"`
+	Type     string                         `json:"type,omitempty"`
+	Role     string                         `json:"role"`
+	Content  []responsesInputContent        `json:"content"`
+	Metadata *responsesInputMessageMetadata `json:"internal_chat_message_metadata_passthrough,omitempty"`
+}
+
+type responsesInputMessageMetadata struct {
+	ContentItemKinds []string `json:"content_item_kinds,omitempty"`
+}
+
+type responsesInputContent struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type responsesAgentAPIResponse struct {
+	ID         string                      `json:"id"`
+	Model      string                      `json:"model"`
+	OutputText string                      `json:"output_text"`
+	Output     []responsesAgentOutputItem  `json:"output"`
+	Usage      responsesAgentAPIUsage      `json:"usage"`
+	Error      *responsesAgentAPIErrorBody `json:"error,omitempty"`
+}
+
+type responsesAgentOutputItem struct {
+	ID                    string                       `json:"id"`
+	Type                  string                       `json:"type"`
+	Role                  string                       `json:"role"`
+	Phase                 string                       `json:"phase"`
+	Content               []responsesAgentContentBlock `json:"content"`
+	Name                  string                       `json:"name"`
+	Namespace             string                       `json:"namespace"`
+	CallID                string                       `json:"call_id"`
+	EncryptedContent      *string                      `json:"encrypted_content"`
+	Arguments             any                          `json:"arguments"`
+	EncryptedFunctionArgs *[]string                    `json:"encrypted_function_args"`
+	Input                 string                       `json:"input"`
+	Status                string                       `json:"status"`
+	Revised               string                       `json:"revised_prompt"`
+	Result                string                       `json:"result"`
+	Execution             string                       `json:"execution"`
+	Search                map[string]any               `json:"search"`
+	Action                map[string]any               `json:"action"`
+}
+
+type responsesAgentContentBlock struct {
+	Type        string `json:"type"`
+	Text        string `json:"text"`
+	Annotations *[]any `json:"annotations,omitempty"`
+	Logprobs    *[]any `json:"logprobs,omitempty"`
+}
+
+type responsesAgentAPIUsage struct {
+	InputTokens  int64 `json:"input_tokens"`
+	OutputTokens int64 `json:"output_tokens"`
+	TotalTokens  int64 `json:"total_tokens"`
+	// CodexRolloutBudgetUnits mirrors the Rust ResponseCompletedUsage field:
+	// provider-reported units consumed from the shared rollout budget. It can
+	// be a fractional number (e.g. 2.5), so json.Number preserves the literal.
+	CodexRolloutBudgetUnits json.Number `json:"codex_rollout_budget_units"`
+	InputTokensDetails      *struct {
+		CachedTokens     int64 `json:"cached_tokens"`
+		CacheWriteTokens int64 `json:"cache_write_tokens"`
+	} `json:"input_tokens_details,omitempty"`
+	OutputTokensDetails *struct {
+		ReasoningTokens int64 `json:"reasoning_tokens"`
+	} `json:"output_tokens_details,omitempty"`
+}
+
+type responsesAgentAPIErrorBody struct {
+	Message string `json:"message"`
+	Type    string `json:"type,omitempty"`
+	Code    any    `json:"code,omitempty"`
+	// LimitWindowMinutes is the server-selected window responsible for a usage
+	// limit. It stays untyped because Rust accepts any JSON value and keeps only
+	// unsigned integers that fit in u16 (Rust #48174).
+	LimitWindowMinutes any `json:"limit_window_minutes,omitempty"`
+	// Misalignment carries the optional public explanation and continuation
+	// instruction returned with a misalignment block (Rust #40952).
+	Misalignment json.RawMessage `json:"misalignment,omitempty"`
+}
+
+type ResponsesAPIError struct {
+	StatusCode int
+	Message    string
+	Body       string
+	// UserMessage overrides the rendered message when the host has
+	// provider-specific guidance (Rust's `UnexpectedResponseError::user_message`):
+	// the Cloudflare-blocked copy and Amazon Bedrock's expired-signature copy.
+	UserMessage string
+	// URL is the request URL Rust renders after the message (Rust's `url`).
+	URL                    string
+	RequestID              string
+	CFRay                  string
+	AuthorizationError     string
+	AuthorizationErrorCode string
+	retryAfter             codexapi.RetryAfter
+	hasRetryAfter          bool
+}
+
+// unexpectedResponseBodyMaxBytes is Rust's `UNEXPECTED_RESPONSE_BODY_MAX_BYTES`.
+const unexpectedResponseBodyMaxBytes = 1000
+
+// cloudflareBlockedMessage is Rust codex-api's `CLOUDFLARE_BLOCKED_MESSAGE`.
+const cloudflareBlockedMessage = "Access blocked by Cloudflare. This usually happens when connecting from a restricted region"
+
+// Error renders Rust's `UnexpectedResponseError::Display` (#48174's error lane):
+// a provider-specific user message when present, otherwise the status and the
+// body, followed by whatever response context the request carried. The
+// app-server reports this string as the turn error message, so it must match
+// Rust rather than carry a Go-only prefix.
+func (e *ResponsesAPIError) Error() string {
+	if e == nil {
+		return "responses API request failed"
+	}
+	message := e.UserMessage
+	if message == "" {
+		message = fmt.Sprintf("unexpected status %s: %s", httpStatusDisplay(e.StatusCode), e.displayBody())
+	}
+	if e.URL != "" {
+		message += ", url: " + e.URL
+	}
+	if e.CFRay != "" {
+		message += ", cf-ray: " + e.CFRay
+	}
+	if e.RequestID != "" {
+		message += ", request id: " + e.RequestID
+	}
+	if e.AuthorizationError != "" {
+		message += ", auth error: " + e.AuthorizationError
+	}
+	if e.AuthorizationErrorCode != "" {
+		message += ", auth error code: " + e.AuthorizationErrorCode
+	}
+	return message
+}
+
+// displayBody mirrors Rust's `UnexpectedResponseError::display_body`: a JSON
+// body's `error.message` wins, an empty body reports `Unknown error`, and any
+// other body is truncated with an ellipsis at the byte limit.
+func (e *ResponsesAPIError) displayBody() string {
+	if message := extractUnexpectedResponseErrorMessage(e.Body); message != "" {
+		return message
+	}
+	trimmed := strings.TrimSpace(e.Body)
+	if trimmed == "" {
+		return "Unknown error"
+	}
+	return truncateWithEllipsis(trimmed, unexpectedResponseBodyMaxBytes)
+}
+
+// extractUnexpectedResponseErrorMessage mirrors Rust's `extract_error_message`:
+// the body's `error.message` string, trimmed, or nothing when it is absent or
+// blank.
+func extractUnexpectedResponseErrorMessage(body string) string {
+	var payload struct {
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(body), &payload); err != nil || payload.Error == nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.Error.Message)
+}
+
+// truncateWithEllipsis mirrors Rust's `truncate_with_ellipsis`: cut at the byte
+// limit on a UTF-8 boundary and mark the truncation.
+func truncateWithEllipsis(text string, maxBytes int) string {
+	if len(text) <= maxBytes {
+		return text
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	return text[:cut] + "..."
+}
+
+// httpStatusDisplay mirrors `http::StatusCode`'s Display: the code and its
+// reason phrase, or just the code for a status this build does not name.
+func httpStatusDisplay(statusCode int) string {
+	if text := http.StatusText(statusCode); text != "" {
+		return strconv.Itoa(statusCode) + " " + text
+	}
+	return strconv.Itoa(statusCode)
+}
+
+// responsesProviderUserMessage mirrors Rust's provider-specific `user_message`
+// overrides: codex-api's Cloudflare-blocked 403 copy and model-provider's
+// Amazon Bedrock expired-signature 401 copy.
+func responsesProviderUserMessage(providerName string, statusCode int, bodyText string) string {
+	if providerName == AmazonBedrockProviderName && statusCode == http.StatusUnauthorized && strings.Contains(bodyText, "Signature expired:") {
+		return bedrockExpiredSignatureMessage
+	}
+	if statusCode == http.StatusForbidden && strings.Contains(bodyText, "Cloudflare") && strings.Contains(bodyText, "blocked") {
+		return cloudflareBlockedMessage + " (status " + httpStatusDisplay(statusCode) + ")"
+	}
+	return ""
+}
+
+// setResponsesAPIErrorURL records the request URL Rust renders after an
+// unexpected-status message (`UnexpectedResponseError::url`). The transport
+// error carries it in Rust; Go's HTTP client exposes it on the response.
+func setResponsesAPIErrorURL(err error, response *http.Response) {
+	responsesErr, ok := err.(*ResponsesAPIError)
+	if !ok || responsesErr == nil || response == nil || response.Request == nil || response.Request.URL == nil {
+		return
+	}
+	responsesErr.URL = response.Request.URL.String()
+}
+
+func NewResponsesAgentRunner(options *ResponsesAgentOptions) *ResponsesAgentRunner {
+	if options == nil {
+		options = &ResponsesAgentOptions{}
+	}
+	provider := options.Provider
+	if provider == nil {
+		provider = defaultAPIProvider()
+	} else {
+		provider = cloneAPIProvider(provider)
+	}
+	client := options.HTTPClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	var providerAuthFetchedAt time.Time
+	if provider.Auth != nil && options.Auth != nil {
+		providerAuthFetchedAt = time.Now()
+	}
+	providerCapabilities := DefaultProviderCapabilities()
+	if options.ProviderCapabilities != nil {
+		providerCapabilities = *options.ProviderCapabilities
+	}
+	providerRequiresOpenAIAuth := options.ProviderRequiresOpenAIAuth
+	if !providerRequiresOpenAIAuth && provider != nil && strings.EqualFold(provider.Name, OpenAIProviderName) {
+		providerRequiresOpenAIAuth = true
+	}
+	return &ResponsesAgentRunner{
+		Provider:                   provider,
+		Auth:                       cloneAuthHeaders(options.Auth),
+		HTTPClient:                 client,
+		ProviderID:                 strings.TrimSpace(options.ProviderID),
+		ProviderCapabilities:       providerCapabilities,
+		ProviderRequiresOpenAIAuth: providerRequiresOpenAIAuth,
+		ProviderUsesOwnCredentials: options.ProviderUsesOwnCredentials || provider.Auth != nil,
+		Stream:                     options.Stream,
+		StreamHandler:              options.StreamHandler,
+		AuthRecoveryHandler:        options.AuthRecoveryHandler,
+		CodexHome:                  strings.TrimSpace(options.CodexHome),
+		AuthSnapshot:               cloneAuthSnapshot(options.AuthSnapshot),
+		AuthIssuer:                 strings.TrimSpace(options.AuthIssuer),
+		StoreOptions:               cloneStoreOptions(options.StoreOptions),
+		ExternalAuthRefresh:        options.ExternalAuthRefresh,
+		WorkloadIdentityRefresh:    options.WorkloadIdentityRefresh,
+		AgentIdentity:              cloneAgentIdentityOptions(options.AgentIdentity),
+		AgentIdentityTelemetry:     agentIdentityTelemetryFromAuthHeaders(options.Auth),
+		ModelsManager:              options.ModelsManager,
+		EnableRequestCompression:   options.EnableRequestCompression,
+		ContentItemKindsEnabled:    cloneBoolPtrModel(options.ContentItemKindsEnabled),
+		IncludeAttestation:         options.IncludeAttestation,
+		AttestationProvider:        options.AttestationProvider,
+		SupportsWebsockets:         options.SupportsWebsockets,
+		WebsocketConnectTimeout:    options.WebsocketConnectTimeout,
+		RejectRedirects:            options.RejectRedirects,
+		OutputTokenReplayEnabled:   options.OutputTokenReplayEnabled,
+		UnboundedConnectionRetries: cloneBoolPtrModel(options.UnboundedConnectionRetries),
+		AWS:                        cloneProviderAWSAuthInfo(options.AWS),
+		Metrics:                    options.Metrics,
+		ApiKeyCyberAccessPrograms:  options.ApiKeyCyberAccessPrograms,
+		ImageStore:                 attachmentstore.StoreOrDefault(options.ImageStore),
+		AWSRefreshMu:               &sync.Mutex{},
+		providerAuthFetchedAt:      providerAuthFetchedAt,
+		turnState:                  &responsesTurnStateCache{},
+		websocketSessions:          &responsesWebsocketSessionCache{sessions: map[string]*responsesWebsocketSession{}},
+		inferenceTools:             &responsesInferenceToolCache{},
+	}
+}
+
+func (r *ResponsesAgentRunner) awsRefreshMutex() *sync.Mutex {
+	if r.AWSRefreshMu == nil {
+		r.AWSRefreshMu = &sync.Mutex{}
+	}
+	return r.AWSRefreshMu
+}
+
+func (r *ResponsesAgentRunner) websocketSession(request *AgentRequest) *responsesWebsocketSession {
+	key := r.websocketSessionKey(request)
+	r.websocketSessions.mu.Lock()
+	defer r.websocketSessions.mu.Unlock()
+	session := r.websocketSessions.sessions[key]
+	if session == nil {
+		session = &responsesWebsocketSession{}
+		r.websocketSessions.sessions[key] = session
+	}
+	return session
+}
+
+// websocketSessionKey resolves the cache key of the session a request uses,
+// including the reviewer-specific suffix.
+func (r *ResponsesAgentRunner) websocketSessionKey(request *AgentRequest) string {
+	key := responsesWebsocketSessionKey(request)
+	if request != nil && request.Endpoint != ResponsesEndpointResponses {
+		// Rust #40892 keeps endpoint-specific websocket connections separate so a
+		// Guardian route never reuses the ordinary /responses socket.
+		key += fmt.Sprintf(":endpoint=%s", request.Endpoint.Path())
+	}
+	// Rust #45736 reconnects the cached socket when the applicable responses
+	// headers change (they are scoped to the reviewer model), so a Guardian
+	// review never reuses the reviewed thread's ordinary connection or the
+	// connection of a review with a different model.
+	guardianModel := ""
+	if request != nil {
+		guardianModel = strings.TrimSpace(request.Model)
+	}
+	if r.isGuardianReviewerInference(guardianModel, request) {
+		key += ":guardian-reviewer"
+	}
+	return key
+}
+
+// dropConnectionForRequest mirrors Rust #48141's
+// `ModelClientSession::drop_connection`: a preempted sampling request drops its
+// cached WebSocket connection and the continuation state, so the replacement
+// request starts a fresh connection and sends full history.
+func (r *ResponsesAgentRunner) dropConnectionForRequest(request *AgentRequest) {
+	if r == nil {
+		return
+	}
+	if r.websocketSessions != nil {
+		key := r.websocketSessionKey(request)
+		r.websocketSessions.mu.Lock()
+		session := r.websocketSessions.sessions[key]
+		delete(r.websocketSessions.sessions, key)
+		r.websocketSessions.mu.Unlock()
+		if session != nil {
+			session.mu.Lock()
+			closeResponsesWebsocketSession(session, "preempted")
+			session.mu.Unlock()
+		}
+	}
+	if r.turnState != nil {
+		r.turnState.mu.Lock()
+		r.turnState.turnID = ""
+		r.turnState.value = ""
+		r.turnState.mu.Unlock()
+	}
+}
+
+func (r *ResponsesAgentRunner) websocketsDisabled() bool {
+	if r == nil || r.websocketSessions == nil {
+		return false
+	}
+	r.websocketSessions.mu.Lock()
+	defer r.websocketSessions.mu.Unlock()
+	return r.websocketSessions.disabled
+}
+
+// ResetAuthOwnedCaches drops cached Responses WebSocket connections and the
+// per-turn routing state so the next request reconnects with the current
+// credential owner and sends the full input with fresh routing state
+// (Rust #44489). It intentionally leaves the provider-level websocket
+// capability flag alone: that reflects provider/config support, not auth.
+func (r *ResponsesAgentRunner) ResetAuthOwnedCaches() {
+	if r == nil {
+		return
+	}
+	if r.websocketSessions != nil {
+		r.websocketSessions.mu.Lock()
+		for key, session := range r.websocketSessions.sessions {
+			if session != nil {
+				session.mu.Lock()
+				closeResponsesWebsocketSession(session, "auth ownership changed")
+				session.mu.Unlock()
+			}
+			delete(r.websocketSessions.sessions, key)
+		}
+		r.websocketSessions.mu.Unlock()
+	}
+	if r.turnState != nil {
+		r.turnState.mu.Lock()
+		r.turnState.turnID = ""
+		r.turnState.value = ""
+		r.turnState.mu.Unlock()
+	}
+}
+
+func (r *ResponsesAgentRunner) disableWebsockets() {
+	if r == nil || r.websocketSessions == nil {
+		return
+	}
+	r.websocketSessions.mu.Lock()
+	r.websocketSessions.disabled = true
+	r.websocketSessions.sessions = map[string]*responsesWebsocketSession{}
+	r.websocketSessions.mu.Unlock()
+}
+
+func responsesWebsocketSessionKey(request *AgentRequest) string {
+	if request == nil {
+		return "default"
+	}
+	if threadID := strings.TrimSpace(request.ThreadID); threadID != "" {
+		return "thread:" + threadID + ":turn:" + strings.TrimSpace(request.TurnID)
+	}
+	if subagent := strings.TrimSpace(request.ClientMetadata["x-openai-subagent"]); subagent != "" {
+		return "subagent:" + subagent
+	}
+	if request.TaskKind != "" {
+		return "task:" + string(request.TaskKind)
+	}
+	return "default"
+}
+
+func closeResponsesWebsocketSession(session *responsesWebsocketSession, reason string) {
+	if session == nil || session.conn == nil {
+		return
+	}
+	_ = session.conn.Close(websocket.StatusNormalClosure, reason)
+	session.conn = nil
+}
+
+func (r *ResponsesAgentRunner) Prewarm(ctx context.Context, request *AgentRequest) (*AgentResponse, error) {
+	if r == nil || !r.SupportsWebsockets || r.websocketsDisabled() {
+		return nil, nil
+	}
+	if request == nil {
+		return nil, ErrInvalidAgentRequest
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	session := r.websocketSession(request)
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.conn != nil {
+		return nil, nil
+	}
+	modelID := strings.TrimSpace(request.Model)
+	if modelID == "" {
+		modelID = "gpt-5.5"
+	}
+	apiRequest := &responsesAgentRequest{
+		Model: modelID, Instructions: "", Input: r.gateContentItemKinds(responsesInputItemsForProviderWithStore(request, r.providerName(), r.imageStore())), Tools: normalizeResponseToolParameters(cloneAnySlice(request.Tools)), ToolChoice: "auto",
+		Stream: true, Store: request.Store, ParallelToolCalls: request.ParallelToolCalls, ClientMetadata: cloneStringMap(request.ClientMetadata),
+	}
+	apiRequest.Input, _ = prependResponsesBaseInstructions(apiRequest.Input, responsesInstructions(request), request.ThreadID)
+	apiRequest.Reasoning = responsesReasoningParam(request, &ModelInfo{Slug: modelID, SupportsReasoningSummaries: true})
+	apiRequest.StreamOptions = responsesStreamOptionsForRequest(request, apiRequest.Reasoning, r.providerName())
+	apiRequest.Input = boundedInputForResponseMessage(apiRequest, request, r.Metrics)
+	httpRequest, err := r.newResponsesHTTPRequest(ctx, request, apiRequest, "")
+	if err != nil {
+		return nil, err
+	}
+	endpoint, err := websocketURLFromHTTP(httpRequest.URL)
+	if err != nil {
+		return nil, err
+	}
+	timeout := r.WebsocketConnectTimeout
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	connectCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	dialStartedAt := time.Now()
+	// Rust #46506: a secure WebSocket handshake reuses the HTTP factory's
+	// ChatGPT cookie store, while an explicit Cookie header still wins.
+	headers := httpRequest.Header
+	if headers.Get("Cookie") == "" {
+		if cookie := network.ChatGPTCookieHeader(endpoint); cookie != "" {
+			cloned := headers.Clone()
+			cloned.Set("Cookie", cookie)
+			headers = cloned
+		}
+	}
+	conn, response, err := websocket.Dial(connectCtx, endpoint, &websocket.DialOptions{HTTPHeader: headers})
+	if response != nil {
+		// A rejected upgrade can refresh infrastructure cookies exactly like an
+		// HTTP response.
+		network.StoreChatGPTResponseCookies(endpoint, response.Header)
+	}
+	// The prewarm handshake reports the same attempt telemetry, with a fresh
+	// connection and no retry.
+	r.recordWebsocketConnectRecord(ctx, request, apiRequest, httpRequest, response, err, time.Since(dialStartedAt), "", "")
+	if err != nil {
+		if response != nil && response.StatusCode == http.StatusUpgradeRequired {
+			r.disableWebsockets()
+			return nil, nil
+		}
+		if response != nil {
+			return nil, fmt.Errorf("responses websocket handshake failed: HTTP %d: %w", response.StatusCode, err)
+		}
+		return nil, err
+	}
+	session.conn = conn
+	payload := map[string]any{
+		"type": "response.create", "model": apiRequest.Model, "input": apiRequest.Input, "tool_choice": apiRequest.ToolChoice,
+		"parallel_tool_calls": apiRequest.ParallelToolCalls, "store": apiRequest.Store, "stream": true, "include": []string{}, "generate": false,
+	}
+	if apiRequest.Instructions != "" {
+		payload["instructions"] = apiRequest.Instructions
+	}
+	if clientMetadata := websocketClientMetadata(apiRequest.ClientMetadata, request.Trace); len(clientMetadata) > 0 {
+		payload["client_metadata"] = clientMetadata
+	}
+	if len(apiRequest.Tools) > 0 {
+		payload["tools"] = apiRequest.Tools
+	}
+	if apiRequest.Reasoning != nil {
+		payload["reasoning"] = apiRequest.Reasoning
+	}
+	if len(apiRequest.Include) > 0 {
+		payload["include"] = apiRequest.Include
+	}
+	if apiRequest.StreamOptions != nil {
+		payload["stream_options"] = apiRequest.StreamOptions
+	}
+	if apiRequest.Text != nil {
+		payload["text"] = apiRequest.Text
+	}
+	if apiRequest.ServiceTier != "" {
+		payload["service_tier"] = apiRequest.ServiceTier
+	}
+	if apiRequest.PromptCacheKey != "" {
+		payload["prompt_cache_key"] = apiRequest.PromptCacheKey
+	}
+	if apiRequest.AccessPrograms != nil {
+		payload["access_programs"] = apiRequest.AccessPrograms
+	}
+	requestStartedAt := time.Now()
+	r.recordWebsocketContinuation("full", "prewarm", "warmup")
+	writeErr := conn.Write(connectCtx, websocket.MessageText, marshalResponsesMessage(payload))
+	r.recordWebsocketRequest(writeErr, time.Since(requestStartedAt))
+	// The prewarm dials a fresh connection (it returns early when one exists).
+	r.recordWebsocketRequestRecord(ctx, writeErr, time.Since(requestStartedAt), false)
+	if writeErr != nil {
+		closeResponsesWebsocketSession(session, "prewarm write failed")
+		return nil, writeErr
+	}
+	for {
+		_, data, err := conn.Read(ctx)
+		if err != nil {
+			closeResponsesWebsocketSession(session, "prewarm read failed")
+			return nil, fmt.Errorf("responses websocket closed before response.completed: %w", err)
+		}
+		var event map[string]any
+		if err := json.Unmarshal(data, &event); err != nil {
+			return nil, fmt.Errorf("failed to decode responses websocket event: %w", err)
+		}
+		switch strings.TrimSpace(responseToolString(event["type"])) {
+		case "response.completed":
+			responseID := responseIDFromWebsocketEvent(event)
+			return &AgentResponse{ResponseID: responseID, ProviderID: r.ProviderID}, nil
+		case "response.incomplete":
+			// Rust #48508: an interrupted incomplete response is completion, so the
+			// prewarm keeps the connection; every other reason stays an error.
+			if responseIncompleteReason(data) != "interrupted" {
+				closeResponsesWebsocketSession(session, "prewarm incomplete")
+				return nil, responseIncompleteError(data)
+			}
+			return &AgentResponse{ResponseID: responseIDFromWebsocketEvent(event), ProviderID: r.ProviderID}, nil
+		case "response.failed", "error":
+			closeResponsesWebsocketSession(session, "prewarm failed")
+			return nil, fmt.Errorf("responses websocket prewarm failed: %s", strings.TrimSpace(responseToolString(event["error"])))
+		}
+	}
+}
+
+// toolResultMetadataDestinationAllowed reports whether raw tool-result metadata
+// may be sent to the resolved destination: only HTTPS api.openai.com or an
+// allowed ChatGPT host (Rust #44336).
+func toolResultMetadataDestinationAllowed(baseURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || parsed.Scheme != "https" {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == "api.openai.com" {
+		return true
+	}
+	switch host {
+	case "chatgpt.com", "chat.openai.com", "chatgpt-staging.com":
+		return true
+	}
+	return strings.HasSuffix(host, ".chatgpt.com") || strings.HasSuffix(host, ".chatgpt-staging.com")
+}
+
+// includeInternalMetadata reports whether the resolved provider may receive
+// internal tool metadata: the provider definition's runtime-only grant, or the
+// first-party HTTPS destination check (Rust #48344's
+// `ModelProvider::include_internal_metadata`).
+func (r *ResponsesAgentRunner) includeInternalMetadata() bool {
+	baseURL := ""
+	if r != nil && r.Provider != nil {
+		if r.Provider.IncludeInternalMetadata {
+			return true
+		}
+		baseURL = r.Provider.BaseURL
+	}
+	return toolResultMetadataDestinationAllowed(baseURL)
+}
+
+// filterToolResultMetadataForDestination clears raw tool-result metadata when the
+// resolved request destination is not an allowed OpenAI/ChatGPT HTTPS host. HTTP
+// and WebSocket requests share this filter (Rust #44336).
+func (r *ResponsesAgentRunner) filterToolResultMetadataForDestination(items []any) []any {
+	if r.includeInternalMetadata() {
+		return items
+	}
+	out := make([]any, 0, len(items))
+	for _, item := range items {
+		out = append(out, clearToolResultMetadataInPromptItem(item))
+	}
+	return out
+}
+
+func clearToolResultMetadataInPromptItem(value any) any {
+	switch typed := value.(type) {
+	case *AgentItem:
+		if typed != nil {
+			typed.ClearToolResultMetadata()
+		}
+		return value
+	case map[string]any:
+		metadata, ok := typed[internalChatMessageMetadataPassthroughField].(map[string]any)
+		if !ok {
+			return value
+		}
+		calls, ok := metadata[executedToolCallsField].([]any)
+		if !ok {
+			return value
+		}
+		for _, raw := range calls {
+			if call, ok := raw.(map[string]any); ok {
+				delete(call, toolResultMetadataField)
+			}
+		}
+		return value
+	default:
+		return value
+	}
+}
+
+func (r *ResponsesAgentRunner) RunWebSocket(ctx context.Context, request *AgentRequest) (*AgentResponse, error) {
+	return r.runWebSocket(ctx, request, "", "", false, &authRecoveryState{})
+}
+
+func (r *ResponsesAgentRunner) runWebSocket(ctx context.Context, request *AgentRequest, recoveryMode, recoveryPhase string, transportRetried bool, recovery *authRecoveryState) (*AgentResponse, error) {
+	if r == nil || !r.SupportsWebsockets || r.websocketsDisabled() {
+		return r.Run(ctx, request)
+	}
+	if request == nil {
+		return nil, ErrInvalidAgentRequest
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	session := r.websocketSession(request)
+	session.mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			session.mu.Unlock()
+		}
+	}()
+	modelID := strings.TrimSpace(request.Model)
+	if modelID == "" {
+		modelID = "gpt-5.5"
+	}
+	modelInfo := r.modelInfoForRequest(modelID)
+	inputItems := responsesInputItemsForProviderWithStore(request, r.providerName(), r.imageStore())
+	instructions := responsesInstructions(request)
+	tools := normalizeResponseToolParameters(cloneAnySlice(request.Tools))
+	if modelInfo.UseResponsesLite {
+		// Rust #51480: a responses-lite window that already recorded its tool
+		// declarations replays the recorded items and omits the rebuilt
+		// `instructions` / `tools` fields, exactly like the HTTP runner, so the
+		// websocket transport never re-declares (or moves) the window's catalog.
+		if WindowHasToolDeclarations(inputItems) {
+			inputItems = responsesLiteDeclaredInputItems(inputItems)
+			instructions = ""
+			tools = nil
+		}
+	} else {
+		// Rust #44249: downgrade `original` image detail for models that do not
+		// support it before sending the request over the websocket transport.
+		inputItems = normalizeResponseInputImageDetailsForModel(inputItems, modelInfo.SupportsImageDetailOriginal)
+		// Rust #51156: standard Responses requests carry base instructions as a
+		// stable developer input message instead of the top-level field.
+		inputItems, instructions = prependResponsesBaseInstructions(inputItems, instructions, request.ThreadID)
+	}
+	if !strings.EqualFold(strings.TrimSpace(r.providerName()), OpenAIProviderName) {
+		inputItems = clearInternalChatMessageMetadata(inputItems)
+	}
+	accessPrograms, err := AccessProgramsForAuth(request.CyberAccessProgram, r.AuthSnapshot, r.ApiKeyCyberAccessPrograms)
+	if err != nil {
+		return nil, err
+	}
+	apiRequest := &responsesAgentRequest{
+		Model: modelID, Instructions: instructions, Input: r.filterToolResultMetadataForDestination(r.gateContentItemKinds(inputItems)), Tools: tools, ToolChoice: "auto",
+		Stream: true, Store: request.Store, ParallelToolCalls: request.ParallelToolCalls && !modelInfo.UseResponsesLite,
+		ServiceTier: r.serviceTierForRequest(&modelInfo, request.ServiceTier), PromptCacheKey: strings.TrimSpace(request.PromptCacheKey),
+		AccessPrograms: accessPrograms,
+		ClientMetadata: cloneStringMap(request.ClientMetadata), Text: responsesTextParamForRequest(request.OutputSchema, request.ModelVerbosity, &modelInfo),
+	}
+	apiRequest.Reasoning = responsesReasoningParam(request, &modelInfo)
+	apiRequest.StreamOptions = responsesStreamOptionsForRequest(request, apiRequest.Reasoning, r.providerName())
+	if apiRequest.Reasoning != nil || r.outputTokenReplayForProvider() {
+		apiRequest.Include = r.responsesInclude()
+	}
+	apiRequest.Input = boundedInputForResponseMessage(apiRequest, request, r.Metrics)
+	httpRequest, err := r.newResponsesHTTPRequest(ctx, request, apiRequest, "")
+	if err != nil {
+		return nil, err
+	}
+	endpoint, err := websocketURLFromHTTP(httpRequest.URL)
+	if err != nil {
+		return nil, err
+	}
+	timeout := r.WebsocketConnectTimeout
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	conn := session.conn
+	// A dial only happens when the session had no connection, so an existing
+	// connection means this request reused it (Rust's connection_reused).
+	connectionReused := conn != nil
+	if conn == nil {
+		connectCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		var response *http.Response
+		dialStartedAt := time.Now()
+		conn, response, err = websocket.Dial(connectCtx, endpoint, &websocket.DialOptions{HTTPHeader: httpRequest.Header})
+		// Rust reports every handshake attempt with connection_reused false,
+		// because a dial always establishes a new connection.
+		r.recordWebsocketConnectRecord(ctx, request, apiRequest, httpRequest, response, err, time.Since(dialStartedAt), recoveryMode, recoveryPhase)
+		if err != nil {
+			if response != nil && response.StatusCode == http.StatusUpgradeRequired {
+				r.disableWebsockets()
+				return r.Run(ctx, request)
+			}
+			// Rust's websocket loop recovers from each recoverable auth error and
+			// `continue`s: the plan cursor bounds the retries, so a no-change
+			// reload retries once and the following 401 runs the token refresh.
+			if response != nil && response.StatusCode == http.StatusUnauthorized {
+				debug := authRecoveryDebug{
+					RequestID:     responseHeaderValue(response.Header, responsesRequestIDHeader, responsesOAIRequestIDHeader),
+					CFRay:         responseHeaderValue(response.Header, "cf-ray"),
+					AuthError:     responseHeaderValue(response.Header, "x-openai-authorization-error"),
+					AuthErrorCode: responseAuthorizationErrorCode(response.Header),
+				}
+				if mode, phase, refreshErr := r.recoverUnauthorizedAuth(ctx, recovery, debug); refreshErr == nil {
+					session.mu.Unlock()
+					locked = false
+					return r.runWebSocket(ctx, request, string(mode), string(phase), transportRetried, recovery)
+				}
+			}
+			if response != nil {
+				return nil, fmt.Errorf("responses websocket handshake failed: HTTP %d: %w", response.StatusCode, err)
+			}
+			return nil, err
+		}
+		session.conn = conn
+		// Rust's websocket connect records the handshake response's turn state once
+		// per request (`connect_websocket`'s `turn_state.set`), so the next request
+		// in the turn carries it.
+		if response != nil {
+			r.rememberTurnStateFromHeaders(request, response.Header)
+		}
+	}
+	payload := websocketResponseCreatePayload(apiRequest, request.PreviousResponseID, nil, request.Trace)
+	requestStartedAt := time.Now()
+	continuationMode, continuationReason := websocketContinuationTags(request.PreviousResponseID, connectionReused)
+	r.recordWebsocketContinuation(continuationMode, continuationReason, "generation")
+	writeErr := conn.Write(ctx, websocket.MessageText, marshalResponsesMessage(payload))
+	r.recordWebsocketRequest(writeErr, time.Since(requestStartedAt))
+	r.recordWebsocketRequestRecord(ctx, writeErr, time.Since(requestStartedAt), connectionReused)
+	if writeErr != nil {
+		closeResponsesWebsocketSession(session, "response write failed")
+		if !transportRetried {
+			session.mu.Unlock()
+			locked = false
+			return r.runWebSocket(ctx, request, recoveryMode, recoveryPhase, true, recovery)
+		}
+		r.disableWebsockets()
+		return r.Run(ctx, request)
+	}
+	handler := combinedResponsesStreamHandler(r.StreamHandler, request.StreamHandler)
+	accumulator := newResponsesStreamAccumulator(request)
+	var outputText strings.Builder
+	receivedEvent := false
+	for {
+		messageStartedAt := time.Now()
+		_, data, err := conn.Read(ctx)
+		if err != nil {
+			closeResponsesWebsocketSession(session, "response read failed")
+			if !receivedEvent && !transportRetried {
+				session.mu.Unlock()
+				locked = false
+				return r.runWebSocket(ctx, request, recoveryMode, recoveryPhase, true, recovery)
+			}
+			if !receivedEvent {
+				r.disableWebsockets()
+				return r.Run(ctx, request)
+			}
+			return nil, fmt.Errorf("responses websocket closed before response.completed: %w", err)
+		}
+		receivedEvent = true
+		var event map[string]any
+		if err := json.Unmarshal(data, &event); err != nil {
+			// Rust's websocket telemetry reports a parse_error kind.
+			recordWebsocketEvent(r.Metrics, "parse_error", false, time.Since(messageStartedAt))
+			return nil, fmt.Errorf("failed to decode responses websocket event: %w", err)
+		}
+		rawType := strings.TrimSpace(responseToolString(event["type"]))
+		// Rust's log_websocket_event records one sample per received message;
+		// success is false for a response.failed message.
+		recordWebsocketEvent(r.Metrics, rawType, rawType != "response.failed", time.Since(messageStartedAt))
+		if rawType == responsesWebsocketTimingKind {
+			recordResponsesTimingMetrics(r.Metrics, data)
+		}
+		switch rawType {
+		case "response.output_text.delta":
+			outputText.WriteString(responseToolString(event["delta"]))
+		case "response.output_text.done":
+			if outputText.Len() == 0 {
+				outputText.WriteString(responseToolString(event["text"]))
+			}
+		case "error":
+			closeResponsesWebsocketSession(session, "response failed")
+			if usageLimit, ok := websocketUsageLimitError(event); ok {
+				// Rust's wrapped-WebSocket mapping builds `Transport(Http{headers})`
+				// and `map_api_error` then reads the rate-limit headers off it, so a
+				// WebSocket usage limit refreshes the session's snapshot too.
+				emitUsageLimitErrorHeaderEvents(handler, websocketEventHTTPHeaders(event), usageLimit)
+				return nil, usageLimit
+			}
+			if websocketEventErrorCode(event) == "previous_response_not_found" && strings.TrimSpace(request.PreviousResponseID) != "" && !transportRetried {
+				clone := *request
+				clone.PreviousResponseID = ""
+				session.mu.Unlock()
+				locked = false
+				return r.runWebSocket(ctx, &clone, recoveryMode, recoveryPhase, true, recovery)
+			}
+			if apiErr := websocketErrorEventAPIError(event); apiErr != nil {
+				return nil, apiErr
+			}
+			return nil, fmt.Errorf("responses websocket request failed: %s", websocketEventError(event))
+		}
+		// Rust's `safety_buffering_for_event` refreshes the treatment from the
+		// event's own JSON headers before every event, so a WebSocket stream can
+		// switch the fallback model mid-stream.
+		if headers, ok := event["headers"].(map[string]any); ok {
+			if updated, ok := safetyBufferingTreatmentFromJSONHeaders(headers); ok {
+				accumulator.safetyBufferingTreatment = updated
+			}
+			// Rust's `ResponseEvent::turn_state` reads the `x-codex-turn-state`
+			// entry from a `response.metadata` event's JSON headers, so a stream
+			// can refresh the turn state without a new handshake.
+			if rawType == "response.metadata" {
+				r.rememberTurnStateFromHeaders(request, jsonHeadersToHTTPHeaders(headers))
+			}
+		}
+		completed, err := accumulator.apply(&responsesSSEEvent{Event: rawType, Data: data}, handler)
+		if err != nil {
+			return nil, err
+		}
+		if !completed {
+			continue
+		}
+		if len(accumulator.items) == 0 && strings.TrimSpace(outputText.String()) != "" {
+			accumulator.recordAgentItem(&AgentItem{Type: "agent_message", Text: outputText.String()})
+		}
+		return accumulator.agentResponse(request, r.ProviderID)
+	}
+}
+
+// Websocket client-metadata keys that carry the request's W3C trace context
+// (Rust codex-api's WS_REQUEST_HEADER_TRACEPARENT_CLIENT_METADATA_KEY /
+// WS_REQUEST_HEADER_TRACESTATE_CLIENT_METADATA_KEY).
+const (
+	websocketTraceparentMetadataKey = "ws_request_header_traceparent"
+	websocketTracestateMetadataKey  = "ws_request_header_tracestate"
+)
+
+// websocketClientMetadata mirrors codex-api's response_create_client_metadata:
+// the request's client metadata with the trace context added, or nil when the
+// merged map is empty.
+func websocketClientMetadata(clientMetadata map[string]string, trace *protocol.W3CTraceContext) map[string]string {
+	merged := map[string]string{}
+	for key, value := range clientMetadata {
+		merged[key] = value
+	}
+	if trace != nil {
+		if traceparent := strings.TrimSpace(trace.Traceparent); traceparent != "" {
+			merged[websocketTraceparentMetadataKey] = traceparent
+		}
+		if tracestate := strings.TrimSpace(trace.Tracestate); tracestate != "" {
+			merged[websocketTracestateMetadataKey] = tracestate
+		}
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	return merged
+}
+
+func websocketResponseCreatePayload(apiRequest *responsesAgentRequest, previousResponseID string, generate *bool, trace *protocol.W3CTraceContext) map[string]any {
+	payload := map[string]any{
+		"type": "response.create", "model": apiRequest.Model, "input": apiRequest.Input, "tool_choice": apiRequest.ToolChoice,
+		"parallel_tool_calls": apiRequest.ParallelToolCalls, "store": apiRequest.Store, "stream": true, "include": apiRequest.Include,
+	}
+	if strings.TrimSpace(previousResponseID) != "" {
+		payload["previous_response_id"] = strings.TrimSpace(previousResponseID)
+	}
+	if generate != nil {
+		payload["generate"] = *generate
+	}
+	if apiRequest.Instructions != "" {
+		payload["instructions"] = apiRequest.Instructions
+	}
+	if clientMetadata := websocketClientMetadata(apiRequest.ClientMetadata, trace); len(clientMetadata) > 0 {
+		payload["client_metadata"] = clientMetadata
+	}
+	if len(apiRequest.Tools) > 0 {
+		payload["tools"] = apiRequest.Tools
+	}
+	if apiRequest.Reasoning != nil {
+		payload["reasoning"] = apiRequest.Reasoning
+	}
+	if apiRequest.StreamOptions != nil {
+		payload["stream_options"] = apiRequest.StreamOptions
+	}
+	if apiRequest.Text != nil {
+		payload["text"] = apiRequest.Text
+	}
+	if apiRequest.ServiceTier != "" {
+		payload["service_tier"] = apiRequest.ServiceTier
+	}
+	if apiRequest.PromptCacheKey != "" {
+		payload["prompt_cache_key"] = apiRequest.PromptCacheKey
+	}
+	if apiRequest.AccessPrograms != nil {
+		payload["access_programs"] = apiRequest.AccessPrograms
+	}
+	return payload
+}
+
+func websocketEventError(event map[string]any) string {
+	if value, ok := event["error"].(map[string]any); ok {
+		return firstAgentItemValue(responseToolString(value["message"]), responseToolString(value["code"]), "unknown error")
+	}
+	return firstAgentItemValue(responseToolString(event["message"]), "unknown error")
+}
+
+func websocketEventErrorCode(event map[string]any) string {
+	if value, ok := event["error"].(map[string]any); ok {
+		return strings.TrimSpace(responseToolString(value["code"]))
+	}
+	return strings.TrimSpace(responseToolString(event["code"]))
+}
+
+// websocketEventHTTPHeaders converts a WebSocket event's JSON `headers` object
+// into HTTP headers, mirroring Rust's `json_headers_to_http_headers` use on the
+// wrapped transport error.
+func websocketEventHTTPHeaders(event map[string]any) http.Header {
+	headers, ok := event["headers"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	return jsonHeadersToHTTPHeaders(headers)
+}
+
+// websocketErrorEventAdviceHeaders mirrors Rust #51440: nested `error.headers`
+// wins when they carry valid retry advice, otherwise the top-level headers are
+// the fallback.
+func websocketErrorEventAdviceHeaders(event map[string]any) http.Header {
+	if value, ok := event["error"].(map[string]any); ok {
+		if headers, ok := value["headers"].(map[string]any); ok {
+			httpHeaders := jsonHeadersToHTTPHeaders(headers)
+			if _, valid := responsesRequestedRetryDelay(httpHeaders, time.Now()); valid {
+				return httpHeaders
+			}
+		}
+	}
+	return websocketEventHTTPHeaders(event)
+}
+
+// websocketErrorEventAPIError maps rate-limit and overload `error` events that
+// carry Retry-After advice to the shared retryable API error, preserving the
+// server deadline (Rust #51440). Headerless rate limits and all other codes stay
+// on the terminal generic-error path.
+func websocketErrorEventAPIError(event map[string]any) *codexapi.APIError {
+	var kind codexapi.APIErrorKind
+	switch strings.ToLower(strings.TrimSpace(websocketEventErrorCode(event))) {
+	case "rate_limit_exceeded", "rate_limited", "rate_limit":
+		kind = codexapi.ErrorRateLimitExceeded
+	case "server_is_overloaded", "overloaded":
+		kind = codexapi.ErrorServerOverloaded
+	default:
+		return nil
+	}
+	delay, ok := responsesRequestedRetryDelay(websocketErrorEventAdviceHeaders(event), time.Now())
+	if !ok {
+		return nil
+	}
+	status, _ := uint64FromAny(event["status"])
+	if status == 0 {
+		if value, ok := event["error"].(map[string]any); ok {
+			status, _ = uint64FromAny(value["status"])
+		}
+	}
+	if status > 65535 {
+		status = 0
+	}
+	return (&codexapi.APIError{
+		Kind:    kind,
+		Status:  int(status),
+		Message: websocketEventError(event),
+	}).WithRetryDelay(delay)
+}
+
+// websocketUsageLimitError mirrors Rust's wrapped-WebSocket usage-limit
+// mapping: the event must carry a numeric status and a `usage_limit_reached`
+// error type, which then reaches analytics with its preserved window
+// (Rust #48174).
+func websocketUsageLimitError(event map[string]any) (*codexapi.APIError, bool) {
+	value, ok := event["error"].(map[string]any)
+	if !ok || strings.TrimSpace(responseToolString(value["type"])) != "usage_limit_reached" {
+		return nil, false
+	}
+	status, ok := uint64FromAny(event["status"])
+	if !ok || status == 0 || status > 65535 {
+		return nil, false
+	}
+	// Rust maps the whole event text through `map_api_error`, so the evidence -
+	// including the reset instant and plan type - comes from the event's `error`
+	// object exactly as it would from an HTTP body.
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return nil, false
+	}
+	errorBody, ok := decodeUsageLimitErrorBody(payload)
+	if !ok {
+		return nil, false
+	}
+	return usageLimitReachedAPIError(int(status), usageLimitEvidenceFromResponse(errorBody, websocketEventHTTPHeaders(event))), true
+}
+
+func websocketURLFromHTTP(value *url.URL) (string, error) {
+	if value == nil {
+		return "", errors.New("responses websocket URL is nil")
+	}
+	copy := *value
+	switch copy.Scheme {
+	case "http":
+		copy.Scheme = "ws"
+	case "https":
+		copy.Scheme = "wss"
+	case "ws", "wss":
+	default:
+		return "", fmt.Errorf("unsupported responses websocket scheme %q", copy.Scheme)
+	}
+	return copy.String(), nil
+}
+
+func responseIDFromWebsocketEvent(event map[string]any) string {
+	if response, ok := event["response"].(map[string]any); ok {
+		return strings.TrimSpace(responseToolString(response["id"]))
+	}
+	return strings.TrimSpace(responseToolString(event["response_id"]))
+}
+
+func mustJSONBytes(value any) []byte {
+	data, _ := json.Marshal(value)
+	return data
+}
+
+// responsesRequestWireOrder is the field order Rust gives Responses request
+// bodies (codex-api's ResponsesApiRequest and ResponseCreateWsRequest, #49675):
+// the routing fields come before the potentially multi-megabyte input so a
+// gateway can route a request from a partially read body. The websocket
+// builders hand their payload over as a map, which encoding/json would
+// otherwise emit in lexical key order.
+var responsesRequestWireOrder = []string{
+	"type",
+	"model",
+	"stream",
+	"service_tier",
+	"previous_response_id",
+	"instructions",
+	"input",
+	"tools",
+	"tool_choice",
+	"parallel_tool_calls",
+	"reasoning",
+	"store",
+	"stream_options",
+	"include",
+	"prompt_cache_key",
+	"text",
+	"generate",
+	"client_metadata",
+	"access_programs",
+}
+
+// marshalResponsesMessage encodes a Responses request payload with
+// responsesRequestWireOrder's fields first and any remaining fields in the
+// lexical order encoding/json uses for maps (Rust #49675). Values - including
+// explicit nils - are encoded exactly as mustJSONBytes would encode them, so
+// the routing-first order is the only visible change on the wire.
+func marshalResponsesMessage(entries map[string]any) []byte {
+	if len(entries) == 0 {
+		return []byte("{}")
+	}
+	keys := make([]string, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, key := range responsesRequestWireOrder {
+		if _, ok := entries[key]; !ok {
+			continue
+		}
+		keys = append(keys, key)
+		seen[key] = struct{}{}
+	}
+	remaining := make([]string, 0, len(entries)-len(keys))
+	for key := range entries {
+		if _, ok := seen[key]; !ok {
+			remaining = append(remaining, key)
+		}
+	}
+	sort.Strings(remaining)
+	keys = append(keys, remaining...)
+
+	buffer := bytes.NewBuffer(make([]byte, 0, 256))
+	buffer.WriteByte('{')
+	for index, key := range keys {
+		if index > 0 {
+			buffer.WriteByte(',')
+		}
+		encodedKey := mustJSONBytes(key)
+		encodedValue := mustJSONBytes(entries[key])
+		if encodedKey == nil || encodedValue == nil {
+			return nil
+		}
+		buffer.Write(encodedKey)
+		buffer.WriteByte(':')
+		buffer.Write(encodedValue)
+	}
+	buffer.WriteByte('}')
+	return buffer.Bytes()
+}
+
+func NewResponsesAgentRunnerFromRuntimeProvider(providerID string, runtimeProvider RuntimeProvider, httpClient HTTPDoer) (*ResponsesAgentRunner, error) {
+	return NewResponsesAgentRunnerFromRuntimeProviderWithAuth(providerID, runtimeProvider, httpClient, "", nil)
+}
+
+func NewResponsesAgentRunnerFromRuntimeProviderWithAuth(providerID string, runtimeProvider RuntimeProvider, httpClient HTTPDoer, codexHome string, snapshot *auth.AuthDotJSON) (*ResponsesAgentRunner, error) {
+	if runtimeProvider == nil {
+		return nil, errors.New("runtime provider is nil")
+	}
+	apiProvider, err := runtimeProvider.APIProvider()
+	if err != nil {
+		return nil, err
+	}
+	authHeaders, err := runtimeProvider.APIAuth()
+	if err != nil {
+		return nil, err
+	}
+	modelsManager := runtimeProvider.ModelsManager(nil)
+	providerInfo := runtimeProvider.Info()
+	if remote, ok := modelsManager.(*RemoteModelsManager); ok && strings.TrimSpace(codexHome) != "" {
+		remote.ConfigureCache(filepath.Clean(codexHome))
+	}
+	return NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider:                   &apiProvider,
+		Auth:                       &authHeaders,
+		HTTPClient:                 httpClient,
+		ProviderID:                 providerID,
+		ProviderCapabilities:       cloneProviderCapabilities(runtimeProvider.Capabilities()),
+		ProviderRequiresOpenAIAuth: providerInfo.RequiresOpenAIAuth,
+		ProviderUsesOwnCredentials: strings.TrimSpace(providerInfo.EnvKey) != "" || strings.TrimSpace(providerInfo.ExperimentalBearerToken) != "" || providerInfo.Auth != nil,
+		CodexHome:                  codexHome,
+		AuthSnapshot:               snapshot,
+		ModelsManager:              modelsManager,
+		IncludeAttestation:         runtimeProvider.SupportsAttestation(),
+		SupportsWebsockets:         providerInfo.SupportsWebsockets,
+		WebsocketConnectTimeout: func() time.Duration {
+			info := runtimeProvider.Info()
+			return (&info).EffectiveWebsocketConnectTimeout()
+		}(),
+	}), nil
+}
+
+func (r *ResponsesAgentRunner) WithStreamHandler(handler ResponsesStreamHandler) *ResponsesAgentRunner {
+	if r == nil {
+		return nil
+	}
+	clone := *r
+	clone.Stream = true
+	clone.StreamHandler = handler
+	clone.AWSRefreshMu = &sync.Mutex{}
+	clone.Auth = cloneAuthHeaders(r.Auth)
+	clone.AuthSnapshot = cloneAuthSnapshot(r.AuthSnapshot)
+	clone.StoreOptions = cloneStoreOptions(r.StoreOptions)
+	clone.AgentIdentity = cloneAgentIdentityOptions(r.AgentIdentity)
+	clone.AgentIdentityTelemetry = cloneAgentIdentityTelemetry(r.AgentIdentityTelemetry)
+	clone.ModelsManager = r.ModelsManager
+	clone.AttestationProvider = r.AttestationProvider
+	clone.ProviderCapabilities = r.ProviderCapabilities
+	clone.ProviderRequiresOpenAIAuth = r.ProviderRequiresOpenAIAuth
+	return &clone
+}
+
+func (r *ResponsesAgentRunner) Run(ctx context.Context, request *AgentRequest) (*AgentResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if request == nil {
+		return nil, ErrInvalidAgentRequest
+	}
+	prompt := strings.TrimSpace(request.Prompt)
+	if prompt == "" && len(request.InputItems) == 0 {
+		return nil, errors.New("prompt or input items are required")
+	}
+	if err := r.resolveAgentIdentityAuth(ctx); err != nil {
+		return nil, err
+	}
+	modelID := strings.TrimSpace(request.Model)
+	if modelID == "" {
+		modelID = "gpt-5.5"
+	}
+	modelInfo := r.modelInfoForRequest(modelID)
+	instructions := responsesInstructions(request)
+	inputItems := responsesInputItemsForProviderWithStore(request, r.providerName(), r.imageStore())
+	tools := normalizeResponseToolParameters(cloneAnySlice(request.Tools))
+	if !request.DisableHostedImageGeneration {
+		tools = r.withHostedToolsForRequest(tools, &modelInfo)
+	}
+	tools = normalizeResponseToolParameters(tools)
+	parallelToolCalls := request.ParallelToolCalls && !modelInfo.UseResponsesLite
+	if modelInfo.UseResponsesLite {
+		// Rust #51480: an existing context window keeps the tool declarations it
+		// already recorded. Only a window that has no declarations builds the
+		// `additional_tools` / base-instruction prefix for this request, so a
+		// resumed window never moves or duplicates declarations it already sent.
+		if WindowHasToolDeclarations(inputItems) {
+			inputItems = responsesLiteDeclaredInputItems(inputItems)
+		} else {
+			inputItems = responsesLiteInputItems(inputItems, tools, instructions, request.ThreadID)
+		}
+		instructions = ""
+		tools = nil
+	} else {
+		// Rust #44249: request copies downgrade `original` image detail when the
+		// receiving model does not support it. Stored image details are left
+		// untouched so switching back to a supporting model retains `original`.
+		inputItems = normalizeResponseInputImageDetailsForModel(inputItems, modelInfo.SupportsImageDetailOriginal)
+		// Rust #51156: standard Responses requests carry base instructions as a
+		// stable developer input message instead of the top-level field.
+		inputItems, instructions = prependResponsesBaseInstructions(inputItems, instructions, request.ThreadID)
+	}
+	if !strings.EqualFold(strings.TrimSpace(r.providerName()), OpenAIProviderName) {
+		inputItems = clearInternalChatMessageMetadata(inputItems)
+	}
+	inputItems = r.gateContentItemKinds(inputItems)
+	// Send raw tool-result metadata only to allowed OpenAI/ChatGPT HTTPS
+	// destinations (Rust #44336).
+	inputItems = r.filterToolResultMetadataForDestination(inputItems)
+	// Only Responses WebSocket v2 supports previous_response_id. This HTTP/SSE
+	// runner carries conversation context by sending full history in input.
+	accessPrograms, err := AccessProgramsForAuth(request.CyberAccessProgram, r.AuthSnapshot, r.ApiKeyCyberAccessPrograms)
+	if err != nil {
+		return nil, err
+	}
+	apiRequest := &responsesAgentRequest{
+		Model:                modelID,
+		Instructions:         instructions,
+		Input:                inputItems,
+		Tools:                tools,
+		ToolChoice:           "auto",
+		Stream:               r.Stream,
+		Store:                request.Store,
+		ParallelToolCalls:    parallelToolCalls,
+		ServiceTier:          r.serviceTierForRequest(&modelInfo, request.ServiceTier),
+		PromptCacheKey:       strings.TrimSpace(request.PromptCacheKey),
+		AccessPrograms:       accessPrograms,
+		ClientMetadata:       cloneStringMap(request.ClientMetadata),
+		Text:                 responsesTextParamForRequest(request.OutputSchema, request.ModelVerbosity, &modelInfo),
+		UseResponsesLite:     modelInfo.UseResponsesLite,
+		IncludeTimingMetrics: request.IncludeTimingMetrics,
+		BetaFeaturesHeader:   strings.TrimSpace(request.BetaFeaturesHeader),
+	}
+	apiRequest.Reasoning = responsesReasoningParam(request, &modelInfo)
+	apiRequest.StreamOptions = responsesStreamOptionsForRequest(request, apiRequest.Reasoning, r.providerName())
+	if apiRequest.Reasoning != nil || r.outputTokenReplayForProvider() {
+		apiRequest.Include = r.responsesInclude()
+	}
+	apiRequest.Input = boundedInputForResponseMessage(apiRequest, request, r.Metrics)
+	if apiRequest.Stream {
+		return r.runStreaming(ctx, request, apiRequest)
+	}
+	httpResponse, preempted, err := r.runResponsesHTTPRequestPreemptible(ctx, request, apiRequest)
+	receivedAt := time.Now()
+	if preempted {
+		return preemptedAgentResponse(request), nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer httpResponse.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(httpResponse.Body, 16<<20))
+	if err != nil {
+		return nil, err
+	}
+	if httpResponse.StatusCode < 200 || httpResponse.StatusCode >= 300 {
+		apiErr := responsesHTTPError(r.providerName(), httpResponse.StatusCode, httpResponse.Header, responseBody, receivedAt)
+		setResponsesAPIErrorURL(apiErr, httpResponse)
+		emitUsageLimitErrorHeaderEvents(combinedResponsesStreamHandler(r.StreamHandler, request.StreamHandler), httpResponse.Header, apiErr)
+		return nil, apiErr
+	}
+	r.rememberTurnStateFromHeaders(request, httpResponse.Header)
+	var apiResponse responsesAgentAPIResponse
+	if err := json.Unmarshal(responseBody, &apiResponse); err != nil {
+		return nil, fmt.Errorf("failed to decode responses API response: %w", err)
+	}
+	return agentResponseFromResponses(&apiResponse, request, r.ProviderID, httpResponse.Header)
+}
+
+func responsesReasoningParam(request *AgentRequest, info *ModelInfo) *responsesReasoning {
+	if info == nil {
+		return nil
+	}
+	if !info.SupportsReasoningSummaries {
+		return nil
+	}
+	effort := strings.TrimSpace(request.ReasoningEffort)
+	if effort == "" {
+		effort = strings.TrimSpace(info.DefaultReasoningLevel)
+	}
+	// Rust #40799/#43110: shared model-owned normalization keeps "persistent"
+	// in local settings but sends "disabled" to the Responses API.
+	effort = ResolveReasoningEffort(info, effort)
+	summary := strings.TrimSpace(request.ReasoningSummary)
+	if summary == "" {
+		summary = strings.TrimSpace(info.DefaultReasoningSummary)
+	}
+	reasoning := &responsesReasoning{Effort: effort}
+	if !strings.EqualFold(summary, "none") {
+		reasoning.Summary = summary
+	}
+	if info.UseResponsesLite {
+		reasoning.Context = "all_turns"
+	}
+	return reasoning
+}
+
+// reasoningEffortForRequest mirrors Rust core/src/client.rs
+// reasoning_effort_for_request (#41206). When the selected effort is Ultra, the
+// model-aware override is used when present and supported; otherwise the fallback
+// prefers max, then the highest supported non-ultra effort, and finally medium
+// when the model declares no reasoning levels. Other efforts pass through.
+func reasoningEffortForRequest(info *ModelInfo, effort string) string {
+	if info == nil || effort != "ultra" {
+		return effort
+	}
+	if info.MultiAgentReasoningEffort != nil {
+		if override := strings.TrimSpace(*info.MultiAgentReasoningEffort); override != "" &&
+			override != "ultra" && containsString(info.SupportedReasoningLevels, override) {
+			return override
+		}
+	}
+	if containsString(info.SupportedReasoningLevels, "max") {
+		return "max"
+	}
+	for i := len(info.SupportedReasoningLevels) - 1; i >= 0; i-- {
+		if level := info.SupportedReasoningLevels[i]; level != "ultra" {
+			return level
+		}
+	}
+	return "medium"
+}
+
+func responsesStreamOptionsForRequest(request *AgentRequest, reasoning *responsesReasoning, providerName string) *responsesStreamOptions {
+	if request == nil || !request.ConcurrentReasoningSummaries || reasoning == nil {
+		return nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(providerName), OpenAIProviderName) {
+		return nil
+	}
+	if strings.TrimSpace(reasoning.Summary) == "" {
+		return nil
+	}
+	return &responsesStreamOptions{ReasoningSummaryDelivery: "sequential_cutoff"}
+}
+
+func (r *ResponsesAgentRunner) modelInfoForRequest(modelID string) ModelInfo {
+	manager := ModelsManager(nil)
+	if r != nil {
+		manager = r.ModelsManager
+	}
+	if manager == nil {
+		manager = NewStaticModelsManager(BundledModelsResponse())
+	}
+	return manager.GetModelInfo(strings.TrimSpace(modelID), nil)
+}
+
+func responsesTextParamForRequest(schema any, verbosity string, info *ModelInfo) *responsesTextParam {
+	text := &responsesTextParam{}
+	if info != nil && info.SupportVerbosity {
+		text.Verbosity = strings.TrimSpace(verbosity)
+		if text.Verbosity == "" {
+			text.Verbosity = strings.TrimSpace(info.DefaultVerbosity)
+		}
+	}
+	if schema == nil {
+		if text.Verbosity == "" {
+			return nil
+		}
+		return text
+	}
+	text.Format = &responsesTextFormat{
+		Name:   "codex_output_schema",
+		Type:   "json_schema",
+		Strict: true,
+		Schema: cloneAny(schema),
+	}
+	return text
+}
+
+func responsesTextParamForOutputSchema(schema any) *responsesTextParam {
+	if schema == nil {
+		return nil
+	}
+	return responsesTextParamForRequest(schema, "", nil)
+}
+
+func (r *ResponsesAgentRunner) withHostedToolsForRequest(tools []any, info *ModelInfo) []any {
+	if !r.shouldAddHostedImageGenerationTool(info) ||
+		responsesToolsContainType(tools, "image_generation") ||
+		responsesToolsContainNamespaceFunction(tools, "image_gen", "imagegen") {
+		return tools
+	}
+	return append(tools, map[string]any{
+		"type":          "image_generation",
+		"output_format": "png",
+	})
+}
+
+func (r *ResponsesAgentRunner) shouldAddHostedImageGenerationTool(info *ModelInfo) bool {
+	if r == nil || info == nil {
+		return false
+	}
+	if info.UseResponsesLite {
+		return false
+	}
+	if !r.ProviderCapabilities.ImageGeneration {
+		return false
+	}
+	if !modelInfoSupportsImageInput(info) {
+		return false
+	}
+	return r.imageGenerationAuthEnabled()
+}
+
+func (r *ResponsesAgentRunner) imageGenerationAuthEnabled() bool {
+	if r == nil {
+		return false
+	}
+	if account := auth.AccountFromAuth(r.AuthSnapshot); account != nil && account.PlanType == auth.PlanFree {
+		return false
+	}
+	if r.providerUsesOpenAIActorAuthorization() {
+		return true
+	}
+	if r.AuthSnapshot == nil {
+		return false
+	}
+	if authSnapshotUsesCodexBackend(r.AuthSnapshot) {
+		return r.ProviderRequiresOpenAIAuth || r.providerName() == OpenAIProviderName
+	}
+	return r.providerName() == OpenAIProviderName && r.AuthSnapshot.Mode() == "api-key"
+}
+
+func (r *ResponsesAgentRunner) providerUsesOpenAIActorAuthorization() bool {
+	if r == nil || r.Provider == nil {
+		return false
+	}
+	for name, values := range r.Provider.Headers {
+		if !strings.EqualFold(name, OpenAIActorAuthorizationHeader) {
+			continue
+		}
+		for _, value := range values {
+			if strings.TrimSpace(value) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func modelInfoSupportsImageInput(info *ModelInfo) bool {
+	if info == nil {
+		return false
+	}
+	for _, modality := range info.InputModalities {
+		if strings.EqualFold(strings.TrimSpace(modality), "image") {
+			return true
+		}
+	}
+	return false
+}
+
+func responsesToolsContainType(tools []any, toolType string) bool {
+	toolType = strings.TrimSpace(toolType)
+	if toolType == "" {
+		return false
+	}
+	for _, tool := range tools {
+		item, ok := tool.(map[string]any)
+		if !ok {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(responseToolString(item["type"])), toolType) {
+			return true
+		}
+	}
+	return false
+}
+
+func responsesToolsContainNamespaceFunction(tools []any, namespace string, name string) bool {
+	namespace = strings.TrimSpace(namespace)
+	name = strings.TrimSpace(name)
+	if namespace == "" || name == "" {
+		return false
+	}
+	for _, tool := range tools {
+		item, ok := tool.(map[string]any)
+		if !ok {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(responseToolString(item["type"])), "namespace") ||
+			!strings.EqualFold(strings.TrimSpace(responseToolString(item["name"])), namespace) {
+			continue
+		}
+		switch children := item["tools"].(type) {
+		case []map[string]any:
+			for _, child := range children {
+				if strings.EqualFold(strings.TrimSpace(responseToolString(child["name"])), name) {
+					return true
+				}
+			}
+		case []any:
+			for _, childValue := range children {
+				child, ok := childValue.(map[string]any)
+				if ok && strings.EqualFold(strings.TrimSpace(responseToolString(child["name"])), name) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func (r *ResponsesAgentRunner) newResponsesHTTPRequest(ctx context.Context, request *AgentRequest, apiRequest *responsesAgentRequest, accept string) (*http.Request, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := r.ensureFreshProviderCommandAuth(ctx); err != nil {
+		return nil, err
+	}
+	endpoint := ResponsesEndpointResponses
+	if request != nil {
+		endpoint = request.Endpoint
+	}
+	dedicatedGuardianEndpoint := endpoint == ResponsesEndpointGuardian || endpoint == ResponsesEndpointGuardianClassifier
+	// Rust #45736: a Guardian reviewer request carries `x-codex-guardian:
+	// reviewer` and drops its service tier (the backend controls Guardian
+	// billing), so both are decided before the body is serialized.
+	guardianReviewer := r.isGuardianReviewerInference(apiRequest.Model, request)
+	if guardianReviewer || dedicatedGuardianEndpoint {
+		apiRequest.ServiceTier = ""
+	} else if r.usesCodexBackend() && r.supportsCodexBackendRoutes() {
+		// Rust #45736: ordinary Codex-backend traffic asks the backend to bill
+		// Guardian credits; reviewer traffic identifies itself by header instead.
+		apiRequest.ClientMetadata = withGuardianCreditsRequested(apiRequest.ClientMetadata)
+	}
+	body, err := json.Marshal(apiRequest)
+	if err != nil {
+		return nil, err
+	}
+	requestBody := body
+	contentEncoding := ""
+	if r.shouldCompressResponsesRequest() {
+		requestBody, err = zstdCompressResponsesBody(body)
+		if err != nil {
+			return nil, err
+		}
+		contentEncoding = "zstd"
+	}
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, r.responsesURL(endpoint), bytes.NewReader(requestBody))
+	if err != nil {
+		return nil, err
+	}
+	httpRequest.Header.Set("Content-Type", "application/json")
+	if strings.TrimSpace(accept) != "" {
+		httpRequest.Header.Set("Accept", accept)
+	}
+	addResponsesLiteHeader(httpRequest.Header, apiRequest.UseResponsesLite)
+	addIncludeTimingMetricsHeader(httpRequest.Header, apiRequest.IncludeTimingMetrics)
+	addTurnStateHeader(httpRequest.Header, r.turnStateForRequest(request))
+	addBetaFeaturesHeader(httpRequest.Header, apiRequest.BetaFeaturesHeader)
+	addOriginatorHeader(httpRequest.Header, requestOriginator(request))
+	addSessionIdentityHeaders(httpRequest.Header, request)
+	if guardianReviewer {
+		httpRequest.Header.Set(GuardianHeaderName, GuardianHeaderReviewer)
+	}
+	// A Guardian reviewer request never carries a routing hint (Rust's
+	// `!guardian_reviewer` guard around build_routing_hint_header).
+	if !guardianReviewer && !dedicatedGuardianEndpoint {
+		if routingHint := r.responsesRoutingHint(apiRequest.Model, apiRequest.ServiceTier); routingHint != "" {
+			httpRequest.Header.Set(codexapi.ClientCodexRoutingHintHeader, routingHint)
+		}
+	}
+	addCompatibilityMetadataHeaders(httpRequest.Header, apiRequest.ClientMetadata)
+	addMemoryGenerationHeader(httpRequest.Header, apiRequest.ClientMetadata)
+	addHeaders(httpRequest.Header, r.providerHeaders())
+	if residency := strings.TrimSpace(r.Residency); residency != "" {
+		// Managed enforce_residency is authoritative over any provider
+		// http_headers value (Rust #39645).
+		httpRequest.Header.Set(ResidencyHeaderName, residency)
+	}
+	if err := r.addAttestationHeader(ctx, httpRequest.Header, request); err != nil {
+		return nil, err
+	}
+	if contentEncoding != "" {
+		httpRequest.Header.Set("Content-Encoding", contentEncoding)
+	}
+	if r.Auth != nil {
+		if err := r.Auth.Apply(ctx, httpRequest, requestBody); err != nil {
+			return nil, err
+		}
+	}
+	return httpRequest, nil
+}
+
+func (r *ResponsesAgentRunner) responsesRoutingHint(modelID, serviceTier string) string {
+	if !r.usesCodexBackend() {
+		return ""
+	}
+	modelID = strings.TrimSpace(modelID)
+	serviceTier = strings.TrimSpace(serviceTier)
+	if modelID == "" || strings.ContainsAny(modelID, "\r\n") || strings.ContainsAny(serviceTier, "\r\n") {
+		return ""
+	}
+	if serviceTier != "" {
+		return fmt.Sprintf("model=%s;tier=%s", modelID, serviceTier)
+	}
+	return "model=" + modelID
+}
+
+// usesCodexBackend reports whether the current provider/auth combination is
+// eligible for Codex-backend routing (Rust ModelClient::uses_codex_backend,
+// #40892).
+func (r *ResponsesAgentRunner) usesCodexBackend() bool {
+	if r == nil || !strings.EqualFold(r.providerName(), OpenAIProviderName) || !r.ProviderRequiresOpenAIAuth || r.ProviderUsesOwnCredentials || r.Provider == nil || r.Provider.Auth != nil {
+		return false
+	}
+	return authSnapshotUsesCodexBackend(r.AuthSnapshot)
+}
+
+// supportsCodexBackendRoutes reports whether the provider base URL permits the
+// dedicated Codex backend routes (Rust
+// ModelProviderInfo::supports_codex_backend_routes, #40892).
+func (r *ResponsesAgentRunner) supportsCodexBackendRoutes() bool {
+	if r == nil || !strings.EqualFold(r.providerName(), OpenAIProviderName) {
+		return false
+	}
+	baseURL := ""
+	if r.Provider != nil {
+		baseURL = strings.TrimRight(strings.TrimSpace(r.Provider.BaseURL), "/")
+	}
+	if baseURL == "" {
+		return true
+	}
+	return strings.HasSuffix(baseURL, "/backend-api/codex")
+}
+
+// approvalReviewPreferredModel mirrors Rust
+// RuntimeProvider::approval_review_preferred_model (#37103 / #40892).
+func (r *ResponsesAgentRunner) approvalReviewPreferredModel() string {
+	if r.AuthSnapshot != nil && r.AuthSnapshot.Mode() == "api-key" {
+		return APIKeyApprovalReviewPreferredModel
+	}
+	return DefaultApprovalReviewPreferredModel
+}
+
+// withGuardianCreditsRequested mirrors Rust's set_guardian_metadata arm: the
+// reserved `guardian_credits_requested` key is added to a copy of the request's
+// client metadata so the backend bills ordinary Codex-backend traffic for
+// Guardian (Rust #45736).
+func withGuardianCreditsRequested(metadata map[string]string) map[string]string {
+	out := cloneStringMap(metadata)
+	if out == nil {
+		out = map[string]string{}
+	}
+	out[codexapi.GuardianCreditsRequestedKey] = "true"
+	return out
+}
+
+// isGuardianReviewRequest reports whether the agent request is a Guardian
+// approval-review inference (Rust guardian session source, #40892). The Go
+// reviewer reuses the main ResponsesAgentRunner, so eligibility is derived from
+// the request's review task kind / guardian originator.
+const (
+	// GuardianHeaderName identifies a Guardian request to the Codex backend
+	// (Rust #45736). Go only produces the reviewer value: it has no asynchronous
+	// Guardian classifier.
+	GuardianHeaderName = "x-codex-guardian"
+	// GuardianHeaderReviewer marks a full synchronous approval review.
+	GuardianHeaderReviewer = "reviewer"
+)
+
+func isGuardianReviewRequest(request *AgentRequest) bool {
+	if request == nil {
+		return false
+	}
+	if request.TaskKind == AgentTaskReview {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(request.Originator), "guardian")
+}
+
+// isGuardianReviewerInference reports whether the request is a Guardian review
+// inference that must identify itself to the Codex backend with
+// `x-codex-guardian: reviewer` (Rust #45736).
+//
+// Rust seeds the header on the reviewer session for the provider's preferred
+// review model and applies it only while the request still targets that model,
+// uses Codex backend auth, and the provider supports the backend routes.
+// `features.guardianv2.free_guardian` is retained for config compatibility but
+// no longer gates this decision - the backend controls Guardian billing.
+func (r *ResponsesAgentRunner) isGuardianReviewerInference(model string, request *AgentRequest) bool {
+	if r == nil || !isGuardianReviewRequest(request) {
+		return false
+	}
+	model = strings.TrimSpace(model)
+	return model != "" &&
+		model == r.approvalReviewPreferredModel() &&
+		r.usesCodexBackend() &&
+		r.supportsCodexBackendRoutes()
+}
+
+func (r *ResponsesAgentRunner) addAttestationHeader(ctx context.Context, headers http.Header, request *AgentRequest) error {
+	if headers == nil || r == nil || !r.IncludeAttestation {
+		return nil
+	}
+	provider := r.AttestationProvider
+	if request != nil && request.AttestationProvider != nil {
+		provider = request.AttestationProvider
+	}
+	if provider == nil {
+		return nil
+	}
+	threadID := ""
+	if request != nil {
+		threadID = strings.TrimSpace(request.ThreadID)
+	}
+	value, ok, err := provider.HeaderForRequest(ctx, &codexapi.AttestationContext{ThreadID: threadID})
+	if err != nil {
+		return err
+	}
+	value = strings.TrimSpace(value)
+	if !ok || value == "" || strings.ContainsAny(value, "\r\n") {
+		return nil
+	}
+	headers.Set(codexapi.AttestationHeader, value)
+	return nil
+}
+
+func (r *ResponsesAgentRunner) turnStateForRequest(request *AgentRequest) string {
+	if r == nil || r.turnState == nil {
+		return ""
+	}
+	turnID := turnStateRequestTurnID(request)
+	if turnID == "" {
+		return ""
+	}
+	r.turnState.mu.Lock()
+	defer r.turnState.mu.Unlock()
+	if r.turnState.turnID != turnID {
+		return ""
+	}
+	return r.turnState.value
+}
+
+func turnStateRequestTurnID(request *AgentRequest) string {
+	if request == nil {
+		return ""
+	}
+	if turnID := strings.TrimSpace(request.TurnID); turnID != "" {
+		return turnID
+	}
+	if turnID := strings.TrimSpace(request.ClientMetadata[codexapi.TurnIDKey]); turnID != "" {
+		return turnID
+	}
+	turnMetadata := strings.TrimSpace(request.ClientMetadata[codexapi.ClientCodexTurnMetadataHeader])
+	if turnMetadata == "" {
+		turnMetadata = strings.TrimSpace(request.ClientMetadata[codexapi.TurnMetadataHeader])
+	}
+	if turnMetadata == "" {
+		return ""
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(turnMetadata), &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(responseToolString(payload[codexapi.TurnIDKey]))
+}
+
+func (r *ResponsesAgentRunner) shouldCompressResponsesRequest() bool {
+	if r == nil || !r.EnableRequestCompression {
+		return false
+	}
+	if r.providerName() != OpenAIProviderName {
+		return false
+	}
+	return authSnapshotUsesCodexBackend(r.AuthSnapshot)
+}
+
+func authSnapshotUsesCodexBackend(snapshot *auth.AuthDotJSON) bool {
+	if snapshot == nil {
+		return false
+	}
+	switch snapshot.Mode() {
+	case "chatgpt", "chatgptAuthTokens", "personal-access-token", "agent-identity":
+		return true
+	default:
+		return false
+	}
+}
+
+func zstdCompressResponsesBody(body []byte) ([]byte, error) {
+	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest))
+	if err != nil {
+		return nil, err
+	}
+	defer encoder.Close()
+	return encoder.EncodeAll(body, nil), nil
+}
+
+func addResponsesLiteHeader(headers http.Header, useResponsesLite bool) {
+	if headers == nil || !useResponsesLite {
+		return
+	}
+	headers.Set(responsesLiteHeader, "true")
+}
+
+func addIncludeTimingMetricsHeader(headers http.Header, includeTimingMetrics bool) {
+	if headers == nil || !includeTimingMetrics {
+		return
+	}
+	headers.Set(responsesIncludeTimingMetricsHeader, "true")
+}
+
+func addTurnStateHeader(headers http.Header, turnState string) {
+	turnState = strings.TrimSpace(turnState)
+	if headers == nil || turnState == "" || strings.ContainsAny(turnState, "\r\n") {
+		return
+	}
+	headers.Set(codexapi.ClientCodexTurnStateHeader, turnState)
+}
+
+func addBetaFeaturesHeader(headers http.Header, betaFeaturesHeader string) {
+	betaFeaturesHeader = strings.TrimSpace(betaFeaturesHeader)
+	if headers == nil || betaFeaturesHeader == "" || strings.ContainsAny(betaFeaturesHeader, "\r\n") {
+		return
+	}
+	headers.Set(codexapi.ClientCodexBetaFeaturesHeader, betaFeaturesHeader)
+}
+
+func (r *ResponsesAgentRunner) doResponsesHTTPRequest(httpRequest *http.Request) (*http.Response, error) {
+	client := r.HTTPClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	if r != nil && r.RejectRedirects {
+		// A routed provider must never follow a redirect: the request carries the
+		// account-routing credential scoped to the discovered origin (Rust
+		// ClientRedirectPolicy::Reject).
+		if standard, ok := client.(*http.Client); ok {
+			clone := *standard
+			clone.CheckRedirect = func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			}
+			client = &clone
+		}
+	}
+	return client.Do(httpRequest)
+}
+
+// runResponsesHTTPRequestPreemptible mirrors Rust #48141 for the non-streaming
+// sampling path: the request is raced against the step's preemption signal, and
+// a preemption cancels the in-flight request and drops the connection state.
+func (r *ResponsesAgentRunner) runResponsesHTTPRequestPreemptible(ctx context.Context, request *AgentRequest, apiRequest *responsesAgentRequest) (*http.Response, bool, error) {
+	if request == nil || request.Preempt == nil {
+		response, err := r.doResponsesHTTPRequestWithRetry(ctx, request, apiRequest, "application/json", r.requestMaxRetries())
+		return response, false, err
+	}
+	select {
+	case <-request.Preempt:
+		r.dropConnectionForRequest(request)
+		return nil, true, nil
+	default:
+	}
+	requestCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type outcome struct {
+		response *http.Response
+		err      error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		response, err := r.doResponsesHTTPRequestWithRetry(requestCtx, request, apiRequest, "application/json", r.requestMaxRetries())
+		done <- outcome{response: response, err: err}
+	}()
+	select {
+	case result := <-done:
+		return result.response, false, result.err
+	case <-request.Preempt:
+		cancel()
+		r.dropConnectionForRequest(request)
+		return nil, true, nil
+	}
+}
+
+func (r *ResponsesAgentRunner) doResponsesHTTPRequestWithRetry(ctx context.Context, request *AgentRequest, apiRequest *responsesAgentRequest, accept string, maxRetries uint64) (*http.Response, error) {
+	retryTooManyRequests := apiRequest != nil && apiRequest.Stream
+	// recovery tracks this request's unauthorized handling (Rust's
+	// UnauthorizedRecovery plus the provider-owned recovery latch).
+	recovery := &authRecoveryState{}
+	// retryAfterUnauthorized mirrors Rust's PendingUnauthorizedRetry: the attempt
+	// that follows a 401 recovery reports that it retried.
+	retryAfterUnauthorized := false
+	// recoveryMode/recoveryPhase name the recovery that produced the retry, which
+	// the following attempt's records report (Rust's PendingUnauthorizedRetry).
+	recoveryMode, recoveryPhase := "", ""
+	// Rust's 401 handling loop is bounded by the recovery plan (the provider
+	// attempt latch plus the step cursor), not the transport retry budget, so an
+	// auth retry does not consume `maxRetries`.
+	transportRetries := uint64(0)
+	for attempt := uint64(0); ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		httpRequest, err := r.newResponsesHTTPRequest(ctx, request, apiRequest, accept)
+		if err != nil {
+			return nil, err
+		}
+		responsesDiagnostic("http.attempt", map[string]any{
+			"thread_id":        request.ThreadID,
+			"turn_id":          request.TurnID,
+			"http_attempt":     attempt + 1,
+			"http_max_retries": maxRetries,
+			"accept":           accept,
+		})
+		attemptStartedAt := time.Now()
+		httpResponse, err := r.doResponsesHTTPRequest(httpRequest)
+		attemptDuration := time.Since(attemptStartedAt)
+		shouldRetry := shouldRetryResponsesHTTPRequest(httpResponse, err, retryTooManyRequests)
+		status := 0
+		requestID := ""
+		traceID := ""
+		if httpResponse != nil {
+			status = httpResponse.StatusCode
+			requestID = responseHeaderValue(httpResponse.Header, responsesRequestIDHeader, responsesOAIRequestIDHeader)
+			traceID = responseHeaderValue(httpResponse.Header, "x-trace-id")
+		}
+		// Rust's RequestTelemetry::on_request fires per HTTP attempt, before the
+		// retry decision, so retries each record an api_request sample.
+		r.recordAPIRequest(status, err, attemptDuration)
+		r.recordAPIRequestRecord(ctx, request, apiRequest, httpRequest, httpResponse, attempt, err, attemptDuration, retryAfterUnauthorized, recoveryMode, recoveryPhase)
+		responsesDiagnostic("http.result", map[string]any{
+			"thread_id":       request.ThreadID,
+			"turn_id":         request.TurnID,
+			"http_attempt":    attempt + 1,
+			"http_status":     status,
+			"request_id":      requestID,
+			"trace_id":        traceID,
+			"transport_error": diagnosticErrorMessage(err),
+			"retryable":       shouldRetry,
+		})
+		if shouldRetry && httpResponse != nil && httpResponse.StatusCode == http.StatusUnauthorized {
+			debug := authRecoveryDebug{
+				RequestID:     responseHeaderValue(httpResponse.Header, responsesRequestIDHeader, responsesOAIRequestIDHeader),
+				CFRay:         responseHeaderValue(httpResponse.Header, "cf-ray"),
+				AuthError:     responseHeaderValue(httpResponse.Header, "x-openai-authorization-error"),
+				AuthErrorCode: responseAuthorizationErrorCode(httpResponse.Header),
+			}
+			mode, phase, recoverErr := r.recoverUnauthorizedAuth(ctx, recovery, debug)
+			if recoverErr != nil {
+				if errors.Is(recoverErr, errNoAuthRecoveryStep) {
+					// The plan ran no step, so Rust surfaces the original 401
+					// (Go hands the response back for the caller's error).
+					if err != nil {
+						return nil, err
+					}
+					return httpResponse, nil
+				}
+				drainResponsesResponseBody(httpResponse)
+				return nil, recoverErr
+			}
+			// Rust's PendingUnauthorizedRetry reports the recovery that produced
+			// this retry on the next attempt's records.
+			recoveryMode, recoveryPhase = string(mode), string(phase)
+			retryAfterUnauthorized = true
+			drainResponsesResponseBody(httpResponse)
+			recordResponsesRetry("request", attempt+1, 0, "http")
+			continue
+		}
+		if shouldRetry && transportRetries < maxRetries {
+			transportRetries++
+			retryAfterUnauthorized = false
+			recoveryMode, recoveryPhase = "", ""
+			delay := responsesRetryDelay(httpResponse, attempt+1)
+			drainResponsesResponseBody(httpResponse)
+			recordResponsesRetry("request", attempt+1, delay, "http")
+			if err := sleepWithContext(ctx, delay); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		return httpResponse, nil
+	}
+}
+
+// drainResponsesResponseBody discards a bounded prefix of a response body the
+// retry loop does not read, so the connection can be reused.
+func drainResponsesResponseBody(httpResponse *http.Response) {
+	if httpResponse == nil || httpResponse.Body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(httpResponse.Body, 4<<10))
+	_ = httpResponse.Body.Close()
+}
+
+func responsesUserMessage(prompt string) responsesInputMessage {
+	return responsesInputMessage{
+		Type: "message",
+		Role: "user",
+		Content: []responsesInputContent{{
+			Type: "input_text",
+			Text: prompt,
+		}},
+	}
+}
+
+func responsesInputItems(request *AgentRequest) []any {
+	return responsesInputItemsWithStore(request, nil)
+}
+
+// responsesInputItemsWithStore is the store-aware form of responsesInputItems.
+// The attachment store (Rust `Session::image_store`) decides whether the images
+// the preparation pipeline re-encodes stay inline or become file references,
+// and the request's ephemeral intent travels on every upload (Rust #51517).
+func responsesInputItemsWithStore(request *AgentRequest, store attachmentstore.Store) []any {
+	if request == nil {
+		return nil
+	}
+	items := make([]any, 0, 1+len(request.InputItems))
+	for i := range request.InputItems {
+		if request.InputItems[i] != nil {
+			items = append(items, request.InputItems[i])
+		}
+	}
+	if strings.TrimSpace(request.Prompt) != "" {
+		items = append(items, responsesUserMessage(strings.TrimSpace(request.Prompt)))
+	}
+	for i := range request.PostPromptInputItems {
+		if request.PostPromptInputItems[i] != nil {
+			items = append(items, request.PostPromptInputItems[i])
+		}
+	}
+	items = SanitizeExecutedToolCallsForPrompt(items)
+	if request.DropReasoningEffortUpdates {
+		items = dropConfigurationUpdateItems(items)
+	}
+	if !request.Store && !request.ItemIDsEnabled {
+		items = stripResponseInputItemIDs(items)
+	}
+	items = prepareResponseInputImagesWithStore(items, store, responsesImagePrepOrigin(request))
+	return items
+}
+
+// responsesImagePrepOrigin mirrors the origin Rust's image preparation carries
+// into every upload request: the receiving thread and its persistence intent.
+func responsesImagePrepOrigin(request *AgentRequest) eventmap.ImagePrepOrigin {
+	if request == nil {
+		return eventmap.ImagePrepOrigin{}
+	}
+	return eventmap.ImagePrepOrigin{ThreadID: request.ThreadID, Ephemeral: request.Ephemeral}
+}
+
+// dropConfigurationUpdateItems mirrors Rust ModelClient's
+// `input.retain(|item| !matches!(item, ResponseItem::ConfigurationUpdate { .. }))`
+// for models that do not accept reasoning-effort update items (#46530).
+func dropConfigurationUpdateItems(items []any) []any {
+	filtered := items[:0:0]
+	for _, item := range items {
+		if isConfigurationUpdateResponseItem(item) {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
+}
+
+func isConfigurationUpdateResponseItem(item any) bool {
+	payload, ok := item.(map[string]any)
+	if !ok {
+		return false
+	}
+	itemType, _ := payload["type"].(string)
+	return strings.TrimSpace(itemType) == "configuration_update"
+}
+
+// prepareResponseInputImages runs the image-preparation pipeline over every
+// input_image in the request, mirroring Rust prepare_response_items. The Rust
+// version processes all response items (messages and tool outputs) at request
+// time so images are always re-encoded to a format the Responses API accepts
+// (webp/png/jpeg/gif) and unsupported inputs are replaced with a placeholder.
+// Go previously only prepared the current user message, so images carried in
+// tool outputs (e.g. view_image, which labels bytes application/octet-stream)
+// or replayed from history could reach the API and be rejected as an
+// unsupported image.
+func prepareResponseInputImages(items []any) []any {
+	return prepareResponseInputImagesWithStore(items, nil, eventmap.ImagePrepOrigin{})
+}
+
+// prepareResponseInputImagesWithStore is the store-aware form of
+// prepareResponseInputImages, mirroring Rust `prepare_response_items` which
+// takes the thread origin and the session image store.
+func prepareResponseInputImagesWithStore(items []any, store attachmentstore.Store, origin eventmap.ImagePrepOrigin) []any {
+	if len(items) == 0 {
+		return items
+	}
+	data, err := json.Marshal(items)
+	if err != nil {
+		return items
+	}
+	if !bytes.Contains(data, []byte(`"input_image"`)) {
+		return items
+	}
+	var normalized []any
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&normalized); err != nil {
+		return items
+	}
+	prepareResponseInputImageBlocks(normalized, store, origin)
+	return normalized
+}
+
+func prepareResponseInputImageBlocks(value any, store attachmentstore.Store, origin eventmap.ImagePrepOrigin) {
+	switch typed := value.(type) {
+	case map[string]any:
+		prepareResponseInputImageBlock(typed, store, origin)
+		md, _ := typed["internal_chat_message_metadata_passthrough"].(map[string]any)
+		kinds, _ := md["content_item_kinds"].([]any)
+		for _, key := range []string{"content", "output", "content_items"} {
+			if child, ok := typed[key]; ok {
+				if key == "content" && kinds != nil {
+					prepareResponseInputImageContentWithKinds(child, kinds, store, origin)
+				} else {
+					prepareResponseInputImageBlocks(child, store, origin)
+				}
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			prepareResponseInputImageBlocks(child, store, origin)
+		}
+	}
+}
+
+// prepareResponseInputImageContentWithKinds processes a message content array
+// while updating content_item_kinds for image-preparation failures, mirroring
+// Rust image_preparation.rs which tags failed images as images.preparation_error
+// (#40281).
+func prepareResponseInputImageContentWithKinds(value any, kinds []any, store attachmentstore.Store, origin eventmap.ImagePrepOrigin) {
+	content, ok := value.([]any)
+	if !ok {
+		prepareResponseInputImageBlocks(value, store, origin)
+		return
+	}
+	for i, block := range content {
+		prepareResponseInputImageBlock(block.(map[string]any), store, origin)
+		if i < len(kinds) && kinds[i] == "user.image" {
+			if m, ok := block.(map[string]any); ok && m["type"] == "input_text" && blockWasPreparationError(m) {
+				kinds[i] = "images.preparation_error"
+			}
+		}
+	}
+}
+
+var imagePrepErrorPrefix = "image content omitted because"
+
+// blockWasPreparationError reports whether an input_text block was produced by a
+// failed image preparation (a placeholder rather than real user text).
+func blockWasPreparationError(block map[string]any) bool {
+	text, _ := block["text"].(string)
+	return strings.HasPrefix(strings.TrimSpace(text), imagePrepErrorPrefix)
+}
+
+func prepareResponseInputImageBlock(block map[string]any, store attachmentstore.Store, origin eventmap.ImagePrepOrigin) {
+	itemType, _ := block["type"].(string)
+	if itemType != "input_image" && itemType != "image" {
+		return
+	}
+	imageURL, _ := block["image_url"].(string)
+	if strings.TrimSpace(imageURL) == "" {
+		// Already a file reference (or an unsupported shape): Rust's
+		// `ImageReference::File` branch leaves the item untouched.
+		return
+	}
+	detail := eventmap.ImagePrepDetail(responseToolString(block["detail"]))
+	prepared, err := eventmap.PrepareImagePrepImageWithStoreResult(store, origin, imageURL, detail)
+	if err != nil {
+		// Replace an image that cannot be processed with a placeholder text
+		// block, matching Rust image_preparation.rs.
+		delete(block, "image_url")
+		delete(block, "detail")
+		block["type"] = "input_text"
+		block["text"] = eventmap.ImagePrepPlaceholderForError(err)
+		return
+	}
+	if prepared == nil {
+		return
+	}
+	if prepared.FileID != "" {
+		// The store kept the prepared bytes as a file reference, mirroring
+		// Rust's `ImageReference::File { file_id }`.
+		delete(block, "detail")
+		delete(block, "image_url")
+		block["file_id"] = prepared.FileID
+		return
+	}
+	block["image_url"] = prepared.URL
+}
+
+// gateContentItemKinds clears content_item_kinds from every request item when
+// the content_item_kinds feature is explicitly disabled, mirroring Rust's
+// client.rs prepare_response_items_for_request. A nil gate (the feature
+// default is enabled) preserves the annotation.
+func (r *ResponsesAgentRunner) gateContentItemKinds(items []any) []any {
+	if r == nil || r.ContentItemKindsEnabled == nil || *r.ContentItemKindsEnabled {
+		return items
+	}
+	return stripResponseItemContentKinds(items)
+}
+
+// stripResponseItemContentKinds removes the content_item_kinds metadata key
+// from each message item in place. Items without the passthrough metadata are
+// left untouched.
+func stripResponseItemContentKinds(items []any) []any {
+	for i, item := range items {
+		switch typed := item.(type) {
+		case map[string]any:
+			md, ok := typed["internal_chat_message_metadata_passthrough"].(map[string]any)
+			if ok {
+				delete(md, "content_item_kinds")
+				if len(md) == 0 {
+					delete(typed, "internal_chat_message_metadata_passthrough")
+				}
+			}
+		case responsesInputMessage:
+			typed.Metadata = nil
+			items[i] = typed
+		case *responsesInputMessage:
+			if typed != nil {
+				clone := *typed
+				clone.Metadata = nil
+				items[i] = &clone
+			}
+		}
+	}
+	return items
+}
+
+// clearInternalChatMessageMetadata removes harness-only response metadata for
+// providers other than OpenAI. Rust applies this after the Responses Lite
+// prefix is inserted (#40296), so the generated base-instruction message cannot
+// leak its internal classification to third-party providers.
+func clearInternalChatMessageMetadata(items []any) []any {
+	for i, item := range items {
+		switch typed := item.(type) {
+		case map[string]any:
+			clone := cloneMapAny(typed)
+			delete(clone, "internal_chat_message_metadata_passthrough")
+			items[i] = clone
+		case responsesInputMessage:
+			typed.Metadata = nil
+			items[i] = typed
+		case *responsesInputMessage:
+			if typed != nil {
+				clone := *typed
+				clone.Metadata = nil
+				items[i] = &clone
+			}
+		}
+	}
+	return items
+}
+
+func responsesInputItemsForProvider(request *AgentRequest, providerName string) []any {
+	return responsesInputItemsForProviderWithStore(request, providerName, nil)
+}
+
+// responsesInputItemsForProviderWithStore is the store-aware form of
+// responsesInputItemsForProvider.
+func responsesInputItemsForProviderWithStore(request *AgentRequest, providerName string, store attachmentstore.Store) []any {
+	items := responsesInputItemsWithStore(request, store)
+	if strings.EqualFold(strings.TrimSpace(providerName), OpenAIProviderName) {
+		return items
+	}
+	out := make([]any, 0, len(items))
+	for _, item := range items {
+		switch typed := item.(type) {
+		case *AgentItem:
+			if typed == nil {
+				out = append(out, nil)
+				continue
+			}
+			clone := *typed
+			clone.EncryptedFunctionArgs = nil
+			clone.Data = cloneAgentItemMap(typed.Data)
+			clearAgentItemEncryptedContent(&clone)
+			out = append(out, &clone)
+		case AgentItem:
+			clone := typed
+			clone.EncryptedFunctionArgs = nil
+			clone.Data = cloneAgentItemMap(typed.Data)
+			clearAgentItemEncryptedContent(&clone)
+			out = append(out, clone)
+		case map[string]any:
+			clone := cloneMapAny(typed)
+			delete(clone, "encrypted_function_args")
+			if !agentItemTypeKeepsEncryptedContent(stringFromAny(clone, "type")) {
+				delete(clone, "encrypted_content")
+				delete(clone, "encryptedContent")
+			}
+			out = append(out, clone)
+		default:
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func clearAgentItemEncryptedContent(item *AgentItem) {
+	if item == nil {
+		return
+	}
+	if agentItemTypeKeepsEncryptedContent(item.Type) {
+		return
+	}
+	delete(item.Data, "encrypted_content")
+	delete(item.Data, "encryptedContent")
+}
+
+func agentItemTypeKeepsEncryptedContent(itemType string) bool {
+	normalized := strings.ToLower(strings.NewReplacer("_", "", "-", "", " ", "").Replace(strings.TrimSpace(itemType)))
+	switch normalized {
+	case "reasoning", "compaction", "contextcompaction":
+		return true
+	default:
+		return false
+	}
+}
+
+func stripResponseInputItemIDs(items []any) []any {
+	out := make([]any, 0, len(items))
+	for i := range items {
+		out = append(out, stripResponseInputItemID(items[i]))
+	}
+	return out
+}
+
+func stripResponseInputItemID(item any) any {
+	switch typed := item.(type) {
+	case *AgentItem:
+		if typed == nil {
+			return nil
+		}
+		clone := *typed
+		if !isPrefixedResponseItemID(clone.ID) {
+			clone.ID = ""
+		}
+		clone.Data = cloneAgentItemMap(typed.Data)
+		clone.Search = cloneAgentItemMap(typed.Search)
+		return &clone
+	case AgentItem:
+		clone := typed
+		if !isPrefixedResponseItemID(clone.ID) {
+			clone.ID = ""
+		}
+		clone.Data = cloneAgentItemMap(typed.Data)
+		clone.Search = cloneAgentItemMap(typed.Search)
+		return clone
+	case map[string]any:
+		clone := cloneMapAny(typed)
+		if !isPrefixedResponseItemID(responseToolString(clone["id"])) {
+			delete(clone, "id")
+		}
+		return clone
+	case interface {
+		ResponseItemID() string
+		WithResponseItemID(string) any
+	}:
+		id := typed.ResponseItemID()
+		if !isPrefixedResponseItemID(id) {
+			id = ""
+		}
+		return typed.WithResponseItemID(id)
+	default:
+		return item
+	}
+}
+
+func isPrefixedResponseItemID(value string) bool {
+	value = strings.TrimSpace(value)
+	prefix, suffix, ok := strings.Cut(value, "_")
+	return ok && prefix != "" && suffix != ""
+}
+
+func responsesLiteInputItems(inputItems []any, tools []any, instructions string, threadID string) []any {
+	if tools == nil {
+		tools = []any{}
+	}
+	// Responses Lite rebuilds its tools and base-instruction prefix on every
+	// request. Derive deterministic item IDs from the thread ID plus each
+	// item's serialized payload so an unchanged prefix keeps its identity
+	// across retries and resumed sessions (Rust client.rs #40962). Changing the
+	// thread or the payload changes the IDs.
+	prefixItems := []any{responsesLiteAdditionalToolsItem(tools, threadID)}
+	if strings.TrimSpace(instructions) != "" {
+		fragment := contextfrag.BaseInstructionsFragment{Text: strings.TrimSpace(instructions)}
+		prefixItems = append(prefixItems, responsesInputMessage{
+			ID:   responsesLiteItemID("msg", []byte(strings.TrimSpace(instructions)), threadID),
+			Type: "message",
+			Role: fragment.Role(),
+			Content: []responsesInputContent{{
+				Type: "input_text",
+				Text: fragment.Body(),
+			}},
+			Metadata: &responsesInputMessageMetadata{
+				ContentItemKinds: []string{fragment.ContentKind()},
+			},
+		})
+	}
+	items := make([]any, 0, len(prefixItems)+len(inputItems))
+	items = append(items, prefixItems...)
+	for i := range inputItems {
+		items = append(items, stripResponsesLiteImageDetails(inputItems[i]))
+	}
+	return items
+}
+
+// prependResponsesBaseInstructions mirrors Rust #51156: base instructions are a
+// developer input message with an ID hashed from the thread and instruction
+// text, and the top-level instructions field is cleared. The returned
+// instruction string is always empty when the item was prepended.
+func prependResponsesBaseInstructions(inputItems []any, instructions string, threadID string) ([]any, string) {
+	instructions = strings.TrimSpace(instructions)
+	if instructions == "" {
+		return inputItems, instructions
+	}
+	fragment := contextfrag.BaseInstructionsFragment{Text: instructions}
+	item := responsesInputMessage{
+		ID:   responsesLiteItemID("msg", []byte(instructions), threadID),
+		Type: "message",
+		Role: fragment.Role(),
+		Content: []responsesInputContent{{
+			Type: "input_text",
+			Text: fragment.Body(),
+		}},
+		Metadata: &responsesInputMessageMetadata{
+			ContentItemKinds: []string{fragment.ContentKind()},
+		},
+	}
+	out := make([]any, 0, len(inputItems)+1)
+	out = append(out, item)
+	out = append(out, inputItems...)
+	return out, ""
+}
+
+// responsesLiteDeclaredInputItems returns the request input for a
+// responses-lite context window whose tool declarations are already recorded in
+// history (Rust #51480 `has_tool_declarations`): the recorded `additional_tools`
+// item and base-instruction developer message stay exactly where the window put
+// them, so only the per-model image-detail normalization still applies.
+func responsesLiteDeclaredInputItems(inputItems []any) []any {
+	items := make([]any, 0, len(inputItems))
+	for i := range inputItems {
+		items = append(items, stripResponsesLiteImageDetails(inputItems[i]))
+	}
+	return items
+}
+
+// WindowHasToolDeclarations reports whether a context window's history already
+// carries harness-authored tool declarations, mirroring Rust
+// `ContextManager::has_tool_declarations` (#51480). Responses Lite records the
+// `additional_tools` item once per context window; a window that has one must
+// not have its declarations rebuilt or moved by a later request, because moving
+// them inside an existing window invalidates the server-side prefix cache.
+func WindowHasToolDeclarations(items []any) bool {
+	for _, item := range items {
+		if responseInputItemType(item) == "additional_tools" {
+			return true
+		}
+	}
+	return false
+}
+
+// responseInputItemType reads the wire `type` of a request input item across the
+// representations the runner accepts: typed agent items, decoded JSON objects
+// and raw JSON payloads loaded from a rollout record.
+func responseInputItemType(item any) string {
+	switch typed := item.(type) {
+	case nil:
+		return ""
+	case *AgentItem:
+		if typed == nil {
+			return ""
+		}
+		return strings.TrimSpace(typed.Type)
+	case AgentItem:
+		return strings.TrimSpace(typed.Type)
+	case map[string]any:
+		return strings.TrimSpace(responseToolString(typed["type"]))
+	case json.RawMessage:
+		var object map[string]any
+		if err := json.Unmarshal(typed, &object); err != nil {
+			return ""
+		}
+		return strings.TrimSpace(responseToolString(object["type"]))
+	case []byte:
+		var object map[string]any
+		if err := json.Unmarshal(typed, &object); err != nil {
+			return ""
+		}
+		return strings.TrimSpace(responseToolString(object["type"]))
+	case string:
+		var object map[string]any
+		if err := json.Unmarshal([]byte(typed), &object); err != nil {
+			return ""
+		}
+		return strings.TrimSpace(responseToolString(object["type"]))
+	default:
+		return ""
+	}
+}
+
+func responsesLiteAdditionalToolsItem(tools []any, threadID string) map[string]any {
+	item := map[string]any{
+		"type":  "additional_tools",
+		"role":  "developer",
+		"tools": tools,
+	}
+	if payload, err := json.Marshal(tools); err == nil {
+		item["id"] = responsesLiteItemID("at", payload, threadID)
+	}
+	return item
+}
+
+func responsesLiteItemID(prefix string, payload []byte, threadID string) string {
+	namespace := uuid.NewSHA1(uuid.NameSpaceOID, []byte(threadID))
+	return prefix + "_" + uuid.NewSHA1(namespace, payload).String()
+}
+
+func stripResponsesLiteImageDetails(value any) any {
+	if value == nil {
+		return nil
+	}
+	normalized, ok := normalizeResponsesInputValue(value)
+	if !ok {
+		normalized = cloneAny(value)
+	}
+	stripResponsesLiteImageDetailsInPlace(normalized)
+	return normalized
+}
+
+func normalizeResponsesInputValue(value any) (any, bool) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, false
+	}
+	var out any
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+func stripResponsesLiteImageDetailsInPlace(value any) {
+	switch typed := value.(type) {
+	case map[string]any:
+		if itemType, _ := typed["type"].(string); itemType == "input_image" || itemType == "image" {
+			delete(typed, "detail")
+		}
+		for _, child := range typed {
+			stripResponsesLiteImageDetailsInPlace(child)
+		}
+	case []any:
+		for i := range typed {
+			stripResponsesLiteImageDetailsInPlace(typed[i])
+		}
+	}
+}
+
+// normalizeResponseInputImageDetailsForModel mirrors Rust normalize_image_details
+// (client_common.rs, #44249): request copies downgrade `original` to the default
+// detail when the receiving model does not advertise
+// supports_image_detail_original. Stored items are never mutated, so switching
+// back to a supporting model still sends `original`.
+func normalizeResponseInputImageDetailsForModel(items []any, supportsImageDetailOriginal bool) []any {
+	if supportsImageDetailOriginal || len(items) == 0 {
+		return items
+	}
+	out := make([]any, 0, len(items))
+	for i := range items {
+		out = append(out, downgradeResponseInputImageDetail(items[i]))
+	}
+	return out
+}
+
+func downgradeResponseInputImageDetail(value any) any {
+	if value == nil {
+		return nil
+	}
+	normalized, ok := normalizeResponsesInputValue(value)
+	if !ok {
+		normalized = cloneAny(value)
+	}
+	downgradeResponseInputImageDetailInPlace(normalized)
+	return normalized
+}
+
+func downgradeResponseInputImageDetailInPlace(value any) {
+	switch typed := value.(type) {
+	case map[string]any:
+		if itemType, _ := typed["type"].(string); itemType == "input_image" || itemType == "image" {
+			if detail, ok := typed["detail"].(string); ok && strings.EqualFold(strings.TrimSpace(detail), "original") {
+				typed["detail"] = "high"
+			}
+		}
+		for _, child := range typed {
+			downgradeResponseInputImageDetailInPlace(child)
+		}
+	case []any:
+		for i := range typed {
+			downgradeResponseInputImageDetailInPlace(typed[i])
+		}
+	}
+}
+
+func agentResponseFromResponses(apiResponse *responsesAgentAPIResponse, request *AgentRequest, providerID string, headers http.Header) (*AgentResponse, error) {
+	if apiResponse == nil {
+		return nil, errors.New("responses API response is nil")
+	}
+	items := make([]AgentItem, 0, len(apiResponse.Output))
+	var messages []string
+	accumulator := newResponsesStreamAccumulator(request)
+	for index, output := range apiResponse.Output {
+		if item, ok := toolCallAgentItem(&output, index); ok {
+			accumulator.applyToolInputDeltas(item)
+			items = append(items, *item)
+			continue
+		}
+		if item, ok := imageGenerationAgentItem(&output, index); ok {
+			items = append(items, *item)
+			continue
+		}
+		if output.Type != "" && output.Type != "message" {
+			continue
+		}
+		if output.Role != "" && output.Role != "assistant" {
+			continue
+		}
+		text := strings.TrimSpace(output.text())
+		if text == "" {
+			continue
+		}
+		id := output.ID
+		if id == "" {
+			id = fmt.Sprintf("agent-message-%d", index+1)
+		}
+		items = append(items, AgentItem{ID: id, Type: "agent_message", Text: text})
+		messages = append(messages, text)
+	}
+	if len(items) > 0 && len(messages) == 0 {
+		return applyResponsesHeaderMetadata(&AgentResponse{
+			ResponseID: apiResponse.ID,
+			Items:      items,
+			Usage:      usageFromResponses(&apiResponse.Usage, ""),
+			Model:      firstNonEmptyResponseValue(apiResponse.Model, requestModel(request)),
+			ProviderID: firstNonEmptyResponseValue(providerID, requestProviderID(request)),
+		}, headers), nil
+	}
+	if len(items) == 0 && strings.TrimSpace(apiResponse.OutputText) != "" {
+		text := strings.TrimSpace(apiResponse.OutputText)
+		id := apiResponse.ID
+		if id == "" {
+			id = "agent-message-1"
+		}
+		items = append(items, AgentItem{ID: id, Type: "agent_message", Text: text})
+		messages = append(messages, text)
+	}
+	message := strings.TrimSpace(strings.Join(messages, "\n\n"))
+	if message == "" {
+		return nil, errors.New("responses API response did not contain assistant text")
+	}
+	return applyResponsesHeaderMetadata(&AgentResponse{
+		ResponseID: apiResponse.ID,
+		Message:    message,
+		Items:      items,
+		Usage:      usageFromResponses(&apiResponse.Usage, message),
+		Model:      firstNonEmptyResponseValue(apiResponse.Model, requestModel(request)),
+		ProviderID: firstNonEmptyResponseValue(providerID, requestProviderID(request)),
+	}, headers), nil
+}
+
+func applyResponsesHeaderMetadata(response *AgentResponse, headers http.Header) *AgentResponse {
+	if response == nil || len(headers) == 0 {
+		return response
+	}
+	response.RequestID = responseHeaderValue(headers, responsesRequestIDHeader, responsesOAIRequestIDHeader)
+	response.ServerModel = responseHeaderValue(headers, responsesOpenAIModelHeader, responsesXOpenAIModelHeader)
+	response.TurnState = responseHeaderValue(headers, responsesCodexTurnStateHeader)
+	response.ModelsETag = responseHeaderValue(headers, responsesModelsETagHeader)
+	response.Headers = cloneResponseHeaders(headers)
+	response.RateLimits = parseResponsesRateLimits(headers)
+	if headerExists(headers, responsesReasoningHeader) {
+		included := true
+		response.ReasoningIncluded = &included
+	}
+	return response
+}
+
+func toolCallAgentItem(output *responsesAgentOutputItem, index int) (*AgentItem, bool) {
+	if output == nil {
+		return nil, false
+	}
+	switch output.Type {
+	case "function_call", "custom_tool_call", "tool_search_call", "web_search_call":
+	default:
+		return nil, false
+	}
+	id := output.ID
+	if id == "" {
+		id = fmt.Sprintf("%s-%d", output.Type, index+1)
+	}
+	callID := output.CallID
+	if callID == "" {
+		callID = id
+	}
+	item := &AgentItem{
+		ID:                    id,
+		Type:                  output.Type,
+		Name:                  output.Name,
+		Namespace:             output.Namespace,
+		CallID:                callID,
+		Arguments:             responseArgumentsString(output.Arguments),
+		EncryptedFunctionArgs: cloneAgentStringSlicePtr(output.EncryptedFunctionArgs),
+		Input:                 output.Input,
+		Execution:             output.Execution,
+		Search:                cloneResponseSearch(output.Search),
+		Status:                output.Status,
+		Data:                  responseItemEncryptedContentData(output.EncryptedContent),
+	}
+	if item.Type == "tool_search_call" && len(item.Search) == 0 {
+		item.Search = responseArgumentsMap(output.Arguments)
+	}
+	if item.Type == "web_search_call" {
+		item.Search = cloneResponseSearch(output.Action)
+	}
+	return item, true
+}
+
+func responseItemEncryptedContentData(value *string) map[string]any {
+	if value == nil {
+		return nil
+	}
+	return map[string]any{
+		"encrypted_content": *value,
+		"encryptedContent":  *value,
+	}
+}
+
+func imageGenerationAgentItem(output *responsesAgentOutputItem, index int) (*AgentItem, bool) {
+	if output == nil || output.Type != "image_generation_call" {
+		return nil, false
+	}
+	id := output.ID
+	if id == "" {
+		id = fmt.Sprintf("image-generation-%d", index+1)
+	}
+	status := NormalizeImageGenerationStatus(output.Status, output.Result)
+	data := map[string]any{
+		"status": status,
+		"result": output.Result,
+	}
+	if output.EncryptedContent != nil {
+		data["encrypted_content"] = *output.EncryptedContent
+		data["encryptedContent"] = *output.EncryptedContent
+	}
+	if strings.TrimSpace(output.Revised) != "" {
+		data["revisedPrompt"] = output.Revised
+		data["revised_prompt"] = output.Revised
+	}
+	return &AgentItem{
+		ID:     id,
+		Type:   "image_generation_call",
+		Text:   output.Result,
+		Status: status,
+		Data:   data,
+	}, true
+}
+
+func NormalizeImageGenerationStatus(status string, result string) string {
+	status = strings.TrimSpace(status)
+	hasResult := strings.TrimSpace(result) != ""
+	if hasResult && (status == "" ||
+		strings.EqualFold(status, "generating") ||
+		strings.EqualFold(status, "in_progress") ||
+		strings.EqualFold(status, "running")) {
+		return "completed"
+	}
+	if status == "" {
+		if hasResult {
+			return "completed"
+		}
+		return "in_progress"
+	}
+	if strings.EqualFold(status, "generating") {
+		return "in_progress"
+	}
+	return status
+}
+
+func responseArgumentsString(arguments any) string {
+	switch value := arguments.(type) {
+	case nil:
+		return ""
+	case string:
+		return value
+	default:
+		data, err := json.Marshal(value)
+		if err != nil {
+			return ""
+		}
+		return string(data)
+	}
+}
+
+func responseArgumentsMap(arguments any) map[string]any {
+	switch value := arguments.(type) {
+	case map[string]any:
+		return cloneResponseSearch(value)
+	case nil:
+		return nil
+	default:
+		data, err := json.Marshal(value)
+		if err != nil {
+			return nil
+		}
+		var out map[string]any
+		if err := json.Unmarshal(data, &out); err != nil {
+			return nil
+		}
+		return out
+	}
+}
+
+func cloneResponseSearch(search map[string]any) map[string]any {
+	if search == nil {
+		return nil
+	}
+	out := make(map[string]any, len(search))
+	for key, value := range search {
+		out[key] = value
+	}
+	return out
+}
+
+func firstNonEmptyResponseValue(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func uniqueNonEmptyResponseValues(values ...string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func responsesInstructions(request *AgentRequest) string {
+	if request != nil && strings.TrimSpace(request.Instructions) != "" {
+		return strings.TrimSpace(request.Instructions)
+	}
+	return BaseInstructions
+}
+
+func requestModel(request *AgentRequest) string {
+	if request == nil {
+		return ""
+	}
+	return request.Model
+}
+
+func requestProviderID(request *AgentRequest) string {
+	if request == nil {
+		return ""
+	}
+	return request.ProviderID
+}
+
+func requestOriginator(request *AgentRequest) string {
+	if request == nil {
+		return ""
+	}
+	return strings.TrimSpace(request.Originator)
+}
+
+func addOriginatorHeader(headers http.Header, originator string) {
+	originator = strings.TrimSpace(originator)
+	if headers == nil || originator == "" || strings.ContainsAny(originator, "\r\n") {
+		return
+	}
+	headers.Set("originator", originator)
+}
+
+// addSessionIdentityHeaders mirrors Rust's ResponsesClient::stream_request,
+// which stamps every Responses call with the correlation headers built by
+// codex_api::requests::headers::build_session_headers:
+//
+//	session-id         <- ResponsesOptions::session_id
+//	thread-id          <- ResponsesOptions::thread_id
+//	x-client-request-id <- thread_id (Rust sets the request id from the thread)
+//
+// Go models a session per thread, so the turn's thread id is both the session
+// and the thread identity (upstream sends the same value for the main thread).
+func addSessionIdentityHeaders(headers http.Header, request *AgentRequest) {
+	if headers == nil || request == nil {
+		return
+	}
+	threadID := strings.TrimSpace(request.ThreadID)
+	if threadID == "" || strings.ContainsAny(threadID, "\r\n") {
+		return
+	}
+	sessionID := strings.TrimSpace(request.SessionID)
+	if sessionID == "" || strings.ContainsAny(sessionID, "\r\n") {
+		sessionID = threadID
+	}
+	if headers.Get("session-id") == "" {
+		headers.Set("session-id", sessionID)
+	}
+	if headers.Get("thread-id") == "" {
+		headers.Set("thread-id", threadID)
+	}
+	if headers.Get("x-client-request-id") == "" {
+		headers.Set("x-client-request-id", threadID)
+	}
+}
+
+func addCompatibilityMetadataHeaders(headers http.Header, metadata map[string]string) {
+	if headers == nil || len(metadata) == 0 {
+		return
+	}
+	for _, key := range []string{
+		codexapi.ClientCodexWindowIDHeader,
+		codexapi.ClientCodexTurnMetadataHeader,
+		codexapi.ClientCodexParentThreadIDHeader,
+		codexapi.ClientOpenAISubagentHeader,
+	} {
+		value := strings.TrimSpace(metadata[key])
+		if key == codexapi.ClientCodexTurnMetadataHeader {
+			value = boundedCompatibilityTurnMetadata(value)
+		}
+		if value == "" || strings.ContainsAny(value, "\r\n") {
+			continue
+		}
+		headers.Set(key, value)
+	}
+}
+
+func addMemoryGenerationHeader(headers http.Header, metadata map[string]string) {
+	if headers == nil {
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(metadata[codexapi.ClientOpenAISubagentHeader]), "memory_consolidation") {
+		headers.Set(codexapi.ClientOpenAIMemgenRequestHeader, "true")
+	}
+}
+
+func boundedCompatibilityTurnMetadata(value string) string {
+	if value == "" {
+		return ""
+	}
+	var metadata map[string]any
+	if json.Unmarshal([]byte(value), &metadata) != nil || metadata == nil {
+		return value
+	}
+	// Rust keeps the unbounded tool inventory in the canonical client metadata
+	// only, so the bounded compatibility projection drops it.
+	delete(metadata, codexapi.ToolNamespacesInfoKey)
+	delete(metadata, codexapi.CodeModeToolNamesKey)
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return value
+	}
+	return string(encoded)
+}
+
+func (i *responsesAgentOutputItem) text() string {
+	if i == nil {
+		return ""
+	}
+	var parts []string
+	for _, content := range i.Content {
+		switch content.Type {
+		case "output_text", "text", "":
+			if strings.TrimSpace(content.Text) != "" {
+				parts = append(parts, content.Text)
+			}
+		}
+	}
+	return strings.Join(parts, "")
+}
+
+func usageFromResponses(usage *responsesAgentAPIUsage, fallbackText string) AgentUsage {
+	if usage == nil {
+		outputTokens := estimateTokens(fallbackText)
+		return AgentUsage{OutputTokens: outputTokens, TotalTokens: outputTokens}
+	}
+	out := AgentUsage{
+		InputTokens:  usage.InputTokens,
+		OutputTokens: usage.OutputTokens,
+		TotalTokens:  usage.TotalTokens,
+	}
+	out.CodexRolloutBudgetUnits = usage.CodexRolloutBudgetUnits
+	if usage.InputTokensDetails != nil {
+		out.CachedInputTokens = usage.InputTokensDetails.CachedTokens
+		out.CacheWriteInputTokens = usage.InputTokensDetails.CacheWriteTokens
+	}
+	if usage.OutputTokensDetails != nil {
+		out.ReasoningOutputTokens = usage.OutputTokensDetails.ReasoningTokens
+	}
+	if out.OutputTokens == 0 {
+		out.OutputTokens = estimateTokens(fallbackText)
+	}
+	if out.TotalTokens == 0 {
+		out.TotalTokens = AgentUsageTotalTokens(out)
+	}
+	return out
+}
+
+func (r *ResponsesAgentRunner) responsesURL(endpoint ResponsesEndpoint) string {
+	provider := r.Provider
+	if provider == nil {
+		provider = &APIProvider{BaseURL: defaultResponsesEndpoint}
+	}
+	baseURL := strings.TrimRight(provider.BaseURL, "/")
+	if baseURL == "" {
+		baseURL = defaultResponsesEndpoint
+	}
+	raw := baseURL + endpoint.Path()
+	if len(provider.QueryParams) == 0 {
+		return raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	query := parsed.Query()
+	for key, value := range provider.QueryParams {
+		query.Set(key, value)
+	}
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
+}
+
+func (r *ResponsesAgentRunner) providerHeaders() http.Header {
+	if r == nil || r.Provider == nil {
+		return nil
+	}
+	return r.Provider.Headers
+}
+
+func (r *ResponsesAgentRunner) providerName() string {
+	if r == nil || r.Provider == nil {
+		return ""
+	}
+	return r.Provider.Name
+}
+
+func (r *ResponsesAgentRunner) responsesInclude() []string {
+	include := []string{"reasoning.encrypted_content"}
+	if r != nil && r.outputTokenReplayForProvider() {
+		include = append(include, "output.encrypted_content")
+	}
+	return include
+}
+
+func (r *ResponsesAgentRunner) outputTokenReplayForProvider() bool {
+	return r != nil && r.OutputTokenReplayEnabled && strings.EqualFold(strings.TrimSpace(r.providerName()), OpenAIProviderName)
+}
+
+// serviceTierForRequest mirrors Rust ModelClient #46230/#50472: a tier is sent
+// only when the model advertises it. Amazon Bedrock no longer drops every
+// tier — the GPT-6 Astra entry advertises `ultrafast` — but it still requires
+// the tier to be advertised, including flex, which the generic OpenAI resolver
+// permits without catalog support. ServiceTierForRequest already enforces that
+// membership, so the Bedrock-specific filter is subsumed here.
+func (r *ResponsesAgentRunner) serviceTierForRequest(modelInfo *ModelInfo, serviceTier string) string {
+	return ServiceTierForRequest(modelInfo, serviceTier)
+}
+
+func (r *ResponsesAgentRunner) authHeaders() http.Header {
+	if r == nil || r.Auth == nil {
+		return nil
+	}
+	return r.Auth.Headers
+}
+
+const usageLimitMaxWindowMinutes = 65535
+
+// usageLimitReachedAPIError mirrors Rust's `CodexErr::UsageLimitReached` for a
+// `usage_limit_reached` response: the failure keeps the evidence the response
+// supplied and reports Rust's recovery copy instead of the body's message
+// (Rust #48174).
+func usageLimitReachedAPIError(status int, evidence usageLimitEvidence) *codexapi.APIError {
+	return &codexapi.APIError{
+		Kind:                           codexapi.ErrorRateLimit,
+		Status:                         status,
+		Message:                        usageLimitReachedMessage(evidence),
+		UsageLimitWindowMinutes:        evidence.LimitWindowMinutes,
+		UsageLimitPlanType:             stringPointerIfNotEmpty(evidence.PlanType),
+		UsageLimitResetsAt:             evidence.ResetsAt,
+		UsageLimitLimitName:            stringPointerIfNotEmpty(evidence.LimitName),
+		UsageLimitPromoMessage:         stringPointerIfNotEmpty(evidence.PromoMessage),
+		UsageLimitRateLimitReachedType: stringPointerIfNotEmpty(evidence.RateLimitReachedType),
+	}
+}
+
+// stringPointerIfNotEmpty mirrors Rust's `Option` for the usage-limit evidence: an
+// absent value stays unset rather than becoming an empty string.
+func stringPointerIfNotEmpty(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+// usageLimitWindowMinutesFromValue accepts unsigned integers that fit in u16,
+// matching Rust's `Value::as_u64` plus `u16::try_from`. Missing, null,
+// malformed and out-of-range values are unknown.
+func usageLimitWindowMinutesFromValue(value any) *uint16 {
+	minutes, ok := uint64FromAny(value)
+	if !ok || minutes > usageLimitMaxWindowMinutes {
+		return nil
+	}
+	converted := uint16(minutes)
+	return &converted
+}
+
+func responsesHTTPError(providerName string, statusCode int, headers http.Header, body []byte, receivedAt ...time.Time) error {
+	retryAfterReceivedAt := time.Now()
+	if len(receivedAt) > 0 && !receivedAt[0].IsZero() {
+		retryAfterReceivedAt = receivedAt[0]
+	}
+	var payload struct {
+		Error *responsesAgentAPIErrorBody `json:"error"`
+	}
+	bodyText := strings.TrimSpace(string(body))
+	message := bodyText
+	if err := json.Unmarshal(body, &payload); err == nil && payload.Error != nil && strings.TrimSpace(payload.Error.Message) != "" {
+		message = strings.TrimSpace(payload.Error.Message)
+	}
+	// Rust #38682: misalignment policy violations from HTTP 400/403 responses
+	// surface as a typed, non-retryable error.
+	if (statusCode == http.StatusBadRequest || statusCode == http.StatusForbidden) &&
+		payload.Error != nil &&
+		responseErrorCode(payload.Error) == "misalignment_policy_violation" {
+		if strings.TrimSpace(message) == "" {
+			message = "This request was blocked due to a misalignment policy violation."
+		}
+		return &codexapi.APIError{Kind: codexapi.ErrorMisalignmentPolicyViolation, Status: statusCode, Message: message}
+	}
+	// Rust #46306: HTTP 400 policy refusals keep their classification, keeping
+	// the server message and using a policy-specific fallback when it is blank.
+	if statusCode == http.StatusBadRequest && payload.Error != nil {
+		policyMessage := strings.TrimSpace(payload.Error.Message)
+		switch responseErrorCode(payload.Error) {
+		case "cyber_policy":
+			return &codexapi.APIError{
+				Kind:    codexapi.ErrorCyberPolicy,
+				Status:  statusCode,
+				Message: fallbackPolicyMessage(policyMessage, CyberPolicyFallbackMessage),
+			}
+		case "bio_policy":
+			return &codexapi.APIError{
+				Kind:    codexapi.ErrorBioPolicy,
+				Status:  statusCode,
+				Message: fallbackPolicyMessage(policyMessage, BioPolicyFallbackMessage),
+			}
+		}
+	}
+	// Rust #45602: a 503 body distinguishes model capacity from a retryable
+	// rate limit instead of treating both as one blanket overload.
+	if statusCode == http.StatusServiceUnavailable && payload.Error != nil {
+		switch responseErrorCode(payload.Error) {
+		case "server_is_overloaded":
+			// `map_api_error` attaches the response's `Retry-After` advice to
+			// every transport classification it maps
+			// (`ApiError::Transport(TransportError::Http { retry_after, .. })` ->
+			// `CodexErr::with_retry_after`), and Rust #49441 makes an overload
+			// retry only while that advice is present, so the classification has
+			// to keep it.
+			overloaded := &codexapi.APIError{Kind: codexapi.ErrorServerOverloaded, Message: message}
+			if retryAfter, ok := responsesRequestedRetryAfter(headers, retryAfterReceivedAt); ok {
+				return overloaded.WithRetryAfter(retryAfter)
+			}
+			return overloaded
+		case "slow_down":
+			// The same `with_retry_after` arm keeps a retryable rate limit's
+			// advice (Rust #45602 classifies it), so the retry waits for the
+			// server's deadline instead of the local backoff.
+			slowDown := &codexapi.APIError{Kind: codexapi.ErrorRateLimitExceeded, Message: strings.TrimSpace(payload.Error.Message)}
+			if retryAfter, ok := responsesRequestedRetryAfter(headers, retryAfterReceivedAt); ok {
+				return slowDown.WithRetryAfter(retryAfter)
+			}
+			return slowDown
+		}
+	}
+	if statusCode == http.StatusTooManyRequests {
+		// Rust #47967 (api_bridge.rs): the `flex_unavailable` code is checked on
+		// the lenient error object before the strict usage-error decode, so it
+		// stays a terminal Flex-capacity failure even when the body's other
+		// fields are malformed.
+		if payload.Error != nil && responseErrorCode(payload.Error) == "flex_unavailable" {
+			if strings.TrimSpace(message) == "" {
+				message = "Flex capacity unavailable."
+			}
+			return &codexapi.APIError{Kind: codexapi.ErrorFlexUnavailable, Status: statusCode, Message: message}
+		}
+		// Rust parses the 429 body once as `UsageErrorResponse`; a body it
+		// cannot decode skips every classification below and falls through to
+		// the generic (retryable) API error. The strict decode therefore gates
+		// the usage-limit (#48174), usage-not-included and quota (#44492)
+		// branches alike, rather than only the usage-limit branch.
+		if errorBody, ok := decodeUsageLimitErrorBody(body); ok {
+			switch {
+			case errorBody.Type != nil && strings.TrimSpace(*errorBody.Type) == "usage_limit_reached":
+				return usageLimitReachedAPIError(statusCode, usageLimitEvidenceFromResponse(errorBody, headers))
+			case errorBody.Type != nil && strings.TrimSpace(*errorBody.Type) == "usage_not_included":
+				if strings.TrimSpace(message) == "" {
+					message = http.StatusText(statusCode)
+				}
+				return &codexapi.APIError{Kind: codexapi.ErrorUsageNotIncluded, Message: message}
+			case usageLimitErrorBodyIsQuotaError(errorBody):
+				if strings.TrimSpace(message) == "" {
+					message = http.StatusText(statusCode)
+				}
+				return &codexapi.APIError{Kind: codexapi.ErrorQuotaExceeded, Status: statusCode, Message: message}
+			}
+		}
+	}
+	if message == "" {
+		message = http.StatusText(statusCode)
+	}
+	message = mapProviderAPIErrorMessage(providerName, statusCode, bodyText, message)
+	apiError := &ResponsesAPIError{
+		StatusCode:             statusCode,
+		Message:                message,
+		Body:                   bodyText,
+		UserMessage:            responsesProviderUserMessage(providerName, statusCode, bodyText),
+		RequestID:              responseHeaderValue(headers, responsesRequestIDHeader, responsesOAIRequestIDHeader),
+		CFRay:                  responseHeaderValue(headers, "cf-ray"),
+		AuthorizationError:     responseHeaderValue(headers, "x-openai-authorization-error"),
+		AuthorizationErrorCode: responseAuthorizationErrorCode(headers),
+	}
+	if retryAfter, ok := responsesRequestedRetryAfter(headers, retryAfterReceivedAt); ok {
+		apiError.retryAfter = retryAfter
+		apiError.hasRetryAfter = true
+	}
+	return apiError
+}
+
+const bedrockExpiredSignatureMessage = "Amazon Bedrock rejected the request because its AWS signature has expired. Refresh your AWS credentials and retry. If `AWS_BEARER_TOKEN_BEDROCK` is set, update or unset it, then restart Codex"
+
+// Policy-refusal messages mirror Rust's codex-api constants (#46306).
+const (
+	CyberPolicyFallbackMessage = "This request has been flagged for possible cybersecurity risk."
+	BioPolicyFallbackMessage   = "This content was flagged for possible biological risk."
+)
+
+func fallbackPolicyMessage(message string, fallback string) string {
+	if strings.TrimSpace(message) == "" {
+		return fallback
+	}
+	return message
+}
+
+// responsesQuotaErrorCodes mirrors Rust #44492's HTTP 429 quota classification.
+var responsesQuotaErrorCodes = map[string]bool{
+	"insufficient_quota":                true,
+	"credit_balance_exhausted":          true,
+	"organization_spend_limit_exceeded": true,
+	"project_spend_limit_exceeded":      true,
+	"organization_usage_limit_exceeded": true,
+}
+
+func mapProviderAPIErrorMessage(providerName string, statusCode int, bodyText string, message string) string {
+	if providerName == AmazonBedrockProviderName && statusCode == http.StatusUnauthorized && strings.Contains(bodyText, "Signature expired:") {
+		return bedrockExpiredSignatureMessage
+	}
+	return message
+}
+
+func responseAuthorizationErrorCode(headers http.Header) string {
+	encoded := strings.TrimSpace(responseHeaderValue(headers, "x-error-json"))
+	if encoded == "" {
+		return ""
+	}
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return ""
+	}
+	var payload struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(decoded, &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.Error.Code)
+}
+
+func (r *ResponsesAgentRunner) requestMaxRetries() uint64 {
+	if r == nil || r.Provider == nil {
+		return DefaultRequestMaxRetries
+	}
+	return r.Provider.RequestMaxRetries
+}
+
+func (r *ResponsesAgentRunner) streamMaxRetries() uint64 {
+	if r == nil || r.Provider == nil {
+		return DefaultStreamMaxRetries
+	}
+	return r.Provider.StreamMaxRetries
+}
+
+func (r *ResponsesAgentRunner) streamIdleTimeout() time.Duration {
+	if r == nil || r.Provider == nil || r.Provider.StreamIdleTimeout <= 0 {
+		return time.Duration(DefaultStreamIdleTimeoutMS) * time.Millisecond
+	}
+	return r.Provider.StreamIdleTimeout
+}
+
+func shouldRetryResponsesHTTPRequest(response *http.Response, err error, retryTooManyRequests bool) bool {
+	if err != nil {
+		return true
+	}
+	if response == nil {
+		return false
+	}
+	return response.StatusCode == http.StatusUnauthorized || (retryTooManyRequests && response.StatusCode == http.StatusTooManyRequests) || response.StatusCode >= 500
+}
+
+func (r *ResponsesAgentRunner) refreshProviderCommandAuth(ctx context.Context) error {
+	if r == nil || r.Provider == nil || r.Provider.Auth == nil {
+		return nil
+	}
+	headers, err := ResolveProviderCommandAuth(ctx, r.Provider.Auth)
+	if err != nil {
+		return err
+	}
+	r.Auth = &headers
+	r.providerAuthFetchedAt = time.Now()
+	return nil
+}
+
+func (r *ResponsesAgentRunner) ensureFreshProviderCommandAuth(ctx context.Context) error {
+	if r == nil || r.Provider == nil || r.Provider.Auth == nil {
+		return nil
+	}
+	if r.Auth == nil {
+		return r.refreshProviderCommandAuth(ctx)
+	}
+	interval := providerAuthRefreshInterval(r.Provider.Auth)
+	if interval <= 0 {
+		return nil
+	}
+	if !r.providerAuthFetchedAt.IsZero() && time.Since(r.providerAuthFetchedAt) < interval {
+		return nil
+	}
+	return r.refreshProviderCommandAuth(ctx)
+}
+
+// refreshWorkloadIdentityAuth re-exchanges workload identity after a
+// downstream 401 (Rust AuthManager refresh_external_auth + WorkloadIdentity
+// ExternalAuth::refresh, #38188): when the process selected workload identity,
+// the refresh preserves the previously authenticated account instead of
+// falling through to OAuth token refresh.
+func (r *ResponsesAgentRunner) refreshWorkloadIdentityAuth(ctx context.Context) error {
+	if r == nil || r.AuthSnapshot == nil {
+		return errors.New("workload identity refresh is not available")
+	}
+	if r.WorkloadIdentityRefresh != nil {
+		refreshed, err := r.WorkloadIdentityRefresh(ctx, accountIDFromMap(r.AuthSnapshot.Tokens))
+		if err != nil {
+			return err
+		}
+		if refreshed == nil {
+			return errors.New("workload identity refresh returned no auth")
+		}
+		return r.applyRefreshedAuth(refreshed)
+	}
+	if !auth.IsWorkloadIdentitySelected() {
+		return errors.New("workload identity is not selected")
+	}
+	options := r.workloadIdentityOptions()
+	if options == nil {
+		return errors.New("workload identity options are not configured")
+	}
+	authProvider, err := auth.WorkloadIdentityAuthForProcess(options)
+	if err != nil {
+		return err
+	}
+	if authProvider == nil {
+		return errors.New("workload identity is not selected")
+	}
+	refreshed, err := authProvider.RefreshAuth(ctx, accountIDFromMap(r.AuthSnapshot.Tokens))
+	if err != nil {
+		return err
+	}
+	if refreshed == nil {
+		return errors.New("workload identity refresh returned no auth")
+	}
+	return r.applyRefreshedAuth(refreshed)
+}
+
+func (r *ResponsesAgentRunner) applyRefreshedAuth(refreshed *auth.AuthDotJSON) error {
+	headers, err := AuthHeadersFromAuth(*refreshed)
+	if err != nil {
+		return err
+	}
+	r.AuthSnapshot = cloneAuthSnapshot(refreshed)
+	r.Auth = &headers
+	r.AgentIdentityTelemetry = agentIdentityTelemetryFromAuthHeaders(&headers)
+	return nil
+}
+
+func (r *ResponsesAgentRunner) workloadIdentityOptions() *auth.WorkloadIdentityAuthOptions {
+	if r == nil {
+		return nil
+	}
+	if r.StoreOptions != nil && r.StoreOptions.WorkloadIdentity != nil {
+		return r.StoreOptions.WorkloadIdentity
+	}
+	if strings.TrimSpace(r.AuthIssuer) == "" {
+		return nil
+	}
+	return &auth.WorkloadIdentityAuthOptions{ChatGPTBaseURL: r.AuthIssuer}
+}
+
+func providerAuthRefreshInterval(info *ProviderAuthInfo) time.Duration {
+	if info == nil || info.RefreshIntervalMS == 0 {
+		return 0
+	}
+	return time.Duration(info.RefreshIntervalMS) * time.Millisecond
+}
+
+// authRecoveryDebug carries the failed response's debug context, which Rust
+// reports on the recovery record and the retrying attempt.
+type authRecoveryDebug struct {
+	RequestID     string
+	CFRay         string
+	AuthError     string
+	AuthErrorCode string
+}
+
+// recordAuthRecovery reports one recovery step (Rust's record_auth_recovery).
+func (r *ResponsesAgentRunner) recordAuthRecovery(ctx context.Context, mode auth.UnauthorizedRecoveryMode, step auth.UnauthorizedRecoveryStep, outcome string, debug authRecoveryDebug, authStateChanged *bool) {
+	r.recordAuthRecoveryWithReason(ctx, mode, step, outcome, "", debug, authStateChanged)
+}
+
+// recordAuthRecoveryWithReason reports one recovery step with Rust's
+// recovery_reason (only the not-run outcome carries one).
+func (r *ResponsesAgentRunner) recordAuthRecoveryWithReason(ctx context.Context, mode auth.UnauthorizedRecoveryMode, step auth.UnauthorizedRecoveryStep, outcome string, reason string, debug authRecoveryDebug, authStateChanged *bool) {
+	if r == nil || r.Telemetry == nil {
+		return
+	}
+	r.Telemetry.RecordAuthRecovery(ctx, AuthRecoveryRecord{
+		Mode:             string(mode),
+		Step:             string(step),
+		Outcome:          outcome,
+		RecoveryReason:   reason,
+		RequestID:        debug.RequestID,
+		CFRay:            debug.CFRay,
+		AuthError:        debug.AuthError,
+		AuthErrorCode:    debug.AuthErrorCode,
+		AuthStateChanged: authStateChanged,
+	})
+}
+
+// authCredentialFingerprint identifies the credential a snapshot carries, so a
+// recovery step can report whether it changed the cached auth.
+func authCredentialFingerprint(snapshot *auth.AuthDotJSON) string {
+	if snapshot == nil {
+		return ""
+	}
+	return strings.Join([]string{
+		snapshot.Mode(),
+		accountIDFromMap(snapshot.Tokens),
+		stringFromAny(snapshot.Tokens, "access_token"),
+		stringFromAny(snapshot.Tokens, "id_token"),
+	}, "|")
+}
+
+// refreshBedrockAWSCredentials mirrors Rust #39410: when a Bedrock session
+// using the AWS SDK credential chain reports expired credentials (e.g.
+// "Signature expired"), run the configured aws.auth_refresh command once,
+// reload the SDK credentials, and re-sign subsequent requests.
+func (r *ResponsesAgentRunner) refreshBedrockAWSCredentials(ctx context.Context) error {
+	if r == nil || r.Provider == nil || r.Provider.Name != AmazonBedrockProviderName || r.AWS == nil ||
+		(r.AWS.AuthRefresh == nil && r.AWS.CredentialExport == nil) {
+		return errors.New("bedrock aws auth recovery is not configured")
+	}
+	// Rust #39274: at most one provider-owned recovery attempt per request.
+	if r.bedrockAuthRecoveryAttempted {
+		return errors.New("bedrock aws auth refresh already attempted for this request")
+	}
+	r.bedrockAuthRecoveryAttempted = true
+	refresh := r.AWS.AuthRefresh
+	if refresh != nil && strings.TrimSpace(refresh.Command) == "" {
+		return errors.New("bedrock aws auth refresh command is empty")
+	}
+	// Share refresh state across matching provider configurations so
+	// concurrent failures invoke the command only once (Rust shared_state).
+	r.awsRefreshMutex().Lock()
+	if r.AWSRefreshInFlight != nil {
+		ch := r.AWSRefreshInFlight
+		r.awsRefreshMutex().Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ch:
+		}
+		return nil
+	}
+	ch := make(chan struct{})
+	r.AWSRefreshInFlight = ch
+	r.awsRefreshMutex().Unlock()
+
+	var runErr error
+	if refresh != nil {
+		runErr = r.runBedrockAWSRefreshCommand(ctx, refresh)
+	}
+
+	r.awsRefreshMutex().Lock()
+	r.AWSRefreshInFlight = nil
+	close(ch)
+	r.awsRefreshMutex().Unlock()
+	if runErr != nil {
+		return runErr
+	}
+	// Reload credentials and re-sign future requests. Configured credential
+	// export re-runs the exporter (#44028); otherwise the SDK chain reloads.
+	// Rust BedrockSigV4AuthProvider::apply_auth re-signs through the same
+	// endpoint-aware config, so the SigV4 service follows the provider's
+	// endpoint (#38470 d5e256ceb2).
+	endpoint := bedrockEndpointForProviderName(r.Provider.Name)
+	awsConfig := &auth.AWSAuthConfig{
+		Profile: strings.TrimSpace(r.AWS.Profile),
+		Region:  strings.TrimSpace(r.AWS.Region),
+		Service: bedrockServiceNameForEndpoint(endpoint),
+	}
+	var awsContext *auth.AWSAuthContext
+	var err error
+	if exportConfig, ok := bedrockCredentialExportConfig(r.AWS); ok {
+		provider := credentialExportProviderForConfig(exportConfig)
+		if err := provider.Refresh(ctx); err != nil {
+			return fmt.Errorf("failed to export Amazon Bedrock credentials after refresh: %w", err)
+		}
+		awsContext, err = auth.LoadAWSAuthContextWithProviderAndOptions(awsConfig, provider, awsAuthLoadOptions())
+	} else {
+		awsContext, err = auth.LoadAWSAuthContextWithOptions(awsConfig, awsAuthLoadOptions())
+	}
+	if err != nil {
+		return fmt.Errorf("failed to reload Amazon Bedrock auth after refresh: %w", err)
+	}
+	if r.Auth == nil {
+		r.Auth = &AuthHeaders{Headers: http.Header{}}
+	}
+	r.Auth.SignRequest = func(ctx context.Context, request *http.Request, body []byte) (*SignedRequest, error) {
+		return signBedrockRequest(awsContext, request, body, endpoint)
+	}
+	return nil
+}
+
+func (r *ResponsesAgentRunner) runBedrockAWSRefreshCommand(ctx context.Context, refresh *ProviderAuthRefreshInfo) error {
+	if refresh == nil || strings.TrimSpace(refresh.Command) == "" {
+		return errors.New("bedrock aws auth refresh command is empty")
+	}
+	timeoutMS := refresh.TimeoutMS
+	if timeoutMS == 0 {
+		timeoutMS = DefaultProviderAuthTimeoutMS
+	}
+	execCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMS)*time.Millisecond)
+	defer cancel()
+	args := append([]string(nil), refresh.Args...)
+	cmd := exec.CommandContext(execCtx, refresh.Command, args...)
+	// Rust #48483: the refresh helper is piped, so it must not allocate a console
+	// window when the CLI itself has no console.
+	envutil.SuppressConsoleWindow(cmd)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			message = err.Error()
+		}
+		return fmt.Errorf("bedrock aws auth refresh failed: %s", message)
+	}
+	return nil
+}
+
+func (r *ResponsesAgentRunner) resolveAgentIdentityAuth(ctx context.Context) error {
+	if r == nil || r.agentIdentityBypass || r.agentIdentityTried || r.AgentIdentity == nil || !r.AgentIdentity.Enabled {
+		return nil
+	}
+	r.agentIdentityTried = true
+	if r.AuthSnapshot == nil || r.AuthSnapshot.Mode() != "chatgpt" {
+		return nil
+	}
+	httpClient, _ := r.HTTPClient.(*http.Client)
+	resolved, err := auth.BootstrapManagedAgentIdentity(ctx, &auth.AgentIdentityBootstrapOptions{
+		CodexHome:                 r.CodexHome,
+		AuthSnapshot:              r.AuthSnapshot,
+		StoreOptions:              r.StoreOptions,
+		HTTPClient:                httpClient,
+		ChatGPTBaseURL:            r.AgentIdentity.ChatGPTBaseURL,
+		AgentIdentityAuthAPIURL:   r.AgentIdentity.AuthAPIBaseURL,
+		ForcedChatGPTWorkspaceIDs: append([]string(nil), r.AgentIdentity.ForcedChatGPTWorkspaceIDs...),
+		SessionSource:             r.AgentIdentity.SessionSource,
+		AgentVersion:              r.AgentIdentity.AgentVersion,
+	})
+	if err != nil {
+		var bootstrapUnavailable *auth.AgentIdentityBootstrapUnavailableError
+		if errors.As(err, &bootstrapUnavailable) {
+			r.agentIdentityBypass = true
+			return nil
+		}
+		return err
+	}
+	if resolved == nil {
+		return nil
+	}
+	headers, err := AuthHeadersFromAuth(*resolved)
+	if err != nil {
+		return err
+	}
+	r.AuthSnapshot = cloneAuthSnapshot(resolved)
+	r.Auth = &headers
+	r.AgentIdentityTelemetry = agentIdentityTelemetryFromAuthHeaders(&headers)
+	return nil
+}
+
+func (r *ResponsesAgentRunner) refreshExternalChatGPTAuth(ctx context.Context) error {
+	if r == nil || r.AuthSnapshot == nil || r.AuthSnapshot.Mode() != "chatgptAuthTokens" {
+		return errors.New("external chatgpt auth refresh is not available")
+	}
+	if r.ExternalAuthRefresh == nil {
+		return errors.New("external chatgpt auth refresh callback is not configured")
+	}
+	response, err := r.ExternalAuthRefresh(ctx, &ExternalAuthRefreshRequest{
+		Reason:            ExternalAuthRefreshUnauthorized,
+		PreviousAccountID: accountIDFromMap(r.AuthSnapshot.Tokens),
+	})
+	if err != nil {
+		return err
+	}
+	if response == nil || strings.TrimSpace(response.AccessToken) == "" || strings.TrimSpace(response.ChatGPTAccountID) == "" {
+		return errors.New("external chatgpt auth refresh response omitted accessToken or chatgptAccountId")
+	}
+	snapshot := auth.FromChatGPTAuthTokens(response.AccessToken, response.ChatGPTAccountID, response.ChatGPTPlanType)
+	headers, err := AuthHeadersFromAuth(snapshot)
+	if err != nil {
+		return err
+	}
+	r.AuthSnapshot = cloneAuthSnapshot(&snapshot)
+	r.Auth = &headers
+	r.AgentIdentityTelemetry = agentIdentityTelemetryFromAuthHeaders(&headers)
+	return nil
+}
+
+func (r *ResponsesAgentRunner) refreshManagedChatGPTAuth(ctx context.Context) error {
+	if r == nil || r.AuthSnapshot == nil || !authHasChatGPTAccount(r.AuthSnapshot) {
+		return errors.New("chatgpt auth refresh is not available")
+	}
+	if r.AuthSnapshot.Mode() == "chatgptAuthTokens" {
+		return errors.New("managed chatgpt auth refresh is not available for external tokens")
+	}
+	if strings.TrimSpace(r.CodexHome) == "" {
+		return errors.New("codex home is required for chatgpt auth refresh")
+	}
+	httpClient, _ := r.HTTPClient.(*http.Client)
+	refreshed, err := auth.RefreshChatGPTTokens(ctx, &auth.RefreshChatGPTTokenOptions{
+		CodexHome:    r.CodexHome,
+		Issuer:       r.AuthIssuer,
+		HTTPClient:   httpClient,
+		RefreshToken: stringFromAny(r.AuthSnapshot.Tokens, "refresh_token"),
+		AuthSnapshot: r.AuthSnapshot,
+		StoreOptions: r.StoreOptions,
+		// Rust #53991: this refresh runs as the managed auth source's
+		// UnauthorizedRecoveryStepRefreshToken after a 401, so it reports
+		// `unauthorized_recovery` instead of the `forced` default.
+		Reason: auth.RefreshReasonUnauthorizedRecovery,
+	})
+	if err != nil {
+		return err
+	}
+	headers, err := AuthHeadersFromAuth(*refreshed)
+	if err != nil {
+		return err
+	}
+	r.AuthSnapshot = cloneAuthSnapshot(refreshed)
+	r.Auth = &headers
+	r.AgentIdentityTelemetry = agentIdentityTelemetryFromAuthHeaders(&headers)
+	return nil
+}
+
+func responsesRetryDelay(response *http.Response, attempt uint64) time.Duration {
+	if response != nil {
+		if delay, ok := responsesRequestedRetryDelay(response.Header, time.Now()); ok {
+			return delay
+		}
+	}
+	if attempt == 0 {
+		attempt = 1
+	}
+	// Rust #46540 codex_async_utils::backoff: 200 ms doubling per attempt with
+	// up to 10% jitter and no cap. Callers enforce their own retry budget, so a
+	// fixed ceiling here would retry sooner than Rust.
+	delay := defaultResponsesRetryBaseDelay
+	for i := uint64(1); i < attempt; i++ {
+		if delay > time.Duration(math.MaxInt64/2) {
+			delay = time.Duration(math.MaxInt64)
+			break
+		}
+		delay *= 2
+	}
+	// Match Rust's backoff jitter range so reconnecting clients do not retry in lockstep.
+	jitter := 0.9 + rand.Float64()*0.2
+	return time.Duration(float64(delay) * jitter)
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func addHeaders(dst http.Header, src http.Header) {
+	for key, values := range src {
+		if strings.TrimSpace(key) == "" {
+			continue
+		}
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
+func cloneAPIProvider(provider *APIProvider) *APIProvider {
+	if provider == nil {
+		return nil
+	}
+	return normalizeAPIProvider(&APIProvider{
+		Name:              provider.Name,
+		BaseURL:           provider.BaseURL,
+		QueryParams:       cloneStringMap(provider.QueryParams),
+		Headers:           cloneHTTPHeader(provider.Headers),
+		Auth:              cloneProviderAuthInfo(provider.Auth),
+		RequestMaxRetries: provider.RequestMaxRetries,
+		StreamMaxRetries:  provider.StreamMaxRetries,
+		StreamIdleTimeout: provider.StreamIdleTimeout,
+		// The runtime-only metadata grant travels with the resolved provider, so
+		// the runner clone must not drop it (Rust #48344).
+		IncludeInternalMetadata: provider.IncludeInternalMetadata,
+	})
+}
+
+func defaultAPIProvider() *APIProvider {
+	return &APIProvider{
+		Name:              OpenAIProviderName,
+		BaseURL:           defaultResponsesEndpoint,
+		RequestMaxRetries: DefaultRequestMaxRetries,
+		StreamMaxRetries:  DefaultStreamMaxRetries,
+		StreamIdleTimeout: time.Duration(DefaultStreamIdleTimeoutMS) * time.Millisecond,
+	}
+}
+
+func normalizeAPIProvider(provider *APIProvider) *APIProvider {
+	if provider == nil {
+		return nil
+	}
+	out := *provider
+	out.QueryParams = cloneStringMap(out.QueryParams)
+	out.Headers = cloneHTTPHeader(out.Headers)
+	if out.BaseURL == "" {
+		out.BaseURL = defaultResponsesEndpoint
+	}
+	return &out
+}
+
+func cloneAuthHeaders(headers *AuthHeaders) *AuthHeaders {
+	if headers == nil {
+		return nil
+	}
+	return &AuthHeaders{
+		Headers:                cloneHTTPHeader(headers.Headers),
+		SignRequest:            headers.SignRequest,
+		AgentIdentityTelemetry: cloneAgentIdentityTelemetry(headers.AgentIdentityTelemetry),
+	}
+}
+
+func cloneProviderCapabilities(capabilities ProviderCapabilities) *ProviderCapabilities {
+	clone := capabilities
+	return &clone
+}
+
+func agentIdentityTelemetryFromAuthHeaders(headers *AuthHeaders) *codexapi.AgentIdentityTelemetry {
+	if headers == nil {
+		return nil
+	}
+	return cloneAgentIdentityTelemetry(headers.AgentIdentityTelemetry)
+}
+
+func cloneAgentIdentityTelemetry(value *codexapi.AgentIdentityTelemetry) *codexapi.AgentIdentityTelemetry {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}
+
+func cloneAuthSnapshot(snapshot *auth.AuthDotJSON) *auth.AuthDotJSON {
+	if snapshot == nil {
+		return nil
+	}
+	clone := *snapshot
+	if snapshot.Tokens != nil {
+		clone.Tokens = cloneMapAny(snapshot.Tokens)
+	}
+	clone.AgentIdentity = cloneAgentIdentitySnapshot(snapshot.AgentIdentity)
+	return &clone
+}
+
+func cloneAgentIdentitySnapshot(value any) any {
+	switch record := value.(type) {
+	case *auth.AgentIdentityAuthRecord:
+		if record == nil {
+			return nil
+		}
+		clone := *record
+		clone.Email = cloneStringPtrModel(record.Email)
+		clone.TaskID = cloneStringPtrModel(record.TaskID)
+		return &clone
+	case auth.AgentIdentityAuthRecord:
+		clone := record
+		clone.Email = cloneStringPtrModel(record.Email)
+		clone.TaskID = cloneStringPtrModel(record.TaskID)
+		return clone
+	case map[string]any:
+		return cloneMapAny(record)
+	default:
+		return value
+	}
+}
+
+func cloneStringPtrModel(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}
+
+func cloneBoolPtrModel(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}
+
+func cloneProviderAWSAuthInfo(value *ProviderAWSAuthInfo) *ProviderAWSAuthInfo {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	if value.CredentialExport != nil {
+		export := *value.CredentialExport
+		export.Args = append([]string(nil), value.CredentialExport.Args...)
+		clone.CredentialExport = &export
+	}
+	if value.AuthRefresh != nil {
+		refresh := *value.AuthRefresh
+		refresh.Args = append([]string(nil), value.AuthRefresh.Args...)
+		clone.AuthRefresh = &refresh
+	}
+	return &clone
+}
+
+func cloneStoreOptions(options *auth.StoreOptions) *auth.StoreOptions {
+	if options == nil {
+		return nil
+	}
+	clone := *options
+	return &clone
+}
+
+func cloneAgentIdentityOptions(options *AgentIdentityOptions) *AgentIdentityOptions {
+	if options == nil {
+		return nil
+	}
+	clone := *options
+	clone.ForcedChatGPTWorkspaceIDs = append([]string(nil), options.ForcedChatGPTWorkspaceIDs...)
+	return &clone
+}
+
+func cloneHTTPHeader(headers http.Header) http.Header {
+	if headers == nil {
+		return nil
+	}
+	out := http.Header{}
+	for key, values := range headers {
+		out[key] = append([]string(nil), values...)
+	}
+	return out
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	out := make(map[string]string, len(values))
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
+}
