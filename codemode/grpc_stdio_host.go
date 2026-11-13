@@ -11,6 +11,8 @@ import (
 
 	codemodev1 "codex_core/codemode/grpc"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // stdioConn adapts a duplex pipe pair to net.Conn so gRPC can run over a host
@@ -95,7 +97,7 @@ func RunGrpcStdioHost(ctx context.Context, stdin io.Reader, stdout io.Writer) er
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	listener := &singleConnListener{done: make(chan struct{})}
+	server, listener := newGrpcHostServer(ctx)
 	// Rust #52723: the host exits when its stdio connection closes. Closing the
 	// accepted conn unblocks Accept so Serve returns instead of waiting forever
 	// for a replacement connection.
@@ -105,11 +107,6 @@ func RunGrpcStdioHost(ctx context.Context, stdin io.Reader, stdout io.Writer) er
 			_ = listener.Close()
 		},
 	}
-	server := grpc.NewServer(
-		grpc.MaxRecvMsgSize(ProtocolMaxFrameBytes),
-		grpc.MaxSendMsgSize(ProtocolMaxFrameBytes),
-	)
-	codemodev1.RegisterCodeModeHostServer(server, &grpcStdioHostServer{ctx: ctx})
 	go func() {
 		<-ctx.Done()
 		server.Stop()
@@ -124,6 +121,51 @@ func RunGrpcStdioHost(ctx context.Context, stdin io.Reader, stdout io.Writer) er
 	default:
 	}
 	return err
+}
+
+// RunGrpcTCPHost serves the same gRPC Transport on a TCP listener, matching
+// Rust's `--listen grpc://IP:PORT` transport.
+func RunGrpcTCPHost(ctx context.Context, address string) error {
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return err
+	}
+	return ServeGrpcTCPHost(ctx, listener)
+}
+
+// ServeGrpcTCPHost serves the gRPC host on an existing listener until the
+// context is cancelled or the server fails.
+func ServeGrpcTCPHost(ctx context.Context, listener net.Listener) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	server, _ := newGrpcHostServer(ctx)
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(listener) }()
+	var err error
+	select {
+	case err = <-served:
+	case <-ctx.Done():
+		server.Stop()
+		err = <-served
+	}
+	if errors.Is(err, grpc.ErrServerStopped) || errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return err
+}
+
+func newGrpcHostServer(ctx context.Context) (*grpc.Server, *singleConnListener) {
+	ensureGrpcZstdRegistered()
+	server := grpc.NewServer(
+		grpc.MaxRecvMsgSize(ProtocolMaxFrameBytes),
+		grpc.MaxSendMsgSize(ProtocolMaxFrameBytes),
+	)
+	codemodev1.RegisterCodeModeHostServer(server, &grpcStdioHostServer{
+		ctx:     ctx,
+		metrics: newProcessMetricsSampler(defaultProcessMetricsCollector),
+	})
+	return server, &singleConnListener{done: make(chan struct{})}
 }
 
 // connectionCloseNotifier closes the single-connection listener when gRPC
@@ -144,14 +186,37 @@ func (c *connectionCloseNotifier) Close() error {
 
 type grpcStdioHostServer struct {
 	codemodev1.UnimplementedCodeModeHostServer
-	ctx context.Context
+	ctx     context.Context
+	metrics *processMetricsSampler
+}
+
+// GetProcessMetrics reports a bounded host observation without opening a
+// session (Rust #57841). A host built without a collector answers UNIMPLEMENTED
+// so clients can distinguish unsupported from a failed sample.
+func (s *grpcStdioHostServer) GetProcessMetrics(ctx context.Context, _ *codemodev1.GetProcessMetricsRequest) (*codemodev1.GetProcessMetricsResponse, error) {
+	if s == nil || s.metrics == nil {
+		return nil, status.Error(codes.Unimplemented, "process metrics are unsupported")
+	}
+	metrics, err := s.metrics.sample(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &codemodev1.GetProcessMetricsResponse{
+		ProcessId:               metrics.ProcessID,
+		ProcessStartTimeSeconds: metrics.ProcessStartTimeSeconds,
+		CpuSecondsTotal:         metrics.CPUSecondsTotal,
+		ResidentMemoryBytes:     metrics.ResidentMemoryBytes,
+	}, nil
 }
 
 // Transport runs the shared code-mode host loop over one framed gRPC stream.
 func (s *grpcStdioHostServer) Transport(stream codemodev1.CodeModeHost_TransportServer) error {
+	// Rust #57212: compress responses for clients that advertise zstd and keep
+	// identity responses for clients that do not.
+	_ = grpc.SetSendCompressor(stream.Context(), grpcZstdEncodingName)
 	ctx, cancel := context.WithCancel(s.ctx)
 	defer cancel()
-	inbound := make(chan ClientToHost, 16)
+	inbound := make(chan ClientToHost, outgoingChannelCapacity)
 	readErr := make(chan error, 1)
 	go func() {
 		defer close(inbound)
@@ -203,5 +268,5 @@ func (s *grpcStdioHostServer) Transport(stream codemodev1.CodeModeHost_Transport
 		defer writeMu.Unlock()
 		return stream.Send(&codemodev1.FramedMessage{Payload: data})
 	}
-	return runCodemodeHost(ctx, read, write)
+	return runCodemodeHost(ctx, read, write, codemodeHostOptions{enforceSessionDelegateLimits: true})
 }

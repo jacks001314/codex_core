@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +19,13 @@ var (
 	ErrNoActiveTurnToSteer  = errors.New("no active turn to steer")
 	ErrExpectedTurnMismatch = errors.New("expected active turn mismatch")
 	ErrEmptyTurnSteerInput  = errors.New("empty turn steer input")
+	// ErrNoActiveTurnToInterrupt reports a turn/interrupt for a thread whose
+	// requested turn has already terminated (Rust app-server "no active turn to
+	// interrupt").
+	ErrNoActiveTurnToInterrupt = errors.New("no active turn to interrupt")
+	// ErrInterruptTurnMismatch reports an interrupt for a turn other than the
+	// thread's active turn.
+	ErrInterruptTurnMismatch = errors.New("interrupt turn mismatch")
 )
 
 const (
@@ -108,13 +116,75 @@ type TurnUserInput struct {
 // TurnToolOutput carries a standalone named function-call output used to start
 // or steer a turn without a user prompt (Rust TurnToolOutput, #41002).
 type TurnToolOutput struct {
-	Name      string `json:"name"`
-	Namespace string `json:"namespace,omitempty"`
-	Output    string `json:"output"`
+	Name      string             `json:"name"`
+	Namespace string             `json:"namespace,omitempty"`
+	Output    TurnToolOutputBody `json:"output"`
 	// Retain marks a client-submitted tool output that must be retained as
 	// client-authored history (Rust #52671 `retain` annotation). The marker is
 	// stored as harness metadata and never reaches a model request.
 	Retain bool `json:"retain,omitempty"`
+}
+
+// TurnToolOutputBody is the on-wire FunctionCallOutputBody of a standalone tool
+// output: either plain text or a structured list of content items (text and
+// inline images), mirroring Rust FunctionCallOutputBody (#41002).
+type TurnToolOutputBody struct {
+	Text  string
+	Items []FunctionCallOutputContentItem
+}
+
+// ToolOutputText returns a plain-text tool output body.
+func ToolOutputText(text string) TurnToolOutputBody {
+	return TurnToolOutputBody{Text: text}
+}
+
+// ToolOutputContentItems returns a structured tool output body.
+func ToolOutputContentItems(items ...FunctionCallOutputContentItem) TurnToolOutputBody {
+	return TurnToolOutputBody{Items: items}
+}
+
+func (b *TurnToolOutputBody) UnmarshalJSON(data []byte) error {
+	var text string
+	if err := json.Unmarshal(data, &text); err == nil {
+		*b = TurnToolOutputBody{Text: text}
+		return nil
+	}
+	var items []FunctionCallOutputContentItem
+	if err := json.Unmarshal(data, &items); err != nil {
+		return fmt.Errorf("%w: toolOutput.output must be a string or a list of content items", ErrInvalidTurnRequest)
+	}
+	*b = TurnToolOutputBody{Items: items}
+	return nil
+}
+
+func (b TurnToolOutputBody) MarshalJSON() ([]byte, error) {
+	if b.Items != nil {
+		return json.Marshal(b.Items)
+	}
+	return json.Marshal(b.Text)
+}
+
+// TextCharCount mirrors Rust's text-char accounting: text entries count, image
+// entries do not.
+func (b TurnToolOutputBody) TextCharCount() int {
+	if b.Items == nil {
+		return utf8.RuneCountInString(b.Text)
+	}
+	total := 0
+	for _, item := range b.Items {
+		if item.Type == "" || item.Type == "input_text" {
+			total += utf8.RuneCountInString(item.Text)
+		}
+	}
+	return total
+}
+
+// WireValue returns the function_call_output body as the model consumes it.
+func (b TurnToolOutputBody) WireValue() any {
+	if b.Items != nil {
+		return b.Items
+	}
+	return b.Text
 }
 
 type ByteRange struct {
@@ -185,10 +255,14 @@ func (i *TurnUserInput) MarshalJSON() ([]byte, error) {
 			Path:   i.Path,
 		})
 	case "audio":
+		// Rust #58430: the untagged audio input keeps both arms on the wire -
+		// the inline payload and the uploaded file reference - so a client that
+		// round-trips the input does not lose the file id.
 		return json.Marshal(struct {
-			Type string `json:"type"`
-			URL  string `json:"url"`
-		}{Type: "audio", URL: i.URL})
+			Type   string `json:"type"`
+			URL    string `json:"url,omitempty"`
+			FileID string `json:"fileId,omitempty"`
+		}{Type: "audio", URL: i.URL, FileID: i.FileID})
 	case "localAudio":
 		return json.Marshal(struct {
 			Type string `json:"type"`
@@ -231,12 +305,20 @@ type TurnStartParams struct {
 	ThreadID string `json:"threadId"`
 	// DisabledPluginIDs replaces this thread's disabled plugin IDs. Omitted or
 	// null preserves the saved list; an empty list clears it (Rust #44905).
-	DisabledPluginIDs    *[]string         `json:"disabledPluginIds,omitempty"`
-	Input                []TurnUserInput   `json:"input,omitempty"`
-	ToolOutput           *TurnToolOutput   `json:"toolOutput,omitempty"`
-	Prompt               string            `json:"prompt,omitempty"`
-	ClientUserMessageID  string            `json:"clientUserMessageId,omitempty"`
-	ResponsesAPIMetadata map[string]string `json:"responsesapiClientMetadata,omitempty"`
+	DisabledPluginIDs   *[]string       `json:"disabledPluginIds,omitempty"`
+	Input               []TurnUserInput `json:"input,omitempty"`
+	ToolOutput          *TurnToolOutput `json:"toolOutput,omitempty"`
+	Prompt              string          `json:"prompt,omitempty"`
+	ClientUserMessageID string          `json:"clientUserMessageId,omitempty"`
+	// UserItemUUID is the host-assigned UUID for this input's Responses item
+	// (Rust #57538 TurnInputRequest::user_item_uuid). It is never part of the
+	// app-server wire; in-process hosts set it directly.
+	UserItemUUID string `json:"-"`
+	// UserInputExtensionData is host-only data delivered with this input's
+	// completion callback (Rust #59455). It never enters model input, the
+	// app-server wire, or persisted history.
+	UserInputExtensionData map[string]any    `json:"-"`
+	ResponsesAPIMetadata   map[string]string `json:"responsesapiClientMetadata,omitempty"`
 	// ResponsesAPIMetadataPatch adds or overwrites individual client
 	// metadata entries without replacing the map. It is applied after
 	// ResponsesAPIMetadata when both are supplied (Rust #54053).
@@ -258,15 +340,24 @@ type TurnStartParams struct {
 	Environments               []map[string]any           `json:"environments,omitempty"`
 	ServiceTier                *string                    `json:"serviceTier,omitempty"`
 	ServiceTierSet             bool                       `json:"-"`
+	// PromptCacheTTL requests a minimum Responses prompt-cache lifetime for the
+	// turn this request starts ("30m" or "12h"). It is scoped to the started
+	// turn and omitted when unset (Rust #59480).
+	PromptCacheTTL *string `json:"promptCacheTtl,omitempty"`
 	// ServiceTierForTurn overrides the service tier only for the turn this
 	// request starts ("default" for standard speed); it does not change the
 	// thread's tier and is ignored when the request steers a turn (Rust
 	// TurnStartParams::service_tier_for_turn).
-	ServiceTierForTurn *string        `json:"serviceTierForTurn,omitempty"`
-	Effort             *string        `json:"effort,omitempty"`
-	Summary            *string        `json:"summary,omitempty"`
-	OutputSchema       any            `json:"outputSchema,omitempty"`
-	CollaborationMode  map[string]any `json:"collaborationMode,omitempty"`
+	ServiceTierForTurn *string `json:"serviceTierForTurn,omitempty"`
+	// DirectOnlyToolNamespaces overrides the thread's direct-only Code Mode
+	// namespaces for the turn this request starts. A nil pointer inherits the
+	// thread configuration; a non-nil empty slice clears it for this turn.
+	// Steering ignores the option because it targets an already-built turn.
+	DirectOnlyToolNamespaces *[]string      `json:"-"`
+	Effort                   *string        `json:"effort,omitempty"`
+	Summary                  *string        `json:"summary,omitempty"`
+	OutputSchema             any            `json:"outputSchema,omitempty"`
+	CollaborationMode        map[string]any `json:"collaborationMode,omitempty"`
 	// Deprecated: accepted for old app-server clients, but ignored by runtime.
 	MultiAgentMode *string `json:"multiAgentMode,omitempty"`
 	// CyberAccessProgram requests a workspace-authorized cyber program for this
@@ -300,6 +391,10 @@ type TurnStartParams struct {
 	// wire (matching Rust, which never sends it in the Responses metadata).
 	InitiatingAgentPath  string `json:"-"`
 	AdditionalInputItems []any  `json:"-"`
+	// AutomaticWake marks an internal turn started by queue-only inter-agent
+	// mail (Rust `TurnStartKind::Automatic`). The runtime revalidates the
+	// reservation after model discovery before any of its mail is consumed.
+	AutomaticWake bool `json:"-"`
 	// Trace carries the W3C trace context of the request that started this turn
 	// (Rust TurnInputRequest::with_trace), so the model request continues the
 	// caller's trace.
@@ -330,6 +425,7 @@ func (p *TurnStartParams) MarshalJSON() ([]byte, error) {
 		SandboxPolicy       any                 `json:"sandboxPolicy,omitempty"`
 		Model               string              `json:"model,omitempty"`
 		ServiceTier         *string             `json:"serviceTier,omitempty"`
+		PromptCacheTTL      *string             `json:"promptCacheTtl,omitempty"`
 		Effort              *string             `json:"effort,omitempty"`
 		Summary             *string             `json:"summary,omitempty"`
 		Personality         *string             `json:"personality,omitempty"`
@@ -350,6 +446,7 @@ func (p *TurnStartParams) MarshalJSON() ([]byte, error) {
 		SandboxPolicy:       p.SandboxPolicy,
 		Model:               p.Model,
 		ServiceTier:         p.ServiceTier,
+		PromptCacheTTL:      p.PromptCacheTTL,
 		Effort:              p.Effort,
 		Summary:             p.Summary,
 		Personality:         p.Personality,
@@ -395,6 +492,13 @@ func (p *TurnStartParams) Validate() error {
 	if err := ValidateDynamicTools(p.DynamicTools); err != nil {
 		return err
 	}
+	if p.PromptCacheTTL != nil {
+		ttl := strings.TrimSpace(*p.PromptCacheTTL)
+		if ttl != "30m" && ttl != "12h" {
+			return fmt.Errorf("%w: promptCacheTtl must be 30m or 12h", ErrInvalidTurnRequest)
+		}
+		p.PromptCacheTTL = &ttl
+	}
 	if err := validateRuntimeWorkspaceRoots(p.RuntimeWorkspaceRoots); err != nil {
 		return err
 	}
@@ -408,10 +512,21 @@ func (p *TurnStartParams) Validate() error {
 		if userInputTextChars(p.Prompt, p.Input) > 0 {
 			return fmt.Errorf("%w: toolOutput cannot be combined with nonempty input", ErrInvalidTurnRequest)
 		}
-		if actualChars := utf8.RuneCountInString(p.ToolOutput.Output); actualChars > MaxUserInputTextChars {
+		if p.ToolOutput.Output.Items != nil && p.ToolOutput.Output.Text != "" {
+			return fmt.Errorf("%w: toolOutput.output must be either text or content items", ErrInvalidTurnRequest)
+		}
+		if actualChars := p.ToolOutput.Output.TextCharCount(); actualChars > MaxUserInputTextChars {
 			return &InputTooLargeError{
 				MaxChars:    MaxUserInputTextChars,
 				ActualChars: actualChars,
+			}
+		}
+		for _, item := range p.ToolOutput.Output.Items {
+			if item.Type != "input_image" {
+				continue
+			}
+			if strings.TrimSpace(item.FileID) == "" && isRemoteImageURL(item.ImageURL) {
+				return fmt.Errorf("%w: %s", ErrInvalidTurnRequest, remoteImageURLError)
 			}
 		}
 	}
@@ -419,6 +534,10 @@ func (p *TurnStartParams) Validate() error {
 		return err
 	}
 	if err := rejectConfigurationUpdateInput(p.Input); err != nil {
+		return err
+	}
+	// Rust validates context names after the app-server's input-length checks.
+	if err := ValidateAdditionalContext(p.AdditionalContext); err != nil {
 		return err
 	}
 	return nil
@@ -464,13 +583,20 @@ func asciiLetter(value byte) bool {
 }
 
 type TurnSteerParams struct {
-	ThreadID             string            `json:"threadId"`
-	ExpectedTurnID       string            `json:"expectedTurnId"`
-	Input                []TurnUserInput   `json:"input,omitempty"`
-	Prompt               string            `json:"prompt,omitempty"`
-	ApprovalsReviewer    *string           `json:"approvalsReviewer,omitempty"`
-	ClientUserMessageID  string            `json:"clientUserMessageId,omitempty"`
-	ResponsesAPIMetadata map[string]string `json:"responsesapiClientMetadata,omitempty"`
+	ThreadID            string          `json:"threadId"`
+	ExpectedTurnID      string          `json:"expectedTurnId"`
+	Input               []TurnUserInput `json:"input,omitempty"`
+	Prompt              string          `json:"prompt,omitempty"`
+	ApprovalsReviewer   *string         `json:"approvalsReviewer,omitempty"`
+	ClientUserMessageID string          `json:"clientUserMessageId,omitempty"`
+	// UserItemUUID is the host-assigned UUID for this steer's Responses item
+	// (Rust #57538); it is never part of the app-server wire.
+	UserItemUUID string `json:"-"`
+	// UserInputExtensionData is host-only data delivered with this steer's
+	// user-message completion (Rust #59455). It is never model-visible or
+	// persisted.
+	UserInputExtensionData map[string]any    `json:"-"`
+	ResponsesAPIMetadata   map[string]string `json:"responsesapiClientMetadata,omitempty"`
 	// ResponsesAPIMetadataPatch adds or overwrites individual client
 	// metadata entries without replacing the map. It is applied after
 	// ResponsesAPIMetadata when both are supplied (Rust #54053).
@@ -505,6 +631,10 @@ func (p *TurnSteerParams) Validate() error {
 		return err
 	}
 	if err := rejectConfigurationUpdateInput(p.Input); err != nil {
+		return err
+	}
+	// Rust validates context names after the app-server's input-length checks.
+	if err := ValidateAdditionalContext(p.AdditionalContext); err != nil {
 		return err
 	}
 	return nil
@@ -714,6 +844,84 @@ const (
 type AdditionalContextEntry struct {
 	Value string                `json:"value"`
 	Kind  AdditionalContextKind `json:"kind"`
+	// Name optionally labels untrusted context when it is rendered as an
+	// agent-namespaced tool output (Rust #57279).
+	Name *string `json:"name,omitempty"`
+}
+
+// maxAdditionalContextNameBytes mirrors the 64-byte bound Rust applies to an
+// optional untrusted-context name.
+const maxAdditionalContextNameBytes = 64
+
+// AdditionalContextValidationError reports an invalid optional untrusted-context
+// name (Rust AdditionalContextEntry::validate, #57181). Message is the exact
+// text the app-server returns as a JSON-RPC invalid-request error.
+type AdditionalContextValidationError struct {
+	Message string
+}
+
+func (e *AdditionalContextValidationError) Error() string {
+	if e == nil {
+		return ErrInvalidTurnRequest.Error()
+	}
+	return fmt.Sprintf("%s: %s", ErrInvalidTurnRequest, e.Message)
+}
+
+func (e *AdditionalContextValidationError) Unwrap() error {
+	return ErrInvalidTurnRequest
+}
+
+// Validate mirrors Rust AdditionalContextEntry::validate: a name is optional,
+// only valid on untrusted context, and must match [a-z][a-z0-9_]{0,63}.
+func (e AdditionalContextEntry) Validate() error {
+	if e.Name == nil {
+		return nil
+	}
+	if e.Kind == AdditionalContextApplication {
+		return &AdditionalContextValidationError{Message: "additional context name is only supported for untrusted context"}
+	}
+	if !validAdditionalContextName(*e.Name) {
+		return &AdditionalContextValidationError{Message: "additional context name must match [a-z][a-z0-9_]{0,63}"}
+	}
+	return nil
+}
+
+// validAdditionalContextName bounds the name by bytes, matching Rust's
+// `name.len() > 64` check rather than a rune count.
+func validAdditionalContextName(name string) bool {
+	if len(name) == 0 || len(name) > maxAdditionalContextNameBytes {
+		return false
+	}
+	for index := 0; index < len(name); index++ {
+		char := name[index]
+		if char >= 'a' && char <= 'z' {
+			continue
+		}
+		if index > 0 && ((char >= '0' && char <= '9') || char == '_') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// ValidateAdditionalContext reports the first invalid entry, visiting keys in
+// the same order as Rust's BTreeMap so callers observe the same error.
+func ValidateAdditionalContext(values map[string]AdditionalContextEntry) error {
+	if len(values) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if err := values[key].Validate(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type TurnService struct {
@@ -781,8 +989,11 @@ func (s *TurnService) Interrupt(params *TurnInterruptParams) (*TurnInterruptResp
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	turn, ok := s.active[params.ThreadID]
-	if !ok || turn.ID != params.TurnID {
-		return nil, fmt.Errorf("turn %s is not active", params.TurnID)
+	if !ok {
+		return nil, ErrNoActiveTurnToInterrupt
+	}
+	if turn.ID != params.TurnID {
+		return nil, fmt.Errorf("%w: expected active turn id %s but found %s", ErrInterruptTurnMismatch, params.TurnID, turn.ID)
 	}
 	delete(s.active, params.ThreadID)
 	return &TurnInterruptResponse{}, nil

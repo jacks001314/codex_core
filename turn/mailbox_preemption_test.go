@@ -179,6 +179,24 @@ func itemsCarryToolCall(items []any) bool {
 	return false
 }
 
+// itemsCarryItemID reports whether the wire input still carries the response
+// item with the given id.
+func itemsCarryItemID(items []any, id string) bool {
+	for _, item := range items {
+		switch value := item.(type) {
+		case *model.AgentItem:
+			if value != nil && value.ID == id {
+				return true
+			}
+		case model.AgentItem:
+			if value.ID == id {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func itemTypes(items []any) []string {
 	types := make([]string, 0, len(items))
 	for _, item := range items {
@@ -231,6 +249,15 @@ func TestAgentLoopPreemptsForMailboxMailAtBoundaryLikeRust(t *testing.T) {
 			if itemsCarryToolCall(agent.requests[1].InputItems) {
 				t.Fatalf("dropped tool call reached the follow-up request: %v", itemTypes(agent.requests[1].InputItems))
 			}
+			// Rust #55969: mailbox preemption retains the completed boundary item
+			// and the response id so the follow-up continues incrementally instead
+			// of discarding what the model already produced.
+			if !itemsCarryItemID(agent.requests[1].InputItems, testCase.boundary.ID) {
+				t.Fatalf("completed boundary item missing from the follow-up request: %v", itemTypes(agent.requests[1].InputItems))
+			}
+			if got := agent.requests[1].PreviousResponseID; got != "resp-boundary" {
+				t.Fatalf("follow-up previous_response_id = %q, want resp-boundary", got)
+			}
 			if !itemsCarryAgentMail(agent.requests[1].InputItems) {
 				t.Fatalf("queued mail missing from the follow-up request: %v", itemTypes(agent.requests[1].InputItems))
 			}
@@ -270,6 +297,86 @@ func TestAgentLoopKeepsResponseAtNonPreemptingItemsLikeRust(t *testing.T) {
 			}
 		})
 	}
+}
+
+// drainedPreemptionLoopAgent reports a drained Responses Lite WebSocket
+// preemption: the server retained a completed reasoning item and a buffered
+// tool call before the interrupt (Rust #55969).
+type drainedPreemptionLoopAgent struct {
+	requests []model.AgentRequest
+	deliver  func(threadID string, turnID string)
+}
+
+func (a *drainedPreemptionLoopAgent) Run(_ context.Context, request *model.AgentRequest) (*model.AgentResponse, error) {
+	a.requests = append(a.requests, *request)
+	if len(a.requests) == 1 {
+		if a.deliver != nil {
+			a.deliver(request.ThreadID, request.TurnID)
+		}
+		return &model.AgentResponse{
+			Preempted:  true,
+			Drained:    true,
+			ResponseID: "resp-drain",
+			Usage:      model.AgentUsage{OutputTokens: 3, TotalTokens: 3},
+			Items: []model.AgentItem{
+				{ID: "boundary", Type: "reasoning"},
+				{ID: "buffered-tool-item", Type: "function_call", Name: "echo", CallID: "buffered-tool", Arguments: `{}`},
+			},
+		}, nil
+	}
+	return &model.AgentResponse{
+		ResponseID: "resp-final",
+		Message:    "done",
+		Items: []model.AgentItem{{
+			ID: "final-1", Type: "agent_message", Text: "done", Data: map[string]any{"phase": "final_answer"},
+		}},
+	}, nil
+}
+
+func TestAgentLoopKeepsDrainedItemsAndContinuationLikeRust(t *testing.T) {
+	mailbox := NewSteerMailbox()
+	agent := &drainedPreemptionLoopAgent{deliver: mailDuringResponse(t, mailbox)}
+	loop, executed := newMailboxPreemptionHarness(t, agent, mailbox, false)
+	result, err := loop.Run(context.Background(), &AgentLoopRequest{
+		Prompt: "plan the next action while the worker finishes", Model: "gpt-test", ThreadID: "thread-1", TurnID: "turn-1",
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if *executed != 0 || len(result.ToolExecutions) != 0 {
+		t.Fatalf("buffered tool call ran during the drain: executed=%d result=%d", *executed, len(result.ToolExecutions))
+	}
+	if len(agent.requests) != 2 {
+		t.Fatalf("sampling requests = %d, want 2", len(agent.requests))
+	}
+	if got := agent.requests[1].PreviousResponseID; got != "resp-drain" {
+		t.Fatalf("follow-up previous_response_id = %q, want resp-drain", got)
+	}
+	if !itemsCarryItemID(agent.requests[1].InputItems, "boundary") || !itemsCarryItemID(agent.requests[1].InputItems, "buffered-tool-item") {
+		t.Fatalf("drained items missing from the follow-up request: %v", itemTypes(agent.requests[1].InputItems))
+	}
+	aborted, ok := findToolCallOutput(agent.requests[1].InputItems, "buffered-tool")
+	if !ok || aborted != "aborted before dispatch" {
+		t.Fatalf("buffered call output = %q/%v, want an aborted-before-dispatch output", aborted, ok)
+	}
+	if !itemsCarryAgentMail(agent.requests[1].InputItems) {
+		t.Fatalf("queued mail missing from the follow-up request: %v", itemTypes(agent.requests[1].InputItems))
+	}
+	if result.Response == nil || result.Response.Message != "done" {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func findToolCallOutput(items []any, callID string) (string, bool) {
+	for _, item := range items {
+		raw, ok := item.(map[string]any)
+		if !ok || raw["type"] != "function_call_output" || raw["call_id"] != callID {
+			continue
+		}
+		output, _ := raw["output"].(string)
+		return output, true
+	}
+	return "", false
 }
 
 func TestAgentLoopDefersMailboxPreemptionWhenEnabledLikeRust(t *testing.T) {
@@ -336,7 +443,11 @@ func TestAgentLoopDefersMailboxDeliveryForFinalAnswersOnlyLikeRust(t *testing.T)
 		defers bool
 	}{
 		{"final_answer", "final_answer", "The answer.", true},
+		// Rust #56133: an explicit final_answer is terminal even when empty.
+		{"empty_final_answer", "final_answer", "", true},
+		{"whitespace_final_answer", "final_answer", " \n\t", true},
 		{"untagged", "", "The answer.", true},
+		{"untagged_empty", "", "", false},
 		{"commentary", "commentary", "Working on it.", false},
 		{"partial_answer", "partial_answer", "Part of the answer.", false},
 	}

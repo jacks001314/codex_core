@@ -14,7 +14,7 @@ import (
 
 const (
 	MaxFrameLen        = 8 * 1024 * 1024
-	IPCProtocolVersion = 4
+	IPCProtocolVersion = 5
 )
 
 type MessageType string
@@ -50,7 +50,13 @@ type SpawnRequest struct {
 	TimeoutMS         *uint64                        `json:"timeout_ms"`
 	TTY               bool                           `json:"tty"`
 	StdinOpen         bool                           `json:"stdin_open"`
-	UsePrivateDesktop bool                           `json:"use_private_desktop"`
+	// PrivateDesktopName is kept alive by the parent across runner exits.
+	PrivateDesktopName string `json:"private_desktop_name"`
+	// RegisteredAlias is the service-written execution alias a registered Core
+	// launch runs instead of the app-contained runner (Rust
+	// spawn_runner_transport). It is parent-process state, so it never crosses
+	// the runner protocol.
+	RegisteredAlias string `json:"-"`
 }
 
 type SpawnReady struct {
@@ -358,49 +364,49 @@ func (f *FramedMessage) UnmarshalJSON(data []byte) error {
 
 func (r SpawnRequest) MarshalJSON() ([]byte, error) {
 	type wireSpawnRequest struct {
-		Command           []string               `json:"command"`
-		CWD               string                 `json:"cwd"`
-		Env               map[string]string      `json:"env"`
-		PermissionProfile *rustPermissionProfile `json:"permission_profile"`
-		WorkspaceRoots    []string               `json:"workspace_roots"`
-		CodexHome         string                 `json:"codex_home"`
-		RealCodexHome     string                 `json:"real_codex_home"`
-		CapSIDs           []string               `json:"cap_sids"`
-		TimeoutMS         *uint64                `json:"timeout_ms"`
-		TTY               bool                   `json:"tty"`
-		StdinOpen         bool                   `json:"stdin_open"`
-		UsePrivateDesktop bool                   `json:"use_private_desktop"`
+		Command            []string               `json:"command"`
+		CWD                string                 `json:"cwd"`
+		Env                map[string]string      `json:"env"`
+		PermissionProfile  *rustPermissionProfile `json:"permission_profile"`
+		WorkspaceRoots     []string               `json:"workspace_roots"`
+		CodexHome          string                 `json:"codex_home"`
+		RealCodexHome      string                 `json:"real_codex_home"`
+		CapSIDs            []string               `json:"cap_sids"`
+		TimeoutMS          *uint64                `json:"timeout_ms"`
+		TTY                bool                   `json:"tty"`
+		StdinOpen          bool                   `json:"stdin_open"`
+		PrivateDesktopName string                 `json:"private_desktop_name"`
 	}
 	return json.Marshal(wireSpawnRequest{
-		Command:           append([]string(nil), r.Command...),
-		CWD:               r.CWD,
-		Env:               cloneStringMap(r.Env),
-		PermissionProfile: rustPermissionProfileFromSandbox(r.PermissionProfile),
-		WorkspaceRoots:    append([]string(nil), r.WorkspaceRoots...),
-		CodexHome:         r.CodexHome,
-		RealCodexHome:     r.RealCodexHome,
-		CapSIDs:           append([]string(nil), r.CapSIDs...),
-		TimeoutMS:         r.TimeoutMS,
-		TTY:               r.TTY,
-		StdinOpen:         r.StdinOpen,
-		UsePrivateDesktop: r.UsePrivateDesktop,
+		Command:            append([]string(nil), r.Command...),
+		CWD:                r.CWD,
+		Env:                cloneStringMap(r.Env),
+		PermissionProfile:  rustPermissionProfileFromSandbox(r.PermissionProfile),
+		WorkspaceRoots:     append([]string(nil), r.WorkspaceRoots...),
+		CodexHome:          r.CodexHome,
+		RealCodexHome:      r.RealCodexHome,
+		CapSIDs:            append([]string(nil), r.CapSIDs...),
+		TimeoutMS:          r.TimeoutMS,
+		TTY:                r.TTY,
+		StdinOpen:          r.StdinOpen,
+		PrivateDesktopName: r.PrivateDesktopName,
 	})
 }
 
 func (r *SpawnRequest) UnmarshalJSON(data []byte) error {
 	type wireSpawnRequest struct {
-		Command           []string               `json:"command"`
-		CWD               string                 `json:"cwd"`
-		Env               map[string]string      `json:"env"`
-		PermissionProfile *rustPermissionProfile `json:"permission_profile"`
-		WorkspaceRoots    []string               `json:"workspace_roots"`
-		CodexHome         string                 `json:"codex_home"`
-		RealCodexHome     string                 `json:"real_codex_home"`
-		CapSIDs           []string               `json:"cap_sids"`
-		TimeoutMS         *uint64                `json:"timeout_ms"`
-		TTY               bool                   `json:"tty"`
-		StdinOpen         bool                   `json:"stdin_open"`
-		UsePrivateDesktop bool                   `json:"use_private_desktop"`
+		Command            []string               `json:"command"`
+		CWD                string                 `json:"cwd"`
+		Env                map[string]string      `json:"env"`
+		PermissionProfile  *rustPermissionProfile `json:"permission_profile"`
+		WorkspaceRoots     []string               `json:"workspace_roots"`
+		CodexHome          string                 `json:"codex_home"`
+		RealCodexHome      string                 `json:"real_codex_home"`
+		CapSIDs            []string               `json:"cap_sids"`
+		TimeoutMS          *uint64                `json:"timeout_ms"`
+		TTY                bool                   `json:"tty"`
+		StdinOpen          bool                   `json:"stdin_open"`
+		PrivateDesktopName string                 `json:"private_desktop_name"`
 	}
 	var wire wireSpawnRequest
 	if err := json.Unmarshal(data, &wire); err != nil {
@@ -417,7 +423,7 @@ func (r *SpawnRequest) UnmarshalJSON(data []byte) error {
 	r.TimeoutMS = wire.TimeoutMS
 	r.TTY = wire.TTY
 	r.StdinOpen = wire.StdinOpen
-	r.UsePrivateDesktop = wire.UsePrivateDesktop
+	r.PrivateDesktopName = wire.PrivateDesktopName
 	return nil
 }
 

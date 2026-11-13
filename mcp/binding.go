@@ -3,6 +3,8 @@ package mcp
 import (
 	"fmt"
 	"strings"
+
+	"codex_core/sandbox"
 )
 
 // Binding captures the MCP catalog revision that a model step observed.
@@ -10,6 +12,20 @@ type Binding struct {
 	service    *MCPService
 	generation uint64
 	tools      map[string]map[string]bool
+	// toolInfos preserves the exact captured declarations needed by scoped
+	// discovery without requiring a live catalog read.
+	toolInfos map[string][]MCPToolInfo
+	// hostOwnedApps marks the trusted codex_apps registration captured for this
+	// model step.
+	hostOwnedApps map[string]bool
+	// searchTool and searchInvocationContext are populated only by a successful
+	// model-search discovery. The latter is the connector-owned opaque pin.
+	searchTool              *RuntimeToolInfo
+	searchInvocationContext any
+	// catalogs records the exact client catalog each server's tools came from.
+	// A refreshed catalog advances only its own client's revision, so calls for
+	// unrelated servers stay valid (Rust #43031).
+	catalogs map[string]bindingCatalogRevision
 	// cachedRevisions records the tool-list revision observed with a catalog
 	// accepted under startup_readiness = "catalog". A later notification must
 	// invalidate the binding even if the service generation did not change.
@@ -19,10 +35,25 @@ type Binding struct {
 	// authority has no owner permissions and its calls are rejected.
 	authorityPublished bool
 	authority          map[string]bool
+	// permissionSources freezes each prepared server's policy and directory
+	// context. A runtime refresh may publish new permissions, but this model
+	// step must execute with the authority it observed (Rust #59020).
+	permissionSources map[string]MCPServerPermissionSource
+}
+
+// bindingCatalogRevision identifies one client's catalog at one revision. The
+// catalog pointer keeps clients with independent catalog histories distinct.
+type bindingCatalogRevision struct {
+	catalog  *clientToolCatalog
+	revision uint64
 }
 
 func (s *MCPService) CaptureBinding(statuses []MCPServerStatus) *Binding {
-	b := &Binding{service: s, generation: s.Generation(), tools: map[string]map[string]bool{}}
+	b := &Binding{
+		service: s, generation: s.Generation(),
+		tools: map[string]map[string]bool{}, toolInfos: map[string][]MCPToolInfo{},
+		hostOwnedApps: map[string]bool{},
+	}
 	if s != nil && s.HasPublishedPermissionAuthority() {
 		b.authorityPublished = true
 		b.authority = map[string]bool{}
@@ -32,34 +63,56 @@ func (s *MCPService) CaptureBinding(statuses []MCPServerStatus) *Binding {
 		if server == "" {
 			continue
 		}
+		var set map[string]bool
 		if config, ok := s.ServerConfigForServer(server); ok &&
 			config.StartupReadiness.Effective() == MCPStartupReadinessCatalog {
 			tools, usable := s.cachedCatalogStartupTools(server, &config, status)
 			if !usable {
 				continue
 			}
-			b.tools[server] = toolNameSet(tools)
+			set = toolNameSet(tools)
 			if b.cachedRevisions == nil {
 				b.cachedRevisions = map[string]uint64{}
 			}
 			b.cachedRevisions[server] = s.cachedToolListRevision(server)
-			if b.authorityPublished {
-				if _, ok := s.PermissionProfileForServer(server); ok {
-					b.authority[server] = true
-				}
+		} else {
+			set = cachedTools(status)
+			// Rust #41336 snapshots the cached catalog before waiting for server
+			// startup. A non-ready server remains capturable when it already has a
+			// published catalog; ordinary servers need at least one cached tool, while
+			// the Apps server may legitimately publish an empty catalog.
+			if status.State != "" && status.State != MCPServerReady &&
+				len(set) == 0 && !IsCodexAppsMCPServerName(server) {
+				continue
 			}
-			continue
 		}
-		set := cachedTools(status)
-		// Rust #41336 snapshots the cached catalog before waiting for server
-		// startup. A non-ready server remains capturable when it already has a
-		// published catalog; ordinary servers need at least one cached tool, while
-		// the Apps server may legitimately publish an empty catalog.
-		if status.State != "" && status.State != MCPServerReady &&
-			len(set) == 0 && !IsCodexAppsMCPServerName(server) {
-			continue
+		toolInfos := cloneMCPToolInfos(status.Tools)
+		if catalog := s.liveClientToolCatalog(server); catalog != nil {
+			var revision uint64
+			catalog.read(func(current uint64, tools []MCPToolInfo) {
+				revision = current
+				// Discovery may answer from the shared startup cache until this
+				// client is refreshed; executable bindings always capture this
+				// client's own catalog once it has published one.
+				if current > 0 {
+					set = toolNameSet(tools)
+					toolInfos = cloneMCPToolInfos(tools)
+				}
+			})
+			if b.catalogs == nil {
+				b.catalogs = map[string]bindingCatalogRevision{}
+			}
+			b.catalogs[server] = bindingCatalogRevision{catalog: catalog, revision: revision}
 		}
 		b.tools[server] = set
+		b.toolInfos[server] = toolInfos
+		b.hostOwnedApps[server] = status.hostOwnedApps
+		if source, ok := s.PermissionSourceForServer(server); ok {
+			if b.permissionSources == nil {
+				b.permissionSources = map[string]MCPServerPermissionSource{}
+			}
+			b.permissionSources[server] = cloneMCPServerPermissionSource(source)
+		}
 		if b.authorityPublished {
 			if _, ok := s.PermissionProfileForServer(server); ok {
 				b.authority[server] = true
@@ -87,6 +140,21 @@ func (b *Binding) Generation() uint64 {
 	}
 	return b.generation
 }
+
+// PermissionSourceForServer returns the permission authority captured by this
+// binding for server. Approval code must use this source instead of the live
+// service: an environment owner may publish new permissions after the model
+// step prepared the call (Rust #59028).
+func (b *Binding) PermissionSourceForServer(server string) (MCPServerPermissionSource, bool) {
+	if b == nil {
+		return MCPServerPermissionSource{}, false
+	}
+	source, ok := b.permissionSources[strings.TrimSpace(server)]
+	if !ok {
+		return MCPServerPermissionSource{}, false
+	}
+	return cloneMCPServerPermissionSource(source), true
+}
 func (b *Binding) CallTool(params *MCPToolCallParams) (*MCPToolCallResponse, error) {
 	if b == nil || b.service == nil {
 		return nil, invalidMCPRequest("MCP binding is unavailable")
@@ -105,9 +173,40 @@ func (b *Binding) CallTool(params *MCPToolCallParams) (*MCPToolCallResponse, err
 	if b.authorityPublished && !b.authority[server] {
 		return nil, fmt.Errorf("%w: MCP server %q has no published permission authority", ErrInvalidMCPRequest, server)
 	}
-	response, err := b.service.CallTool(params)
-	if err != nil {
-		return nil, err
+	callParams := *params
+	if source, ok := b.permissionSources[server]; ok {
+		if strings.TrimSpace(callParams.PermissionProfile) == "" && source.Profile != nil {
+			if encoded, encodeErr := sandbox.RuntimePermissionProfileJSON(*source.Profile); encodeErr == nil {
+				callParams.PermissionProfile = strings.TrimSpace(encoded)
+			}
+		}
+		if strings.TrimSpace(callParams.SandboxCWD) == "" {
+			callParams.SandboxCWD = strings.TrimSpace(source.CWD)
+		}
+	}
+	var (
+		response *MCPToolCallResponse
+		err      error
+	)
+	if ref, ok := b.catalogs[server]; ok && ref.catalog != nil {
+		// Hold the catalog's read lock for the call so a refresh publishes only
+		// after calls prepared against the current revision finish (Rust #43031).
+		ran, runErr := ref.catalog.runWithRevision(ref.revision, func() error {
+			var callErr error
+			response, callErr = b.service.CallTool(&callParams)
+			return callErr
+		})
+		if !ran {
+			return nil, fmt.Errorf("%w: MCP tool catalog changed after this model step was prepared", ErrInvalidMCPRequest)
+		}
+		if runErr != nil {
+			return nil, runErr
+		}
+	} else {
+		response, err = b.service.CallTool(&callParams)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if b.service.Generation() != b.generation {
 		return nil, fmt.Errorf("%w: MCP tool catalog changed while the call was executing", ErrInvalidMCPRequest)

@@ -24,6 +24,7 @@ const (
 	envJSONFlag                          = "--env-json"
 	permissionProfileFlag                = "--permission-profile"
 	privateDesktopFlag                   = "--windows-sandbox-private-desktop"
+	privateDesktopNameFlag               = "--windows-sandbox-private-desktop-name"
 	preserveProxySettingsFlag            = "--preserve-proxy-settings"
 	proxyEnforcedFlag                    = "--proxy-enforced"
 	readRootsIncludePlatformDefaultsFlag = "--read-roots-include-platform-defaults"
@@ -48,7 +49,6 @@ type WindowsSandboxCommandArgsRequest struct {
 	Env                              map[string]string
 	PermissionProfile                *coresandbox.PermissionProfile
 	WindowsSandboxLevel              WindowsSandboxLevel
-	WindowsSandboxPrivateDesktop     bool
 	ProxyEnforced                    bool
 	ProxySettingsMode                ProxySettingsMode
 	ReadRootsOverride                []string
@@ -59,6 +59,8 @@ type WindowsSandboxCommandArgsRequest struct {
 	DenyReadPathsOverride            []string
 	DenyWritePathsOverride           []string
 	CodexHome                        string
+	PrivateDesktopName               string
+	PreparePrivateDesktop            bool
 }
 
 type WindowsSandboxWrapperRequest struct {
@@ -112,8 +114,15 @@ func CreateWindowsSandboxCommandArgsForPermissionProfile(req WindowsSandboxComma
 	for _, root := range workspaceRoots {
 		args = append(args, workspaceRootFlag, root)
 	}
-	if req.WindowsSandboxPrivateDesktop {
-		args = append(args, privateDesktopFlag)
+	// Rust #46554 removed the private-desktop opt-out: every sandboxed launch
+	// runs on a private desktop, so the child always receives the flag.
+	args = append(args, privateDesktopFlag)
+	// Rust #44658: the caller owns the desktop cache so the desktop outlives
+	// this short-lived wrapper; the wrapper only opens the named desktop.
+	if name, err := req.privateDesktopNameForLaunch(); err != nil {
+		return nil, err
+	} else if name != "" {
+		args = append(args, privateDesktopNameFlag, name)
 	}
 	if req.ProxyEnforced {
 		args = append(args, proxyEnforcedFlag)
@@ -224,7 +233,15 @@ func ParseWindowsSandboxWrapperArgs(args []string) (*WindowsSandboxWrapperReques
 			}
 			req.WindowsSandboxLevel, i = level, next
 		case privateDesktopFlag:
-			req.WindowsSandboxPrivateDesktop = true
+			// Accepted for compatibility with an already-built wrapper command
+			// line; the private desktop is no longer optional (Rust #46554).
+			continue
+		case privateDesktopNameFlag:
+			value, next, err := nextFlagValue(args, i, arg)
+			if err != nil {
+				return nil, err
+			}
+			req.PrivateDesktopName, i = value, next
 		case proxyEnforcedFlag:
 			req.ProxyEnforced = true
 		case preserveProxySettingsFlag:
@@ -276,6 +293,13 @@ func ParseWindowsSandboxWrapperArgs(args []string) (*WindowsSandboxWrapperReques
 	}
 	if err := req.validateParsed(); err != nil {
 		return nil, err
+	}
+	// Rust #44658 parse_windows_sandbox_wrapper_args requires the caller-owned
+	// desktop name; a short-lived wrapper must never create its own desktop.
+	// Go keeps one carve-out: a disabled sandbox runs the command directly and
+	// never touches a desktop, so it needs no name.
+	if req.WindowsSandboxLevel != WindowsSandboxLevelDisabled && strings.TrimSpace(req.PrivateDesktopName) == "" {
+		return nil, fmt.Errorf("missing required %s", privateDesktopNameFlag)
 	}
 	return &WindowsSandboxWrapperRequest{WindowsSandboxCommandArgsRequest: req}, nil
 }
@@ -376,7 +400,6 @@ func wrapperCaptureRequest(req *WindowsSandboxWrapperRequest) *CaptureRequest {
 		Command:                          cloneStrings(req.Command),
 		CWD:                              req.CommandCWD,
 		Env:                              cloneEnv(req.Env),
-		UsePrivateDesktop:                req.WindowsSandboxPrivateDesktop,
 		ProxyEnforced:                    req.ProxyEnforced,
 		ProxySettingsMode:                req.ProxySettingsMode,
 		ReadRootsOverride:                cloneStrings(req.ReadRootsOverride),
@@ -386,6 +409,7 @@ func wrapperCaptureRequest(req *WindowsSandboxWrapperRequest) *CaptureRequest {
 		WriteRootsOverrideSet:            req.WriteRootsOverrideSet,
 		DenyReadPaths:                    cloneStrings(req.DenyReadPathsOverride),
 		DenyWritePaths:                   cloneStrings(req.DenyWritePathsOverride),
+		PrivateDesktopName:               req.PrivateDesktopName,
 	}
 }
 
@@ -484,6 +508,11 @@ func (r *WindowsSandboxCommandArgsRequest) validateForArgs() error {
 func (r *WindowsSandboxCommandArgsRequest) validateParsed() error {
 	if err := r.validateForArgs(); err != nil {
 		return err
+	}
+	if name := strings.TrimSpace(r.PrivateDesktopName); name != "" {
+		if err := ValidatePrivateDesktopName(name); err != nil {
+			return err
+		}
 	}
 	if !isWindowsSandboxAbs(r.CodexHome) {
 		return fmt.Errorf("%s must be absolute: %s", codexHomeFlag, r.CodexHome)

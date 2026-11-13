@@ -61,6 +61,7 @@ type OtelExporterKind struct {
 // after defaults are applied.
 type OtelConfig struct {
 	ToolResult             protocol.ToolResultLogConfig
+	LogSSEDeltas           bool
 	LogUserPrompt          bool
 	LogGuardianAssessments bool
 	LogAgentResponses      bool
@@ -70,6 +71,12 @@ type OtelConfig struct {
 	MetricsExporter        OtelExporterKind
 	SpanAttributes         map[string]string
 	Tracestate             map[string]map[string]string
+	// HeadersHelper is the command that prints collector headers for the
+	// explicit OTLP HTTP exporters; it runs from CODEX_HOME (Rust #61028).
+	HeadersHelper string
+	// HeadersHelperRefreshIntervalMS is the helper's refresh cadence. Zero means
+	// Rust's 29-minute default.
+	HeadersHelperRefreshIntervalMS int
 }
 
 // DefaultOtelConfig mirrors OtelConfig::default: no log/trace exporter, the
@@ -78,6 +85,7 @@ type OtelConfig struct {
 func DefaultOtelConfig() OtelConfig {
 	return OtelConfig{
 		ToolResult:      protocol.DefaultToolResultLogConfig(),
+		LogSSEDeltas:    true,
 		Environment:     DefaultOtelEnvironment,
 		Exporter:        OtelExporterKind{Kind: OtelExporterKindNone},
 		TraceExporter:   OtelExporterKind{Kind: OtelExporterKindNone},
@@ -102,6 +110,9 @@ func ResolveOtelConfig(values map[string]any) (OtelConfig, []string) {
 	if logUserPrompt, ok := otel["log_user_prompt"].(bool); ok {
 		resolved.LogUserPrompt = logUserPrompt
 	}
+	if logSSEDeltas, ok := otel["log_sse_deltas"].(bool); ok {
+		resolved.LogSSEDeltas = logSSEDeltas
+	}
 	if logGuardian, ok := otel["log_guardian_assessments"].(bool); ok {
 		resolved.LogGuardianAssessments = logGuardian
 	}
@@ -119,6 +130,12 @@ func ResolveOtelConfig(values map[string]any) (OtelConfig, []string) {
 	}
 	if exporter, ok := otelExporterKind(otel["metrics_exporter"]); ok {
 		resolved.MetricsExporter = exporter
+	}
+	if helper, ok := otel["headers_helper"].(string); ok {
+		resolved.HeadersHelper = strings.TrimSpace(helper)
+	}
+	if interval, ok := otelConfigIntValue(otel["headers_helper_refresh_interval_ms"]); ok {
+		resolved.HeadersHelperRefreshIntervalMS = interval
 	}
 	metadata, warnings := ResolveOtelTraceMetadata(values)
 	resolved.SpanAttributes = metadata.SpanAttributes
@@ -161,6 +178,21 @@ func ValidateOtelConfigValues(values map[string]any) error {
 	if value, ok := otel["environment"]; ok && value != nil {
 		if _, isString := value.(string); !isString {
 			return errors.New("otel.environment must be a string")
+		}
+	}
+	if value, ok := otel["headers_helper"]; ok && value != nil {
+		helper, isString := value.(string)
+		if !isString {
+			return errors.New("otel.headers_helper must be a string")
+		}
+		if strings.TrimSpace(helper) == "" {
+			return errors.New("otel.headers_helper must not be empty")
+		}
+	}
+	if value, ok := otel["headers_helper_refresh_interval_ms"]; ok && value != nil {
+		interval, valid := otelConfigIntValue(value)
+		if !valid || interval <= 0 {
+			return errors.New("otel.headers_helper_refresh_interval_ms must be a positive integer")
 		}
 	}
 	if value, ok := otel["tool_result"]; ok && value != nil {

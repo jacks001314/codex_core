@@ -459,6 +459,92 @@ func TestResponsesAgentRunnerPrewarmUsesWebSocketGenerateFalse(t *testing.T) {
 	if continuation == nil || continuation.tags["mode"] != "full" || continuation.tags["reason"] != "prewarm" || continuation.tags["phase"] != "warmup" {
 		t.Fatalf("continuation metric = %#v", continuation)
 	}
+	if continuation.tags["after_prewarm"] != "false" {
+		t.Fatalf("prewarm after_prewarm = %q, want false", continuation.tags["after_prewarm"])
+	}
+	var websocketCheck *recordedMetricSample
+	for index := range sink.counters {
+		if sink.counters[index].name == startupPrewarmWebsocketCheckMetric {
+			websocketCheck = &sink.counters[index]
+		}
+	}
+	if websocketCheck == nil || websocketCheck.tags["outcome"] != "needs_prewarm" || websocketCheck.tags["input"] != "base" {
+		t.Fatalf("websocket check metric = %#v", websocketCheck)
+	}
+}
+
+// Mirrors Rust #48812: only the generation that consumes the prepared warmup
+// response is tagged after_prewarm, both for the warmup itself and for later
+// requests in the same turn.
+func TestResponsesAgentRunnerWebSocketContinuationMarksAfterPrewarmLikeRust(t *testing.T) {
+	var created atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		conn, err := websocket.Accept(w, request, nil)
+		if err != nil {
+			t.Errorf("Accept() error = %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "done")
+		for {
+			if _, _, err := conn.Read(request.Context()); err != nil {
+				return
+			}
+			id := fmt.Sprintf("resp-%d", created.Add(1))
+			_ = conn.Write(request.Context(), websocket.MessageText, []byte(`{"type":"response.created","response":{"id":"`+id+`"}}`))
+			_ = conn.Write(request.Context(), websocket.MessageText, []byte(`{"type":"response.output_item.done","item":{"id":"msg-`+id+`","type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}`))
+			_ = conn.Write(request.Context(), websocket.MessageText, []byte(`{"type":"response.completed","response":{"id":"`+id+`"}}`))
+		}
+	}))
+	defer server.Close()
+	sink := &recordingMetricsSink{}
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider:                &APIProvider{BaseURL: server.URL},
+		Auth:                    &AuthHeaders{Headers: http.Header{"Authorization": []string{"Bearer secret"}}},
+		SupportsWebsockets:      true,
+		WebsocketConnectTimeout: time.Second,
+	})
+	runner.Metrics = sink
+	if _, err := runner.Prewarm(context.Background(), &AgentRequest{Model: "gpt-test"}); err != nil {
+		t.Fatalf("Prewarm() error = %v", err)
+	}
+	if _, err := runner.RunWebSocket(context.Background(), &AgentRequest{
+		Model:                       "gpt-test",
+		Prompt:                      "hello",
+		ThreadID:                    "thread-after-prewarm",
+		TurnID:                      "turn-after-prewarm",
+		PreviousResponseID:          "resp-1",
+		PreviousResponseFromPrewarm: true,
+	}); err != nil {
+		t.Fatalf("RunWebSocket() error = %v", err)
+	}
+	if _, err := runner.RunWebSocket(context.Background(), &AgentRequest{
+		Model:              "gpt-test",
+		Prompt:             "again",
+		ThreadID:           "thread-after-prewarm",
+		TurnID:             "turn-after-prewarm",
+		PreviousResponseID: "resp-2",
+	}); err != nil {
+		t.Fatalf("RunWebSocket() second error = %v", err)
+	}
+	var phases []string
+	var afterPrewarm []string
+	for index := range sink.counters {
+		if sink.counters[index].name != websocketContinuationCountMetric {
+			continue
+		}
+		phases = append(phases, sink.counters[index].tags["phase"])
+		afterPrewarm = append(afterPrewarm, sink.counters[index].tags["after_prewarm"])
+	}
+	wantPhases := []string{"warmup", "generation", "generation"}
+	wantAfter := []string{"false", "true", "false"}
+	if len(phases) != len(wantPhases) {
+		t.Fatalf("continuation phases = %#v, want %#v", phases, wantPhases)
+	}
+	for index := range wantPhases {
+		if phases[index] != wantPhases[index] || afterPrewarm[index] != wantAfter[index] {
+			t.Fatalf("continuation[%d] = (%q, %q), want (%q, %q)", index, phases[index], afterPrewarm[index], wantPhases[index], wantAfter[index])
+		}
+	}
 }
 
 // Mirrors Rust #46051: every generation response.create records the
@@ -2254,9 +2340,51 @@ func TestResponsesAgentRunnerGuardianRoutingLikeRust(t *testing.T) {
 		t.Fatalf("api-key guardian header = %q, want empty", got)
 	}
 
-	// A provider without the backend routes is unmarked as well.
-	plainRunner := makeRunner("chatgpt", "https://example.test/v1")
-	request, err = plainRunner.newResponsesHTTPRequest(context.Background(), &AgentRequest{
+	// Rust #57439: a custom OpenAI base URL keeps the reviewer marker, the
+	// service-tier drop and the routing-hint suppression because they depend on
+	// the provider and auth rather than the URL.
+	for _, baseURL := range []string{"https://example.test/v1", "https://example.test/api/codex"} {
+		customRunner := makeRunner("chatgpt", baseURL)
+		request, err = customRunner.newResponsesHTTPRequest(context.Background(), &AgentRequest{
+			TaskKind:   AgentTaskReview,
+			Originator: "guardian",
+			Model:      DefaultApprovalReviewPreferredModel,
+		}, &responsesAgentRequest{Model: DefaultApprovalReviewPreferredModel, ServiceTier: "priority"}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := request.Header.Get(GuardianHeaderName); got != GuardianHeaderReviewer {
+			t.Fatalf("%s guardian header = %q, want %q", baseURL, got, GuardianHeaderReviewer)
+		}
+		if got := request.Header.Get(codexapi.ClientCodexRoutingHintHeader); got != "" {
+			t.Fatalf("%s guardian routing hint = %q, want empty", baseURL, got)
+		}
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(body), "service_tier") {
+			t.Fatalf("%s guardian body kept a service tier: %s", baseURL, body)
+		}
+	}
+
+	// Header-based auth also marks the review on a direct backend endpoint.
+	headersRunner := makeRunner("headers", "https://example.test/api/codex")
+	request, err = headersRunner.newResponsesHTTPRequest(context.Background(), &AgentRequest{
+		TaskKind:   AgentTaskReview,
+		Originator: "guardian",
+		Model:      DefaultApprovalReviewPreferredModel,
+	}, &responsesAgentRequest{Model: DefaultApprovalReviewPreferredModel}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := request.Header.Get(GuardianHeaderName); got != GuardianHeaderReviewer {
+		t.Fatalf("header-auth guardian header = %q, want %q", got, GuardianHeaderReviewer)
+	}
+
+	// API-key auth on a custom OpenAI URL stays unmarked.
+	apiKeyCustomRunner := makeRunner("api-key", "https://example.test/v1")
+	request, err = apiKeyCustomRunner.newResponsesHTTPRequest(context.Background(), &AgentRequest{
 		TaskKind: AgentTaskReview,
 		Model:    DefaultApprovalReviewPreferredModel,
 	}, &responsesAgentRequest{Model: DefaultApprovalReviewPreferredModel}, "")
@@ -2264,7 +2392,46 @@ func TestResponsesAgentRunnerGuardianRoutingLikeRust(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := request.Header.Get(GuardianHeaderName); got != "" {
-		t.Fatalf("plain-provider guardian header = %q, want empty", got)
+		t.Fatalf("api-key custom-url guardian header = %q, want empty", got)
+	}
+}
+
+// Mirrors Rust #57439: ordinary Codex-backend traffic requests parent Guardian
+// credits from the OpenAI provider plus ChatGPT auth regardless of the base URL,
+// while API-key, header-based and other providers stay excluded.
+func TestResponsesAgentRunnerGuardianCreditsFollowProviderAndAuthLikeRust(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		authMode  string
+		provider  string
+		baseURL   string
+		wantCreds bool
+	}{
+		{name: "chatgpt custom v1", authMode: "chatgpt", provider: OpenAIProviderName, baseURL: "https://example.test/v1", wantCreds: true},
+		{name: "chatgpt direct backend", authMode: "chatgpt", provider: OpenAIProviderName, baseURL: "https://example.test/api/codex", wantCreds: true},
+		{name: "chatgpt backend codex", authMode: "chatgpt", provider: OpenAIProviderName, baseURL: "https://example.test/backend-api/codex", wantCreds: true},
+		{name: "api key", authMode: "api-key", provider: OpenAIProviderName, baseURL: "https://example.test/v1", wantCreds: false},
+		{name: "header auth", authMode: "headers", provider: OpenAIProviderName, baseURL: "https://example.test/api/codex", wantCreds: false},
+		{name: "custom provider", authMode: "chatgpt", provider: "Custom", baseURL: "https://example.test/v1", wantCreds: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+				Provider:     &APIProvider{Name: test.provider, BaseURL: test.baseURL},
+				AuthSnapshot: &auth.AuthDotJSON{AuthMode: test.authMode},
+			})
+			request, err := runner.newResponsesHTTPRequest(context.Background(), &AgentRequest{}, &responsesAgentRequest{Model: "gpt-test"}, "")
+			if err != nil {
+				t.Fatalf("newResponsesHTTPRequest: %v", err)
+			}
+			body, err := io.ReadAll(request.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+			gotCreds := strings.Contains(string(body), `"`+codexapi.GuardianCreditsRequestedKey+`":"true"`)
+			if gotCreds != test.wantCreds {
+				t.Fatalf("guardian credits = %t, want %t (body %s)", gotCreds, test.wantCreds, body)
+			}
+		})
 	}
 }
 
@@ -3658,7 +3825,7 @@ func TestResponsesAgentRunnerStreamsResponsesSSE(t *testing.T) {
 		w.Header().Set("x-codex-secondary-limit-name", "gpt-secondary")
 		_, _ = w.Write([]byte(responsesSSE(
 			`{"type":"response.metadata","headers":{"openai-model":"gpt-metadata"}}`,
-			`{"type":"response.metadata","metadata":{"model_reroute":{"from_model":"gpt-old","to_model":"gpt-new","reason":"high_risk_cyber_activity"},"model_verification":{"verifications":["trusted_access_for_cyber"]},"turn_moderation_metadata":{"flagged":true}}}`,
+			`{"type":"response.metadata","metadata":{"model_reroute":{"from_model":"gpt-old","to_model":"gpt-new","reason":"high_risk_cyber_activity"},"model_verification":{"verifications":["trusted_access_for_cyber"]},"openai_chatgpt_moderation_metadata":{"flagged":true}}}`,
 			`{"type":"response.metadata","metadata":{"type":"safety_buffering","use_cases":["cyber"],"reasons":["review"],"show_buffering_ui":true,"faster_model":"gpt-fast"}}`,
 			`{"type":"response.created","response":{"id":"resp-1"}}`,
 			`{"type":"responsesapi.websocket_timing","timing_metrics":{"responses_duration_excl_engine_and_client_tool_time_ms":120,"engine_iapi_ttft_total_ms":310,"engine_service_ttft_total_ms":340}}`,
@@ -3931,6 +4098,120 @@ func TestResponsesAgentRunnerDoesNotRetryFatalResponseFailedLikeRust(t *testing.
 	}
 }
 
+// Rust #47353 recognizes invalid_prompt on HTTP 400 responses and on the
+// wrapped WebSocket body (type/status alongside error), preserving the
+// provider message and falling back only when it is missing or blank.
+func TestInvalidPromptErrorsAreTypedAcrossHTTPAndWrappedWebsocketLikeRust(t *testing.T) {
+	strPtr := func(value string) *string { return &value }
+	cases := []struct {
+		name        string
+		message     *string
+		wantMessage string
+	}{
+		{name: "message", message: strPtr("The prompt is invalid."), wantMessage: "The prompt is invalid."},
+		{name: "typed code wins over context heuristic", message: strPtr("prompt is too long"), wantMessage: "prompt is too long"},
+		{name: "missing", wantMessage: InvalidPromptFallbackMessage},
+		{name: "empty", message: strPtr(""), wantMessage: InvalidPromptFallbackMessage},
+		{name: "blank", message: strPtr("  "), wantMessage: InvalidPromptFallbackMessage},
+	}
+	for _, wrapped := range []bool{false, true} {
+		for _, tc := range cases {
+			name := tc.name
+			if wrapped {
+				name += " wrapped websocket"
+			}
+			t.Run(name, func(t *testing.T) {
+				body := map[string]any{"error": map[string]any{"code": "invalid_prompt"}}
+				if tc.message != nil {
+					body["error"].(map[string]any)["message"] = *tc.message
+				}
+				if wrapped {
+					body["type"] = "error"
+					body["status"] = http.StatusBadRequest
+				}
+				raw, err := json.Marshal(body)
+				if err != nil {
+					t.Fatalf("Marshal: %v", err)
+				}
+				httpErr := responsesHTTPError("openai", http.StatusBadRequest, http.Header{}, raw)
+				var apiErr *codexapi.APIError
+				if !errors.As(httpErr, &apiErr) || apiErr.Kind != codexapi.ErrorInvalidPrompt {
+					t.Fatalf("http error = %#v, want invalid prompt", httpErr)
+				}
+				if apiErr.Status != http.StatusBadRequest || apiErr.Message != tc.wantMessage {
+					t.Fatalf("http error = status:%d message:%q, want status:%d message:%q", apiErr.Status, apiErr.Message, http.StatusBadRequest, tc.wantMessage)
+				}
+				if isRetryableResponsesStreamError(httpErr) {
+					t.Fatal("invalid_prompt must be terminal")
+				}
+			})
+		}
+	}
+}
+
+// Rust #47353 asserts an HTTP invalid_prompt failure reaches the caller after
+// exactly one request, with the typed classification preserved.
+func TestResponsesAgentRunnerHTTPInvalidPromptIsTerminalLikeRust(t *testing.T) {
+	var attempts atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"code":"invalid_prompt","message":"The prompt is invalid."}}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{BaseURL: server.URL + "/v1", RequestMaxRetries: 2},
+	})
+	_, err := runner.Run(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"})
+	var apiErr *codexapi.APIError
+	if !errors.As(err, &apiErr) || apiErr.Kind != codexapi.ErrorInvalidPrompt {
+		t.Fatalf("Run() error = %#v, want invalid prompt", err)
+	}
+	if apiErr.Status != http.StatusBadRequest || apiErr.Message != "The prompt is invalid." {
+		t.Fatalf("invalid prompt = status:%d message:%q", apiErr.Status, apiErr.Message)
+	}
+	if attempts.Load() != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts.Load())
+	}
+}
+
+func TestResponsesAgentRunnerWebSocketInvalidPromptIsTerminalLikeRust(t *testing.T) {
+	var dials atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		dials.Add(1)
+		conn, err := websocket.Accept(w, request, nil)
+		if err != nil {
+			t.Errorf("Accept() error = %v", err)
+			return
+		}
+		defer conn.Close(websocket.StatusNormalClosure, "done")
+		if _, _, err := conn.Read(request.Context()); err != nil {
+			t.Errorf("Read() error = %v", err)
+			return
+		}
+		_ = conn.Write(request.Context(), websocket.MessageText, []byte(`{"type":"response.created","response":{"id":"resp-invalid"}}`))
+		_ = conn.Write(request.Context(), websocket.MessageText, []byte(`{"type":"error","status":400,"error":{"code":"invalid_prompt","message":"The prompt is invalid."}}`))
+	}))
+	defer server.Close()
+
+	runner := NewResponsesAgentRunner(&ResponsesAgentOptions{
+		Provider: &APIProvider{BaseURL: server.URL}, SupportsWebsockets: true, WebsocketConnectTimeout: time.Second,
+	})
+	_, err := runner.RunWebSocket(context.Background(), &AgentRequest{Prompt: "hello", Model: "gpt-test"})
+	var apiErr *codexapi.APIError
+	if !errors.As(err, &apiErr) || apiErr.Kind != codexapi.ErrorInvalidPrompt {
+		t.Fatalf("RunWebSocket() error = %#v, want invalid prompt", err)
+	}
+	if apiErr.Status != http.StatusBadRequest || apiErr.Message != "The prompt is invalid." {
+		t.Fatalf("invalid prompt = status:%d message:%q", apiErr.Status, apiErr.Message)
+	}
+	if dials.Load() != 1 {
+		t.Fatalf("dials = %d, want 1", dials.Load())
+	}
+}
+
 func TestMisalignmentPolicyViolationErrorsAreTypedAndNonRetryableLikeRust(t *testing.T) {
 	err := responseFailedError([]byte(`{"type":"response.failed","response":{"error":{"code":"misalignment_policy_violation","message":"This request violated the misalignment policy."}}}`))
 	var apiErr *codexapi.APIError
@@ -4010,7 +4291,8 @@ func TestBioPolicyErrorsAreTypedAcrossStreamAndHTTPLikeRust(t *testing.T) {
 
 func TestResponseFailedRateLimitRetryDelayLikeRust(t *testing.T) {
 	err := responseFailedError([]byte(`{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"Please try again in 11.054s."}}}`))
-	if delay, ok := codexapi.RetryDelayInfo(err); !ok || delay != 11054*time.Millisecond {
+	want := 11054 * time.Millisecond
+	if delay, ok := codexapi.RetryDelayInfo(err); !ok || delay < want-time.Millisecond || delay > want {
 		t.Fatalf("retry delay = %v, %t", delay, ok)
 	}
 }
@@ -4342,7 +4624,7 @@ func TestRefreshBedrockAWSCredentialsRunsCommandOnceAndReloads(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell helper not needed; command path is cross-platform")
 	}
-	helper := `
+	helper := `#!/bin/sh
 if [ "$1" = "refresh" ]; then
   touch "$CODEX_TEST_REFRESH_MARKER"
   exit 0

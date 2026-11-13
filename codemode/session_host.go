@@ -10,13 +10,24 @@ import (
 type SessionHost struct {
 	runtime             *SessionRuntime
 	cellExecutionLimits *CellExecutionLimits
+	outputTruncation    OutputTruncation
 }
 
 func NewSessionHost(runtime *SessionRuntime) *SessionHost {
 	if runtime == nil {
 		runtime = NewSessionRuntime()
 	}
-	return &SessionHost{runtime: runtime}
+	return &SessionHost{runtime: runtime, outputTruncation: OutputTruncationClient}
+}
+
+// OutputTruncation reports who applies output budgets for this session
+// (Rust #57272). The runtime honors the setting so each observation is bounded
+// before transmission.
+func (h *SessionHost) OutputTruncation() OutputTruncation {
+	if h == nil {
+		return OutputTruncationClient
+	}
+	return h.outputTruncation
 }
 
 // Handle serves one host request. The trailing signal is the request's
@@ -35,16 +46,20 @@ func (h *SessionHost) Handle(ctx context.Context, request *HostRequest, yield *t
 		// captured at open and applied to every later execute/wait yield time
 		// without terminating the running cell.
 		h.cellExecutionLimits = request.CellExecutionLimits
+		// The runtime resolves each observation timeout from these limits
+		// (Rust applies max_yield_time_ms after the yield grace).
+		h.runtime.SetCellExecutionLimits(request.CellExecutionLimits)
+		h.outputTruncation = OutputTruncationClient
+		if request.OutputTruncation != nil {
+			h.outputTruncation = *request.OutputTruncation
+		}
+		h.runtime.SetOutputTruncation(h.outputTruncation)
 		return &HostResponse{Type: "session/ready", SessionID: request.SessionID}, nil, nil
 	case "session/execute":
 		if request.Request == nil {
 			return nil, nil, fmt.Errorf("session/execute request is required")
 		}
 		clamped := *request.Request
-		if request.Request.YieldTimeMS != nil {
-			value := h.cellExecutionLimits.ClampYieldTimeMS(*request.Request.YieldTimeMS)
-			clamped.YieldTimeMS = &value
-		}
 		started, err := h.runtime.Execute(ctx, &clamped, yield)
 		if err != nil {
 			return nil, nil, err
@@ -56,14 +71,17 @@ func (h *SessionHost) Handle(ctx context.Context, request *HostRequest, yield *t
 			return nil, nil, fmt.Errorf("session/wait request is required")
 		}
 		clamped := *request.Wait
-		clamped.YieldTimeMS = h.cellExecutionLimits.ClampYieldTimeMS(request.Wait.YieldTimeMS)
+		// The wire carries the budget on the enclosing host request (Rust #57870).
+		if request.MaxOutputTokens != nil {
+			clamped.MaxOutputTokens = request.MaxOutputTokens
+		}
 		outcome, err := h.runtime.Wait(ctx, &clamped, yield)
 		if err != nil {
 			return nil, nil, err
 		}
 		return &HostResponse{Type: "wait/completed", Outcome: outcome}, nil, nil
 	case "session/terminate":
-		outcome, err := h.runtime.Terminate(request.CellID)
+		outcome, err := h.runtime.Terminate(TerminateRequest{CellID: request.CellID, MaxOutputTokens: request.MaxOutputTokens})
 		if err != nil {
 			return nil, nil, err
 		}

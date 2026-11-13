@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"codex_core/context"
 	"codex_core/retainedctx"
@@ -135,10 +136,12 @@ type Action struct {
 	// `arguments` and `annotations`.
 	Arguments   any                `json:"-"`
 	Annotations *ActionAnnotations `json:"-"`
-	// EnvironmentID / SessionID / Chars mirror Rust WriteStdinApprovalAction.
-	EnvironmentID string `json:"-"`
-	SessionID     *int   `json:"-"`
-	Chars         string `json:"-"`
+	// EnvironmentID / SessionID / Chars mirror Rust WriteStdinApprovalAction,
+	// and OriginalCommand carries the terminal's launch command (Rust #57758).
+	EnvironmentID   string `json:"-"`
+	SessionID       *int   `json:"-"`
+	Chars           string `json:"-"`
+	OriginalCommand string `json:"-"`
 	// ApprovalID / ProcessID mirror Rust GuardianAssessmentAction::WriteStdin.
 	ApprovalID string `json:"-"`
 	ProcessID  string `json:"-"`
@@ -149,7 +152,30 @@ type Action struct {
 	// `<guardian_tool_descriptions>` block instead of the action JSON.
 	ToolDescription      string `json:"-"`
 	ConnectorDescription string `json:"-"`
+	// NativeCall is the exact proposed function call of a native tool call
+	// review (Rust GuardianApprovalRequest::NativeToolCall). It is delivered as
+	// its own native message and evidence output, so it never appears in the
+	// action JSON or a client notification.
+	NativeCall json.RawMessage `json:"-"`
 }
+
+// ActionNativeToolCall reviews one opted-in function call before dispatch
+// (Rust GuardianReviewedAction::NativeToolCall).
+const ActionNativeToolCall = "native_tool_call"
+
+// GuardianMaxTextPartEstimatedTokens mirrors guardian-context's delivery cap on
+// one text part: it sits below the 10K-token context-item guidance and also
+// bounds native call evidence (Rust #58071).
+const GuardianMaxTextPartEstimatedTokens = 9_000
+
+// GuardianMaxTextPartBytes is that cap in bytes at the four-bytes-per-token
+// estimate Rust's TruncationPolicy uses (36KB).
+const GuardianMaxTextPartBytes = GuardianMaxTextPartEstimatedTokens * 4
+
+// GuardianNativeToolCallMaxTokens mirrors guardian-context's cap on the native
+// call evidence, counting the paired evidence output. It shares the delivered
+// text-part limit (Rust #58071).
+const GuardianNativeToolCallMaxTokens = GuardianMaxTextPartEstimatedTokens
 
 // ActionAnnotations mirrors Rust GuardianMcpAnnotations: the privileged hints
 // the invoked MCP tool declared, rendered with the reviewed action.
@@ -188,6 +214,14 @@ func (a *Action) Validate() error {
 		if len(a.Permissions) == 0 {
 			return fmt.Errorf("%w: permissions are required", ErrInvalidGuardianRequest)
 		}
+	case "write_stdin":
+		if a.SessionID == nil || a.CWD == "" {
+			return fmt.Errorf("%w: session id and cwd are required", ErrInvalidGuardianRequest)
+		}
+	case ActionNativeToolCall:
+		if len(a.NativeCall) == 0 {
+			return fmt.Errorf("%w: native call is required", ErrInvalidGuardianRequest)
+		}
 	default:
 		return fmt.Errorf("%w: unsupported action %q", ErrInvalidGuardianRequest, a.Type)
 	}
@@ -225,7 +259,55 @@ type Event struct {
 	UserAuthorization *UserAuthorization `json:"userAuthorization,omitempty"`
 	Rationale         string             `json:"rationale,omitempty"`
 	DecisionSource    *DecisionSource    `json:"decisionSource,omitempty"`
-	Action            Action             `json:"action"`
+	// ReviewReason is the request-scoped trigger that sent this review to
+	// Guardian (Rust GuardianAssessmentEvent::review_reason). It is absent on
+	// events recorded before the field existed.
+	ReviewReason *GuardianReviewReason `json:"reviewReason,omitempty"`
+	Action       Action                `json:"action"`
+	// GuardianContextMode is host telemetry attribution, not part of the
+	// persisted or client-visible review event.
+	GuardianContextMode string `json:"-"`
+}
+
+// GuardianReviewReason mirrors Rust's GuardianReviewReason
+// (codex-rs/protocol/src/approvals.rs). Values serialize as snake_case, and an
+// unknown future value decodes to Unknown like serde's #[serde(other)].
+type GuardianReviewReason string
+
+const (
+	GuardianReviewReasonPolicy                 GuardianReviewReason = "policy"
+	GuardianReviewReasonFreshRequired          GuardianReviewReason = "fresh_required"
+	GuardianReviewReasonMissingScore           GuardianReviewReason = "missing_score"
+	GuardianReviewReasonStaleScore             GuardianReviewReason = "stale_score"
+	GuardianReviewReasonInvalidScore           GuardianReviewReason = "invalid_score"
+	GuardianReviewReasonIncompatibleCompaction GuardianReviewReason = "incompatible_compaction"
+	GuardianReviewReasonElevatedRisk           GuardianReviewReason = "elevated_risk"
+	GuardianReviewReasonScoringFailure         GuardianReviewReason = "scoring_failure"
+	GuardianReviewReasonAuthorizationChanged   GuardianReviewReason = "authorization_changed"
+	GuardianReviewReasonUnknown                GuardianReviewReason = "unknown"
+)
+
+func (r *GuardianReviewReason) UnmarshalJSON(data []byte) error {
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	switch reason := GuardianReviewReason(value); reason {
+	case GuardianReviewReasonPolicy,
+		GuardianReviewReasonFreshRequired,
+		GuardianReviewReasonMissingScore,
+		GuardianReviewReasonStaleScore,
+		GuardianReviewReasonInvalidScore,
+		GuardianReviewReasonIncompatibleCompaction,
+		GuardianReviewReasonElevatedRisk,
+		GuardianReviewReasonScoringFailure,
+		GuardianReviewReasonAuthorizationChanged,
+		GuardianReviewReasonUnknown:
+		*r = reason
+	default:
+		*r = GuardianReviewReasonUnknown
+	}
+	return nil
 }
 
 func NewInProgressEvent(id string, turnID string, targetItemID string, action Action, now time.Time) (*Event, error) {
@@ -328,6 +410,10 @@ const (
 	DecisionDenied   ReviewDecision = "denied"
 	DecisionTimedOut ReviewDecision = "timed_out"
 	DecisionAborted  ReviewDecision = "aborted"
+	// DecisionAskUser defers an optional automatic review that cannot be
+	// completed locally (Rust #44569 ExhaustedReviewBudget): the approval falls
+	// back to the user instead of being denied.
+	DecisionAskUser ReviewDecision = "ask_user"
 )
 
 func DecisionFromEvent(event *Event) ReviewDecision {
@@ -456,15 +542,44 @@ func (s *ReviewStore) NewReviewID() string {
 }
 
 func (s *ReviewStore) Start(turnID string, targetItemID string, action Action) (*Event, error) {
+	return s.startReview(turnID, targetItemID, action, nil)
+}
+
+// StartWithReason starts a review with the request-scoped trigger Rust records
+// on GuardianAssessmentEvent::review_reason. The reason is retained on the
+// stored event so every terminal transition keeps it.
+func (s *ReviewStore) StartWithReason(turnID string, targetItemID string, action Action, reason GuardianReviewReason) (*Event, error) {
+	return s.startReview(turnID, targetItemID, action, &reason)
+}
+
+func (s *ReviewStore) startReview(turnID string, targetItemID string, action Action, reason *GuardianReviewReason) (*Event, error) {
 	id := s.NewReviewID()
 	event, err := NewInProgressEvent(id, turnID, targetItemID, action, s.now())
 	if err != nil {
 		return nil, err
 	}
+	event.ReviewReason = reason
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.events[id] = event
 	return cloneEvent(event), nil
+}
+
+// SetGuardianContextMode records host-only telemetry attribution on the stored
+// review event. Start returns a clone, so updating only that clone would lose
+// the mode when a later failure transition copies the stored event.
+func (s *ReviewStore) SetGuardianContextMode(id string, mode string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	event := s.events[id]
+	if event == nil {
+		return false
+	}
+	event.GuardianContextMode = mode
+	return true
 }
 
 func (s *ReviewStore) Complete(id string, assessment Assessment) (*Event, error) {
@@ -570,15 +685,60 @@ func NotificationFromEvent(threadID string, event *Event) Notification {
 	return Notification{Method: NotificationReviewCompleted, Params: ReviewCompletedNotification{ThreadID: threadID, TurnID: event.TurnID, Review: review}}
 }
 
+type assessmentPayload struct {
+	RiskLevel         *RiskLevel         `json:"riskLevel"`
+	UserAuthorization *UserAuthorization `json:"userAuthorization"`
+	Outcome           *Outcome           `json:"outcome"`
+	Rationale         *string            `json:"rationale"`
+}
+
+// ParseAssessment mirrors Rust's parse_guardian_assessment: strict JSON is
+// preferred, a surrounding prose wrapper is tolerated, and omitted optional
+// fields fall back to outcome-specific defaults.
 func ParseAssessment(data []byte) (*Assessment, error) {
-	var assessment Assessment
-	if err := json.Unmarshal(data, &assessment); err != nil {
-		return nil, err
+	payload := &assessmentPayload{}
+	if err := json.Unmarshal(data, payload); err != nil {
+		text := string(data)
+		start := strings.IndexByte(text, '{')
+		end := strings.LastIndexByte(text, '}')
+		if start < 0 || end <= start {
+			return nil, fmt.Errorf("guardian assessment was not valid JSON: %w", err)
+		}
+		payload = &assessmentPayload{}
+		if err := json.Unmarshal([]byte(text[start:end+1]), payload); err != nil {
+			return nil, err
+		}
+	}
+	if payload.Outcome == nil {
+		return nil, fmt.Errorf("%w: assessment field outcome is required", ErrInvalidGuardianRequest)
+	}
+	outcome := *payload.Outcome
+	riskLevel := RiskLow
+	rationale := "Auto-review returned a low-risk allow decision."
+	if outcome == OutcomeDeny {
+		riskLevel = RiskHigh
+		rationale = "Auto-review returned a deny decision without a rationale."
+	}
+	if payload.RiskLevel != nil {
+		riskLevel = *payload.RiskLevel
+	}
+	userAuthorization := AuthorizationUnknown
+	if payload.UserAuthorization != nil {
+		userAuthorization = *payload.UserAuthorization
+	}
+	if payload.Rationale != nil && strings.TrimSpace(*payload.Rationale) != "" {
+		rationale = *payload.Rationale
+	}
+	assessment := &Assessment{
+		RiskLevel:         riskLevel,
+		UserAuthorization: userAuthorization,
+		Outcome:           outcome,
+		Rationale:         rationale,
 	}
 	if err := assessment.Validate(); err != nil {
 		return nil, err
 	}
-	return &assessment, nil
+	return assessment, nil
 }
 
 func BuildPrompt(action Action, transcript []string) (string, error) {
@@ -679,9 +839,10 @@ type guardianPromptSection struct {
 // model (previous reviews, trusted tool/skills) come from the review's inherited
 // context instead. The stateful synchronous reviewer keeps the retained snapshot
 // in that single instructions section (#51627); only the asynchronous framing
-// separates the retained assistant context into its own section after the
-// transcript, so growing assistant evidence cannot invalidate the instruction
-// prefix for independent snapshots.
+// separates the retained assistant context into its own section. Rust #49993
+// also moves the whole asynchronous retained snapshot behind the transcript and
+// attestations, immediately before the planned action, so a rolling retained
+// window cannot invalidate the reusable transcript prefix.
 func BuildPromptWithOptions(action Action, transcript []string, options BuildPromptOptions) (string, error) {
 	prompt, _, err := BuildPromptWithSectionCosts(action, transcript, options)
 	return prompt, err
@@ -764,10 +925,14 @@ func BuildPromptPartsWithSectionCosts(
 			}
 			recordCost(section.id, len(trimmed), 0, 0)
 			if len(parts) > 0 && len(parts[len(parts)-1].Native) == 0 {
-				parts[len(parts)-1].Text += "\n\n" + trimmed
-				continue
+				trimmed = parts[len(parts)-1].Text + "\n\n" + trimmed
+				parts = parts[:len(parts)-1]
 			}
-			parts = append(parts, GuardianPromptPart{Text: trimmed})
+			// Rust #58071 bounds individual delivered text parts without
+			// changing the source text or entry identity.
+			for _, chunk := range SplitGuardianTextParts(trimmed, GuardianMaxTextPartBytes) {
+				parts = append(parts, GuardianPromptPart{Text: chunk})
+			}
 		}
 		textSections = nil
 	}
@@ -789,10 +954,22 @@ func BuildPromptPartsWithSectionCosts(
 		addSection("sender_user_messages", strings.Join(items, ""))
 	}
 	// The retained snapshot layout follows the reviewed consumer's framing
-	// (#51627): the stateful synchronous reviewer renders one section ahead of the
-	// transcript, while the asynchronous independent snapshot keeps the
-	// instruction prefix there and moves the assistant context behind it.
-	retainedSections := RenderRetainedInstructionSectionsForPresentation(options.RetainedContext, options.Presentation)
+	// (#51627): the retained user-instruction prefix always precedes the
+	// transcript, while the asynchronous independent snapshot keeps the assistant
+	// context in its own section behind the transcript and attestations.
+	// The asynchronous scorer omits instructions this request's own transcript
+	// already carries (#48110); the ordering banners remain, and nothing from a
+	// previous sample can suppress an original.
+	isAsync := options.Presentation == ActionPresentationAsync
+	var retainedSections RetainedInstructionSections
+	if isAsync {
+		retainedSections = DeduplicateRetainedInstructions(
+			options.RetainedContext,
+			GuardianTranscriptRetainedSources(transcript),
+		)
+	} else {
+		retainedSections = RenderRetainedInstructionSectionsForPresentation(options.RetainedContext, options.Presentation)
+	}
 	retainedSections = ApplyRetainedOmissionDeduplication(retainedSections, options.PreviousRetainedOmissions, HasLegacyRetainedOrder(options.RetainedContext))
 	if len(retainedSections.Instructions) > 0 {
 		addSection("retained_user_instructions", strings.Join(retainedSections.Instructions, ""))
@@ -814,6 +991,13 @@ func BuildPromptPartsWithSectionCosts(
 				flushSections()
 				parts = append(parts, GuardianPromptPart{Native: append(json.RawMessage(nil), entry.Native...)})
 				recordCost("conversation_transcript", len(entry.Native), 0, 0)
+				// Rust's composer pairs a preserved native function call with
+				// its evidence-only output, and both count toward the section
+				// cost (#57448).
+				if output, ok := GuardianNativeFunctionCallEvidenceOutput(entry.Native); ok {
+					parts = append(parts, GuardianPromptPart{Native: output})
+					recordCost("conversation_transcript", len(output), 0, 0)
+				}
 				run.Reset()
 				continue
 			}
@@ -831,7 +1015,7 @@ func BuildPromptPartsWithSectionCosts(
 		}
 		addSection("conversation_transcript", run.String())
 	}
-	if len(retainedSections.AssistantContext) > 0 {
+	if !isAsync && len(retainedSections.AssistantContext) > 0 {
 		addSection("retained_assistant_context", strings.Join(retainedSections.AssistantContext, ""))
 	}
 	if options.NodeReplEvidence != nil {
@@ -844,6 +1028,14 @@ func BuildPromptPartsWithSectionCosts(
 		// it; the block separator already supplies that paragraph break here.
 		addSection("permissions", strings.TrimLeft(strings.Join(items, ""), "\n"))
 	}
+	if isAsync {
+		// Rust #51627: independent snapshot preparation moves the retained user
+		// instructions ahead of the transcript, so only the rolling assistant
+		// context stays behind it (immediately before the planned action).
+		if len(retainedSections.AssistantContext) > 0 {
+			addSection("retained_assistant_context", strings.Join(retainedSections.AssistantContext, ""))
+		}
+	}
 	actionPrompt, err := joinPlannedAction(action, options.Presentation)
 	if err != nil {
 		return nil, nil, err
@@ -853,7 +1045,63 @@ func BuildPromptPartsWithSectionCosts(
 		addSection("planned_action", descriptions)
 	}
 	flushSections()
+	if strings.TrimSpace(action.Type) == ActionNativeToolCall {
+		if err := appendGuardianNativeToolCallParts(&parts, func(section string, textBytes int) {
+			recordCost(section, textBytes, 0, 0)
+		}, action.NativeCall); err != nil {
+			return nil, nil, err
+		}
+	}
 	return parts, costs, nil
+}
+
+// SplitGuardianTextParts splits one delivered text into parts of at most
+// maxBytes, cutting on UTF-8 boundaries. The parts concatenate back to text.
+func SplitGuardianTextParts(text string, maxBytes int) []string {
+	if maxBytes <= 0 || len(text) <= maxBytes {
+		return []string{text}
+	}
+	var parts []string
+	remaining := text
+	for len(remaining) > maxBytes {
+		end := maxBytes
+		for end > 0 && !utf8.RuneStart(remaining[end]) {
+			end--
+		}
+		if end == 0 {
+			// The first rune alone exceeds the budget; keep it whole.
+			_, size := utf8.DecodeRuneInString(remaining)
+			end = size
+		}
+		parts = append(parts, remaining[:end])
+		remaining = remaining[end:]
+	}
+	if remaining != "" {
+		parts = append(parts, remaining)
+	}
+	return parts
+}
+
+// appendGuardianNativeToolCallParts mirrors Rust's sync-only planned-action
+// section: the exact call and its paired evidence-only output are delivered as
+// native response items, which keeps encrypted argument metadata intact for the
+// backend. The whole evidence, output included, is bounded by
+// GuardianNativeToolCallMaxTokens.
+func appendGuardianNativeToolCallParts(parts *[]GuardianPromptPart, recordCost func(section string, textBytes int), native json.RawMessage) error {
+	if _, _, ok := GuardianNativeFunctionCall(native); !ok {
+		return fmt.Errorf("guardian native tool call review requires a function call")
+	}
+	if GuardianNativeFunctionCallTokens(native) > GuardianNativeToolCallMaxTokens {
+		return fmt.Errorf("Guardian native tool call evidence exceeds the %d-token review limit", GuardianNativeToolCallMaxTokens)
+	}
+	call := append(json.RawMessage(nil), native...)
+	*parts = append(*parts, GuardianPromptPart{Native: call})
+	recordCost("planned_action", len(call))
+	if output, ok := GuardianNativeFunctionCallEvidenceOutput(call); ok {
+		*parts = append(*parts, GuardianPromptPart{Native: output})
+		recordCost("planned_action", len(output))
+	}
+	return nil
 }
 
 // writeGuardianPromptSection appends one prompt block, separated from the

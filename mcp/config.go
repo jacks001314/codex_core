@@ -97,6 +97,10 @@ type ServerConfig struct {
 	// ID and is used for token exchange/refresh instead of persisting it in the
 	// token record.
 	OAuthClientSecret string `json:"oauth_client_secret,omitempty"`
+	// OAuthTokenEndpointAuthMethod is the registered EMA client authentication
+	// method for a confidential MCP registration (Rust #56001). Empty means the
+	// public-client `none` method.
+	OAuthTokenEndpointAuthMethod string `json:"oauth_token_endpoint_auth_method,omitempty"`
 	// ToolInputSchemaMaxBytes is the best-effort compaction threshold for this
 	// server's tool input schemas (Rust #47936). Nil uses 5,000 bytes.
 	ToolInputSchemaMaxBytes *int   `json:"tool_input_schema_max_bytes,omitempty"`
@@ -161,6 +165,13 @@ type ServerConfig struct {
 	// from the connection identity's JSON, and added explicitly to every cache
 	// key instead.
 	CredentialPolicy CredentialPolicy `json:"-"`
+	// EMAConfigured reports that a trusted enterprise profile admitted this
+	// ema_auth server; EMACredentialsAvailable reports a stored account-scoped
+	// IdP grant. EMAAuthExtension advertises the enterprise-managed
+	// authorization MCP extension on the 2026-07-28 protocol.
+	EMAConfigured           bool `json:"-"`
+	EMACredentialsAvailable bool `json:"-"`
+	EMAAuthExtension        bool `json:"-"`
 }
 
 func (c *ServerConfig) EffectiveEnvironmentID() string {
@@ -231,11 +242,23 @@ func ValidateServerAuth(serverName string, config *ServerConfig) error {
 		return nil
 	}
 	if config.EffectiveAuth() == ServerAuthEMAAuth {
-		// EMA MCP connections are not enabled in this version (Rust #44832).
-		return errors.New("EMA MCP connections are not enabled in this version")
+		// Rust #55334: EMA is admitted only from a trusted enterprise profile
+		// and always uses a host-owned streamable HTTP transport.
+		if !config.EMAConfigured {
+			return errors.New("enterprise MCP authorization requires an enabled, directly configured server and a trusted enterprise profile")
+		}
+		if strings.TrimSpace(config.OAuthClientSecret) != "" && strings.TrimSpace(config.OAuthClientID) == "" {
+			return errors.New("oauth.client_secret requires oauth.client_id")
+		}
+		return config.ValidateEMAAuthTransport()
 	}
 	if strings.TrimSpace(config.OAuthClientSecret) != "" && strings.TrimSpace(config.OAuthClientID) == "" {
 		return errors.New("oauth.client_secret requires oauth.client_id")
+	}
+	// Rust #56001: the registered EMA authentication method only applies to
+	// enterprise-managed authorization.
+	if strings.TrimSpace(config.OAuthTokenEndpointAuthMethod) != "" {
+		return errors.New("oauth.token_endpoint_auth_method requires auth = \"ema_auth\"")
 	}
 	if strings.TrimSpace(config.HTTPHeadersHelper) != "" {
 		if strings.TrimSpace(config.URL) == "" || strings.TrimSpace(config.Command) != "" {
@@ -269,6 +292,25 @@ func (c *ServerConfig) ValidateEMAAuthTransport() error {
 		len(c.EnvHTTPHeaders) != 0 ||
 		strings.TrimSpace(c.HTTPHeadersHelper) != "" {
 		return errors.New("ema_auth cannot be combined with alternate HTTP credentials")
+	}
+	// Rust #56001: a confidential MCP registration needs a non-empty secret and
+	// a pinned authorization server issuer, and its authentication method
+	// requires that secret.
+	method := managedconfig.MCPEMATokenEndpointAuthMethod(strings.TrimSpace(c.OAuthTokenEndpointAuthMethod))
+	if method != "" && !method.IsValid() {
+		return fmt.Errorf("unknown value %q for oauth.token_endpoint_auth_method", c.OAuthTokenEndpointAuthMethod)
+	}
+	if c.OAuthClientSecret == "" {
+		if method != "" {
+			return errors.New("oauth.token_endpoint_auth_method requires oauth.client_secret")
+		}
+		return nil
+	}
+	if strings.TrimSpace(c.OAuthClientSecret) == "" {
+		return errors.New("ema_auth oauth.client_secret must not be empty")
+	}
+	if strings.TrimSpace(c.OAuthAuthorizationServerIssuer) == "" {
+		return errors.New("confidential ema_auth requires oauth.authorization_server_issuer")
 	}
 	return nil
 }
@@ -337,6 +379,18 @@ type RuntimeConfig struct {
 	Auth                 *RuntimeAuth
 	Requirements         *managedconfig.ConfigRequirements
 	ProtocolMode         MCPProtocolMode
+	// LazyStdioStartup mirrors Rust's `mcp_lazy_stdio_startup` feature (#60039):
+	// a regular chat may satisfy startup for an eligible stdio server from a warm
+	// tool catalog and connect on first use.
+	LazyStdioStartup bool
+	// DiscoverLocalStdio mirrors Rust McpConfig::discover_local_stdio (feature
+	// mcp_connection_sharing, disabled by default): eligible local stdio servers
+	// are probed with `server/discover` before the legacy handshake (#57210).
+	DiscoverLocalStdio bool
+	// NetworkPolicyMetadata, when set, supplies call-scoped network policy
+	// metadata to trusted ChatGPT MCP servers (Rust NetworkPolicyMetadataProvider,
+	// #56278). Existing runtimes leave it unset.
+	NetworkPolicyMetadata NetworkPolicyMetadataProvider
 	// RefreshToolListOnNotifications mirrors Rust McpConfig::mcp_tool_list_changed
 	// (feature mcp_tool_list_changed, disabled by default): an ordinary server
 	// that reports a tools/list_changed notification is re-listed before its
@@ -360,6 +414,10 @@ type RuntimeConfig struct {
 	// the server's environment; the default (local) environment falls back to
 	// the server's configured cwd.
 	EnvironmentCWDs map[string]string
+	// HostCWD is the directory used to interpret thread-owned permissions.
+	// Rust #59020 freezes it with each prepared MCP call so a later runtime
+	// refresh cannot reinterpret those permissions in another checkout.
+	HostCWD string
 	// EnvironmentUseMXC maps an environment id to its effective Windows sandbox
 	// backend (Rust McpConfig::environment_use_mxc, #49781). A missing entry
 	// reports false, so one environment's MXC preference never leaks into
@@ -373,9 +431,28 @@ type RuntimeConfig struct {
 	// A server absent from this map has no published authority, so its calls
 	// and elicitations are rejected (#40728).
 	ServerPermissionProfiles map[string]*sandbox.PermissionProfile
+	// ServerPermissionSources retains the directory context that accompanies
+	// each server's permissions (Rust #59020). It is populated by
+	// SetServerPermissionProfiles and is kept alongside the profile map for
+	// callers that need the complete source rather than only its policy.
+	ServerPermissionSources map[string]MCPServerPermissionSource
 	// OAuthCredentialsStoreMode is Rust's `mcp_oauth_credentials_store`
 	// (auto by default) applied to MCP OAuth credential storage.
 	OAuthCredentialsStoreMode OAuthCredentialsStoreMode
+	// XAAEnabled reports `[features].use_xaa` for enterprise-managed MCP auth.
+	XAAEnabled bool
+	// EMAPolicyBinding is the enterprise policy revision this runtime was
+	// resolved from. New enterprise MCP requests are held while the binding is
+	// stale or suspended (Rust #55691).
+	EMAPolicyBinding *managedconfig.CloudConfigBundleBinding
+	// EMAState remembers rejected account grants for each enterprise MCP
+	// registration across threads (Rust McpConfig::ema_state, #55859). It
+	// retains only revision digests, never credentials. A nil value makes
+	// rejection markers local to one enterprise manager.
+	EMAState *EMAState
+	// EnterpriseManagedAuth is the trusted `[mcp_enterprise_managed_auth]`
+	// profile used to derive enterprise IdP credentials.
+	EnterpriseManagedAuth *managedconfig.MCPEnterpriseManagedAuthConfig
 	// RequiresReadOnlyMCPTools mirrors Rust McpConfig: when set, every server's
 	// tool discovery and invocation requests server-side read-only filtering and
 	// invocation checks, and read-only connections never share a connection or
@@ -392,6 +469,24 @@ type RuntimeAuth struct {
 	UsesCodexBackend bool
 	HTTPHeaders      map[string]string
 	ApplyHTTPRequest func(*http.Request, []byte) error
+	// ChatGPTUserID and AccountID identify the account owner for
+	// enterprise-managed MCP authorization (Rust #55334).
+	ChatGPTUserID string
+	AccountID     string
+	// RuntimeProvider supplies per-request runtime credentials for remote
+	// plugin and file-storage requests when runtime agent instances are enabled
+	// (Rust #59564). Nil keeps the static headers.
+	RuntimeProvider OpenAIFileRuntimeAuth
+}
+
+// WithRuntimeProvider attaches a per-request runtime credential provider so
+// remote plugin and file-storage requests can present runtime assertions.
+func (r *RuntimeAuth) WithRuntimeProvider(provider OpenAIFileRuntimeAuth) *RuntimeAuth {
+	if r == nil || provider == nil {
+		return r
+	}
+	r.RuntimeProvider = provider
+	return r
 }
 
 func RuntimeConfigFromValues(values map[string]any, codexHome string) *RuntimeConfig {
@@ -403,6 +498,18 @@ func RuntimeConfigFromValuesWithAuth(values map[string]any, codexHome string, ru
 }
 
 func RuntimeConfigFromValuesWithAuthAndRequirements(values map[string]any, codexHome string, runtimeAuth *RuntimeAuth, requirements *managedconfig.ConfigRequirements) *RuntimeConfig {
+	return runtimeConfigFromValues(values, codexHome, runtimeAuth, requirements, nil)
+}
+
+// RuntimeConfigFromValuesWithAuthRequirementsAndBinding additionally carries the
+// enterprise policy revision the values were resolved from, so new enterprise
+// MCP requests are held while that revision is suspended or stale (Rust #55691
+// `McpConfig` policy binding). A nil binding keeps the previous behavior.
+func RuntimeConfigFromValuesWithAuthRequirementsAndBinding(values map[string]any, codexHome string, runtimeAuth *RuntimeAuth, requirements *managedconfig.ConfigRequirements, binding *managedconfig.CloudConfigBundleBinding) *RuntimeConfig {
+	return runtimeConfigFromValues(values, codexHome, runtimeAuth, requirements, binding)
+}
+
+func runtimeConfigFromValues(values map[string]any, codexHome string, runtimeAuth *RuntimeAuth, requirements *managedconfig.ConfigRequirements, binding *managedconfig.CloudConfigBundleBinding) *RuntimeConfig {
 	out := &RuntimeConfig{
 		Servers:                   map[string]ServerRegistration{},
 		AppsEnabled:               appsEnabledFromRuntimeConfigValues(values),
@@ -414,11 +521,26 @@ func RuntimeConfigFromValuesWithAuthAndRequirements(values map[string]any, codex
 		Auth:                      cloneRuntimeAuth(runtimeAuth),
 		Requirements:              managedconfig.CloneConfigRequirements(requirements),
 		ProtocolMode:              mcpProtocolModeFromValues(values),
+		DiscoverLocalStdio:        mcpFeatureEnabled(values, "mcp_connection_sharing"),
+		LazyStdioStartup:          mcpFeatureEnabled(values, "mcp_lazy_stdio_startup"),
 		HostOwnedAppsProtocolMode: hostOwnedAppsProtocolModeFromValues(values),
 		// Rust #54656 reads the notification refresh from the same feature set
 		// as the MCP protocol modes.
 		RefreshToolListOnNotifications: mcpFeatureEnabled(values, "mcp_tool_list_changed"),
 		OAuthCredentialsStoreMode:      runtimeOAuthCredentialsStoreMode(values),
+		EMAPolicyBinding:               binding,
+	}
+	out.XAAEnabled = mcpFeatureEnabled(values, managedconfig.XAAFeatureKey())
+	if table, ok := values["mcp_enterprise_managed_auth"].(map[string]any); ok {
+		if idp, ok := table["idp"].(map[string]any); ok {
+			issuer, _ := idp["issuer"].(string)
+			clientID, _ := idp["client_id"].(string)
+			if strings.TrimSpace(issuer) != "" && strings.TrimSpace(clientID) != "" {
+				out.EnterpriseManagedAuth = &managedconfig.MCPEnterpriseManagedAuthConfig{
+					IDP: managedconfig.MCPServerIdPOAuthConfig{Issuer: strings.TrimSpace(issuer), ClientID: strings.TrimSpace(clientID)},
+				}
+			}
+		}
 	}
 	rawServers, ok := runtimeConfigMapAny(values, "mcp_servers", "mcpServers")
 	if !ok {
@@ -446,6 +568,12 @@ func RuntimeConfigFromValuesWithAuthAndRequirements(values map[string]any, codex
 		}
 		if config.OAuthCredentialsStoreMode == "" {
 			config.OAuthCredentialsStoreMode = out.OAuthCredentialsStoreMode
+		}
+		if config.EffectiveAuth() == ServerAuthEMAAuth {
+			config.EMAConfigured = out.XAAEnabled && out.EnterpriseManagedAuth != nil
+			config.EMAAuthExtension = config.EMAConfigured
+			modern := MCPProtocol20260728
+			config.ProtocolModeOverride = &modern
 		}
 		out.Servers[name] = ServerRegistration{
 			Name:   name,
@@ -482,6 +610,20 @@ func (m *Manager) RuntimeConfig(base RuntimeConfig, overlays []ConfigOverlay) *R
 	for name, registration := range base.Servers {
 		registration.Name = name
 		servers[name] = cloneRegistration(&registration)
+	}
+	// Rust #56266: an explicit disable must survive runtime overlays, which only
+	// replace a registration's transport and source. A requirements denial also
+	// has to outlive the registration it was applied to, unless a trusted
+	// host-owned Apps registration replaces it.
+	explicitlyDisabled := map[string]string{}
+	requirementsDisabled := map[string]bool{}
+	for name, registration := range servers {
+		if reason, ok := explicitMCPDisabledReason(&registration); ok {
+			explicitlyDisabled[name] = reason
+		}
+		if _, ok := requirementsMCPDisabledReason(&registration); ok {
+			requirementsDisabled[name] = true
+		}
 	}
 	if base.AppsEnabled && base.Auth != nil && base.Auth.UsesCodexBackend {
 		servers[CodexAppsServerName] = ServerRegistration{
@@ -524,6 +666,23 @@ func (m *Manager) RuntimeConfig(base RuntimeConfig, overlays []ConfigOverlay) *R
 			PluginHostRoot:    overlay.PluginHostRoot,
 			SelectionOrder:    overlay.SelectionOrder,
 		}
+	}
+	for name, reason := range explicitlyDisabled {
+		registration, ok := servers[name]
+		if !ok {
+			continue
+		}
+		registration.Config.Enabled = false
+		registration.Config.DisabledReason = reason
+		servers[name] = registration
+	}
+	for name := range requirementsDisabled {
+		registration, ok := servers[name]
+		if !ok || isHostOwnedCodexAppsRegistration(name, registration) {
+			continue
+		}
+		disableMCPRegistrationByRequirements(&registration)
+		servers[name] = registration
 	}
 	out := base
 	out.Servers = servers
@@ -644,12 +803,68 @@ func managedMCPRequirementMatches(requirement managedconfig.MCPServerRequirement
 	return requirement.Matches(strings.TrimSpace(server.Command), server.Args, strings.TrimSpace(server.URL))
 }
 
+// disableMCPRegistrationByRequirements mirrors McpServerConfig::disable_by_requirements
+// (Rust #56266): a requirements denial keeps an existing explicit disable
+// visible in the reason, and repeated filtering keeps the combined reason
+// instead of downgrading it.
 func disableMCPRegistrationByRequirements(registration *ServerRegistration) {
 	if registration == nil {
 		return
 	}
-	registration.Config.Enabled = false
-	registration.Config.DisabledReason = managedconfig.MCPDisabledByRequirements
+	disableServerConfigByRequirements(&registration.Config)
+}
+
+func disableServerConfigByRequirements(config *ServerConfig) {
+	if config == nil {
+		return
+	}
+	reason := managedconfig.MCPDisabledByRequirements
+	switch strings.TrimSpace(config.DisabledReason) {
+	case managedconfig.MCPDisabledByRequirements:
+		// Already denied only by requirements.
+	case managedconfig.MCPDisabledByExplicitAndRequirements:
+		reason = managedconfig.MCPDisabledByExplicitAndRequirements
+	default:
+		// An empty or custom reason with a disabled registration is an explicit
+		// disable, matching Rust's None/Unknown arms.
+		if !config.Enabled {
+			reason = managedconfig.MCPDisabledByExplicitAndRequirements
+		}
+	}
+	config.Enabled = false
+	config.DisabledReason = reason
+}
+
+// requirementsMCPDisabledReason reports whether a disabled registration was
+// denied by managed requirements and returns its reason. Selected plugin
+// registrations do not persist a name-level veto (Rust #56266).
+func requirementsMCPDisabledReason(registration *ServerRegistration) (string, bool) {
+	if registration == nil || registration.Config.Enabled {
+		return "", false
+	}
+	reason := strings.TrimSpace(registration.Config.DisabledReason)
+	if !managedconfig.MCPDisabledByManagedRequirements(reason) {
+		return "", false
+	}
+	if !DisabledRegistrationIsNameVeto(SourceFromRegistration(registration)) {
+		return "", false
+	}
+	return reason, true
+}
+
+// explicitMCPDisabledReason reports whether a registration was disabled without
+// managed requirements and returns the reason to keep across overlays. An
+// explicit disable stays effective when an overlay only replaces the transport
+// and source (Rust #56266).
+func explicitMCPDisabledReason(registration *ServerRegistration) (string, bool) {
+	if registration == nil || registration.Config.Enabled {
+		return "", false
+	}
+	reason := strings.TrimSpace(registration.Config.DisabledReason)
+	if managedconfig.MCPDisabledByManagedRequirements(reason) {
+		return reason, reason == managedconfig.MCPDisabledByExplicitAndRequirements
+	}
+	return registration.Config.DisabledReason, true
 }
 
 func appsEnabledFromRuntimeConfigValues(values map[string]any) bool {
@@ -695,6 +910,7 @@ func runtimeServerConfigFromValues(values map[string]any) *ServerConfig {
 		server.HTTPHeadersHelper = runtimeConfigString(values, "http_headers_helper")
 		server.OAuthClientID = runtimeConfigOAuthClientID(values)
 		server.OAuthClientSecret = runtimeConfigOAuthClientSecret(values)
+		server.OAuthTokenEndpointAuthMethod = runtimeConfigOAuthTokenEndpointAuthMethod(values)
 		server.ToolInputSchemaMaxBytes = runtimeConfigPositiveIntAny(values, "tool_input_schema_max_bytes", "toolInputSchemaMaxBytes")
 		server.OAuthCallbackPort = runtimeConfigOAuthCallbackPort(values)
 		server.OAuthCallbackURL = runtimeConfigStringAny(values, "oauth_callback_url", "oauthCallbackUrl")
@@ -759,15 +975,41 @@ func runtimeConfigOAuthClientID(values map[string]any) string {
 	return runtimeConfigStringAny(oauth, "client_id", "clientId")
 }
 
+// runtimeConfigOAuthClientSecret keeps the configured value untrimmed so a
+// whitespace-only secret is still detectable and rejected (Rust #56001).
 func runtimeConfigOAuthClientSecret(values map[string]any) string {
-	if value := runtimeConfigStringAny(values, "oauth_client_secret", "oauthClientSecret"); value != "" {
+	if value := runtimeConfigRawStringAny(values, "oauth_client_secret", "oauthClientSecret"); value != "" {
 		return value
 	}
 	oauth, ok := runtimeConfigMapAny(values, "oauth")
 	if !ok {
 		return ""
 	}
-	return runtimeConfigStringAny(oauth, "client_secret", "clientSecret")
+	return runtimeConfigRawStringAny(oauth, "client_secret", "clientSecret")
+}
+
+// runtimeConfigRawStringAny returns the first non-empty string value without
+// trimming it.
+func runtimeConfigRawStringAny(values map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := values[key].(string); ok && value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// runtimeConfigOAuthTokenEndpointAuthMethod resolves the registered EMA client
+// authentication method from either the flat or nested oauth form.
+func runtimeConfigOAuthTokenEndpointAuthMethod(values map[string]any) string {
+	if value := runtimeConfigStringAny(values, "oauth_token_endpoint_auth_method", "oauthTokenEndpointAuthMethod", "token_endpoint_auth_method", "tokenEndpointAuthMethod"); value != "" {
+		return value
+	}
+	oauth, ok := runtimeConfigMapAny(values, "oauth")
+	if !ok {
+		return ""
+	}
+	return runtimeConfigStringAny(oauth, "token_endpoint_auth_method", "tokenEndpointAuthMethod")
 }
 
 func runtimeConfigOAuthCallbackPort(values map[string]any) uint16 {

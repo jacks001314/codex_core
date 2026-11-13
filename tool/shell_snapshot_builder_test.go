@@ -7,10 +7,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"codex_core/envutil"
+	"codex_core/network"
 	"codex_core/sandbox"
 )
 
@@ -258,6 +260,7 @@ func TestSnapshotBuilderCapturesWithTheHostShellLikeRust(t *testing.T) {
 	if bash == "" {
 		t.Skip("no bash on this host")
 	}
+	prepareSnapshotSandboxHelper(t)
 	t.Setenv("SNAPSHOT_PROBE_MARKER", "probe-value")
 	codexHome := t.TempDir()
 	profile := sandbox.WorkspaceWritePermissionProfile()
@@ -424,4 +427,219 @@ func hostBashPath() string {
 		}
 	}
 	return ""
+}
+
+// TestSnapshotBuilderPrewarmRunsOnceLikeRust pins Rust #42137's retained
+// prewarm handle: later turns reuse the speculative capture without running it
+// again, and a command after the prewarm still reuses the snapshot.
+func TestSnapshotBuilderPrewarmRunsOnceLikeRust(t *testing.T) {
+	codexHome := t.TempDir()
+	runner := &snapshotBuilderRunner{capture: snapshotBashCaptureStream()}
+	builder := NewSnapshotBuilder(SnapshotBuilderOptions{
+		CodexHome: codexHome,
+		SessionID: "session-1",
+		Runner:    runner.run,
+	})
+	if builder == nil {
+		t.Fatal("NewSnapshotBuilder() = nil")
+	}
+	t.Cleanup(builder.Close)
+	request := SnapshotCaptureRequest{ShellType: ShellBash, ShellPath: "/bin/bash", CWD: "/repo", AllowLoginShell: true}
+	snapshot, reason, attempted := builder.PrewarmSnapshot(context.Background(), request)
+	if !attempted || snapshot == nil || reason != "" || runner.captureCalls() != 1 {
+		t.Fatalf("first prewarm = (%v, %q, %v), captures = %d", snapshot, reason, attempted, runner.captureCalls())
+	}
+	if _, _, attempted = builder.PrewarmSnapshot(context.Background(), request); attempted {
+		t.Fatal("a second prewarm started another capture")
+	}
+	if runner.captureCalls() != 1 {
+		t.Fatalf("captures after the second prewarm = %d, want 1", runner.captureCalls())
+	}
+	reused, _ := builder.Snapshot(context.Background(), request)
+	if reused == nil || reused.Path() != snapshot.Path() || runner.captureCalls() != 1 {
+		t.Fatalf("command reuse = %v after %d captures", reused, runner.captureCalls())
+	}
+}
+
+// blockingPrewarmRunner keeps the speculative capture in flight until the
+// builder's context is cancelled, standing in for a slow login shell.
+type blockingPrewarmRunner struct {
+	started chan struct{}
+	once    sync.Once
+}
+
+func (r *blockingPrewarmRunner) run(ctx context.Context, _ []string, _ string, _ map[string]string, _ *sandbox.PermissionProfile, _ string) ([]byte, error) {
+	r.once.Do(func() { close(r.started) })
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// TestSnapshotBuilderCloseCancelsPrewarmLikeRust pins Rust #42137's shutdown
+// cancellation: unloading a thread aborts an outstanding prewarm promptly
+// instead of waiting for the capture timeout.
+func TestSnapshotBuilderCloseCancelsPrewarmLikeRust(t *testing.T) {
+	runner := &blockingPrewarmRunner{started: make(chan struct{})}
+	builder := NewSnapshotBuilder(SnapshotBuilderOptions{
+		CodexHome: t.TempDir(),
+		SessionID: "session-1",
+		Runner:    runner.run,
+	})
+	if builder == nil {
+		t.Fatal("NewSnapshotBuilder() = nil")
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		builder.PrewarmSnapshot(context.Background(), SnapshotCaptureRequest{
+			ShellType: ShellBash, ShellPath: "/bin/bash", CWD: "/repo", AllowLoginShell: true,
+		})
+	}()
+	select {
+	case <-runner.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("prewarm capture did not start")
+	}
+	begin := time.Now()
+	builder.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not cancel the in-flight prewarm")
+	}
+	if elapsed := time.Since(begin); elapsed > 2*time.Second {
+		t.Fatalf("Close blocked for %s on the capture timeout", elapsed)
+	}
+	if !builder.Closed() {
+		t.Fatal("builder is not closed")
+	}
+}
+
+// TestSnapshotBuilderProtectsBrokeredCaptureLikeRust covers Rust #43909: a
+// protected capture runs in the broker's dummy environment, startup-file
+// credentials are masked out of the written snapshot, and the launch receives
+// the prepared keys the replay wrapper restores from.
+func TestSnapshotBuilderProtectsBrokeredCaptureLikeRust(t *testing.T) {
+	codexHome := t.TempDir()
+	runner := &snapshotBuilderRunner{capture: snapshotCaptureStreamWith(
+		[2]string{"OPENAI_API_KEY", `export OPENAI_API_KEY="sk-real-secret"`},
+		[2]string{"FOO", `export FOO="bar"`},
+	)}
+	builder := NewSnapshotBuilder(SnapshotBuilderOptions{CodexHome: codexHome, SessionID: "session-1", Runner: runner.run})
+	t.Cleanup(builder.Close)
+	env := map[string]string{
+		network.CredentialBrokerActiveEnvKey: "1",
+		network.BrokeredCredentialsEnvKey:    `[["OPENAI_API_KEY","sk-dummy"]]`,
+		"OPENAI_API_KEY":                     "sk-dummy",
+		"PATH":                               "/usr/bin",
+		"BASH_ENV":                           "/tmp/startup",
+	}
+	source := map[string]string{
+		"OPENAI_API_KEY": "sk-real-secret",
+		"PATH":           "/usr/bin",
+		"BASH_ENV":       "/tmp/startup",
+	}
+	snapshot, reason := builder.Snapshot(context.Background(), SnapshotCaptureRequest{
+		ShellType: ShellBash, ShellPath: "/bin/bash", CWD: "/repo", AllowLoginShell: false,
+		Protected: true, Env: env, SourceEnv: source,
+		CredentialPairs: []network.CredentialMaskPair{{Key: "OPENAI_API_KEY", Real: "sk-real-secret", Dummy: "sk-dummy"}},
+	})
+	if reason != "" || snapshot == nil {
+		t.Fatalf("Snapshot() = %v/%q", snapshot, reason)
+	}
+	content, err := os.ReadFile(snapshot.Path())
+	if err != nil {
+		t.Fatalf("read snapshot error = %v", err)
+	}
+	if strings.Contains(string(content), "sk-real-secret") {
+		t.Fatalf("the protected snapshot retained a real credential:\n%s", content)
+	}
+	if !strings.Contains(string(content), "sk-dummy") {
+		t.Fatalf("the protected snapshot did not keep the dummy credential:\n%s", content)
+	}
+	if len(runner.environments) != 2 || runner.environments[0]["OPENAI_API_KEY"] != "sk-dummy" {
+		t.Fatalf("protected capture environment = %#v", runner.environments)
+	}
+	if _, ok := runner.environments[0][network.CredentialBrokerActiveEnvKey]; ok {
+		t.Fatalf("protected capture kept broker activation: %#v", runner.environments[0])
+	}
+	if runner.calls[0][1] != "-c" {
+		t.Fatalf("a protected non-login capture used %q, want -c", runner.calls[0][1])
+	}
+	brokered := snapshot.BrokeredEnv()
+	if brokered[snapshotBrokeredValueEnvPrefix+"OPENAI_API_KEY"] != "sk-dummy" {
+		t.Fatalf("brokered launch value = %#v", brokered)
+	}
+	if brokered[snapshotOriginalBashEnvKey] != "/tmp/startup" {
+		t.Fatalf("brokered startup environment = %#v", brokered)
+	}
+}
+
+// TestSnapshotBuilderRejectsUnvirtualizedCredentialLikeRust covers Rust
+// #44040: a protected capture that still carries a credential the broker could
+// not virtualize is discarded instead of persisted.
+func TestSnapshotBuilderRejectsUnvirtualizedCredentialLikeRust(t *testing.T) {
+	runner := &snapshotBuilderRunner{capture: snapshotCaptureStreamWith(
+		[2]string{"UNKNOWN_TOKEN", `export UNKNOWN_TOKEN="ghp_unvirtualized"`},
+	)}
+	builder := NewSnapshotBuilder(SnapshotBuilderOptions{CodexHome: t.TempDir(), SessionID: "session-1", Runner: runner.run})
+	t.Cleanup(builder.Close)
+	snapshot, reason := builder.Snapshot(context.Background(), SnapshotCaptureRequest{
+		ShellType: ShellBash, ShellPath: "/bin/bash", CWD: "/repo", AllowLoginShell: true,
+		Protected: true,
+		Env:       map[string]string{"PATH": "/usr/bin"},
+		SourceEnv: map[string]string{"PATH": "/usr/bin"},
+		CredentialTextUnsafe: func(text string) bool {
+			return strings.Contains(text, "ghp_unvirtualized")
+		},
+	})
+	if snapshot != nil || reason != SnapshotReasonWriteFailed {
+		t.Fatalf("Snapshot() = %v/%q, want a write failure", snapshot, reason)
+	}
+}
+
+// TestSnapshotBuilderRejectsCredentialReassembledByShellQuotingLikeRust covers
+// Rust's literal_words re-check in prepare_snapshot_credentials (#54432): a
+// protected capture may hide a real credential from plain text masking by
+// splitting it across quoted fragments, so the decoded literal words are
+// checked as well and the snapshot is discarded.
+func TestSnapshotBuilderRejectsCredentialReassembledByShellQuotingLikeRust(t *testing.T) {
+	runner := &snapshotBuilderRunner{capture: snapshotCaptureStreamWith(
+		[2]string{"UNKNOWN_TOKEN", `export UNKNOWN_TOKEN='ghp_''unvirtualized'`},
+	)}
+	builder := NewSnapshotBuilder(SnapshotBuilderOptions{CodexHome: t.TempDir(), SessionID: "session-1", Runner: runner.run})
+	t.Cleanup(builder.Close)
+	snapshot, reason := builder.Snapshot(context.Background(), SnapshotCaptureRequest{
+		ShellType: ShellBash, ShellPath: "/bin/bash", CWD: "/repo", AllowLoginShell: true,
+		Protected: true,
+		Env:       map[string]string{"PATH": "/usr/bin"},
+		SourceEnv: map[string]string{"PATH": "/usr/bin"},
+		CredentialTextUnsafe: func(text string) bool {
+			return strings.Contains(text, "ghp_unvirtualized")
+		},
+	})
+	if snapshot != nil || reason != SnapshotReasonWriteFailed {
+		t.Fatalf("Snapshot() = %v/%q, want a write failure", snapshot, reason)
+	}
+}
+
+// TestSnapshotBuilderKeepsOrdinaryQuotedSnapshotLikeRust keeps the literal
+// re-check from rejecting captures whose decoded words carry no credential.
+func TestSnapshotBuilderKeepsOrdinaryQuotedSnapshotLikeRust(t *testing.T) {
+	runner := &snapshotBuilderRunner{capture: snapshotCaptureStreamWith(
+		[2]string{"GREETING", `export GREETING='hello '\''world'`},
+	)}
+	builder := NewSnapshotBuilder(SnapshotBuilderOptions{CodexHome: t.TempDir(), SessionID: "session-1", Runner: runner.run})
+	t.Cleanup(builder.Close)
+	snapshot, reason := builder.Snapshot(context.Background(), SnapshotCaptureRequest{
+		ShellType: ShellBash, ShellPath: "/bin/bash", CWD: "/repo", AllowLoginShell: true,
+		Protected: true,
+		Env:       map[string]string{"PATH": "/usr/bin"},
+		SourceEnv: map[string]string{"PATH": "/usr/bin"},
+		CredentialTextUnsafe: func(text string) bool {
+			return strings.Contains(text, "ghp_unvirtualized")
+		},
+	})
+	if snapshot == nil || reason != "" {
+		t.Fatalf("Snapshot() = %v/%q, want a snapshot", snapshot, reason)
+	}
 }

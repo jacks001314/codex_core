@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"codex_core/codexapi"
 	"codex_core/model"
@@ -24,16 +25,45 @@ const (
 )
 
 type WebSearchOptions struct {
-	SessionID       string
-	Model           string
-	Originator      string
-	TurnMetadata    string
-	Provider        model.APIProvider
-	Auth            model.AuthHeaders
-	HTTPClient      model.HTTPDoer
+	SessionID    string
+	Model        string
+	Originator   string
+	TurnMetadata string
+	Provider     model.APIProvider
+	Auth         model.AuthHeaders
+	HTTPClient   model.HTTPDoer
+	// RejectRedirects keeps a workspace-routed search request from following a
+	// redirect away from the origin its routing credential is scoped to
+	// (Rust #58140 ClientRedirectPolicy::Reject).
+	RejectRedirects bool
+	// PrepareRequest, when set, resolves the provider, credentials, and redirect
+	// policy immediately before the search request is issued. Rust resolves
+	// workspace routing inside WebSearchTool::run, so a failed discovery breaks
+	// that tool call instead of turn preparation (#58140); a lazily prepared
+	// request keeps the same timing in this package.
+	PrepareRequest  func(ctx context.Context) (*WebSearchRequestContext, error)
 	InputItems      []any
 	Settings        *codexapi.SearchSettings
 	MaxOutputTokens *uint64
+	// SupportsLiteratureSearch gates the `literature_search_query` command and
+	// its schema property on the active model's experimental tool list
+	// (Rust #57542).
+	SupportsLiteratureSearch bool
+	// Admit reserves the thread's native search provider immediately before a
+	// call. A stale response or background cell is rejected when MCP search has
+	// already taken ownership of the thread's browsing references.
+	Admit func() error
+}
+
+// LiteratureSearchQueryToolName is the model capability that enables
+// literature search in the standalone web tool.
+const LiteratureSearchQueryToolName = "literature_search_query"
+
+// WebSearchRequestContext is the provider state resolved for one search request.
+type WebSearchRequestContext struct {
+	Provider        model.APIProvider
+	Auth            model.AuthHeaders
+	RejectRedirects bool
 }
 
 type WebSearchHandler struct {
@@ -51,7 +81,7 @@ func (h *WebSearchHandler) Spec() tool.Spec {
 	return tool.Spec{
 		Name:                 tool.NamespacedName(WebSearchNamespace, WebSearchRunTool),
 		Description:          webRunDescription,
-		InputSchema:          webSearchCommandsSchema(),
+		InputSchema:          webSearchCommandsSchema(h.options.SupportsLiteratureSearch),
 		Exposure:             tool.ExposureModelVisible,
 		Parallel:             true,
 		NamespaceDescription: "Tool for accessing the internet.",
@@ -65,6 +95,11 @@ func (h *WebSearchHandler) Execute(ctx context.Context, invocation *tool.Invocat
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if h.options.Admit != nil {
+		if err := h.options.Admit(); err != nil {
+			return nil, err
+		}
+	}
 	var commands codexapi.SearchCommands
 	args := strings.TrimSpace(invocation.Payload.Arguments)
 	if args == "" {
@@ -73,9 +108,35 @@ func (h *WebSearchHandler) Execute(ctx context.Context, invocation *tool.Invocat
 	if err := json.Unmarshal([]byte(args), &commands); err != nil {
 		return nil, err
 	}
+	if !h.options.SupportsLiteratureSearch && len(commands.LiteratureSearchQuery) > 0 {
+		// Rust #57542: report the gated command back to the model instead of
+		// forwarding it to the search service.
+		return nil, fmt.Errorf("literature_search_query is unavailable for this model")
+	}
 	response, err := h.search(ctx, &commands)
 	if err != nil {
-		return nil, err
+		// Rust #58147: a standalone search failure is a model-facing failed tool
+		// result, not a fatal turn error, and its text is bounded.
+		message := webSearchErrorMessage(err)
+		return &tool.Output{
+			CallID:   invocation.CallID,
+			ToolName: invocation.ToolName,
+			Success:  false,
+			Body:     message,
+			Error:    message,
+			Data: map[string]any{
+				"content_items": []FunctionCallOutputContentItem{{
+					Type: "input_text",
+					Text: message,
+				}},
+				"contains_external_context": true,
+				"web_search":                true,
+				"web_search_action":         webSearchCommandAction(&commands),
+			},
+			LogPreview:              "[standalone web search error]",
+			CompletedAt:             time.Now().UTC(),
+			ContainsExternalContext: true,
+		}, nil
 	}
 	contentItems := []FunctionCallOutputContentItem{{
 		Type: "input_text",
@@ -110,6 +171,26 @@ func (h *WebSearchHandler) Execute(ctx context.Context, invocation *tool.Invocat
 	}, nil
 }
 
+// webSearchMaxErrorBytes bounds a failed search message returned to the model
+// (Rust #58147).
+const webSearchMaxErrorBytes = 1024
+
+func webSearchErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	message := err.Error()
+	if len(message) <= webSearchMaxErrorBytes {
+		return message
+	}
+	const suffix = "… [truncated]"
+	limit := webSearchMaxErrorBytes - len(suffix)
+	for limit > 0 && !utf8.RuneStart(message[limit]) {
+		limit--
+	}
+	return message[:limit] + suffix
+}
+
 func (h *WebSearchHandler) search(ctx context.Context, commands *codexapi.SearchCommands) (*codexapi.SearchResponse, error) {
 	requestPayload := codexapi.SearchRequest{
 		ID:              strings.TrimSpace(h.options.SessionID),
@@ -123,25 +204,39 @@ func (h *WebSearchHandler) search(ctx context.Context, commands *codexapi.Search
 	if err != nil {
 		return nil, err
 	}
+	provider := h.options.Provider
+	auth := h.options.Auth
+	rejectRedirects := h.options.RejectRedirects
+	if prepare := h.options.PrepareRequest; prepare != nil {
+		prepared, err := prepare(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if prepared != nil {
+			provider = prepared.Provider
+			auth = prepared.Auth
+			rejectRedirects = prepared.RejectRedirects
+		}
+	}
 	endpoint := (&codexapi.Provider{
-		Name:        h.options.Provider.Name,
-		BaseURL:     h.options.Provider.BaseURL,
-		QueryParams: h.options.Provider.QueryParams,
-		Headers:     h.options.Provider.Headers,
+		Name:        provider.Name,
+		BaseURL:     provider.BaseURL,
+		QueryParams: provider.QueryParams,
+		Headers:     provider.Headers,
 	}).URLForPath("alpha/search")
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	addHeaderValues(req.Header, h.options.Provider.Headers)
+	addHeaderValues(req.Header, provider.Headers)
 	if originator := strings.TrimSpace(h.options.Originator); originator != "" && !strings.ContainsAny(originator, "\r\n") {
 		req.Header.Set("originator", originator)
 	}
 	if metadata := strings.TrimSpace(h.options.TurnMetadata); metadata != "" && !strings.ContainsAny(metadata, "\r\n") {
 		req.Header.Set(codexapi.ClientCodexTurnMetadataHeader, metadata)
 	}
-	signed, err := h.options.Auth.ApplyRequest(ctx, req, body)
+	signed, err := auth.ApplyRequest(ctx, req, body)
 	if err != nil {
 		return nil, err
 	}
@@ -158,6 +253,15 @@ func (h *WebSearchHandler) search(ctx context.Context, commands *codexapi.Search
 	client := h.options.HTTPClient
 	if client == nil {
 		client = http.DefaultClient
+	}
+	if rejectRedirects {
+		if standard, ok := client.(*http.Client); ok {
+			clone := *standard
+			clone.CheckRedirect = func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			}
+			client = &clone
+		}
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -206,6 +310,9 @@ func webSearchCommandAction(commands *codexapi.SearchCommands) map[string]any {
 		return map[string]any{"type": "other"}
 	}
 	queries := webSearchQueries(commands.SearchQuery)
+	if len(queries) == 0 {
+		queries = webSearchQueries(commands.LiteratureSearchQuery)
+	}
 	if len(queries) == 0 {
 		queries = webSearchQueries(commands.ImageQuery)
 	}
@@ -544,13 +651,18 @@ func addHeaderValues(dst http.Header, src http.Header) {
 	}
 }
 
-func webSearchCommandsSchema() map[string]any {
-	return map[string]any{
+func webSearchCommandsSchema(supportsLiteratureSearch bool) map[string]any {
+	schema := map[string]any{
 		"type": "object",
 		"properties": map[string]any{
 			"search_query": map[string]any{
 				"type":        "array",
 				"description": "Query the internet search engine for a given list of queries.",
+				"items":       webSearchQuerySchema(),
+			},
+			"literature_search_query": map[string]any{
+				"type":        "array",
+				"description": "Search for scientific papers. Open relevant papers and cite the primary sources you use.",
 				"items":       webSearchQuerySchema(),
 			},
 			"image_query": map[string]any{
@@ -637,6 +749,12 @@ func webSearchCommandsSchema() map[string]any {
 			},
 		},
 	}
+	if !supportsLiteratureSearch {
+		if properties, ok := schema["properties"].(map[string]any); ok {
+			delete(properties, LiteratureSearchQueryToolName)
+		}
+	}
+	return schema
 }
 
 func webSearchQuerySchema() map[string]any {

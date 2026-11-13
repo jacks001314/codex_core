@@ -11,17 +11,23 @@ import (
 	"codex_core/eventmap"
 	"codex_core/model"
 	"codex_core/protocol"
+	"codex_core/retainedctx"
 	"codex_core/state"
 	"codex_core/tool"
 )
 
 type AgentLoopOptions struct {
-	Agent                   model.AgentRunner
-	Dispatcher              *ToolDispatcher
-	SteerMailbox            *SteerMailbox
-	MaxTurns                int
-	Now                     func() time.Time
-	ExecutedToolCalls       *ExecutedToolCallRecorder
+	Agent             model.AgentRunner
+	Dispatcher        *ToolDispatcher
+	SteerMailbox      *SteerMailbox
+	MaxTurns          int
+	Now               func() time.Time
+	ExecutedToolCalls *ExecutedToolCallRecorder
+	// MCPAttribution is the thread's cumulative MCP attribution recorder.
+	// Unlike ExecutedToolCalls it is not gated by the executed-tool-call
+	// metadata feature: Rust reports attribution on every request and only the
+	// provider's internal-metadata grant decides whether it reaches the body.
+	MCPAttribution          *ExecutedToolCallRecorder
 	ToolRegistrationMetrics ToolRegistrationMetricSink
 	ToolRegistrationCounts  func() tool.RegistrationCounts
 	// DeferMailboxPreemption mirrors the `features.defer_mailbox_preemption`
@@ -103,6 +109,7 @@ type AgentLoop struct {
 	steerMailbox            *SteerMailbox
 	now                     func() time.Time
 	executedToolCalls       *ExecutedToolCallRecorder
+	mcpAttribution          *ExecutedToolCallRecorder
 	toolRegistrationMetrics ToolRegistrationMetricSink
 	toolRegistrationCounts  func() tool.RegistrationCounts
 	deferMailboxPreemption  bool
@@ -119,6 +126,9 @@ type AgentStepSettings struct {
 	ReasoningSummary string
 	ServiceTier      string
 	ClientMetadata   map[string]string
+	// HookPermissionMode is the step's effective approval policy in the hook
+	// vocabulary (Rust #45248 hook_permission_mode(step_context.settings)).
+	HookPermissionMode string
 }
 
 type AgentLoopRequest struct {
@@ -127,16 +137,26 @@ type AgentLoopRequest struct {
 	Model                   string
 	ToolMode                string
 	DisableCodeModeFallback bool
-	ProviderID              string
-	TaskKind                model.AgentTaskKind
-	ThreadID                string
-	TurnID                  string
+	// InterruptOnCancel asks a cancelled Responses Lite sampling request to
+	// interrupt upstream and drain its terminal event (Rust #57864).
+	InterruptOnCancel bool
+	ProviderID        string
+	TaskKind          model.AgentTaskKind
+	ThreadID          string
+	// SessionID is the Responses session identity, which differs from ThreadID
+	// for host-owned internal sessions that reuse their parent session
+	// (Rust #39994). Empty keeps the thread-id fallback.
+	SessionID string
+	TurnID    string
 	// Ephemeral mirrors Rust's `turn_context.config.ephemeral`: the thread
 	// intentionally skips durable persistence, so attachment uploads made while
 	// preparing this turn's requests carry that intent (Rust #51517).
 	Ephemeral  bool
 	Originator string
-	InputItems []any
+	// RequiredCyberAccessPrograms is the host-installed per-thread requirement
+	// (Rust #59754): every model request must send one of these programs.
+	RequiredCyberAccessPrograms []string
+	InputItems                  []any
 	// PostPromptInputItems are appended after the prompt's user message (and
 	// after InputItems when there is no prompt) for the first sampling request,
 	// then folded into the turn's input for later iterations. Rust records
@@ -147,13 +167,23 @@ type AgentLoopRequest struct {
 	// ToolsForStep rebuilds the tool list when a later sampling step selects a
 	// different model. It lets model-catalog Code Mode messages follow mid-turn
 	// model changes (Rust #47118).
-	ToolsForStep       func(model string) []any
-	HostedTools        []any
-	Store              bool
-	PreviousResponseID string
-	ParallelToolCalls  bool
-	ReasoningEffort    string
-	ReasoningSummary   string
+	ToolsForStep func(model string) []any
+	// UnifiedImageBudget is the turn-start unified_image_budget_enabled value;
+	// UnifiedImageBudgetForModel refreshes it per sampling step.
+	UnifiedImageBudget bool
+	// UnifiedImageBudgetForModel reports unified_image_budget_enabled for the
+	// model of the sampling step, so request image preparation follows it.
+	UnifiedImageBudgetForModel func(model string) bool
+	HostedTools                []any
+	Store                      bool
+	PreviousResponseID         string
+	// PreviousResponseFromPrewarm marks PreviousResponseID as the response a
+	// prewarm prepared, so only the first sampling request is tagged
+	// after_prewarm (Rust #48812).
+	PreviousResponseFromPrewarm bool
+	ParallelToolCalls           bool
+	ReasoningEffort             string
+	ReasoningSummary            string
 	// DropReasoningEffortUpdates removes saved configuration_update items from
 	// the request copy when the effective model/provider does not support them
 	// (Rust #46530).
@@ -169,6 +199,9 @@ type AgentLoopRequest struct {
 	// records it as the `tags_json` field.
 	UsageTags      map[string]string
 	PromptCacheKey string
+	// PromptCacheTTL requests a per-turn minimum prompt-cache lifetime ("30m"
+	// or "12h"); empty omits prompt_cache_options (Rust #59480).
+	PromptCacheTTL string
 	// CyberAccessProgram is the turn's selected cyber access program (core
 	// snake_case, empty when none was selected or the provider is not OpenAI).
 	// Rust carries it on the turn context and copies it into every Prompt
@@ -182,6 +215,9 @@ type AgentLoopRequest struct {
 	// CWD is the turn's working directory, reported on the sampling-request span
 	// like Rust's `run_sampling_request` instrumentation.
 	CWD string
+	// OnModelRequest observes each sampling request attempt (Rust #55144).
+	// Output is diagnostic only and cannot veto the request or alter context.
+	OnModelRequest ModelRequestHook
 	// Tracer, when set, opens the turn loop's spans (Rust's per-turn
 	// instrumentation).
 	Tracer SpanTracer
@@ -202,9 +238,16 @@ type AgentLoopRequest struct {
 	OnCodeModeNotify             CodeModeNotifyCallback
 	OnWarning                    WarningCallback
 	Timing                       *TimingState
-	SamplingFollowUp             SamplingFollowUp
-	SamplingCompaction           SamplingCompaction
-	OnAssistantMessage           AssistantMessageCallback
+	// CriticalPathTiming enables direct-tool dependency-path capture for this
+	// root-agent turn (Rust #57201, default-off feature).
+	CriticalPathTiming bool
+	SamplingFollowUp   SamplingFollowUp
+	SamplingCompaction SamplingCompaction
+	// SamplingCheckpoint returns the highest persisted history identity visible
+	// before a regular inference request. It is captured before dispatch, so
+	// input appended while the request runs remains pending (Rust #59404).
+	SamplingCheckpoint func() (uint64, bool)
+	OnAssistantMessage AssistantMessageCallback
 	// OnCompletedResponseItem receives every completed model response item.
 	// Hosts use it for opt-in telemetry that must observe a final answer before
 	// it is folded into the turn result (Rust #47649).
@@ -213,10 +256,18 @@ type AgentLoopRequest struct {
 	StreamHandler                   model.ResponsesStreamHandler
 	ExecutedToolCallMetadataEnabled bool
 	OnSteerCommitted                func(count int)
+	// ValidateSteerInput vets the items a steer delivered before they join the
+	// conversation. Returning an error fails the turn, mirroring Rust
+	// run_hooks_and_record_inputs(...)? on steered input (#58430).
+	ValidateSteerInput func(items []any) error
 	// InstructionsProvider, when set, supplies the instructions for each model
 	// request so a long turn can refresh them between steps. An empty result
 	// means the instructions were cleared (Rust #44675).
 	InstructionsProvider func() string
+	// ReserveSearch holds the selected fallback search provider for the whole
+	// sampling request and its emitted tool calls. Releasing an unused offer
+	// leaves the thread free to recover hosted search on the next step.
+	ReserveSearch func() (func(), error)
 	// PreSamplingValidation, when set, runs before every sampling request of the
 	// turn; a non-nil error fails the turn before its model request (Rust #51157
 	// validates required environment skills there, as a fatal error). It mirrors
@@ -230,11 +281,31 @@ type AgentLoopRequest struct {
 	// skipped for a missing or malformed usage instead of charging an
 	// estimate made up from the partial response.
 	OnIncompleteResponseUsage IncompleteResponseUsageCallback
+	// IncrementalTools reports the effective incremental-tool mode for this
+	// sampling request (Rust #55692 `current_window_uses_incremental_tools`).
+	// The registration metric labels it, and prompt construction already used
+	// the same decision.
+	IncrementalTools bool
 }
 
 // AgentPreSamplingValidation is the pre-sampling gate of a turn, invoked with
 // the sampling iteration before every model request (Rust #51157).
 type AgentPreSamplingValidation func(ctx context.Context, iteration int) error
+
+// ModelRequestHookEvent describes one model request lifecycle milestone.
+type ModelRequestHookEvent struct {
+	Phase    string
+	Status   string
+	Error    string
+	Model    string
+	ThreadID string
+	TurnID   string
+	CWD      string
+	Usage    *model.AgentUsage
+}
+
+// ModelRequestHook is one observation-only model request callback.
+type ModelRequestHook func(ctx context.Context, event ModelRequestHookEvent)
 
 type AgentLoopResult struct {
 	Response          *model.AgentResponse
@@ -248,6 +319,15 @@ type AgentLoopResult struct {
 	TimingProfile     *Profile
 	SamplingFollowUps int
 	Compactions       int
+	// SampledThroughSequence is the highest input prefix acknowledged by a
+	// completed regular request during this turn.
+	SampledThroughSequence *uint64
+	// ReasoningIncluded is the last server-reported reasoning-inclusion flag of
+	// the turn's sampling requests. Rust #55991 seeds token accounting from the
+	// model's Responses Lite setting and lets server events override it; the
+	// host persists this value so a later resume does not re-estimate retained
+	// reasoning the server already counted.
+	ReasoningIncluded *bool
 }
 
 // postPromptInputItemsForIteration only supplies the turn-level post-prompt
@@ -298,6 +378,7 @@ func NewAgentLoop(options *AgentLoopOptions) *AgentLoop {
 		steerMailbox:            options.SteerMailbox,
 		now:                     now,
 		executedToolCalls:       options.ExecutedToolCalls,
+		mcpAttribution:          options.MCPAttribution,
 		toolRegistrationMetrics: options.ToolRegistrationMetrics,
 		toolRegistrationCounts:  options.ToolRegistrationCounts,
 		deferMailboxPreemption:  options.DeferMailboxPreemption,
@@ -322,6 +403,11 @@ func (l *AgentLoop) Run(ctx context.Context, request *AgentLoopRequest) (*AgentL
 	if timing == nil {
 		timing = NewTimingState()
 	}
+	// Enable once: turn-runtime callers may already have started capture before
+	// the agent loop runs, and re-enabling would reset the recorded path.
+	if request.CriticalPathTiming && !timing.CriticalPathCaptureEnabled() {
+		timing.EnableCriticalPath()
+	}
 	timing.MarkTurnStarted(l.now())
 	prompt := strings.TrimSpace(request.Prompt)
 	promptAppended := false
@@ -345,6 +431,7 @@ func (l *AgentLoop) Run(ctx context.Context, request *AgentLoopRequest) (*AgentL
 		stepReasoningEffort := request.ReasoningEffort
 		stepReasoningSummary := request.ReasoningSummary
 		stepServiceTier := request.ServiceTier
+		stepHookPermissionMode := ""
 		if iteration > 0 && request.StepSettings != nil {
 			if settings := request.StepSettings(); settings != nil {
 				if modelID := strings.TrimSpace(settings.Model); modelID != "" {
@@ -353,12 +440,19 @@ func (l *AgentLoop) Run(ctx context.Context, request *AgentLoopRequest) (*AgentL
 				stepReasoningEffort = settings.ReasoningEffort
 				stepReasoningSummary = settings.ReasoningSummary
 				stepServiceTier = settings.ServiceTier
+				if mode := strings.TrimSpace(settings.HookPermissionMode); mode != "" {
+					stepHookPermissionMode = mode
+				}
 				if len(settings.ClientMetadata) > 0 {
 					clientMetadata = transformClientMetadata(settings.ClientMetadata, request.ClientMetadataTransform)
 				}
 			}
 		}
-		if steer := drainSteer(l.steerMailbox, request); steer != nil {
+		steer, steerErr := drainSteerChecked(l.steerMailbox, request)
+		if steerErr != nil {
+			return nil, steerErr
+		}
+		if steer != nil {
 			if len(steer.InputItems) > 0 {
 				result.InputItems = append(result.InputItems, steer.InputItems...)
 				result.SteerInputItems = append(result.SteerInputItems, steer.InputItems...)
@@ -371,6 +465,7 @@ func (l *AgentLoop) Run(ctx context.Context, request *AgentLoopRequest) (*AgentL
 			}
 		}
 		l.dispatcher.SetStepModel(stepModel)
+		l.dispatcher.SetStepSettings(stepModel, stepReasoningEffort, stepHookPermissionMode)
 		if request.StepInputItems != nil {
 			items, err := request.StepInputItems(ctx, iteration, stepModel, stepReasoningEffort)
 			if err != nil {
@@ -442,10 +537,18 @@ func (l *AgentLoop) Run(ctx context.Context, request *AgentLoopRequest) (*AgentL
 		if stepPreempt != nil {
 			stepCtx = tool.WithCodeModePreempt(stepCtx, stepPreempt)
 		}
+		// Rust #55644: the sampling request also subscribes to the turn's input
+		// activity, so a waiting tool (clock.sleep) ends early when input is
+		// queued, including an injection queued before the tool call started.
+		stepActivity, stopStepActivity := l.dispatcher.BeginStepActivity(l.steerMailbox)
+		if stepActivity != nil {
+			stepCtx = tool.WithStepActivity(stepCtx, stepActivity)
+		}
 		// Rust keeps `run_sampling_request` open until the step's in-flight tool
 		// futures have been drained, so the step's tool spans (mcp.tools.call and
 		// the tool records) nest under it. endSamplingRequestSpan closes the span
 		// exactly once on every path that leaves the step.
+		var releaseSearch func()
 		samplingSpanEnded := false
 		endSamplingRequestSpan := func() {
 			if samplingSpanEnded {
@@ -457,8 +560,16 @@ func (l *AgentLoop) Run(ctx context.Context, request *AgentLoopRequest) (*AgentL
 				stopStepPreempt()
 				stopStepPreempt = nil
 			}
+			if stopStepActivity != nil {
+				stopStepActivity()
+				stopStepActivity = nil
+			}
 			if samplingSpan != nil {
 				samplingSpan.End()
+			}
+			if releaseSearch != nil {
+				releaseSearch()
+				releaseSearch = nil
 			}
 		}
 		if samplingSpan != nil {
@@ -473,26 +584,57 @@ func (l *AgentLoop) Run(ctx context.Context, request *AgentLoopRequest) (*AgentL
 		if l.toolRegistrationCounts != nil {
 			toolRegistrationCounts = l.toolRegistrationCounts()
 		}
-		recordToolRegistrationMetrics(l.toolRegistrationMetrics, toolRegistrationCounts, request.ToolMode)
+		recordToolRegistrationMetrics(l.toolRegistrationMetrics, toolRegistrationCounts, request.ToolMode, request.IncrementalTools)
 		stepTools := request.Tools
 		if iteration > 0 && request.ToolsForStep != nil {
 			stepTools = request.ToolsForStep(stepModel)
+		}
+		if request.ReserveSearch != nil {
+			var err error
+			releaseSearch, err = request.ReserveSearch()
+			if errors.Is(err, ErrSearchReservationUnavailable) {
+				stepTools = withoutModelWebSearchTools(stepTools)
+			} else if err != nil {
+				endSamplingRequestSpan()
+				return nil, err
+			}
+		}
+		if request.OnModelRequest != nil {
+			request.OnModelRequest(stepCtx, ModelRequestHookEvent{
+				Phase: "pre", Model: stepModel, ThreadID: request.ThreadID, TurnID: request.TurnID, CWD: request.CWD,
+			})
+		}
+		unifiedImageBudget := request.UnifiedImageBudget
+		if request.UnifiedImageBudgetForModel != nil {
+			unifiedImageBudget = request.UnifiedImageBudgetForModel(stepModel)
+		}
+		postPromptForIteration := postPromptInputItemsForIteration(postPromptItems, iteration)
+		var sampledThrough *uint64
+		if request.SamplingCheckpoint != nil {
+			if sequence, ok := request.SamplingCheckpoint(); ok {
+				value := sequence
+				sampledThrough = &value
+			}
 		}
 		response, err := l.agent.Run(stepCtx, &model.AgentRequest{
 			Prompt:                       prompt,
 			Instructions:                 instructions,
 			InputItems:                   inputItems,
-			PostPromptInputItems:         postPromptInputItemsForIteration(postPromptItems, iteration),
+			PostPromptInputItems:         postPromptForIteration,
 			Tools:                        append([]any(nil), stepTools...),
+			IncrementalTools:             request.IncrementalTools,
 			Model:                        stepModel,
+			UnifiedImageBudget:           unifiedImageBudget,
 			ProviderID:                   request.ProviderID,
 			TaskKind:                     request.TaskKind,
 			ThreadID:                     request.ThreadID,
+			SessionID:                    request.SessionID,
 			TurnID:                       request.TurnID,
 			Ephemeral:                    request.Ephemeral,
 			Originator:                   request.Originator,
 			Store:                        request.Store,
 			PreviousResponseID:           previousResponseID,
+			PreviousResponseFromPrewarm:  iteration == 0 && request.PreviousResponseFromPrewarm,
 			ParallelToolCalls:            request.ParallelToolCalls,
 			ReasoningEffort:              stepReasoningEffort,
 			ReasoningSummary:             stepReasoningSummary,
@@ -504,8 +646,11 @@ func (l *AgentLoop) Run(ctx context.Context, request *AgentLoopRequest) (*AgentL
 			ItemIDsEnabled:               request.ItemIDsEnabled,
 			ServiceTier:                  stepServiceTier,
 			PromptCacheKey:               request.PromptCacheKey,
+			PromptCacheTTL:               request.PromptCacheTTL,
 			CyberAccessProgram:           request.CyberAccessProgram,
+			RequiredCyberAccessPrograms:  append([]string(nil), request.RequiredCyberAccessPrograms...),
 			ClientMetadata:               cloneStringMap(clientMetadata),
+			MCPAttribution:               l.mcpAttributionSnapshot(),
 			Trace:                        request.Trace,
 			AttestationProvider:          request.AttestationProvider,
 			OutputSchema:                 request.OutputSchema,
@@ -519,6 +664,9 @@ func (l *AgentLoop) Run(ctx context.Context, request *AgentLoopRequest) (*AgentL
 			// Rust #48141: new user input preempts the unfinished sampling
 			// request so the queued input reaches the model without waiting.
 			Preempt: stepPreempt.Done(),
+			// Rust #57864: a cancelled Responses Lite turn interrupts the
+			// upstream response and drains its completed part.
+			InterruptOnCancel: request.InterruptOnCancel,
 			// Rust #49119: a sampling block records its recovery guidance into
 			// the conversation before the retry is issued. The model layer
 			// appends the item to the retried request; recording it here keeps
@@ -532,6 +680,33 @@ func (l *AgentLoop) Run(ctx context.Context, request *AgentLoopRequest) (*AgentL
 			},
 		})
 		sampling.CloseAt(l.now())
+		if request.OnModelRequest != nil {
+			status := "completed"
+			errorText := ""
+			if err != nil {
+				status = "failed"
+				errorText = err.Error()
+				if stepCtx.Err() != nil {
+					status = "cancelled"
+				}
+			}
+			var usage *model.AgentUsage
+			if response != nil {
+				usage = &response.Usage
+			}
+			request.OnModelRequest(stepCtx, ModelRequestHookEvent{
+				Phase: "post", Status: status, Error: errorText, Model: stepModel,
+				ThreadID: request.ThreadID, TurnID: request.TurnID, CWD: request.CWD, Usage: usage,
+			})
+		}
+		if response != nil && sampledThrough != nil {
+			value := *sampledThrough
+			response.SampledThroughSequence = &value
+			if result.SampledThroughSequence == nil || value > *result.SampledThroughSequence {
+				result.SampledThroughSequence = &value
+			}
+		}
+
 		if err != nil {
 			endSamplingRequestSpan()
 			// Rust #53670 (session/turn.rs `try_run_sampling_request`): a
@@ -549,12 +724,70 @@ func (l *AgentLoop) Run(ctx context.Context, request *AgentLoopRequest) (*AgentL
 			}
 			return nil, err
 		}
-		if response.Preempted {
-			// A signaled step produced no assistant output: the turn continues
-			// with the queued input (drained at the top of the next iteration),
-			// and the replacement request sends full history.
+		if response.Canceled {
+			// Rust #57864: a cancelled Responses Lite request interrupts the
+			// upstream response; whatever it completed is still charged, and
+			// the turn ends as aborted.
 			endSamplingRequestSpan()
-			previousResponseID = ""
+			if request.OnIncompleteResponseUsage != nil {
+				request.OnIncompleteResponseUsage(response.Usage)
+			}
+			if err := stepCtx.Err(); err != nil {
+				return nil, err
+			}
+			return nil, context.Canceled
+		}
+		if response.Preempted {
+			if l.steerMailbox.HasPendingMailboxItems(request.ThreadID, request.TurnID) {
+				emitMailboxPreemptionEvent(stepCtx, request, request.ThreadID, request.TurnID)
+			}
+			endSamplingRequestSpan()
+			if !response.Drained {
+				// A signaled step produced no assistant output: the turn
+				// continues with the queued input (drained at the top of the
+				// next iteration), and the replacement request sends full
+				// history.
+				previousResponseID = ""
+				continue
+			}
+			// Rust #55969: an interrupted Responses Lite WebSocket stream is
+			// drained rather than abandoned. Completed items stay in the
+			// transcript, buffered tool calls are cancelled before dispatch
+			// (their output is recorded as aborted), and the response ID is
+			// kept so the follow-up request can continue incrementally.
+			result.Responses = append(result.Responses, response)
+			result.Usage = addAgentUsage(result.Usage, response.Usage)
+			if request.OnTokenUsage != nil {
+				request.OnTokenUsage(result.Usage)
+			}
+			if responseID := strings.TrimSpace(response.ResponseID); responseID != "" {
+				previousResponseID = responseID
+			}
+			if prompt != "" && !promptAppended {
+				if userMessage := model.UserMessageInputItem(prompt); userMessage != nil {
+					result.InputItems = append(result.InputItems, userMessage)
+					promptAppended = true
+				}
+			}
+			prompt = ""
+			if !postPromptAppended && len(postPromptItems) > 0 {
+				for _, item := range postPromptItems {
+					if item != nil {
+						result.InputItems = append(result.InputItems, item)
+					}
+				}
+				postPromptAppended = true
+			}
+			for i := range response.Items {
+				item := response.Items[i]
+				if request.OnCompletedResponseItem != nil {
+					request.OnCompletedResponseItem(item)
+				}
+				result.InputItems = append(result.InputItems, &item)
+				if isToolAgentItem(&item) {
+					result.InputItems = append(result.InputItems, abortedToolCallOutputItem(&item))
+				}
+			}
 			continue
 		}
 		if l.executedToolCalls != nil {
@@ -563,6 +796,10 @@ func (l *AgentLoop) Run(ctx context.Context, request *AgentLoopRequest) (*AgentL
 		recordResponseTiming(timing, response, l.now())
 		result.Response = response
 		result.Responses = append(result.Responses, response)
+		if response.ReasoningIncluded != nil {
+			included := *response.ReasoningIncluded
+			result.ReasoningIncluded = &included
+		}
 		if request.OnCompletedResponseItem != nil {
 			for i := range response.Items {
 				request.OnCompletedResponseItem(response.Items[i])
@@ -630,9 +867,10 @@ func (l *AgentLoop) Run(ctx context.Context, request *AgentLoopRequest) (*AgentL
 			continue
 		}
 		if len(toolItems) > 0 && request.SamplingCompaction != nil {
-			// Rust #49262: the automatic compaction runs in its own
-			// `codex.compaction` phase span.
+			// Rust #49262/#59245: the automatic compaction runs in its own
+			// `codex.compaction` phase span and timing segment.
 			compactionSpan := startTurnPhaseSpan(ctx, request, samplingSpan, CompactionPhaseSpanName, TurnPhaseCompaction, request.ThreadID, request.TurnID)
+			compactionTiming := timing.BeginCompaction(l.now())
 			compacted, err := request.SamplingCompaction(&SamplingCompactionContext{
 				Context:      ctx,
 				Response:     response,
@@ -641,6 +879,7 @@ func (l *AgentLoop) Run(ctx context.Context, request *AgentLoopRequest) (*AgentL
 				HasToolCalls: true,
 				Result:       result,
 			})
+			compactionTiming.CloseAt(l.now())
 			if compactionSpan != nil {
 				compactionSpan.End()
 			}
@@ -684,7 +923,12 @@ func (l *AgentLoop) Run(ctx context.Context, request *AgentLoopRequest) (*AgentL
 			// message reopens the phase (SteerMailbox::Enqueue), so explicit
 			// same-turn work still continues the turn here.
 			if l.steerMailbox.AcceptsMailboxDeliveryForCurrentTurn(request.ThreadID, request.TurnID) {
-				if steer := drainSteer(l.steerMailbox, request); steer != nil && (len(steer.InputItems) > 0 || len(steer.ClientMetadata) > 0) {
+				steer, steerErr := drainSteerChecked(l.steerMailbox, request)
+				if steerErr != nil {
+					endSamplingRequestSpan()
+					return nil, steerErr
+				}
+				if steer != nil && (len(steer.InputItems) > 0 || len(steer.ClientMetadata) > 0) {
 					result.InputItems = append(result.InputItems, steer.InputItems...)
 					result.SteerInputItems = append(result.SteerInputItems, steer.InputItems...)
 					if len(steer.ClientMetadata) > 0 {
@@ -717,8 +961,9 @@ func (l *AgentLoop) Run(ctx context.Context, request *AgentLoopRequest) (*AgentL
 		// the dispatch still runs under the sampling-request span.
 		endSamplingPhaseSpan()
 		toolBlockingSpan := startTurnPhaseSpan(ctx, request, samplingSpan, ToolBlockingPhaseSpanName, TurnPhaseToolBlocking, request.ThreadID, request.TurnID)
-		toolBlocking := timing.BeginToolBlocking(l.now())
-		executions, err := l.dispatcher.ExecuteToolItems(stepCtx, toolItems)
+		batch := l.dispatcher.BatchTiming()
+		toolBlocking := timing.BeginToolBlocking(l.now(), batch)
+		executions, err := l.dispatcher.ExecuteToolItemsWithBatch(stepCtx, toolItems, batch)
 		toolBlocking.CloseAt(l.now())
 		if toolBlockingSpan != nil {
 			toolBlockingSpan.End()
@@ -744,6 +989,18 @@ func (l *AgentLoop) Run(ctx context.Context, request *AgentLoopRequest) (*AgentL
 			}
 		}
 	}
+}
+
+// mcpAttributionSnapshot reports the thread's cumulative MCP attribution at the
+// sampling step about to issue a request (Rust
+// `ExecutedToolCalls::mcp_attribution_snapshot`). A loop without a recorder
+// reports nothing.
+func (l *AgentLoop) mcpAttributionSnapshot() *retainedctx.McpAttribution {
+	if l == nil || l.mcpAttribution == nil {
+		return nil
+	}
+	snapshot := l.mcpAttribution.McpAttributionSnapshot()
+	return &snapshot
 }
 
 // mailboxPreemptionEventName mirrors the tracing event name Rust emits when a
@@ -991,6 +1248,20 @@ func agentItemRecordsTTFT(item *model.AgentItem) bool {
 	}
 }
 
+// drainSteerChecked drains the mailbox and lets the host reject the delivered
+// input before it joins the conversation (Rust #58430: uploaded audio is
+// rejected inside the turn runner). A rejection fails the turn.
+func drainSteerChecked(mailbox *SteerMailbox, request *AgentLoopRequest) (*SteerDrainResult, error) {
+	steer := drainSteer(mailbox, request)
+	if steer == nil || request == nil || request.ValidateSteerInput == nil || len(steer.InputItems) == 0 {
+		return steer, nil
+	}
+	if err := request.ValidateSteerInput(steer.InputItems); err != nil {
+		return nil, err
+	}
+	return steer, nil
+}
+
 func drainSteer(mailbox *SteerMailbox, request *AgentLoopRequest) *SteerDrainResult {
 	if mailbox == nil && request != nil {
 		mailbox = request.SteerMailbox
@@ -1033,6 +1304,22 @@ func isToolAgentItem(item *model.AgentItem) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// abortedToolCallOutputItem answers a tool call that was completed by the
+// server during a mailbox drain but cancelled before dispatch (Rust #55969's
+// `ToolCallRuntime::aborted_response`). The call is already in server history,
+// so resume needs a paired output even though the tool never ran.
+func abortedToolCallOutputItem(item *model.AgentItem) map[string]any {
+	callID := ""
+	if item != nil {
+		callID = firstNonEmpty(item.CallID, item.ID)
+	}
+	return map[string]any{
+		"type":    "function_call_output",
+		"call_id": callID,
+		"output":  "aborted before dispatch",
 	}
 }
 

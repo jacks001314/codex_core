@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"codex_core/network"
 )
 
 // Rust #54346 (`0003732489`) adds a scoped authentication mode to the remote
@@ -30,6 +32,9 @@ const (
 	// environment-bound bearer with no accompanying account credentials,
 	// HTTPS-or-loopback only, and no Direct transport.
 	registryAuthModeExecutorCredential
+	// registryAuthModeChatGPTToken keeps the supplied ChatGPT token and account
+	// headers but treats the bearer as sensitive in registry diagnostics.
+	registryAuthModeChatGPTToken
 )
 
 // executorCredentialTokenMaxBytes is Rust's scoped-mode bound on the bearer
@@ -98,35 +103,34 @@ func isASCIIGraphicToken(token string) bool {
 	return true
 }
 
-// executorCredentialFromHeaders mirrors Rust's scoped-mode gate in
-// `EnvironmentRegistryClient::resolve_auth` (remote.rs): the provider must have
-// produced exactly one header, `Authorization`, holding exactly one
-// `Bearer <token>` value whose token is nonempty, at most 16KiB, and entirely
-// printable ASCII. Anything else is rejected before a request is built.
-func executorCredentialFromHeaders(headers http.Header) (string, error) {
-	if len(headers) != 1 {
-		return "", errInvalidExecutorCredentialAuthorization
-	}
+// registryCredentialFromHeaders mirrors Rust's credential gate in
+// `EnvironmentRegistryClient::resolve_auth`. Scoped executor credentials must
+// be the only header and stay within 16 KiB; ChatGPT auth may carry its account
+// header and has no additional token bound.
+func registryCredentialFromHeaders(headers http.Header, scoped bool) (string, error) {
 	var values []string
-	// Rust looks the header up by its normalized name in a `HeaderMap`, so the
-	// gate cannot accept a companion header under any iteration order. Go's
-	// http.Header canonicalizes keys on Set/Add but a literal keeps both
-	// spellings, so every key is checked here instead of trusting the last one
-	// a map happens to yield.
 	for key, headerValues := range headers {
 		if !strings.EqualFold(key, "Authorization") {
-			return "", errInvalidExecutorCredentialAuthorization
+			if scoped {
+				return "", errInvalidExecutorCredentialAuthorization
+			}
+			continue
 		}
-		values = headerValues
+		values = append(values, headerValues...)
 	}
 	if len(values) != 1 {
 		return "", errInvalidExecutorCredentialAuthorization
 	}
 	token, ok := strings.CutPrefix(values[0], "Bearer ")
-	if !ok || token == "" || len(token) > executorCredentialTokenMaxBytes || !isASCIIGraphicToken(token) {
+	if !ok || token == "" || (scoped && len(token) > executorCredentialTokenMaxBytes) || !isASCIIGraphicToken(token) {
 		return "", errInvalidExecutorCredentialAuthorization
 	}
 	return token, nil
+}
+
+// executorCredentialFromHeaders applies the stricter scoped header contract.
+func executorCredentialFromHeaders(headers http.Header) (string, error) {
+	return registryCredentialFromHeaders(headers, true)
 }
 
 // withAuthMode selects an auth mode on a config the caller built directly. It
@@ -148,15 +152,18 @@ func resolveRemoteEnvironmentAuth(ctx context.Context, cfg RemoteEnvironmentConf
 	if err != nil {
 		return nil, "", err
 	}
-	if cfg.authMode != registryAuthModeExecutorCredential {
+	if cfg.authMode == registryAuthModeLegacy {
 		return headers, "", nil
 	}
-	token, err := executorCredentialFromHeaders(headers)
+	scoped := cfg.authMode == registryAuthModeExecutorCredential
+	token, err := registryCredentialFromHeaders(headers, scoped)
 	if err != nil {
 		return nil, "", err
 	}
-	if err := requireSecureOrLoopback(cfg.BaseURL, "https"); err != nil {
-		return nil, "", err
+	if scoped {
+		if err := requireSecureOrLoopback(cfg.BaseURL, "https"); err != nil {
+			return nil, "", err
+		}
 	}
 	return headers, token, nil
 }
@@ -193,21 +200,14 @@ func withoutSystemProxy(client *http.Client) (*http.Client, error) {
 		client = remoteHTTPClient()
 	}
 	cloned := *client
-	switch transport := client.Transport.(type) {
-	case nil:
-		direct := http.DefaultTransport.(*http.Transport).Clone()
-		direct.Proxy = nil
-		cloned.Transport = direct
-	case *http.Transport:
-		direct := transport.Clone()
-		direct.Proxy = nil
-		cloned.Transport = direct
-	default:
+	direct, ok := network.WithoutSystemProxy(client.Transport)
+	if !ok {
 		// A host-injected RoundTripper (for example the application network
 		// policy client) has no proxy knob to clear, so this fails loudly rather
 		// than silently sending a credential through a proxy.
 		return nil, errScopedRegistryNeedsProxyBypass
 	}
+	cloned.Transport = direct
 	return &cloned, nil
 }
 

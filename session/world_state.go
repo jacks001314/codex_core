@@ -26,6 +26,29 @@ type WorldState struct {
 	// BaseInstructions carries the recorded base-instruction snapshot (Rust
 	// section id `base_instructions`, #51188).
 	BaseInstructions json.RawMessage `json:"baseInstructions,omitempty"`
+	// SkillsCatalog carries the incremental selected-environment skill catalog
+	// snapshot (Rust #57262 section id `skills`): the entries the model has
+	// already seen and the cumulative metadata budget spent on them.
+	SkillsCatalog json.RawMessage `json:"skillsCatalog,omitempty"`
+	// HostSkillsCatalog carries the incremental host skill catalog snapshot
+	// (Rust #57262 section id `host_skills`).
+	HostSkillsCatalog json.RawMessage `json:"hostSkillsCatalog,omitempty"`
+	// Environments carries the environment section snapshot (Rust section id
+	// `environments`, codex-rs/core/src/context/world_state/environment.rs).
+	// The Go renderer always emits the full environment context, so only the
+	// removal-sensitive values are recorded here: they let a later turn report
+	// `<current_date status="unavailable" />` (and the shell_version
+	// equivalent) when a value the model already saw disappears (#45825).
+	Environments json.RawMessage `json:"environments,omitempty"`
+	// CommandSessions carries the retained command-session snapshot (Rust
+	// section id `command_sessions`, #59633): the harness-visible sessions the
+	// model has already seen, used to suppress unchanged updates and to clear
+	// stale handles after a restart or when the feature is disabled.
+	CommandSessions json.RawMessage `json:"commandSessions,omitempty"`
+	// PluginsInstructions carries the plugin guidance world-state snapshot
+	// (Rust section id `plugins_instructions`): the hash of the generic wording
+	// the model has seen and whether it came from the catalog (Rust #58894).
+	PluginsInstructions json.RawMessage `json:"pluginsInstructions,omitempty"`
 }
 
 func DecodeWorldState(raw json.RawMessage) (*WorldState, error) {
@@ -50,6 +73,10 @@ func DecodeWorldState(raw json.RawMessage) (*WorldState, error) {
 	state.Tools = append(json.RawMessage(nil), state.Tools...)
 	state.TopLevelTools = append(json.RawMessage(nil), state.TopLevelTools...)
 	state.BaseInstructions = append(json.RawMessage(nil), state.BaseInstructions...)
+	state.SkillsCatalog = append(json.RawMessage(nil), state.SkillsCatalog...)
+	state.HostSkillsCatalog = append(json.RawMessage(nil), state.HostSkillsCatalog...)
+	state.Environments = append(json.RawMessage(nil), state.Environments...)
+	state.CommandSessions = append(json.RawMessage(nil), state.CommandSessions...)
 	return &state, nil
 }
 

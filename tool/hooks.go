@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -16,6 +17,17 @@ type HookToolName struct {
 type PreToolUsePayload struct {
 	ToolName  *HookToolName
 	ToolInput any
+	// TargetEnvironments is the internal hook-dispatch scope for one call: the
+	// execution environments the call resolves to before it runs (Rust
+	// `ToolInvocation::environments.hook_ids()`). It is not part of the hook
+	// input JSON. An empty list keeps every environment hook eligible, which is
+	// Rust's `ToolEnvironments::All`.
+	TargetEnvironments []string
+	// ToolCWD is the local command's resolved execution directory, reported as
+	// the hook input's cwd (Rust #57198). Remote commands leave it nil so the
+	// hook keeps the host working directory; hook processes always run in the
+	// host cwd either way.
+	ToolCWD *string
 	// McpTool, when set, carries read-only metadata and provenance captured
 	// from the MCP call that will execute (Rust ToolStartInput.mcp_tool,
 	// #40976). It exposes the model-visible MCP tool details and source
@@ -51,6 +63,13 @@ type PostToolUsePayload struct {
 	ToolUseID    string
 	ToolInput    any
 	ToolResponse any
+	// TargetEnvironments mirrors PreToolUsePayload.TargetEnvironments. Rust
+	// captures the call's environments before PreToolUse and reuses them after
+	// the tool runs, so an input rewrite cannot retarget the hooks.
+	TargetEnvironments []string
+	// ToolCWD is the local command's execution directory retained for hook
+	// input (Rust #57203). Remote commands leave it nil.
+	ToolCWD *string
 }
 
 type PreToolUseHookOutcome struct {
@@ -75,12 +94,56 @@ type HookRunner interface {
 	RunPostToolUse(ctx context.Context, invocation *Invocation, payload *PostToolUsePayload) (*PostToolUseHookOutcome, error)
 }
 
+// runCancellableStep waits for one dispatch step while keeping cancellation
+// authoritative. Rust #51556 wraps readiness and hook awaits with
+// OrCancelToolExt so a blocked hook cannot keep an interrupted call alive; Go
+// hooks receive ctx but may not observe it, so the dispatcher must stop waiting
+// even when the hook implementation ignores cancellation.
+func runCancellableStep[T any](ctx context.Context, run func() (T, error)) (T, error) {
+	var zero T
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return zero, ErrToolCancelled
+	}
+	type stepResult struct {
+		value T
+		err   error
+	}
+	results := make(chan stepResult, 1)
+	go func() {
+		value, err := run()
+		results <- stepResult{value: value, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return zero, ErrToolCancelled
+	case result := <-results:
+		if ctx.Err() != nil {
+			return zero, ErrToolCancelled
+		}
+		return result.value, result.err
+	}
+}
+
 type PreToolUsePayloadProvider interface {
 	PreToolUsePayload(invocation *Invocation) (*PreToolUsePayload, bool)
 }
 
 type PostToolUsePayloadProvider interface {
 	PostToolUsePayload(invocation *Invocation, output *Output) (*PostToolUsePayload, bool)
+}
+
+// HookEnvironmentSelector is implemented by tool executors that can name the
+// execution environments a call targets before it runs (Rust
+// `Tool::environments_for_input` and `Tool::live_environment_resolver`). The
+// router copies the ids onto the hook payloads so environment-owned hooks only
+// run for the environment that owns the call. Executors that cannot name an
+// environment keep the unscoped inventory, matching Rust's
+// `ToolEnvironments::All`.
+type HookEnvironmentSelector interface {
+	HookEnvironmentIDs(invocation *Invocation) []string
 }
 
 type HookInputUpdater interface {
@@ -119,9 +182,18 @@ func (r *Router) DispatchWithHooksAfterPreHooks(ctx context.Context, invocation 
 	}
 
 	current := cloneInvocation(invocation)
+	// Rust resolves the invocation's environments before PreToolUse and keeps
+	// them for PostToolUse, so hook scoping is stable across input rewrites.
+	targetEnvironments := hookTargetEnvironments(executor, current)
 	if payload, ok := preToolUsePayload(executor, current); ok {
-		outcome, err := hooks.RunPreToolUse(ctx, current, payload)
+		payload.TargetEnvironments = targetEnvironments
+		outcome, err := runCancellableStep(ctx, func() (*PreToolUseHookOutcome, error) {
+			return hooks.RunPreToolUse(ctx, current, payload)
+		})
 		if err != nil {
+			if errors.Is(err, ErrToolCancelled) {
+				return nil, err
+			}
 			return nil, hookRunnerError(err)
 		}
 		if outcome != nil && outcome.Fatal {
@@ -142,6 +214,11 @@ func (r *Router) DispatchWithHooksAfterPreHooks(ctx context.Context, invocation 
 		}
 	}
 
+	// Rust #57433: an opted-in invocation is reviewed synchronously here, after
+	// pre-tool hooks produced the final arguments and before the handler runs.
+	if err := r.reviewBeforeDispatch(ctx, current); err != nil {
+		return nil, err
+	}
 	if onStarted != nil {
 		onStarted(current)
 	}
@@ -153,8 +230,18 @@ func (r *Router) DispatchWithHooksAfterPreHooks(ctx context.Context, invocation 
 
 	if output.Success {
 		if payload, ok := postToolUsePayload(executor, current, output); ok {
-			outcome, err := hooks.RunPostToolUse(ctx, current, payload)
+			// Capture confirmed messaging text from the post-hook input. The
+			// pre-tool rewrite is already reflected in current's arguments, and
+			// the result must not be recorded before the tool succeeds.
+			captureDeliveredAssistantMessage(output, payload)
+			payload.TargetEnvironments = targetEnvironments
+			outcome, err := runCancellableStep(ctx, func() (*PostToolUseHookOutcome, error) {
+				return hooks.RunPostToolUse(ctx, current, payload)
+			})
 			if err != nil {
+				if errors.Is(err, ErrToolCancelled) {
+					return nil, err
+				}
 				return nil, hookRunnerError(err)
 			}
 			if outcome != nil && outcome.Fatal {
@@ -176,6 +263,38 @@ func (r *Router) DispatchWithHooksAfterPreHooks(ctx context.Context, invocation 
 		}
 	}
 	return output, nil
+}
+
+// hookTargetEnvironments resolves the environment scope of one call. An
+// executor without a selector, or one that names no concrete environment,
+// leaves the inventory unscoped (Rust `ToolEnvironments::All` -> empty
+// `hook_ids`).
+func hookTargetEnvironments(executor Executor, invocation *Invocation) []string {
+	selector, ok := executor.(HookEnvironmentSelector)
+	if !ok {
+		return nil
+	}
+	ids := selector.HookEnvironmentIDs(invocation)
+	if len(ids) == 0 {
+		return nil
+	}
+	targets := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		targets = append(targets, id)
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	return targets
 }
 
 func preToolUsePayload(executor Executor, invocation *Invocation) (*PreToolUsePayload, bool) {
@@ -363,6 +482,19 @@ func preToolUseBlockMessage(invocation *Invocation, reason string) string {
 		}
 	}
 	return fmt.Sprintf("Tool call blocked by PreToolUse hook: %s. Tool: %s", reason, toolName)
+}
+
+// PreToolUseBlockMessage exposes the model-facing rejection a blocked
+// pre-tool-use hook produces. Shared by the live dispatch path and direct
+// Guardian review, which applies the same hooks before checking approval
+// policy (Rust #58357/#58368 `apply_pre_tool_use`).
+func PreToolUseBlockMessage(invocation *Invocation, reason string) string {
+	return preToolUseBlockMessage(invocation, reason)
+}
+
+// PreToolUseStoppedMessage exposes the fatal pre-tool-use hook message.
+func PreToolUseStoppedMessage(reason string) string {
+	return hookFatalMessage("PreToolUse", reason)
 }
 
 func cloneInvocation(invocation *Invocation) *Invocation {

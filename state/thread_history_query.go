@@ -58,17 +58,24 @@ func (e *ThreadHistoryError) Error() string {
 }
 
 type ThreadHistoryItem struct {
-	TurnID             string
-	ItemID             string
-	UpdatedAtOrdinal   uint64
-	CreatedAtMS        int64
+	TurnID           string
+	ItemID           string
+	UpdatedAtOrdinal uint64
+	CreatedAtMS      int64
+	// StartedAtMS and CompletedAtMS carry the item lifecycle times recorded by
+	// canonical item events (Rust #57172).
+	StartedAtMS        *int64
+	CompletedAtMS      *int64
 	ItemJSON           json.RawMessage
 	physicalThreadID   string
 	physicalRolloutPos int64
 }
 
 type ThreadHistoryTurn struct {
-	TurnID       string
+	TurnID string
+	// RootTurnID is the causal root recorded by Rust #51415; nil when the
+	// writer predates lineage persistence.
+	RootTurnID   *string
 	Items        []ThreadHistoryItem
 	ItemsView    ThreadHistoryItemsView
 	Status       string
@@ -177,12 +184,18 @@ func (r *StateRuntime) ThreadHistoryMode(ctx context.Context, threadID string) (
 // `idx_thread_items_page` can scan earlier turns when a turn's final page is
 // underfilled, because the turn filter is only a post-filter on that index. The
 // hint applies exactly where Rust applies it - a turn-scoped page that carries
-// no item-id or updated-at anchor.
-func threadHistoryItemsPageQuery(turnScoped bool) string {
+// no item-id or updated-at anchor. Rust #58751 seeks each requested item ID
+// through the primary-key autoindex instead of scanning the turn in rollout
+// order, so item-id reads take precedence over the turn hint.
+func threadHistoryItemsPageQuery(turnScoped bool, itemIDs bool) string {
 	query := `
-SELECT turn_id, item_id, rollout_ordinal, updated_at_ordinal, created_at_ms, item_json
+SELECT turn_id, item_id, rollout_ordinal, updated_at_ordinal, created_at_ms,
+       started_at_ms, completed_at_ms, item_json
 FROM thread_items`
-	if turnScoped {
+	switch {
+	case itemIDs:
+		query += " INDEXED BY sqlite_autoindex_thread_items_1"
+	case turnScoped:
 		query += " INDEXED BY idx_thread_items_by_turn_page"
 	}
 	return query + `
@@ -190,7 +203,7 @@ WHERE thread_id = ? AND rollout_ordinal >= ?`
 }
 
 func (r *StateRuntime) ListThreadHistoryItems(ctx context.Context, params ThreadHistoryListItemsParams) (*ThreadHistoryItemsPage, error) {
-	lineage, db, err := r.prepareThreadHistoryRead(ctx, params.ThreadID, "list_items")
+	lineage, db, err := r.prepareThreadHistoryPageRead(ctx, params.ThreadID, "list_items")
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +228,7 @@ func (r *StateRuntime) ListThreadHistoryItems(ctx context.Context, params Thread
 		if remaining <= 0 {
 			break
 		}
-		query := threadHistoryItemsPageQuery(params.TurnID != nil)
+		query := threadHistoryItemsPageQuery(params.TurnID != nil, len(params.ItemIDs) > 0)
 		args := []any{segment.segment.ThreadID, sqliteInt(segment.segment.Start)}
 		if segment.segment.End != nil {
 			query += ` AND rollout_ordinal < ?`
@@ -249,8 +262,9 @@ func (r *StateRuntime) ListThreadHistoryItems(ctx context.Context, params Thread
 		for result.Next() {
 			var item ThreadHistoryItem
 			var rolloutOrdinal, updatedOrdinal int64
+			var startedAtMS, completedAtMS sql.NullInt64
 			var itemJSON string
-			if scanErr := result.Scan(&item.TurnID, &item.ItemID, &rolloutOrdinal, &updatedOrdinal, &item.CreatedAtMS, &itemJSON); scanErr != nil {
+			if scanErr := result.Scan(&item.TurnID, &item.ItemID, &rolloutOrdinal, &updatedOrdinal, &item.CreatedAtMS, &startedAtMS, &completedAtMS, &itemJSON); scanErr != nil {
 				_ = result.Close()
 				return nil, fmt.Errorf("scan thread history item: %w", scanErr)
 			}
@@ -259,6 +273,8 @@ func (r *StateRuntime) ListThreadHistoryItems(ctx context.Context, params Thread
 				return nil, errors.New("invalid stored item rollout ordinal")
 			}
 			item.UpdatedAtOrdinal = uint64(updatedOrdinal)
+			item.StartedAtMS = historyNullInt64Ptr(startedAtMS)
+			item.CompletedAtMS = historyNullInt64Ptr(completedAtMS)
 			item.ItemJSON = json.RawMessage(itemJSON)
 			item.physicalThreadID = segment.segment.ThreadID
 			item.physicalRolloutPos = rolloutOrdinal
@@ -278,7 +294,7 @@ func (r *StateRuntime) ListThreadHistoryItems(ctx context.Context, params Thread
 }
 
 func (r *StateRuntime) ListThreadHistoryTurns(ctx context.Context, params ThreadHistoryListTurnsParams) (*ThreadHistoryTurnsPage, error) {
-	lineage, db, err := r.prepareThreadHistoryRead(ctx, params.ThreadID, "list_turns")
+	lineage, db, err := r.prepareThreadHistoryPageRead(ctx, params.ThreadID, "list_turns")
 	if err != nil {
 		return nil, err
 	}
@@ -304,7 +320,7 @@ func (r *StateRuntime) ListThreadHistoryTurns(ctx context.Context, params Thread
 			break
 		}
 		query := `
-SELECT turn_id, rollout_ordinal, status, error_json, started_at, completed_at,
+SELECT turn_id, root_turn_id, rollout_ordinal, status, error_json, started_at, completed_at,
        duration_ms, first_user_item_id, final_agent_item_id
 FROM thread_turns
 WHERE thread_id = ? AND rollout_ordinal >= ?`
@@ -332,10 +348,10 @@ WHERE thread_id = ? AND rollout_ordinal >= ?`
 		for result.Next() {
 			var turn ThreadHistoryTurn
 			var ordinal int64
-			var errorJSON sql.NullString
+			var rootTurnID, errorJSON sql.NullString
 			var startedAt, completedAt, durationMS sql.NullInt64
 			var firstUserID, finalAgentID sql.NullString
-			if scanErr := result.Scan(&turn.TurnID, &ordinal, &turn.Status, &errorJSON, &startedAt, &completedAt, &durationMS, &firstUserID, &finalAgentID); scanErr != nil {
+			if scanErr := result.Scan(&turn.TurnID, &rootTurnID, &ordinal, &turn.Status, &errorJSON, &startedAt, &completedAt, &durationMS, &firstUserID, &finalAgentID); scanErr != nil {
 				_ = result.Close()
 				return nil, fmt.Errorf("scan thread history turn: %w", scanErr)
 			}
@@ -350,6 +366,7 @@ WHERE thread_id = ? AND rollout_ordinal >= ?`
 				return nil, fmt.Errorf("unknown stored turn status: %s", turn.Status)
 			}
 			turn.ErrorJSON = nullStringJSON(errorJSON)
+			turn.RootTurnID = nullStringPtr(rootTurnID)
 			turn.StartedAt = nullInt64Ptr(startedAt)
 			turn.CompletedAt = nullInt64Ptr(completedAt)
 			turn.DurationMS = nullInt64Ptr(durationMS)
@@ -383,6 +400,18 @@ WHERE thread_id = ? AND rollout_ordinal >= ?`
 }
 
 func (r *StateRuntime) prepareThreadHistoryRead(ctx context.Context, threadID, operation string) ([]threadHistoryLineageSegment, *sql.DB, error) {
+	return r.prepareThreadHistoryReadForMode(ctx, threadID, operation, false)
+}
+
+// prepareThreadHistoryPageRead resolves lineage for client-visible history
+// (items, turns, search, fork boundaries). Attached forks stop at the parent
+// bookmark so inherited turns never appear as the child's activity (Rust
+// #57256 `resolve_rollout_lineage_for_history_page`).
+func (r *StateRuntime) prepareThreadHistoryPageRead(ctx context.Context, threadID, operation string) ([]threadHistoryLineageSegment, *sql.DB, error) {
+	return r.prepareThreadHistoryReadForMode(ctx, threadID, operation, true)
+}
+
+func (r *StateRuntime) prepareThreadHistoryReadForMode(ctx context.Context, threadID, operation string, historyPage bool) ([]threadHistoryLineageSegment, *sql.DB, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -394,7 +423,7 @@ func (r *StateRuntime) prepareThreadHistoryRead(ctx context.Context, threadID, o
 	if !found || !strings.EqualFold(strings.TrimSpace(mode), "paginated") {
 		return nil, nil, &ThreadHistoryError{Kind: ThreadHistoryUnsupported, Operation: operation}
 	}
-	lineage, err := r.resolveThreadHistoryLineage(ctx, threadID)
+	lineage, err := r.resolveThreadHistoryLineage(ctx, threadID, historyPage)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -407,14 +436,14 @@ func (r *StateRuntime) prepareThreadHistoryRead(ctx context.Context, threadID, o
 		if segment.Meta.HistoryBase != nil {
 			initialOrdinal = segment.Meta.HistoryBase.EndOrdinalExclusive
 		}
-		if err := MaterializeThreadHistory(ctx, db, segment.ThreadID, segment.Path, initialOrdinal, segment.Meta.SubagentHistoryStartOrdinal); err != nil {
+		if err := r.MaterializeThreadHistory(ctx, db, segment.ThreadID, segment.Path, initialOrdinal, segment.Meta.SubagentHistoryStartOrdinal); err != nil {
 			return nil, nil, err
 		}
 	}
 	return lineage, db, nil
 }
 
-func (r *StateRuntime) resolveThreadHistoryLineage(ctx context.Context, requestedThreadID string) ([]threadHistoryLineageSegment, error) {
+func (r *StateRuntime) resolveThreadHistoryLineage(ctx context.Context, requestedThreadID string, historyPage bool) ([]threadHistoryLineageSegment, error) {
 	segments := make([]threadHistoryLineageSegment, 0, 1)
 	seen := map[string]bool{}
 	threadID := requestedThreadID
@@ -424,28 +453,15 @@ func (r *StateRuntime) resolveThreadHistoryLineage(ctx context.Context, requeste
 			return nil, invalidPaginatedLineage(requestedThreadID, "cycle detected")
 		}
 		seen[threadID] = true
-		path, found, err := r.FindRolloutPathByID(ctx, threadID, nil)
+		existing, meta, err := r.resolveLineageRolloutCopy(ctx, threadID, requestedThreadID)
 		if err != nil {
 			return nil, err
 		}
-		if !found {
-			return nil, invalidPaginatedLineage(threadID, "missing source rollout")
-		}
-		existing, ok := rollout.ExistingRolloutPath(path)
-		if !ok {
-			return nil, invalidPaginatedLineage(threadID, "missing source rollout")
-		}
-		meta, err := rollout.FirstSessionMeta(existing)
-		if err != nil {
-			return nil, fmt.Errorf("read lineage metadata %s: %w", existing, err)
-		}
-		if meta.ID != threadID {
-			return nil, invalidPaginatedLineage(requestedThreadID, "source rollout belongs to another thread")
-		}
-		if !strings.EqualFold(strings.TrimSpace(meta.HistoryMode), "paginated") {
-			return nil, invalidPaginatedLineage(requestedThreadID, "source rollout is not paginated")
-		}
-		if end != nil {
+		// History pages read projected rows and only need the ancestor's
+		// metadata for lineage bounds, so an incomplete ancestor tail does not
+		// invalidate the page (Rust #58960). Context loading and fork
+		// preparation still require the cutoff itself to be durable.
+		if end != nil && !historyPage {
 			if end.EndOrdinalExclusive == 0 {
 				return nil, invalidPaginatedLineage(requestedThreadID, "cutoff cannot include source session metadata")
 			}
@@ -462,8 +478,21 @@ func (r *StateRuntime) resolveThreadHistoryLineage(ctx context.Context, requeste
 			}
 			start = meta.HistoryBase.EndOrdinalExclusive + 1
 		}
+		// Reverts can point to earlier records of the same child. Stop at the
+		// original parent bookmark so views never traverse inherited history.
+		atParent := false
+		if historyPage && meta.AttachedThread && meta.HistoryBase != nil {
+			if forkOrdinal := rollout.ForkedFromOrdinalAtPath(meta, existing); forkOrdinal != nil && meta.HistoryBase.EndOrdinalExclusive <= *forkOrdinal {
+				atParent = true
+				adjusted, adjustErr := rollout.AttachedHistoryStart(existing, start)
+				if adjustErr != nil {
+					return nil, fmt.Errorf("resolve attached history start for %s: %w", threadID, adjustErr)
+				}
+				start = adjusted
+			}
+		}
 		segments = append(segments, threadHistoryLineageSegment{ThreadID: threadID, Path: existing, Start: start, End: cloneRolloutHistoryPosition(end), Meta: meta})
-		if meta.HistoryBase == nil {
+		if meta.HistoryBase == nil || atParent {
 			break
 		}
 		threadID = meta.HistoryBase.ThreadID
@@ -473,6 +502,76 @@ func (r *StateRuntime) resolveThreadHistoryLineage(ctx context.Context, requeste
 		segments[left], segments[right] = segments[right], segments[left]
 	}
 	return segments, nil
+}
+
+// resolveLineageRolloutCopy picks the rollout copy one lineage segment reads.
+// The indexed copy is preferred; when it is missing, unreadable, belongs to
+// another thread or is not paginated, another managed copy of the same thread
+// is retried (Rust #58959/#58960, the same recovery rule as
+// rollout.ResolveHistoryPrefix). The preferred copy's error is returned when no
+// copy can serve the segment.
+func (r *StateRuntime) resolveLineageRolloutCopy(ctx context.Context, threadID string, requestedThreadID string) (string, *rollout.SessionMeta, error) {
+	indexed, found, err := r.FindRolloutPathByID(ctx, threadID, nil)
+	if err != nil {
+		return "", nil, err
+	}
+	var firstErr error
+	if found {
+		if existing, ok := rollout.ExistingRolloutPath(indexed); ok {
+			meta, metaErr := lineageRolloutCopyMeta(existing, threadID, requestedThreadID)
+			if metaErr == nil {
+				return existing, meta, nil
+			}
+			firstErr = metaErr
+		} else if meta, metaErr := lineageRolloutCopyMeta(indexed, threadID, requestedThreadID); metaErr == nil {
+			return indexed, meta, nil
+		} else {
+			firstErr = metaErr
+		}
+	}
+	// Only scan managed storage when the indexed copy cannot serve the
+	// segment.
+	copies, copyErr := rollout.FindThreadRolloutCopies(r.sqlite.Home(), threadID)
+	if copyErr != nil && firstErr == nil {
+		return "", nil, copyErr
+	}
+	if len(copies) == 0 {
+		if firstErr != nil {
+			return "", nil, firstErr
+		}
+		return "", nil, invalidPaginatedLineage(threadID, "missing source rollout")
+	}
+	for _, path := range copies {
+		if found {
+			if existing, ok := rollout.ExistingRolloutPath(indexed); ok && existing == path {
+				continue
+			}
+		}
+		meta, metaErr := lineageRolloutCopyMeta(path, threadID, requestedThreadID)
+		if metaErr == nil {
+			return path, meta, nil
+		}
+	}
+	if firstErr == nil {
+		firstErr = invalidPaginatedLineage(threadID, "missing source rollout")
+	}
+	return "", nil, firstErr
+}
+
+// lineageRolloutCopyMeta validates that one rollout copy can serve a lineage
+// segment.
+func lineageRolloutCopyMeta(path string, threadID string, requestedThreadID string) (*rollout.SessionMeta, error) {
+	meta, err := rollout.FirstSessionMeta(path)
+	if err != nil {
+		return nil, fmt.Errorf("read lineage metadata %s: %w", path, err)
+	}
+	if meta.ID != threadID {
+		return nil, invalidPaginatedLineage(requestedThreadID, "source rollout belongs to another thread")
+	}
+	if !strings.EqualFold(strings.TrimSpace(meta.HistoryMode), "paginated") {
+		return nil, invalidPaginatedLineage(requestedThreadID, "source rollout is not paginated")
+	}
+	return meta, nil
 }
 
 type selectedHistorySegment struct {
@@ -693,7 +792,8 @@ WHERE thread_id = ? AND turn_id = ? AND rollout_ordinal >= ? AND (? IS NULL OR r
 		return []ThreadHistoryItem{}, nil
 	}
 	rows, err := db.QueryContext(ctx, `
-SELECT turn_id, item_id, rollout_ordinal, updated_at_ordinal, created_at_ms, item_json
+SELECT turn_id, item_id, rollout_ordinal, updated_at_ordinal, created_at_ms,
+       started_at_ms, completed_at_ms, item_json
 FROM thread_items
 WHERE thread_id = ? AND turn_id = ? AND rollout_ordinal >= ?
   AND (? IS NULL OR rollout_ordinal < ?) AND (item_id = ? OR item_id = ?)
@@ -706,20 +806,33 @@ ORDER BY rollout_ordinal ASC`, owner, turn.TurnID, sqliteInt(segment.Start), nul
 	for rows.Next() {
 		var item ThreadHistoryItem
 		var rolloutOrdinal, updatedOrdinal int64
+		var startedAtMS, completedAtMS sql.NullInt64
 		var itemJSON string
-		if err := rows.Scan(&item.TurnID, &item.ItemID, &rolloutOrdinal, &updatedOrdinal, &item.CreatedAtMS, &itemJSON); err != nil {
+		if err := rows.Scan(&item.TurnID, &item.ItemID, &rolloutOrdinal, &updatedOrdinal, &item.CreatedAtMS, &startedAtMS, &completedAtMS, &itemJSON); err != nil {
 			return nil, err
 		}
 		if rolloutOrdinal < 0 || updatedOrdinal < 0 {
 			return nil, errors.New("invalid stored item ordinal")
 		}
 		item.UpdatedAtOrdinal = uint64(updatedOrdinal)
+		item.StartedAtMS = historyNullInt64Ptr(startedAtMS)
+		item.CompletedAtMS = historyNullInt64Ptr(completedAtMS)
 		item.ItemJSON = json.RawMessage(itemJSON)
 		item.physicalThreadID = owner
 		item.physicalRolloutPos = rolloutOrdinal
 		items = append(items, item)
 	}
 	return items, rows.Err()
+}
+
+// historyNullInt64Ptr converts a nullable lifecycle column; older rollouts
+// recorded zero for an unknown time and Rust treats that as unrecorded.
+func historyNullInt64Ptr(value sql.NullInt64) *int64 {
+	if !value.Valid || value.Int64 == 0 {
+		return nil
+	}
+	v := value.Int64
+	return &v
 }
 
 func nullableHistoryEnd(end *rollout.HistoryPosition) any {

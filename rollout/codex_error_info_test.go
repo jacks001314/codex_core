@@ -43,6 +43,11 @@ func TestRecordFromPathToleratesUnknownCodexErrorClassifications(t *testing.T) {
 			errorInfo:  `{"active_turn_not_steerable":{"turn_kind":"unknown"}}`,
 			wantStatus: "inProgress",
 		},
+		{
+			name:       "multi-key object is unreadable",
+			errorInfo:  `{"future_error":null,"other":null}`,
+			wantStatus: "inProgress",
+		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			home := t.TempDir()
@@ -90,5 +95,58 @@ func TestRecordFromPathToleratesUnknownCodexErrorClassifications(t *testing.T) {
 				t.Fatalf("known classification was rewritten: %s", string(encoded))
 			}
 		})
+	}
+}
+
+// Rust #47353 added CodexErrorInfo::InvalidPrompt to the core protocol. Saved
+// records carrying either the core snake_case tag or the app-server camelCase
+// spelling must stay classified instead of being rewritten to other.
+func TestCodexErrorInfoPreservesInvalidPromptLikeRust(t *testing.T) {
+	for _, raw := range []string{"invalid_prompt", "invalidPrompt"} {
+		classified, ok := normalizeCodexErrorInfoClassification(raw)
+		if !ok || classified != raw {
+			t.Fatalf("normalizeCodexErrorInfoClassification(%q) = %#v, %t; want preserved", raw, classified, ok)
+		}
+	}
+}
+
+// Rust deserializes CodexErrorInfo as an externally tagged enum, so only a bare
+// known tag, a single-key known tag with a valid payload, or an unknown single
+// tag is representable. Empty/multi-key objects, unit tags carrying a payload,
+// payload tags written as bare strings, and non-string/non-object JSON are
+// unreadable rather than being classified as other.
+func TestCodexErrorInfoRejectsNonEnumShapesLikeRust(t *testing.T) {
+	for _, raw := range []any{
+		map[string]any{},
+		map[string]any{"future_error": nil, "other": nil},
+		map[string]any{"other": map[string]any{"detail": "new payload"}},
+		map[string]any{"context_window_exceeded": 1.0},
+		"response_stream_disconnected",
+		42.0,
+		true,
+		[]any{"other"},
+	} {
+		if classified, ok := normalizeCodexErrorInfoClassification(raw); ok {
+			t.Fatalf("%#v classified as %#v, want unreadable", raw, classified)
+		}
+	}
+}
+
+// Rust #57452 adds policy-restricted capacity as a payload-free rollout
+// classification. Both the core snake_case spelling and the app-server
+// camelCase spelling stay readable and are preserved verbatim.
+func TestCodexErrorInfoPreservesPolicyCapacityTagsLikeRust(t *testing.T) {
+	for _, tag := range []string{"policy_capacity_unavailable", "policyCapacityUnavailable"} {
+		classified, ok := normalizeCodexErrorInfoClassification(tag)
+		if !ok || classified != tag {
+			t.Fatalf("bare %q normalized to %#v (ok=%v), want itself", tag, classified, ok)
+		}
+		classified, ok = normalizeCodexErrorInfoClassification(map[string]any{tag: nil})
+		if !ok {
+			t.Fatalf("tagged %q was rejected", tag)
+		}
+		if _, ok := classified.(map[string]any)[tag]; !ok {
+			t.Fatalf("tagged %q normalized to %#v", tag, classified)
+		}
 	}
 }

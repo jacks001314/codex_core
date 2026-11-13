@@ -32,6 +32,9 @@ type gatewayRefreshPolicy struct {
 	// from the token the failed request used.
 	rejectedAccessToken string
 	afterRejection      bool
+	// withoutInteractiveLogin reports ErrGatewayLoginRequired instead of
+	// opening a browser (Rust `without_interactive_login`).
+	withoutInteractiveLogin bool
 }
 
 func (p gatewayRefreshPolicy) canReuse(token *gatewayStoredToken) bool {
@@ -79,7 +82,7 @@ func NewGatewayAuthManager(config GatewayAuthConfig, codexHome string, client *h
 	manager := &GatewayAuthManager{
 		config:    config,
 		codexHome: codexHome,
-		storage:   newGatewayAuthStorage(codexHome, store),
+		storage:   newGatewayAuthStorage(codexHome, store, config.CredentialsStore),
 		client:    client,
 	}
 	manager.control = gatewayLoginControlFor(codexHome, manager)
@@ -92,10 +95,114 @@ func (m *GatewayAuthManager) ResolveAccessToken(ctx context.Context) (string, er
 	return m.resolve(ctx, gatewayRefreshPolicy{})
 }
 
+// ResolveAccessTokenWithoutLogin resolves a cached or refreshable access token
+// but never opens a browser. Missing credentials report ErrGatewayLoginRequired
+// so background consumers can prompt explicitly (Rust without_interactive_login).
+func (m *GatewayAuthManager) ResolveAccessTokenWithoutLogin(ctx context.Context) (string, error) {
+	return m.resolve(ctx, gatewayRefreshPolicy{withoutInteractiveLogin: true})
+}
+
 // RefreshAccessToken recovers after a request rejected rejectedAccessToken,
 // reusing a usable replacement from storage or refreshing/authorizing.
 func (m *GatewayAuthManager) RefreshAccessToken(ctx context.Context, rejectedAccessToken string) (string, error) {
 	return m.resolve(ctx, gatewayRefreshPolicy{afterRejection: true, rejectedAccessToken: rejectedAccessToken})
+}
+
+// Logout removes the persisted grant and its in-memory copy without contacting
+// the issuer, then publishes NotReady so subscribers prompt for a new sign-in
+// (Rust OAuthSessionManager::logout). It reports whether a stored grant
+// existed.
+func (m *GatewayAuthManager) Logout(ctx context.Context) (bool, error) {
+	if m == nil {
+		return false, errors.New("provider OAuth manager is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	lock, err := lockGatewayCredentials(m.codexHome)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = lock.release() }()
+	removed, err := m.storage.delete(m.CredentialID())
+	if err != nil {
+		return false, err
+	}
+	m.mu.Lock()
+	m.cache.token = nil
+	m.cache.pending = nil
+	m.mu.Unlock()
+	m.publishStatus(GatewayAuthStatus{Kind: GatewayAuthStatusNotReady}, "")
+	return removed, nil
+}
+
+// GatewayCredentials is one resolved access token together with the identity
+// of the exact OAuth grant that supplied it (Rust OAuthRequestCredentials).
+type GatewayCredentials struct {
+	AccessToken     string
+	AuthorizationID string
+}
+
+// CredentialID returns the stable storage identity of this OAuth grant scope:
+// one entry per codex home, issuer, client, resource, and scope set
+// (Rust OAuthSessionManager::credential_id).
+func (m *GatewayAuthManager) CredentialID() string {
+	if m == nil {
+		return ""
+	}
+	return gatewayCredentialID(m.codexHome, m.config)
+}
+
+// AuthorizationID identifies the persisted sign-in without refreshing an
+// expired access token. Refresh preserves this ID; explicit login creates a
+// new one (Rust OAuthSessionManager::authorization_id).
+func (m *GatewayAuthManager) AuthorizationID(ctx context.Context) (string, error) {
+	if m == nil {
+		return "", errors.New("provider OAuth manager is unavailable")
+	}
+	if err := validateGatewayAuthConfig(m.config); err != nil {
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cache.token == nil && m.cache.pending == nil {
+		token, err := m.loadToken()
+		if err != nil {
+			return "", err
+		}
+		m.cache.token = token
+	}
+	token := m.cache.pending
+	if token == nil {
+		token = m.cache.token
+	}
+	if token == nil || strings.TrimSpace(token.AuthorizationID) == "" {
+		return "", ErrGatewayLoginRequired
+	}
+	return token.AuthorizationID, nil
+}
+
+// ResolveCredentialsWithoutLogin resolves a cached or refreshable access token
+// but never opens a browser, returning the grant identity captured with it.
+func (m *GatewayAuthManager) ResolveCredentialsWithoutLogin(ctx context.Context) (GatewayCredentials, error) {
+	accessToken, err := m.ResolveAccessTokenWithoutLogin(ctx)
+	if err != nil {
+		return GatewayCredentials{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, token := range []*gatewayStoredToken{m.cache.pending, m.cache.token} {
+		if token != nil && token.AccessToken == accessToken {
+			return GatewayCredentials{AccessToken: accessToken, AuthorizationID: token.AuthorizationID}, nil
+		}
+	}
+	return GatewayCredentials{AccessToken: accessToken}, nil
 }
 
 func (m *GatewayAuthManager) resolve(ctx context.Context, policy gatewayRefreshPolicy) (string, error) {
@@ -123,6 +230,17 @@ func (m *GatewayAuthManager) resolve(ctx context.Context, policy gatewayRefreshP
 	}
 	if !authorize {
 		return token, nil
+	}
+	if policy.withoutInteractiveLogin {
+		// Rust login_required_error: a request that needs sign-in re-prompts even
+		// after an earlier NotReady notification was dismissed.
+		if !m.publishStatus(GatewayAuthStatus{Kind: GatewayAuthStatusNotReady}, gatewayTokenFingerprint(m.cache.token)) && m.control != nil {
+			m.control.broadcast(GatewayAuthStatusChange{
+				Config: m.config,
+				Status: GatewayAuthStatus{Kind: GatewayAuthStatusNotReady},
+			})
+		}
+		return "", ErrGatewayLoginRequired
 	}
 	// Rust #47170: a request that needs the browser flow reports NotReady before
 	// the interactive authorization starts, so clients can prompt explicitly.
@@ -187,7 +305,7 @@ func (m *GatewayAuthManager) refresh(ctx context.Context, policy gatewayRefreshP
 			resource:     m.config.Resource,
 		}, &response)
 		if oauthErr == nil {
-			stored, err := response.intoStored(refreshToken)
+			stored, err := response.intoStored(m.cache.token)
 			if err != nil {
 				return "", false, err
 			}
@@ -243,7 +361,9 @@ func gatewayTokensEqual(left *gatewayStoredToken, right *gatewayStoredToken) boo
 	if left == nil || right == nil {
 		return left == nil && right == nil
 	}
-	if left.AccessToken != right.AccessToken || left.RefreshToken != right.RefreshToken {
+	if left.AccessToken != right.AccessToken ||
+		left.AuthorizationID != right.AuthorizationID ||
+		left.RefreshToken != right.RefreshToken {
 		return false
 	}
 	switch {
@@ -369,7 +489,7 @@ func (m *GatewayAuthManager) authorizeWithURL(ctx context.Context, onURL func(st
 		_ = errors.As(oauthErr, &typed)
 		return "", gatewayEndpointError(typed, m.config, "authorization_code", redirectURI)
 	}
-	pending, err := response.intoStored("")
+	pending, err := response.intoStored(nil)
 	if err != nil {
 		return "", err
 	}

@@ -161,6 +161,7 @@ func TestConfigRequirementsMarshalRustShape(t *testing.T) {
 		Network: &NetworkRequirements{
 			AllowedDomains: []string{},
 			Domains:        map[string]NetworkPermission{"example.com": NetworkAllow},
+			ReviewDomains:  []string{"review.example.com"},
 		},
 		Models: &ModelsRequirements{NewThread: &NewThreadModelDefaults{Model: &model}},
 		MCPServers: map[string]MCPServerRequirement{
@@ -208,6 +209,9 @@ func TestConfigRequirementsMarshalRustShape(t *testing.T) {
 	}
 	if network["httpPort"] != nil || network["allowLocalBinding"] != nil {
 		t.Fatalf("network nullable fields = %+v", network)
+	}
+	if reviews, ok := network["reviewDomains"].([]any); !ok || len(reviews) != 1 || reviews[0] != "review.example.com" {
+		t.Fatalf("network reviewDomains = %+v", network["reviewDomains"])
 	}
 	models := root["models"].(map[string]any)
 	newThread := models["newThread"].(map[string]any)
@@ -788,11 +792,16 @@ func TestRequirementsClone(t *testing.T) {
 		AllowedSandboxModes:     []sandbox.SandboxMode{sandbox.SandboxWorkspaceWrite},
 		DefaultPermissions:      &defaultPermissions,
 		AllowRemoteControl:      &allow,
-		Network:                 &NetworkRequirements{Enabled: &allow, Domains: map[string]NetworkPermission{"example.com": NetworkAllow}},
+		Network: &NetworkRequirements{
+			Enabled:       &allow,
+			Domains:       map[string]NetworkPermission{"example.com": NetworkAllow},
+			ReviewDomains: []string{"review.example.com"},
+		},
 	})
 	read := service.Requirements()
 	read.Requirements.AllowedApprovalPolicies[0] = sandbox.ApprovalNever
 	read.Requirements.Network.Domains["example.com"] = NetworkDeny
+	read.Requirements.Network.ReviewDomains[0] = "mutated.example.com"
 
 	again := service.Requirements()
 	if again.Requirements.AllowedApprovalPolicies[0] != sandbox.ApprovalOnRequest {
@@ -800,6 +809,9 @@ func TestRequirementsClone(t *testing.T) {
 	}
 	if again.Requirements.Network.Domains["example.com"] != NetworkAllow {
 		t.Fatalf("requirements map mutation leaked")
+	}
+	if len(again.Requirements.Network.ReviewDomains) != 1 || again.Requirements.Network.ReviewDomains[0] != "review.example.com" {
+		t.Fatalf("requirements slice mutation leaked: %#v", again.Requirements.Network.ReviewDomains)
 	}
 }
 
@@ -1005,5 +1017,64 @@ func TestConfigRequirementsReadSupportsIndependentSpeedModesLikeRust(t *testing.
 	}
 	if !strings.Contains(string(encoded), `"requirements":null`) {
 		t.Fatalf("encoded requirements should keep the null requirements key: %s", encoded)
+	}
+}
+
+// Rust config_processor replace_mcp_servers edits the document in place, so a
+// replace of the whole mcp_servers table keeps unrelated bytes (comments,
+// other keys) and swaps exactly the server tables. The table arrives as a
+// plain map, which used to be handed to the splicer as nil and erased every
+// server while writing nothing.
+func TestBatchWriteReplacesMCPServersTableLikeRust(t *testing.T) {
+	home := t.TempDir()
+	writeConfig(t, home, "# keep me\nmodel = \"gpt-5\"\n\n[mcp_servers.old]\nurl = \"https://old.test/mcp\"\n")
+	service := NewConfigService(home)
+	if _, err := service.BatchWrite(&ConfigBatchWriteParams{Edits: []ConfigEdit{
+		{KeyPath: "mcp_servers", Value: map[string]any{"docs": map[string]any{"enabled": true, "url": "https://docs.test/mcp"}}, MergeStrategy: MergeReplace},
+	}}); err != nil {
+		t.Fatalf("BatchWrite() error = %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(home, "config.toml"))
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	text := string(data)
+	for _, want := range []string{"# keep me", "model = \"gpt-5\"", "[mcp_servers.docs]", "url = \"https://docs.test/mcp\""} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("config.toml lost %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "mcp_servers.old") {
+		t.Fatalf("replaced server survived:\n%s", text)
+	}
+	loaded, err := service.Read(&ConfigReadParams{})
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	servers, ok := loaded.Config["mcp_servers"].(map[string]any)
+	if !ok || servers["docs"] == nil || servers["old"] != nil {
+		t.Fatalf("mcp_servers after replace = %#v", loaded.Config["mcp_servers"])
+	}
+}
+
+// A replace of mcp_servers on a config that has no servers yet must still
+// write the table instead of producing an empty document.
+func TestBatchWriteReplacesMCPServersOnFreshConfigLikeRust(t *testing.T) {
+	home := t.TempDir()
+	service := NewConfigService(home)
+	if _, err := service.WriteValue(&ConfigValueWriteParams{
+		KeyPath:       "mcp_servers",
+		Value:         map[string]any{"docs": map[string]any{"enabled": true, "url": "https://docs.test/mcp"}},
+		MergeStrategy: MergeReplace,
+	}); err != nil {
+		t.Fatalf("WriteValue() error = %v", err)
+	}
+	loaded, err := service.Read(&ConfigReadParams{})
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	servers, ok := loaded.Config["mcp_servers"].(map[string]any)
+	if !ok || servers["docs"] == nil {
+		t.Fatalf("mcp_servers after replace = %#v", loaded.Config["mcp_servers"])
 	}
 }

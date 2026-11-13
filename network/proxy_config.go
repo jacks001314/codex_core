@@ -114,8 +114,11 @@ type ProxySettings struct {
 	DangerouslyAllowAllUnixSockets *bool
 	Mode                           ProxyMode
 	Domains                        *ProxyDomainPermissions
-	UnixSockets                    *ProxyUnixSocketPermissions
-	AllowLocalBinding              bool
+	// ReviewDomains are managed-only selectors routed through the approval
+	// flow before ordinary allow rules (Rust #56154).
+	ReviewDomains     []string
+	UnixSockets       *ProxyUnixSocketPermissions
+	AllowLocalBinding bool
 	// AllowLocalBindingSet distinguishes an explicit false from an omitted
 	// setting so executor-specific defaults can be applied later (Rust #46523).
 	AllowLocalBindingSet bool
@@ -289,10 +292,7 @@ func ResolveProxyRuntime(config ProxyConfig) (ProxyRuntimeConfig, error) {
 // `resolve_runtime(cfg, executor_os)` (#46302/#46334): socket allowlist entries
 // are validated against the executor's platform rather than the controller's.
 func ResolveProxyRuntimeForPlatform(config ProxyConfig, platform utils.Platform) (ProxyRuntimeConfig, error) {
-	if _, err := CompileProxyDomainMatcher(config.Network.AllowedDomains(), false); err != nil {
-		return ProxyRuntimeConfig{}, fmt.Errorf("compile network.allowed_domains: %w", err)
-	}
-	if _, err := CompileProxyDomainMatcher(config.Network.DeniedDomains(), true); err != nil {
+	if err := ValidateProxyDomainPatterns(config); err != nil {
 		return ProxyRuntimeConfig{}, err
 	}
 	if config.Network.CredentialBroker && !config.Network.MITM {
@@ -314,6 +314,23 @@ func ResolveProxyRuntimeForPlatform(config ProxyConfig, platform utils.Platform)
 	}
 	httpAddr, socksAddr = ClampProxyBindAddrs(httpAddr, socksAddr, config.Network)
 	return ProxyRuntimeConfig{HTTPAddr: httpAddr, SocksAddr: socksAddr}, nil
+}
+
+// ValidateProxyDomainPatterns compiles the composed policy's allow, deny and
+// review patterns, mirroring Rust build_config_state (#46331). Callers must run
+// it after feature settings and managed requirements are composed so an invalid
+// selected value that requirements replace is never rejected first.
+func ValidateProxyDomainPatterns(config ProxyConfig) error {
+	if _, err := CompileProxyDomainMatcher(config.Network.AllowedDomains(), false); err != nil {
+		return fmt.Errorf("compile network.allowed_domains: %w", err)
+	}
+	if _, err := CompileProxyDomainMatcher(config.Network.DeniedDomains(), true); err != nil {
+		return err
+	}
+	if _, err := CompileProxyDomainMatcher(config.Network.ReviewDomains, false); err != nil {
+		return fmt.Errorf("compile network.review_domains: %w", err)
+	}
+	return nil
 }
 
 func ResolveProxyAddr(value string, defaultPort uint16) (net.TCPAddr, error) {

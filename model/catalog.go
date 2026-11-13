@@ -23,6 +23,13 @@ import (
 //go:embed prompt.md
 var BaseInstructions string
 
+// bundledModelsCatalogJSON is the catalog the binary ships: the bundled
+// models-manager/models.json catalog in the serde shape Rust's ModelInfo
+// prints, so `debug models` renders it without a second source of truth.
+//
+//go:embed bundled_models_catalog.json
+var bundledModelsCatalogJSON []byte
+
 const (
 	TruncationModeBytes  = "bytes"
 	TruncationModeTokens = "tokens"
@@ -106,11 +113,14 @@ func isH1Heading(line string) bool {
 }
 
 type ModelMessages struct {
-	InstructionsTemplate string                     `json:"instructions_template,omitempty"`
-	CollaborationModes   *CollaborationModeMessages `json:"collaboration_modes,omitempty"`
-	MultiAgent           *MultiAgentMessages        `json:"multi_agent,omitempty"`
-	TokenBudget          *ModelTokenBudgetConfig    `json:"token_budget,omitempty"`
-	AutoReview           *AutoReviewMessages        `json:"auto_review,omitempty"`
+	InstructionsTemplate string `json:"instructions_template,omitempty"`
+	// Apps carries optional model-owned Apps wording; it is transported without
+	// runtime interpretation.
+	Apps               *AppsMessages              `json:"apps,omitempty"`
+	CollaborationModes *CollaborationModeMessages `json:"collaboration_modes,omitempty"`
+	MultiAgent         *MultiAgentMessages        `json:"multi_agent,omitempty"`
+	TokenBudget        *ModelTokenBudgetConfig    `json:"token_budget,omitempty"`
+	AutoReview         *AutoReviewMessages        `json:"auto_review,omitempty"`
 	// Approvals is the catalog's `approvals` object (Rust
 	// ModelMessages::approvals); missing or null uses the built-in texts.
 	Approvals *ApprovalMessages `json:"approvals,omitempty"`
@@ -130,11 +140,48 @@ type ModelMessages struct {
 	// classifier fields belong to Rust's async scorer, which Go does not have.
 	GuardianV2 *GuardianV2ModelConfig `json:"guardian_v2,omitempty"`
 	Tools      *ToolMessages          `json:"tools,omitempty"`
+	// Plugins carries catalog overrides for plugin guidance (Rust #58894).
+	Plugins *PluginMessages `json:"plugins,omitempty"`
+}
+
+// PluginMessages mirrors Rust protocol::openai_models::PluginMessages.
+type PluginMessages struct {
+	Generic         *GenericPluginMessages        `json:"generic,omitempty"`
+	Selected        *SelectedPluginMessages       `json:"selected,omitempty"`
+	Recommendations *PluginRecommendationMessages `json:"recommendations,omitempty"`
+}
+
+// GenericPluginMessages overrides the bundled generic plugin guidance.
+type GenericPluginMessages struct {
+	Intro             *string `json:"intro,omitempty"`
+	UsageInstructions *string `json:"usage_instructions,omitempty"`
+}
+
+// SelectedPluginMessages overrides the wording around an explicitly selected
+// plugin. Templates keep their required placeholder.
+type SelectedPluginMessages struct {
+	Intro          *string `json:"intro,omitempty"`
+	SearchTools    *string `json:"search_tools,omitempty"`
+	SkillNamespace *string `json:"skill_namespace,omitempty"`
+	Apps           *string `json:"apps,omitempty"`
+	MCPServers     *string `json:"mcp_servers,omitempty"`
+	Closing        *string `json:"closing,omitempty"`
+	Omitted        *string `json:"omitted,omitempty"`
+}
+
+// PluginRecommendationMessages overrides the recommended-plugins introduction.
+type PluginRecommendationMessages struct {
+	Intro *string `json:"intro,omitempty"`
 }
 
 type CollaborationModeMessages struct {
 	Default *string `json:"default"`
 	Plan    *string `json:"plan"`
+}
+
+// AppsMessages mirrors Rust protocol::openai_models::AppsMessages.
+type AppsMessages struct {
+	UsageInstructions *string `json:"usage_instructions,omitempty"`
 }
 
 // ApprovalMessages mirrors Rust protocol::openai_models::ApprovalMessages:
@@ -144,6 +191,63 @@ type ApprovalMessages struct {
 	OnRequestAutoReview *string `json:"on_request_auto_review,omitempty"`
 	Never               *string `json:"never,omitempty"`
 	UnlessTrusted       *string `json:"unless_trusted,omitempty"`
+	// RequestPermissions is an optional replacement heading for the
+	// request_permissions tool instructions (Rust #57581).
+	RequestPermissions *string `json:"request_permissions,omitempty"`
+	// AutoReviewSuffix introduces harness-owned automatic review guidance
+	// (Rust #57581).
+	AutoReviewSuffix *string `json:"auto_review_suffix,omitempty"`
+	// Granular carries optional catalog templates for harness-owned granular
+	// approval facts (Rust #57325). The templates are preserved verbatim;
+	// validation and rendering are consumer concerns.
+	Granular *GranularApprovalMessages `json:"granular,omitempty"`
+}
+
+// UnmarshalJSON accepts Rust's `request_permissions_tool` alias for
+// `request_permissions` (Rust #57581).
+func (m *ApprovalMessages) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		OnRequest              *string                   `json:"on_request"`
+		OnRequestAutoReview    *string                   `json:"on_request_auto_review"`
+		Never                  *string                   `json:"never"`
+		UnlessTrusted          *string                   `json:"unless_trusted"`
+		RequestPermissions     *string                   `json:"request_permissions"`
+		RequestPermissionsTool *string                   `json:"request_permissions_tool"`
+		AutoReviewSuffix       *string                   `json:"auto_review_suffix"`
+		Granular               *GranularApprovalMessages `json:"granular"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	requestPermissions := raw.RequestPermissions
+	if requestPermissions == nil {
+		requestPermissions = raw.RequestPermissionsTool
+	}
+	*m = ApprovalMessages{
+		OnRequest:           raw.OnRequest,
+		OnRequestAutoReview: raw.OnRequestAutoReview,
+		Never:               raw.Never,
+		UnlessTrusted:       raw.UnlessTrusted,
+		RequestPermissions:  requestPermissions,
+		AutoReviewSuffix:    raw.AutoReviewSuffix,
+		Granular:            raw.Granular,
+	}
+	return nil
+}
+
+// GranularApprovalMessages mirrors Rust protocol::openai_models::
+// GranularApprovalMessages. The harness owns the policy and category lists, so
+// the catalog only supplies presentation around them.
+type GranularApprovalMessages struct {
+	// Intro must be at most 500 UTF-8 bytes and contain exactly one
+	// `{{ policy }}` marker; otherwise consumers use the bundled text.
+	Intro *string `json:"intro,omitempty"`
+	// PromptedCategories wraps `{{ categories }}`, including the fixed
+	// prompted-bucket label. Same byte limit and fallback rules as Intro.
+	PromptedCategories *string `json:"prompted_categories,omitempty"`
+	// RejectedCategories wraps `{{ categories }}`, including the fixed
+	// rejected-bucket label. Same byte limit and fallback rules as Intro.
+	RejectedCategories *string `json:"rejected_categories,omitempty"`
 }
 
 // PermissionMessages mirrors Rust protocol::openai_models::PermissionMessages:
@@ -152,6 +256,25 @@ type PermissionMessages struct {
 	DangerFullAccess *string `json:"danger_full_access,omitempty"`
 	WorkspaceWrite   *string `json:"workspace_write,omitempty"`
 	ReadOnly         *string `json:"read_only,omitempty"`
+	// ApprovedPrefixes supports `{{ approved_prefixes }}`. A missing value
+	// keeps the bundled template; an empty value suppresses the section.
+	ApprovedPrefixes *string `json:"approved_prefixes,omitempty"`
+	// WritableRoot is the singular writable-root sentence with exactly one
+	// `{{ roots }}` placeholder (Rust #56309).
+	WritableRoot *string `json:"writable_root,omitempty"`
+	// WritableRoots is the plural writable-roots sentence with exactly one
+	// `{{ roots }}` placeholder (Rust #56309).
+	WritableRoots *string `json:"writable_roots,omitempty"`
+	// OmittedPaths is optional presentation before the harness-owned omitted
+	// path warning (Rust #57263).
+	OmittedPaths *string `json:"omitted_paths,omitempty"`
+	// DeniedReads is presentation with exactly one `{{ denied_reads }}`
+	// placeholder for the harness-owned denial explanation and path list
+	// (Rust #57263).
+	DeniedReads *string `json:"denied_reads,omitempty"`
+	// ApprovedCommandPrefixSaved is a plain-text heading for the saved-prefix
+	// notice (Rust #57599).
+	ApprovedCommandPrefixSaved *string `json:"approved_command_prefix_saved,omitempty"`
 }
 
 // GuardianV2ModelConfig mirrors Rust
@@ -219,10 +342,100 @@ type ConfirmationPolicies struct {
 	ComputerUse *string `json:"computer_use,omitempty"`
 }
 
+// HistoryToolMessages mirrors Rust protocol::openai_models::HistoryToolMessages
+// (#56313): model-owned history namespace and public tool definitions. Runtime
+// data and tool identity remain with the consumers.
+type HistoryToolMessages struct {
+	NamespaceDescription *string      `json:"namespace_description,omitempty"`
+	ListWindows          *ToolMessage `json:"list_windows,omitempty"`
+	ListItems            *ToolMessage `json:"list_items,omitempty"`
+	ReadItem             *ToolMessage `json:"read_item,omitempty"`
+	SearchContents       *ToolMessage `json:"search_contents,omitempty"`
+}
+
+// NotesToolMessages mirrors Rust protocol::openai_models::NotesToolMessages
+// (#56313).
+type NotesToolMessages struct {
+	NamespaceDescription *string      `json:"namespace_description,omitempty"`
+	ListFilesByPrefix    *ToolMessage `json:"list_files_by_prefix,omitempty"`
+	ReadFile             *ToolMessage `json:"read_file,omitempty"`
+	SearchContents       *ToolMessage `json:"search_contents,omitempty"`
+	AppendToFile         *ToolMessage `json:"append_to_file,omitempty"`
+	WriteFile            *ToolMessage `json:"write_file,omitempty"`
+}
+
+// Tool returns the catalog message for one history tool name, or nil when the
+// catalog does not override it.
+func (h *HistoryToolMessages) Tool(toolName string) *ToolMessage {
+	if h == nil {
+		return nil
+	}
+	switch strings.TrimSpace(toolName) {
+	case "list_windows":
+		return h.ListWindows
+	case "list_items":
+		return h.ListItems
+	case "read_item":
+		return h.ReadItem
+	case "search_contents":
+		return h.SearchContents
+	}
+	return nil
+}
+
+// Tool returns the catalog message for one notes tool name, or nil when the
+// catalog does not override it.
+func (n *NotesToolMessages) Tool(toolName string) *ToolMessage {
+	if n == nil {
+		return nil
+	}
+	switch strings.TrimSpace(toolName) {
+	case "list_files_by_prefix":
+		return n.ListFilesByPrefix
+	case "read_file":
+		return n.ReadFile
+	case "search_contents":
+		return n.SearchContents
+	case "append_to_file":
+		return n.AppendToFile
+	case "write_file":
+		return n.WriteFile
+	}
+	return nil
+}
+
+// Tool returns the catalog message for one context-management tool, or nil.
+func (c *ContextManagementToolMessages) Tool(toolName string) *ToolMessage {
+	if c == nil {
+		return nil
+	}
+	switch strings.TrimSpace(toolName) {
+	case "new_context":
+		return c.NewContext
+	case "get_context_remaining":
+		return c.GetContextRemaining
+	}
+	return nil
+}
+
+// ContextManagementToolMessages mirrors Rust protocol::openai_models::
+// ContextManagementToolMessages (#56313).
+type ContextManagementToolMessages struct {
+	NewContext          *ToolMessage `json:"new_context,omitempty"`
+	GetContextRemaining *ToolMessage `json:"get_context_remaining,omitempty"`
+}
+
 // ToolMessages mirrors Rust protocol::openai_models::ToolMessages (#41461):
 // model-owned descriptions for built-in tools.
 type ToolMessages struct {
-	SendUserMessageAsync *ToolMessage `json:"send_user_message_async,omitempty"`
+	// History and Notes carry the Memento V2 history/notes definitions,
+	// independent of runtime namespace aliases (Rust #56313).
+	History *HistoryToolMessages `json:"history,omitempty"`
+	Notes   *NotesToolMessages   `json:"notes,omitempty"`
+	// ContextManagement carries new_context and get_context_remaining
+	// (Rust #56313).
+	ContextManagement    *ContextManagementToolMessages `json:"context_management,omitempty"`
+	SendUserMessageAsync *ToolMessage                   `json:"send_user_message_async,omitempty"`
 	// IndirectDescriptionPrefixes adds model-owned guidance to namespace
 	// documentation in Code Mode prompts, ALL_TOOLS, and tool search results
 	// without altering direct tool specifications (Rust #47642).
@@ -296,6 +509,17 @@ type MultiAgentToolMessages struct {
 	WaitAgent      *ToolMessage `json:"wait_agent,omitempty"`
 	InterruptAgent *ToolMessage `json:"interrupt_agent,omitempty"`
 	ListAgents     *ToolMessage `json:"list_agents,omitempty"`
+	// Channel tools consume only the description; their parameter schemas are
+	// fixed by the message-board extension (Rust #47670).
+	CreateChannel *ToolMessage `json:"create_channel,omitempty"`
+	GetChannels   *ToolMessage `json:"get_channels,omitempty"`
+	ListThreads   *ToolMessage `json:"list_threads,omitempty"`
+	SearchPosts   *ToolMessage `json:"search_posts,omitempty"`
+	ReadThread    *ToolMessage `json:"read_thread,omitempty"`
+	ReadPost      *ToolMessage `json:"read_post,omitempty"`
+	Subscribe     *ToolMessage `json:"subscribe,omitempty"`
+	Unsubscribe   *ToolMessage `json:"unsubscribe,omitempty"`
+	Post          *ToolMessage `json:"post,omitempty"`
 }
 
 // McpResourceToolMessages mirrors Rust protocol::openai_models::
@@ -327,6 +551,24 @@ func (m *ModelMessages) MultiAgentToolMessage(toolName string) *ToolMessage {
 		return tools.InterruptAgent
 	case "list_agents":
 		return tools.ListAgents
+	case "create_channel":
+		return tools.CreateChannel
+	case "get_channels":
+		return tools.GetChannels
+	case "list_threads":
+		return tools.ListThreads
+	case "search_posts":
+		return tools.SearchPosts
+	case "read_thread":
+		return tools.ReadThread
+	case "read_post":
+		return tools.ReadPost
+	case "subscribe":
+		return tools.Subscribe
+	case "unsubscribe":
+		return tools.Unsubscribe
+	case "post":
+		return tools.Post
 	}
 	return nil
 }
@@ -350,6 +592,33 @@ func (m *ModelMessages) MCPResources() *McpResourceToolMessages {
 		return nil
 	}
 	return m.Tools.McpResources
+}
+
+// HistoryTools returns the Memento V2 history tool overrides, or nil when the
+// catalog does not define them (Rust #56313).
+func (m *ModelMessages) HistoryTools() *HistoryToolMessages {
+	if m == nil || m.Tools == nil {
+		return nil
+	}
+	return m.Tools.History
+}
+
+// NotesTools returns the Memento V2 notes tool overrides, or nil when the
+// catalog does not define them (Rust #56313).
+func (m *ModelMessages) NotesTools() *NotesToolMessages {
+	if m == nil || m.Tools == nil {
+		return nil
+	}
+	return m.Tools.Notes
+}
+
+// ContextManagementTools returns the context-window control tool overrides, or
+// nil when the catalog does not define them (Rust #56313).
+func (m *ModelMessages) ContextManagementTools() *ContextManagementToolMessages {
+	if m == nil || m.Tools == nil {
+		return nil
+	}
+	return m.Tools.ContextManagement
 }
 
 // CodeMode returns the active model's Code Mode tool-message overrides.
@@ -396,6 +665,7 @@ func (m *ModelMessages) RequestUserInputAsyncParametersOverride() *string {
 func (m *ModelMessages) UnmarshalJSON(data []byte) error {
 	var raw struct {
 		InstructionsTemplate   string                     `json:"instructions_template"`
+		Apps                   *AppsMessages              `json:"apps"`
 		CollaborationModes     *CollaborationModeMessages `json:"collaboration_modes"`
 		MultiAgent             *MultiAgentMessages        `json:"multi_agent"`
 		TokenBudget            *ModelTokenBudgetConfig    `json:"token_budget"`
@@ -407,11 +677,13 @@ func (m *ModelMessages) UnmarshalJSON(data []byte) error {
 		ConfirmationPolicies   *ConfirmationPolicies      `json:"confirmation_policies"`
 		GuardianV2             *GuardianV2ModelConfig     `json:"guardian_v2"`
 		Tools                  *ToolMessages              `json:"tools"`
+		Plugins                *PluginMessages            `json:"plugins"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
 	m.InstructionsTemplate = raw.InstructionsTemplate
+	m.Apps = raw.Apps
 	m.CollaborationModes = raw.CollaborationModes
 	m.MultiAgent = raw.MultiAgent
 	m.TokenBudget = raw.TokenBudget
@@ -423,6 +695,7 @@ func (m *ModelMessages) UnmarshalJSON(data []byte) error {
 	m.ConfirmationPolicies = raw.ConfirmationPolicies
 	m.GuardianV2 = raw.GuardianV2
 	m.Tools = raw.Tools
+	m.Plugins = raw.Plugins
 	return nil
 }
 
@@ -484,6 +757,13 @@ func (m *ModelInfo) UsableContextWindow() (int64, bool) {
 	return m.usableContextWindow()
 }
 
+// ResolvedContextWindow is the exported form of resolvedContextWindow for
+// callers outside the catalog (Rust ModelInfo::resolved_context_window, the
+// skill catalog budget's window in #44202).
+func (m *ModelInfo) ResolvedContextWindow() (int64, bool) {
+	return m.resolvedContextWindow()
+}
+
 type TruncationPolicy struct {
 	Mode  string `json:"mode"`
 	Limit int64  `json:"limit"`
@@ -505,6 +785,71 @@ const (
 // A non-nil value with an empty Cyber list is distinct from missing metadata.
 type ModelAccessPrograms struct {
 	Cyber []CyberAccessProgram `json:"cyber"`
+}
+
+// SavedDaybreakChoice is the user's saved Daybreak preference resolved against
+// the selected model's advertised programs (Rust #59192).
+type SavedDaybreakChoice int
+
+const (
+	SavedDaybreakChoiceUnset SavedDaybreakChoice = iota
+	SavedDaybreakChoiceOn
+	SavedDaybreakChoiceOff
+)
+
+// SavedDaybreakChoiceFrom converts a saved optional preference into the
+// three-state choice Rust carries.
+func SavedDaybreakChoiceFrom(enabled *bool) SavedDaybreakChoice {
+	if enabled == nil {
+		return SavedDaybreakChoiceUnset
+	}
+	if *enabled {
+		return SavedDaybreakChoiceOn
+	}
+	return SavedDaybreakChoiceOff
+}
+
+// Daybreak selects the preferred advertised Daybreak program, blue before red.
+func (m *ModelAccessPrograms) Daybreak() *CyberAccessProgram {
+	if m == nil {
+		return nil
+	}
+	for _, want := range []CyberAccessProgram{CyberAccessProgramDaybreakBlue, CyberAccessProgramDaybreakRed} {
+		for i := range m.Cyber {
+			if m.Cyber[i] == want {
+				program := m.Cyber[i]
+				return &program
+			}
+		}
+	}
+	return nil
+}
+
+// Standard selects the advertised standard program.
+func (m *ModelAccessPrograms) Standard() *CyberAccessProgram {
+	if m == nil {
+		return nil
+	}
+	for i := range m.Cyber {
+		if m.Cyber[i] == CyberAccessProgramStandard {
+			program := m.Cyber[i]
+			return &program
+		}
+	}
+	return nil
+}
+
+// SelectSaved returns only an advertised program for explicit saved intent.
+// Unset and unsupported choices stay omitted, including On without Daybreak.
+func (m *ModelAccessPrograms) SelectSaved(choice SavedDaybreakChoice) *CyberAccessProgram {
+	switch choice {
+	case SavedDaybreakChoiceOn:
+		return m.Daybreak()
+	case SavedDaybreakChoiceOff:
+		return m.Standard()
+	default:
+		return nil
+	}
 }
 
 // UnmarshalJSON ignores unknown cyber program names so a newer server catalog
@@ -542,7 +887,13 @@ type ModelInfo struct {
 	Priority                 int      `json:"priority"`
 	AdditionalSpeedTiers     []string `json:"additional_speed_tiers"`
 	ServiceTiers             []string `json:"service_tiers"`
-	DefaultServiceTier       string   `json:"default_service_tier"`
+	// ServiceTierDefinitions keeps the catalog's tier display metadata. Rust's
+	// ModelInfo.service_tiers is a Vec<ModelServiceTier>; ServiceTiers above is
+	// the ordered ID list request support checks consume, while this field
+	// carries the names and descriptions `model/list` and the TUI commands
+	// report (#50472).
+	ServiceTierDefinitions []ModelServiceTier `json:"-"`
+	DefaultServiceTier     string             `json:"default_service_tier"`
 	// AvailableAccessPrograms is nil when the catalog does not provide
 	// access-program metadata (Rust #44893).
 	AvailableAccessPrograms        *ModelAccessPrograms `json:"available_access_programs,omitempty"`
@@ -555,15 +906,18 @@ type ModelInfo struct {
 	// SupportsReasoningSummaries mirrors Rust ModelInfo.supports_reasoning_summary_parameter
 	// (serde default_true: absent means true). The legacy Go wire name
 	// supports_reasoning_summaries is still accepted on parse.
-	SupportsReasoningSummaries bool             `json:"supports_reasoning_summary_parameter"`
-	DefaultReasoningSummary    string           `json:"default_reasoning_summary"`
-	SupportVerbosity           bool             `json:"support_verbosity"`
-	DefaultVerbosity           string           `json:"default_verbosity"`
-	WebSearchToolType          string           `json:"web_search_tool_type"`
-	TruncationPolicy           TruncationPolicy `json:"truncation_policy"`
-	SupportsParallelToolCalls  bool             `json:"supports_parallel_tool_calls"`
-	ToolMode                   string           `json:"tool_mode"`
-	MultiAgentVersion          string           `json:"multi_agent_version"`
+	SupportsReasoningSummaries bool   `json:"supports_reasoning_summary_parameter"`
+	DefaultReasoningSummary    string `json:"default_reasoning_summary"`
+	SupportVerbosity           bool   `json:"support_verbosity"`
+	DefaultVerbosity           string `json:"default_verbosity"`
+	WebSearchToolType          string `json:"web_search_tool_type"`
+	// WebSearchProvider is the provider preference selected by the resolved
+	// model catalog entry (Rust #59033).
+	WebSearchProvider         *string          `json:"web_search_provider,omitempty"`
+	TruncationPolicy          TruncationPolicy `json:"truncation_policy"`
+	SupportsParallelToolCalls bool             `json:"supports_parallel_tool_calls"`
+	ToolMode                  string           `json:"tool_mode"`
+	MultiAgentVersion         string           `json:"multi_agent_version"`
 	// MultiAgentReasoningEffort mirrors Rust ModelInfo.multi_agent_reasoning_effort
 	// (the reasoning effort used for multi-agent work when the user selects Ultra).
 	MultiAgentReasoningEffort     *string  `json:"multi_agent_reasoning_effort,omitempty"`
@@ -628,6 +982,24 @@ type GuardianModelPolicy struct {
 	MCP         *GuardianReviewMode `json:"mcp,omitempty"`
 	Network     *GuardianReviewMode `json:"network,omitempty"`
 	Permissions *GuardianReviewMode `json:"permissions,omitempty"`
+	// InitialCUACall overrides whether the first computer-use call may skip the
+	// synchronous Guardian wait (Rust #41666). Omission keeps the allowance for
+	// adaptive computer use.
+	InitialCUACall *bool `json:"initial_cua_call,omitempty"`
+}
+
+// AllowsInitialCUACall mirrors Rust
+// `GuardianModelPolicy::allows_initial_cua_call`: an explicit catalog value
+// wins, and an omitted value retains the allowance only while computer use is
+// adaptive.
+func (p *GuardianModelPolicy) AllowsInitialCUACall() bool {
+	if p == nil {
+		return false
+	}
+	if p.InitialCUACall != nil {
+		return *p.InitialCUACall
+	}
+	return p.ComputerUse != nil && *p.ComputerUse == GuardianReviewModeAdaptive
 }
 
 // GuardianScope identifies an approval category understood by the model-owned
@@ -641,6 +1013,9 @@ const (
 	GuardianScopeMCP         GuardianScope = "mcp"
 	GuardianScopeNetwork     GuardianScope = "network"
 	GuardianScopePermissions GuardianScope = "permissions"
+	// GuardianScopeNativeTool covers opted-in function calls reviewed before
+	// dispatch. It is always synchronous and has no catalog field (Rust #57433).
+	GuardianScopeNativeTool GuardianScope = "native_tool"
 )
 
 // ReviewMode resolves the model-provided Guardian mode for a scope. An omitted
@@ -648,6 +1023,11 @@ const (
 func (p *GuardianModelPolicy) ReviewMode(scope GuardianScope) GuardianReviewMode {
 	if p == nil {
 		return GuardianReviewModeDisabled
+	}
+	if scope == GuardianScopeNativeTool {
+		// Rust GuardianModelPolicy::review_mode: native tool calls are always
+		// reviewed synchronously, independent of the catalog's other scopes.
+		return GuardianReviewModeSynchronous
 	}
 	var mode *GuardianReviewMode
 	switch scope {
@@ -689,6 +1069,16 @@ func (m *ModelInfo) ComputerUseReviewRequired() bool {
 		return *mode != GuardianReviewModeDisabled
 	}
 	return m != nil && m.NodeReplAutoReviewRequired
+}
+
+// AllowsInitialCUACall reports whether the first computer-use call may proceed
+// without waiting for Guardian review (Rust ModelInfo's Guardian policy,
+// #41666).
+func (m *ModelInfo) AllowsInitialCUACall() bool {
+	if m == nil {
+		return false
+	}
+	return m.Guardian.AllowsInitialCUACall()
 }
 
 // ModelInfoUpgrade carries the replacement model and informational retirement
@@ -762,6 +1152,7 @@ func (m *ModelInfo) UnmarshalJSON(data []byte) error {
 		SupportVerbosity                  bool                  `json:"support_verbosity"`
 		DefaultVerbosity                  any                   `json:"default_verbosity"`
 		WebSearchToolType                 string                `json:"web_search_tool_type"`
+		WebSearchProvider                 *string               `json:"web_search_provider"`
 		TruncationPolicy                  rawTruncationPolicy   `json:"truncation_policy"`
 		SupportsParallelToolCalls         bool                  `json:"supports_parallel_tool_calls"`
 		ToolMode                          any                   `json:"tool_mode"`
@@ -790,6 +1181,7 @@ func (m *ModelInfo) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
+	serviceTierDefinitions := serviceTierDefinitionsFromJSON(raw.ServiceTiers)
 	*m = ModelInfo{
 		Slug:                           raw.Slug,
 		DisplayName:                    raw.DisplayName,
@@ -800,7 +1192,8 @@ func (m *ModelInfo) UnmarshalJSON(data []byte) error {
 		SupportedInAPI:                 raw.SupportedInAPI,
 		Priority:                       raw.Priority,
 		AdditionalSpeedTiers:           cloneStrings(raw.AdditionalSpeedTiers),
-		ServiceTiers:                   serviceTierIDsFromJSON(raw.ServiceTiers),
+		ServiceTiers:                   serviceTierIDs(serviceTierDefinitions),
+		ServiceTierDefinitions:         serviceTierDefinitions,
 		DefaultServiceTier:             stringFromJSONValue(raw.DefaultServiceTier),
 		AvailableAccessPrograms:        raw.AvailableAccessPrograms,
 		BaseInstructions:               raw.BaseInstructions,
@@ -814,6 +1207,7 @@ func (m *ModelInfo) UnmarshalJSON(data []byte) error {
 		SupportVerbosity:               raw.SupportVerbosity,
 		DefaultVerbosity:               stringFromJSONValue(raw.DefaultVerbosity),
 		WebSearchToolType:              raw.WebSearchToolType,
+		WebSearchProvider:              raw.WebSearchProvider,
 		TruncationPolicy:               TruncationPolicy(raw.TruncationPolicy),
 		SupportsParallelToolCalls:      raw.SupportsParallelToolCalls,
 		ToolMode:                       knownToolMode(stringFromJSONValue(raw.ToolMode)),
@@ -866,6 +1260,13 @@ type ModelPreset struct {
 	SupportedReasoningLevels []string
 	MultiAgentVersion        string
 	ServiceTiers             []string
+	// ServiceTierDefinitions carries the catalog's tier display metadata so the
+	// TUI can name and describe each slash command from the catalog instead of
+	// the raw ID (Rust #50472).
+	ServiceTierDefinitions []ModelServiceTier
+	// DefaultServiceTier is the catalog's implicit tier for the model (Rust
+	// ModelPreset.default_service_tier).
+	DefaultServiceTier string
 	// AvailableAccessPrograms is the model's catalog-advertised cyber program
 	// list (Rust ModelInfo.available_access_programs), used by the TUI to choose
 	// standard vs Daybreak per turn.
@@ -888,9 +1289,36 @@ type ModelsManagerConfig struct {
 	ModelCatalog                    *ModelsResponse
 }
 
+// ModelOrigin mirror's Rust codex_models_manager::ModelOrigin (#57770): where an
+// effective catalog entry came from. A bundled entry does not establish that a
+// custom gateway offers that model.
+type ModelOrigin string
+
+const (
+	// ModelOriginBundled is a model that ships with the binary.
+	ModelOriginBundled ModelOrigin = "bundled"
+	// ModelOriginProvider is a model the provider's catalog advertised.
+	ModelOriginProvider ModelOrigin = "provider"
+	// ModelOriginExplicitConfig is a model the configuration supplied.
+	ModelOriginExplicitConfig ModelOrigin = "explicit_config"
+	// ModelOriginSynthetic is generic metadata synthesized because no catalog
+	// entry matched the requested slug (Rust #58361 ModelOrigin::Synthetic).
+	ModelOriginSynthetic ModelOrigin = "synthetic"
+)
+
+// CatalogModel pairs model metadata with the source of that metadata, captured
+// from one catalog snapshot (Rust CatalogModel).
+type CatalogModel struct {
+	Model  ModelInfo
+	Origin ModelOrigin
+}
+
 type RefreshStrategy string
 
 const (
+	// RefreshInMemory mirrors Rust RefreshStrategy::InMemory (#57789): use the
+	// current in-memory catalog, loading no disk cache and never fetching.
+	RefreshInMemory         RefreshStrategy = "in_memory"
 	RefreshOnline           RefreshStrategy = "online"
 	RefreshOffline          RefreshStrategy = "offline"
 	RefreshOnlineIfUncached RefreshStrategy = "online_if_uncached"
@@ -899,9 +1327,16 @@ const (
 type ModelsManager interface {
 	ListModels(strategy RefreshStrategy) []ModelPreset
 	RawModelCatalog(strategy RefreshStrategy) ModelsResponse
+	// ModelCatalogWithOrigins mirrors Rust model_catalog_with_origins: the
+	// effective catalog with each entry's source (#57770).
+	ModelCatalogWithOrigins(strategy RefreshStrategy) []CatalogModel
 	GetRemoteModels() []ModelInfo
 	GetDefaultModel(model string, allowProviderModelFallback bool, strategy RefreshStrategy) string
 	GetModelInfo(model string, config *ModelsManagerConfig) ModelInfo
+	// GetCatalogModel resolves metadata together with its local catalog origin
+	// (Rust #58361). Origin survives config overrides and runtime snapshots,
+	// unlike the serialized model metadata it accompanies.
+	GetCatalogModel(model string, config *ModelsManagerConfig) CatalogModel
 	RefreshIfNewETag(etag string)
 	// RefreshAfterAuthChange is Rust ModelsManager::refresh_after_auth_change
 	// (#46508): a best-effort catalog refresh when the in-memory catalog belongs
@@ -915,10 +1350,30 @@ type ModelsManager interface {
 
 type StaticModelsManager struct {
 	remoteModels []ModelInfo
+	origin       ModelOrigin
 }
 
+// NewStaticModelsManager builds a catalog whose entries are bundled models.
 func NewStaticModelsManager(modelCatalog ModelsResponse) *StaticModelsManager {
-	return &StaticModelsManager{remoteModels: cloneModelInfos(modelCatalog.Models)}
+	return NewStaticModelsManagerWithOrigin(modelCatalog, ModelOriginBundled)
+}
+
+// NewStaticModelsManagerWithOrigin builds a catalog whose entries all carry the
+// supplied source (Rust StaticModelsManager::new's `origin`).
+func NewStaticModelsManagerWithOrigin(modelCatalog ModelsResponse, origin ModelOrigin) *StaticModelsManager {
+	if origin == "" {
+		origin = ModelOriginBundled
+	}
+	return &StaticModelsManager{remoteModels: cloneModelInfos(modelCatalog.Models), origin: origin}
+}
+
+func (m *StaticModelsManager) ModelCatalogWithOrigins(_ RefreshStrategy) []CatalogModel {
+	models := m.GetRemoteModels()
+	catalog := make([]CatalogModel, 0, len(models))
+	for _, info := range models {
+		catalog = append(catalog, CatalogModel{Model: info, Origin: m.origin})
+	}
+	return catalog
 }
 
 func (m *StaticModelsManager) ListModels(strategy RefreshStrategy) []ModelPreset {
@@ -948,7 +1403,11 @@ func (m *StaticModelsManager) GetDefaultModel(model string, allowProviderModelFa
 }
 
 func (m *StaticModelsManager) GetModelInfo(model string, config *ModelsManagerConfig) ModelInfo {
-	return ConstructModelInfoFromCandidates(model, m.GetRemoteModels(), config)
+	return m.GetCatalogModel(model, config).Model
+}
+
+func (m *StaticModelsManager) GetCatalogModel(model string, config *ModelsManagerConfig) CatalogModel {
+	return ConstructCatalogModelFromCandidates(model, m.GetRemoteModels(), m.origin, config)
 }
 
 func (m *StaticModelsManager) RefreshIfNewETag(_ string) {}
@@ -963,7 +1422,25 @@ func BundledModelsResponse() ModelsResponse {
 	if catalog, err := loadBundledModelsResponse(); err == nil && len(catalog.Models) > 0 {
 		return catalog
 	}
+	if catalog, err := loadEmbeddedModelsResponse(); err == nil && len(catalog.Models) > 0 {
+		return catalog
+	}
 	return fallbackBundledModelsResponse()
+}
+
+// BundledModelsCatalogJSON returns the raw bundled catalog, the bytes Rust's
+// `debug models` prints for `bundled_models_response()`.
+func BundledModelsCatalogJSON() []byte {
+	return bundledModelsCatalogJSON
+}
+
+// loadEmbeddedModelsResponse parses the catalog compiled into the binary.
+func loadEmbeddedModelsResponse() (ModelsResponse, error) {
+	var catalog ModelsResponse
+	if err := json.Unmarshal(bundledModelsCatalogJSON, &catalog); err != nil {
+		return ModelsResponse{}, err
+	}
+	return catalog, nil
 }
 
 // LoadModelsResponseFromFile mirrors Rust's load_catalog_json for the
@@ -1036,6 +1513,17 @@ func fallbackBundledModelsResponse() ModelsResponse {
 				InputModalities: []string{"text", "image"}, SupportsParallelToolCalls: true,
 			},
 			{
+				Slug: "gpt-6.1-terra", DisplayName: "GPT-6.1 Terra", Description: "GPT-6.1 Terra Codex model.",
+				Visibility: VisibilityList, SupportedInAPI: true, Priority: 7, BaseInstructions: BaseInstructions,
+				ToolMode: ToolModeCodeModeOnly, MultiAgentVersion: "v2", DefaultReasoningLevel: "low",
+				SupportedReasoningLevels: []string{"low", "medium", "high", "xhigh", "max", "ultra"},
+				ServiceTiers:             []string{"priority"},
+				SupportVerbosity:         true, DefaultVerbosity: "low", WebSearchToolType: "text_and_image",
+				TruncationPolicy: TruncationPolicy{Mode: TruncationModeTokens, Limit: 10000}, SupportsImageDetailOriginal: true,
+				UseResponsesLite: true, DefaultReasoningSummary: "none", SupportsReasoningEffortUpdates: true,
+				ContextWindow: 500000, MaxContextWindow: 872000, EffectiveContextWindowPercent: 95,
+				InputModalities: []string{"text", "image"}, SupportsParallelToolCalls: true,
+			}, {
 				Slug: "gpt-6-sol", DisplayName: "GPT-6-Sol", Description: "Previous generation workhorse model.",
 				Visibility: VisibilityList, SupportedInAPI: true, Priority: 3, BaseInstructions: BaseInstructions,
 				ToolMode: ToolModeCodeModeOnly, MultiAgentVersion: "v2", DefaultReasoningLevel: "medium",
@@ -1115,31 +1603,6 @@ func fallbackBundledModelsResponse() ModelsResponse {
 				SupportsParallelToolCalls:      true,
 			},
 			{
-				Slug: "gpt-5.2", DisplayName: "GPT-5.2", Description: "Optimized for professional work and long-running agents.",
-				Visibility: VisibilityList, SupportedInAPI: true, Priority: 29, BaseInstructions: BaseInstructions,
-				DefaultReasoningLevel: "medium", SupportedReasoningLevels: []string{"low", "medium", "high", "xhigh"},
-				ContextWindow: 272000, MaxContextWindow: 272000, EffectiveContextWindowPercent: 95,
-				InputModalities: []string{"text", "image"}, SupportsParallelToolCalls: true,
-			},
-			{
-				Slug:                           "gpt-5.4-mini",
-				DisplayName:                    "GPT-5.4-Mini",
-				Description:                    "Small, fast, and cost-efficient model for simpler coding tasks.",
-				Visibility:                     VisibilityHide,
-				SupportedInAPI:                 true,
-				Priority:                       23,
-				BaseInstructions:               BaseInstructions,
-				IncludeSkillsUsageInstructions: true,
-				DefaultReasoningLevel:          "medium",
-				SupportedReasoningLevels:       []string{"low", "medium", "high", "xhigh"},
-				TruncationPolicy:               TruncationPolicy{Mode: TruncationModeBytes, Limit: 10000},
-				ContextWindow:                  272000,
-				MaxContextWindow:               272000,
-				EffectiveContextWindowPercent:  95,
-				InputModalities:                []string{"text", "image"},
-				SupportsParallelToolCalls:      true,
-			},
-			{
 				Slug:                          "codex-auto-review",
 				DisplayName:                   "Codex Auto Review",
 				Description:                   "Automatic approval review model for Codex.",
@@ -1169,7 +1632,38 @@ func fallbackBundledModelsResponse() ModelsResponse {
 	// (catalog.go:712/714). Stamp the catalog's values on so the same field
 	// cannot read false here and true on the models.json path.
 	applyBundledCatalogBooleans(&response)
+	// Rust #47397 moves the bundled GPT-6, GPT-5.6, GPT-5.5 and auto-review
+	// catalog entries from `unified_exec` to `shell_command`; the offline
+	// fallback mirrors the bundled catalog so both paths report the same
+	// shell type.
+	for index := range response.Models {
+		if bundledShellCommandSlugs[response.Models[index].Slug] {
+			response.Models[index].ShellType = "shell_command"
+		}
+	}
+	// Every bundled Codex model advertises the freeform apply_patch tool, as in
+	// Rust models-manager/models.json. The fallback catalog is also used when
+	// that JSON is not installed, so it must preserve the model-owned tool
+	// surface (Rust #56284 catalog-dependent tool declarations).
+	for index := range response.Models {
+		if strings.TrimSpace(response.Models[index].ApplyPatchToolType) == "" {
+			response.Models[index].ApplyPatchToolType = "freeform"
+		}
+	}
 	return response
+}
+
+// bundledShellCommandSlugs are the bundled catalog entries Rust #47397 moved to
+// the `shell_command` shell type.
+var bundledShellCommandSlugs = map[string]bool{
+	"gpt-6-astra":       true,
+	"gpt-6-sol":         true,
+	"gpt-6-luna":        true,
+	"gpt-5.6-sol":       true,
+	"gpt-5.6-terra":     true,
+	"gpt-5.6-luna":      true,
+	"gpt-5.5":           true,
+	"codex-auto-review": true,
 }
 
 // applyBundledCatalogBooleans fills the two serde-default-true booleans
@@ -1177,9 +1671,10 @@ func fallbackBundledModelsResponse() ModelsResponse {
 // catalog with the values codex-rs/models-manager/models.json @ b17c74cfd5
 // carries: supports_reasoning_summary_parameter is true for every bundled
 // entry, while include_apps_usage_instructions is on only for the 5.6 family
-// and gpt-5.5. Slugs that catalog no longer lists (the legacy gpt-5.2 /
-// gpt-5.4-mini fallbacks) keep Rust's model_info_from_slug descriptor, i.e.
-// reasoning summaries on and no apps guidance (openai_models.rs:1072-1075).
+// and gpt-5.5. Slugs that catalog no longer lists (including retired saved
+// selections such as gpt-5.2 or gpt-5.4-mini, Rust #44250) keep Rust's
+// model_info_from_slug descriptor, i.e. reasoning summaries on and no apps
+// guidance (openai_models.rs:1072-1075).
 func applyBundledCatalogBooleans(response *ModelsResponse) {
 	appsUsageInstructions := map[string]bool{
 		"gpt-5.6-sol":   true,
@@ -1207,12 +1702,13 @@ func AmazonBedrockModelCatalog() ModelsResponse {
 			// supplied the GPT-6 Sol/Luna entries that predate it.
 			bedrockModel(bundled, "gpt-6.1-sol", AmazonBedrockGPT61SolModelID, "GPT-6.1 Sol", 0),
 			bedrockModel(bundled, "gpt-6-astra", AmazonBedrockGPT6AstraModelID, "GPT-6-Astra", 1),
-			bedrockModel(bundled, "gpt-6-sol", AmazonBedrockGPT6SolModelID, "GPT-6 Sol", 2),
-			bedrockModel(bundled, "gpt-6-luna", AmazonBedrockGPT6LunaModelID, "GPT-6 Luna", 3),
-			bedrockModel(bundled, "gpt-5.6-sol", AmazonBedrockGPT56SolModelID, "GPT-5.6 Sol", 4),
-			bedrockModel(bundled, "gpt-5.6-terra", AmazonBedrockGPT56TerraModelID, "GPT-5.6 Terra", 5),
-			bedrockModel(bundled, "gpt-5.6-luna", AmazonBedrockGPT56LunaModelID, "GPT-5.6 Luna", 6),
-			gpt5BedrockModel(bundled, "gpt-5.5", AmazonBedrockGPT55ModelID, "GPT-5.5", 7),
+			bedrockModel(bundled, "gpt-6.1-terra", AmazonBedrockGPT61TerraModelID, "GPT-6.1 Terra", 2),
+			bedrockModel(bundled, "gpt-6-sol", AmazonBedrockGPT6SolModelID, "GPT-6 Sol", 3),
+			bedrockModel(bundled, "gpt-6-luna", AmazonBedrockGPT6LunaModelID, "GPT-6 Luna", 4),
+			bedrockModel(bundled, "gpt-5.6-sol", AmazonBedrockGPT56SolModelID, "GPT-5.6 Sol", 5),
+			bedrockModel(bundled, "gpt-5.6-terra", AmazonBedrockGPT56TerraModelID, "GPT-5.6 Terra", 6),
+			bedrockModel(bundled, "gpt-5.6-luna", AmazonBedrockGPT56LunaModelID, "GPT-5.6 Luna", 7),
+			gpt5BedrockModel(bundled, "gpt-5.5", AmazonBedrockGPT55ModelID, "GPT-5.5", 8),
 		},
 	}, bedrockEndpointMantle)
 }
@@ -1303,6 +1799,7 @@ const (
 // a Bedrock Runtime variant.
 var bedrockRuntimeBaseSlugs = map[string]bool{
 	AmazonBedrockGPT61SolModelID:   true,
+	AmazonBedrockGPT61TerraModelID: true,
 	AmazonBedrockGPT6AstraModelID:  true,
 	AmazonBedrockGPT6SolModelID:    true,
 	AmazonBedrockGPT6LunaModelID:   true,
@@ -1338,6 +1835,7 @@ func normalizeBundledBedrockCatalog(catalog ModelsResponse, endpoint bedrockEndp
 		model := &catalog.Models[i]
 		model.AdditionalSpeedTiers = nil
 		model.ServiceTiers = nil
+		model.ServiceTierDefinitions = nil
 		model.DefaultServiceTier = ""
 		advertisesUltrafast := (endpoint == bedrockEndpointMantle &&
 			(model.Slug == AmazonBedrockGPT6AstraModelID || model.Slug == AmazonBedrockGPT61SolModelID)) ||
@@ -1348,6 +1846,7 @@ func normalizeBundledBedrockCatalog(catalog ModelsResponse, endpoint bedrockEndp
 					model.Slug == bedrockRuntimeUSSlugPrefix+AmazonBedrockGPT61SolModelID))
 		if advertisesUltrafast {
 			model.ServiceTiers = []string{bedrockUltrafastServiceTierID}
+			model.ServiceTierDefinitions = []ModelServiceTier{bedrockUltrafastServiceTierDefinition}
 		}
 	}
 	return normalizeBedrockCatalog(catalog)
@@ -1430,6 +1929,7 @@ func WithDefaultOnlyServiceTier(catalog ModelsResponse) ModelsResponse {
 	for i := range models {
 		models[i].AdditionalSpeedTiers = nil
 		models[i].ServiceTiers = nil
+		models[i].ServiceTierDefinitions = nil
 		models[i].DefaultServiceTier = ""
 	}
 	return ModelsResponse{Models: models}
@@ -1455,6 +1955,8 @@ func BuildAvailableModels(remoteModels []ModelInfo) []ModelPreset {
 			SupportedReasoningLevels: cloneStrings(model.SupportedReasoningLevels),
 			MultiAgentVersion:        model.MultiAgentVersion,
 			ServiceTiers:             cloneStrings(model.ServiceTiers),
+			ServiceTierDefinitions:   ServiceTierDefinitionsFor(&model),
+			DefaultServiceTier:       model.DefaultServiceTier,
 			AvailableAccessPrograms:  cloneModelAccessPrograms(model.AvailableAccessPrograms),
 		})
 	}
@@ -1601,24 +2103,111 @@ func reasoningLevelsFromJSON(values []json.RawMessage) []string {
 	return out
 }
 
-func serviceTierIDsFromJSON(values []json.RawMessage) []string {
-	out := make([]string, 0, len(values))
+// serviceTierDefinitionsFromJSON parses Rust's service_tiers array, which
+// accepts either bare IDs (legacy catalogs) or {id,name,description} objects
+// (#50472 keeps a custom catalog's tier metadata). Entries without an ID are
+// dropped, matching Rust's ModelServiceTier deserialization.
+func serviceTierDefinitionsFromJSON(values []json.RawMessage) []ModelServiceTier {
+	out := make([]ModelServiceTier, 0, len(values))
 	for _, value := range values {
+		var tier ModelServiceTier
 		var id string
 		if err := json.Unmarshal(value, &id); err == nil {
-			id = strings.TrimSpace(id)
+			tier.ID = strings.TrimSpace(id)
 		}
-		if id == "" {
-			var object map[string]any
+		if tier.ID == "" {
+			var object struct {
+				ID          any `json:"id"`
+				Name        any `json:"name"`
+				Description any `json:"description"`
+			}
 			if err := json.Unmarshal(value, &object); err == nil {
-				id = stringFromJSONValue(object["id"])
+				tier = ModelServiceTier{
+					ID:          stringFromJSONValue(object.ID),
+					Name:        stringFromJSONValue(object.Name),
+					Description: stringFromJSONValue(object.Description),
+				}
 			}
 		}
-		if id != "" {
+		if strings.TrimSpace(tier.ID) == "" {
+			continue
+		}
+		out = append(out, tier)
+	}
+	return out
+}
+
+func serviceTierIDs(definitions []ModelServiceTier) []string {
+	out := make([]string, 0, len(definitions))
+	for _, tier := range definitions {
+		if id := strings.TrimSpace(tier.ID); id != "" {
 			out = append(out, id)
 		}
 	}
 	return out
+}
+
+// bundledServiceTierDefinitions carries the display metadata the bundled
+// models-manager/models.json catalog gives each tier it advertises. The offline
+// fallback catalog builds its entries as literals, so it has to stamp these on
+// (Rust #50472 exposes them through model/list and the TUI slash commands).
+var bundledServiceTierDefinitions = map[string]ModelServiceTier{
+	"priority": {
+		ID:          "priority",
+		Name:        "Fast",
+		Description: "2x speed, increased usage",
+	},
+}
+
+// bedrockUltrafastServiceTierDefinition mirrors Rust
+// amazon_bedrock/catalog.rs normalize_bundled_bedrock_catalog (#50472).
+var bedrockUltrafastServiceTierDefinition = ModelServiceTier{
+	ID:          bedrockUltrafastServiceTierID,
+	Name:        "Ultrafast",
+	Description: "The fastest available responses for latency-sensitive work.",
+}
+
+// ServiceTierDefinitionsFor returns the display metadata for a model's
+// advertised service tiers in catalog order. Definitions the catalog supplied
+// win; IDs without one fall back to the bundled metadata, then to the ID itself
+// (Rust ModelInfo.service_tiers).
+func ServiceTierDefinitionsFor(info *ModelInfo) []ModelServiceTier {
+	if info == nil {
+		return nil
+	}
+	known := make(map[string]ModelServiceTier, len(info.ServiceTierDefinitions))
+	for _, tier := range info.ServiceTierDefinitions {
+		if id := strings.TrimSpace(tier.ID); id != "" {
+			known[id] = tier
+		}
+	}
+	if len(info.ServiceTiers) == 0 {
+		return cloneModelServiceTiers(info.ServiceTierDefinitions)
+	}
+	out := make([]ModelServiceTier, 0, len(info.ServiceTiers))
+	for _, id := range info.ServiceTiers {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if tier, ok := known[id]; ok {
+			out = append(out, tier)
+			continue
+		}
+		if tier, ok := bundledServiceTierDefinitions[id]; ok {
+			out = append(out, tier)
+			continue
+		}
+		out = append(out, ModelServiceTier{ID: id, Name: id, Description: id})
+	}
+	return out
+}
+
+func cloneModelServiceTiers(tiers []ModelServiceTier) []ModelServiceTier {
+	if tiers == nil {
+		return nil
+	}
+	return append([]ModelServiceTier(nil), tiers...)
 }
 
 func modelVisibleInCatalog(visibility string) bool {
@@ -1703,11 +2292,30 @@ func ServiceTierForRequest(info *ModelInfo, serviceTier string) string {
 	return serviceTier
 }
 
-// ServiceTierForConfiguredRequest mirrors Rust `get_service_tier` (#46230): a
-// configured `flex` tier is preserved even when fast mode is disabled or the
-// model catalog does not list it, while every other tier still requires fast
-// mode and catalog support.
-func ServiceTierForConfiguredRequest(info *ModelInfo, serviceTier string, fastModeEnabled bool) string {
+// ServiceTierForSelectedRequest resolves a selected thread service tier the way
+// Rust get_service_tier does (#55923): flex is always preserved, while other
+// tiers require catalog support. Provider-specific request filtering still
+// happens later in the model client.
+func ServiceTierForSelectedRequest(info *ModelInfo, serviceTier string) string {
+	serviceTier = normalizeServiceTierRequestValue(serviceTier)
+	if serviceTier == "" || serviceTier == ServiceTierDefaultRequestValue {
+		return ""
+	}
+	if serviceTier == ServiceTierFlexRequestValue {
+		return serviceTier
+	}
+	if !SupportsServiceTier(info, serviceTier) {
+		return ""
+	}
+	return serviceTier
+}
+
+// ServiceTierForConfiguredRequest mirrors Rust `get_service_tier`
+// (#46230/#51253): a configured `flex` tier is preserved even when its policy is
+// disabled or the model catalog does not list it, while every other tier
+// requires the policy that owns it (Fast mode for ordinary tiers, Ultra Fast
+// mode for `ultrafast`) and catalog support.
+func ServiceTierForConfiguredRequest(info *ModelInfo, serviceTier string, featureSettings map[string]bool) string {
 	value := normalizeServiceTierRequestValue(serviceTier)
 	if value == "" {
 		return ""
@@ -1715,7 +2323,7 @@ func ServiceTierForConfiguredRequest(info *ModelInfo, serviceTier string, fastMo
 	if value == ServiceTierFlexRequestValue {
 		return value
 	}
-	if !fastModeEnabled {
+	if !features.ServiceTierEnabled(featureSettings, value) {
 		return ""
 	}
 	return ServiceTierForRequest(info, value)
@@ -1725,6 +2333,12 @@ func ServiceTierForConfiguredRequest(info *ModelInfo, serviceTier string, fastMo
 // Rust #46230 preserves without fast mode or catalog support.
 func IsFlexServiceTier(serviceTier string) bool {
 	return normalizeServiceTierRequestValue(serviceTier) == ServiceTierFlexRequestValue
+}
+
+// NormalizeServiceTierRequestValue applies the wire-level aliases Rust uses
+// when it stores a selected tier (for example "fast" becomes "priority").
+func NormalizeServiceTierRequestValue(serviceTier string) string {
+	return normalizeServiceTierRequestValue(serviceTier)
 }
 
 func normalizeServiceTierRequestValue(serviceTier string) string {
@@ -1797,19 +2411,30 @@ func setInstructionsTemplate(model *ModelInfo, template string) {
 }
 
 func ConstructModelInfoFromCandidates(model string, candidates []ModelInfo, config *ModelsManagerConfig) ModelInfo {
+	return ConstructCatalogModelFromCandidates(model, candidates, ModelOriginBundled, config).Model
+}
+
+// ConstructCatalogModelFromCandidates resolves metadata and keeps the catalog
+// origin it was found in (Rust #58361 construct_model_info_from_candidates).
+// A slug with no catalog entry resolves to synthetic metadata.
+func ConstructCatalogModelFromCandidates(model string, candidates []ModelInfo, origin ModelOrigin, config *ModelsManagerConfig) CatalogModel {
 	remote, ok := findModelByLongestPrefix(model, candidates)
 	if !ok {
 		remote, ok = findModelByNamespacedSuffix(model, candidates)
 	}
 	var info ModelInfo
+	if origin == "" {
+		origin = ModelOriginBundled
+	}
 	if ok {
 		info = remote
 		info.Slug = model
 		info.UsedFallbackModelMetadata = false
 	} else {
 		info = ModelInfoFromSlug(model)
+		origin = ModelOriginSynthetic
 	}
-	return WithConfigOverrides(info, config)
+	return CatalogModel{Model: WithConfigOverrides(info, config), Origin: origin}
 }
 
 // ConstructModelInfoFromExactCandidate resolves metadata only for an exact
@@ -1817,8 +2442,18 @@ func ConstructModelInfoFromCandidates(model string, candidates []ModelInfo, conf
 // prefix and namespaced-suffix fallback would invent metadata from an
 // unrelated model.
 func ConstructModelInfoFromExactCandidate(model string, candidates []ModelInfo, config *ModelsManagerConfig) ModelInfo {
+	return ConstructCatalogModelFromExactCandidate(model, candidates, ModelOriginBundled, config).Model
+}
+
+// ConstructCatalogModelFromExactCandidate is ConstructCatalogModelFromCandidates
+// restricted to an exact catalog slug (Rust #49135), preserving the catalog
+// origin together with the resolved metadata.
+func ConstructCatalogModelFromExactCandidate(model string, candidates []ModelInfo, origin ModelOrigin, config *ModelsManagerConfig) CatalogModel {
 	var info ModelInfo
 	found := false
+	if origin == "" {
+		origin = ModelOriginBundled
+	}
 	for _, candidate := range candidates {
 		if candidate.Slug == model {
 			info = candidate
@@ -1830,8 +2465,9 @@ func ConstructModelInfoFromExactCandidate(model string, candidates []ModelInfo, 
 		info.UsedFallbackModelMetadata = false
 	} else {
 		info = ModelInfoFromSlug(model)
+		origin = ModelOriginSynthetic
 	}
-	return WithConfigOverrides(info, config)
+	return CatalogModel{Model: WithConfigOverrides(info, config), Origin: origin}
 }
 
 func mergeModelInfos(base []ModelInfo, updates []ModelInfo) []ModelInfo {
@@ -1924,6 +2560,7 @@ func cloneModelInfo(in ModelInfo) ModelInfo {
 	out.SupportedReasoningLevels = cloneStrings(out.SupportedReasoningLevels)
 	out.AdditionalSpeedTiers = cloneStrings(out.AdditionalSpeedTiers)
 	out.ServiceTiers = cloneStrings(out.ServiceTiers)
+	out.ServiceTierDefinitions = cloneModelServiceTiers(out.ServiceTierDefinitions)
 	out.InputModalities = cloneStrings(out.InputModalities)
 	if out.ModelMessages != nil {
 		messages := *out.ModelMessages
@@ -1963,6 +2600,9 @@ func cloneModelInfo(in ModelInfo) ModelInfo {
 			tools.MultiAgent = cloneMultiAgentToolMessages(tools.MultiAgent)
 			tools.McpResources = cloneMcpResourceToolMessages(tools.McpResources)
 			tools.CodeMode = cloneCodeModeToolMessages(tools.CodeMode)
+			tools.History = cloneHistoryToolMessages(tools.History)
+			tools.Notes = cloneNotesToolMessages(tools.Notes)
+			tools.ContextManagement = cloneContextManagementToolMessages(tools.ContextManagement)
 			messages.Tools = &tools
 		}
 		out.ModelMessages = &messages
@@ -1979,6 +2619,43 @@ func cloneToolMessage(in *ToolMessage) *ToolMessage {
 	out.Description = cloneStringPointer(in.Description)
 	out.Parameters = cloneStringPointer(in.Parameters)
 	return &out
+}
+
+func cloneHistoryToolMessages(in *HistoryToolMessages) *HistoryToolMessages {
+	if in == nil {
+		return nil
+	}
+	return &HistoryToolMessages{
+		NamespaceDescription: cloneStringPointer(in.NamespaceDescription),
+		ListWindows:          cloneToolMessage(in.ListWindows),
+		ListItems:            cloneToolMessage(in.ListItems),
+		ReadItem:             cloneToolMessage(in.ReadItem),
+		SearchContents:       cloneToolMessage(in.SearchContents),
+	}
+}
+
+func cloneNotesToolMessages(in *NotesToolMessages) *NotesToolMessages {
+	if in == nil {
+		return nil
+	}
+	return &NotesToolMessages{
+		NamespaceDescription: cloneStringPointer(in.NamespaceDescription),
+		ListFilesByPrefix:    cloneToolMessage(in.ListFilesByPrefix),
+		ReadFile:             cloneToolMessage(in.ReadFile),
+		SearchContents:       cloneToolMessage(in.SearchContents),
+		AppendToFile:         cloneToolMessage(in.AppendToFile),
+		WriteFile:            cloneToolMessage(in.WriteFile),
+	}
+}
+
+func cloneContextManagementToolMessages(in *ContextManagementToolMessages) *ContextManagementToolMessages {
+	if in == nil {
+		return nil
+	}
+	return &ContextManagementToolMessages{
+		NewContext:          cloneToolMessage(in.NewContext),
+		GetContextRemaining: cloneToolMessage(in.GetContextRemaining),
+	}
 }
 
 func cloneCodeModeToolMessages(in *CodeModeToolMessages) *CodeModeToolMessages {
@@ -2024,6 +2701,15 @@ func cloneMultiAgentToolMessages(in *MultiAgentToolMessages) *MultiAgentToolMess
 		WaitAgent:      cloneToolMessage(in.WaitAgent),
 		InterruptAgent: cloneToolMessage(in.InterruptAgent),
 		ListAgents:     cloneToolMessage(in.ListAgents),
+		CreateChannel:  cloneToolMessage(in.CreateChannel),
+		GetChannels:    cloneToolMessage(in.GetChannels),
+		ListThreads:    cloneToolMessage(in.ListThreads),
+		SearchPosts:    cloneToolMessage(in.SearchPosts),
+		ReadThread:     cloneToolMessage(in.ReadThread),
+		ReadPost:       cloneToolMessage(in.ReadPost),
+		Subscribe:      cloneToolMessage(in.Subscribe),
+		Unsubscribe:    cloneToolMessage(in.Unsubscribe),
+		Post:           cloneToolMessage(in.Post),
 	}
 }
 

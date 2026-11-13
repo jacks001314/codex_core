@@ -25,24 +25,34 @@ import (
 // stay isolated. A dead or unresponsive host is reaped and respawned on the
 // next connect.
 type GrpcProcessProvider struct {
-	program string
+	program     string
+	completions *completionWindow
 
-	mu          sync.Mutex
-	connection  *remoteConnection
-	process     *exec.Cmd
-	stdin       io.WriteCloser
-	stdout      io.ReadCloser
-	nextSession atomic.Uint64
-	warned      atomic.Bool
-	available   error
+	mu                 sync.Mutex
+	connection         *remoteConnection
+	grpcConn           *grpc.ClientConn
+	process            *exec.Cmd
+	stdin              io.WriteCloser
+	stdout             io.ReadCloser
+	nextSession        atomic.Uint64
+	nextCellGeneration atomic.Uint64
+	warned             atomic.Bool
+	available          error
 }
 
 func NewGrpcProcessProvider(program string) *GrpcProcessProvider {
-	provider := &GrpcProcessProvider{program: program}
+	provider := &GrpcProcessProvider{program: program, completions: newCompletionWindow()}
 	if stat, err := os.Stat(program); err != nil || !stat.Mode().IsRegular() {
 		provider.available = fmt.Errorf("failed to spawn code-mode host %s: host executable was not found", boundedHostProgram(program))
 	}
 	return provider
+}
+
+func (p *GrpcProcessProvider) completionWindow() *completionWindow {
+	if p == nil {
+		return nil
+	}
+	return p.completions
 }
 
 func (p *GrpcProcessProvider) Availability() error {
@@ -60,8 +70,20 @@ func (p *GrpcProcessProvider) TakeUnavailableWarning(effectiveToolMode string) s
 }
 
 func (p *GrpcProcessProvider) NewSession(delegate tool.CodeModeRemoteDelegate) tool.CodeModeRemoteSession {
+	return p.NewSessionWithOptions(delegate, tool.CodeModeSessionOptions{})
+}
+
+// NewSessionWithOptions honors the requested session options (Rust
+// CodeModeSessionProvider::create_session_with_options, #58125).
+func (p *GrpcProcessProvider) NewSessionWithOptions(delegate tool.CodeModeRemoteDelegate, options tool.CodeModeSessionOptions) tool.CodeModeRemoteSession {
 	value := p.nextSession.Add(1)
-	return &remoteSession{provider: p, delegate: delegate, id: SessionID(fmt.Sprintf("session-%d", value))}
+	return &remoteSession{provider: p, delegate: delegate, id: SessionID(fmt.Sprintf("session-%d", value)), options: sessionOptionsFromTool(options)}
+}
+
+// nextGeneration keeps a reloaded thread's replacement session from reusing
+// cell IDs owned by its previous session (Rust #57615).
+func (p *GrpcProcessProvider) nextGeneration() uint64 {
+	return p.nextCellGeneration.Add(1)
 }
 
 func (p *GrpcProcessProvider) Prewarm(ctx context.Context) error {
@@ -86,6 +108,7 @@ func (p *GrpcProcessProvider) connect(ctx context.Context) (*remoteConnection, e
 	if err != nil {
 		return nil, err
 	}
+	ensureGrpcZstdRegistered()
 	handshakeCtx, cancel := context.WithTimeout(ctx, localHostStartupTimeout)
 	defer cancel()
 	conn := newStdioConn(stdout, stdin)
@@ -128,6 +151,7 @@ func (p *GrpcProcessProvider) connect(ctx context.Context) (*remoteConnection, e
 		return nil, err
 	}
 	p.connection = connection
+	p.grpcConn = grpcConn
 	p.process = cmd
 	p.stdin = stdin
 	p.stdout = stdout
@@ -148,6 +172,10 @@ func (p *GrpcProcessProvider) stopLocked() error {
 	if p.connection != nil {
 		closeErr = p.connection.Close()
 		p.connection = nil
+	}
+	if p.grpcConn != nil {
+		_ = p.grpcConn.Close()
+		p.grpcConn = nil
 	}
 	if p.stdin != nil {
 		_ = p.stdin.Close()
@@ -170,7 +198,10 @@ func (*GrpcProcessProvider) sessionAdmissionRetries() int {
 }
 
 func spawnGrpcStdioProcess(program string) (io.WriteCloser, io.ReadCloser, *exec.Cmd, error) {
-	cmd := exec.Command(program)
+	// Rust's HostConnection::spawn always asks the host for the gRPC stdio
+	// transport (`--listen grpc+stdio://`); the host's default listens for the
+	// framed JSON protocol instead.
+	cmd := exec.Command(program, "--listen", "grpc+stdio://")
 	// Rust c4513cb982: remote helper processes must not inherit Codex launch
 	// context.
 	envutil.ScrubCommandEnv(cmd)

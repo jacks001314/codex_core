@@ -84,9 +84,18 @@ const (
 	ResponseAPIRetryable        ResponseAPIErrorKind = "retryable"
 	ResponseAPIRateLimit        ResponseAPIErrorKind = "rateLimit"
 	ResponseAPIInvalidRequest   ResponseAPIErrorKind = "invalidRequest"
+	ResponseAPIInvalidPrompt    ResponseAPIErrorKind = "invalidPrompt"
 	ResponseAPICyberPolicy      ResponseAPIErrorKind = "cyberPolicy"
 	ResponseAPIServerOverloaded ResponseAPIErrorKind = "serverOverloaded"
 	ResponseAPIFlexUnavailable  ResponseAPIErrorKind = "flexUnavailable"
+	// ResponseAPIPolicyCapacityUnavailable is a policy-restricted capacity
+	// failure (Rust #57452).
+	ResponseAPIPolicyCapacityUnavailable ResponseAPIErrorKind = "policyCapacityUnavailable"
+	ResponseAPIModelNotFound             ResponseAPIErrorKind = "modelNotFound"
+	// ResponseAPIInvalidAudioInput is the response-debug label for audio
+	// validation failures, which telemetry groups with invalid requests
+	// (Rust #58434).
+	ResponseAPIInvalidAudioInput ResponseAPIErrorKind = "invalidAudioInput"
 )
 
 type ResponseAPIError struct {
@@ -124,15 +133,20 @@ func TelemetryResponseAPIErrorMessage(err *ResponseAPIError) string {
 		return "retryable error"
 	case ResponseAPIRateLimit:
 		return "rate limit"
-	case ResponseAPIInvalidRequest:
+	case ResponseAPIInvalidRequest, ResponseAPIInvalidPrompt, ResponseAPIInvalidAudioInput:
 		return "invalid request"
 	case ResponseAPICyberPolicy:
 		return "cyber policy"
 	case ResponseAPIServerOverloaded:
 		return "server overloaded"
+	case ResponseAPIPolicyCapacityUnavailable:
+		return "policy-restricted capacity unavailable"
 	case ResponseAPIFlexUnavailable:
 		// Rust response-debug-context telemetry_api_error_message.
 		return "flex capacity unavailable"
+	case ResponseAPIModelNotFound:
+		// Rust response-debug-context telemetry_api_error_message.
+		return "model not found"
 	default:
 		return err.Message
 	}

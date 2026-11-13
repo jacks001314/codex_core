@@ -3,6 +3,7 @@
 package win
 
 import (
+	"bytes"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"codex_core/sandbox/windowssandbox"
 	json "github.com/goccy/go-json"
@@ -21,9 +23,10 @@ import (
 )
 
 const (
-	setupModeFull         setupMode = "full"
-	setupModeProvision    setupMode = "provision-only"
-	setupModeReadACLsOnly setupMode = "read-acls-only"
+	setupModeFull                 setupMode = "full"
+	setupModeInteractiveProvision setupMode = "interactive-provision"
+	setupModeProvision            setupMode = "provision-only"
+	setupModeReadACLsOnly         setupMode = "read-acls-only"
 
 	createNoWindow       = 0x08000000
 	setupFileDeleteChild = 0x00000040
@@ -45,13 +48,20 @@ type setupPayload struct {
 	AllowLocalBinding bool            `json:"allow_local_binding,omitempty"`
 	Otel              json.RawMessage `json:"otel,omitempty"`
 	RealUser          string          `json:"real_user"`
+	UserProfile       string          `json:"user_profile,omitempty"`
 	Mode              setupMode       `json:"mode,omitempty"`
 	RefreshOnly       bool            `json:"refresh_only,omitempty"`
+	Runtime           string          `json:"runtime,omitempty"`
+}
+
+func (p *setupPayload) sandboxUsernames() []string {
+	return []string{p.OfflineUsername, p.OnlineUsername}
 }
 
 func run(args []string, stdout io.Writer, stderr io.Writer) error {
 	payload, err := payloadFromArgs(args)
 	if err != nil {
+		logTopLevelSetupError(err)
 		return err
 	}
 	sbzDir := windowssandbox.SandboxDir(payload.CodexHome)
@@ -61,7 +71,7 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 			"failed to create sandbox dir %s: %v", sbzDir, err,
 		)
 	}
-	log, err := openSetupLog(sbzDir)
+	log, err := openSetupLog(sbzDir, payload.Mode)
 	if err != nil {
 		return setupFailuref(
 			windowssandbox.SetupErrorHelperLogFailed,
@@ -69,17 +79,23 @@ func run(args []string, stdout io.Writer, stderr io.Writer) error {
 		)
 	}
 	defer log.Close()
+	if payload.Mode == setupModeProvision {
+		restoreSetupLog := windowssandbox.RetainSetupLog(log)
+		defer restoreSetupLog()
+		defer windowssandbox.ReleaseSetupLog()
+	}
 
 	err = runSetupPayload(payload, log, sbzDir)
 	if err != nil {
-		setupLogLine(log, fmt.Sprintf("setup error: %v", err))
-		_ = windowssandbox.LogNoteInDir(sbzDir, fmt.Sprintf("setup error: %v", err))
+		detail := "setup error: " + windowssandbox.SetupErrorChain(err)
+		setupLogLine(log, detail)
+		_ = windowssandbox.LogNoteInDir(sbzDir, detail)
 		failure := extractSetupFailure(err)
 		if failure == nil {
-			failure = windowssandbox.NewSetupFailure(windowssandbox.SetupErrorHelperUnknownError, err.Error())
+			failure = windowssandbox.NewSetupFailure(windowssandbox.SetupErrorHelperUnknownError, windowssandbox.SetupErrorChain(err))
 		}
 		report := &windowssandbox.SetupErrorReport{Code: failure.Code, Message: failure.Message}
-		if writeErr := windowssandbox.WriteSetupErrorReport(payload.CodexHome, report); writeErr != nil {
+		if writeErr := writeSetupErrorReport(payload, report); writeErr != nil {
 			setupLogLine(log, fmt.Sprintf("setup error report write failed: %v", writeErr))
 			_ = windowssandbox.LogNoteInDir(sbzDir, fmt.Sprintf("setup error report write failed: %v", writeErr))
 		}
@@ -123,9 +139,14 @@ func payloadFromArgs(args []string) (*setupPayload, error) {
 		payload.Mode = setupModeFull
 	}
 	switch payload.Mode {
-	case setupModeFull, setupModeProvision, setupModeReadACLsOnly:
+	case setupModeFull, setupModeInteractiveProvision, setupModeProvision, setupModeReadACLsOnly:
 	default:
 		return nil, setupFailuref(windowssandbox.SetupErrorHelperRequestArgsFailed, "unknown setup mode: %s", payload.Mode)
+	}
+	switch payload.Runtime {
+	case "", string(windowssandbox.SetupRuntimeLegacy), string(windowssandbox.SetupRuntimeRegistered):
+	default:
+		return nil, setupFailuref(windowssandbox.SetupErrorHelperRequestArgsFailed, "unknown setup runtime: %s", payload.Runtime)
 	}
 	if strings.TrimSpace(payload.CodexHome) == "" {
 		return nil, setupFailuref(windowssandbox.SetupErrorHelperRequestArgsFailed, "codex_home is required")
@@ -133,11 +154,47 @@ func payloadFromArgs(args []string) (*setupPayload, error) {
 	return &payload, nil
 }
 
+// logTopLevelSetupError mirrors Rust's setup_main main(): an unparsed payload
+// defaults to the ProvisionOnly fresh log, so a malformed request can never
+// append to an existing caller-controlled daily log (Rust #42342).
+func logTopLevelSetupError(err error) {
+	codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME"))
+	if codexHome == "" {
+		return
+	}
+	sbxDir := windowssandbox.SandboxDir(codexHome)
+	if mkErr := os.MkdirAll(sbxDir, 0o700); mkErr != nil {
+		return
+	}
+	log, openErr := windowssandbox.OpenProvisioningSetupLog(sbxDir)
+	if openErr != nil {
+		return
+	}
+	defer log.Close()
+	setupLogLine(log, "top-level error: "+windowssandbox.SetupErrorChain(err))
+}
+
 func runSetupPayload(payload *setupPayload, log io.Writer, sbxDir string) error {
+	if err := validateSetupRuntimeForProvisioning(payload); err != nil {
+		return err
+	}
+	if setupModeProvisionsAccounts(payload.Mode, payload.RefreshOnly) {
+		lock, err := windowssandbox.AcquireSandboxSetupLock(windowssandbox.InfiniteSandboxSetupLockTimeout)
+		if err != nil {
+			return setupFailuref(windowssandbox.SetupErrorHelperSandboxLockFailed, "acquire sandbox setup lock: %s", windowssandbox.SetupErrorChain(err))
+		}
+		defer lock.Release()
+	}
 	writesSetupMarker := !payload.RefreshOnly && payload.Mode != setupModeReadACLsOnly
+	var marker *os.File
 	if writesSetupMarker {
-		if err := prepareSetupMarker(payload.CodexHome, payload.RealUser); err != nil {
+		prepared, err := prepareSetupMarker(payload)
+		if err != nil {
 			return err
+		}
+		marker = prepared
+		if marker != nil {
+			defer marker.Close()
 		}
 	}
 	switch payload.Mode {
@@ -145,7 +202,7 @@ func runSetupPayload(payload *setupPayload, log io.Writer, sbxDir string) error 
 		if err := runReadACLOnly(payload, log); err != nil {
 			return err
 		}
-	case setupModeProvision:
+	case setupModeProvision, setupModeInteractiveProvision:
 		if err := runProvisionOnly(payload, log, sbxDir); err != nil {
 			return err
 		}
@@ -157,11 +214,38 @@ func runSetupPayload(payload *setupPayload, log io.Writer, sbxDir string) error 
 		return setupFailuref(windowssandbox.SetupErrorHelperRequestArgsFailed, "unknown setup mode: %s", payload.Mode)
 	}
 	if writesSetupMarker {
-		if err := commitSetupMarker(payload.CodexHome, payload.OfflineUsername, payload.OnlineUsername, payload.ProxyPorts, payload.AllowLocalBinding); err != nil {
-			return setupFailuref(windowssandbox.SetupErrorHelperSetupMarkerWriteFailed, "commit setup marker failed: %v", err)
+		if err := commitSetupMarker(marker, payload.CodexHome, payload.OfflineUsername, payload.OnlineUsername, payload.ProxyPorts, payload.AllowLocalBinding); err != nil {
+			return setupFailuref(windowssandbox.SetupErrorHelperSetupMarkerWriteFailed, "commit setup marker failed: %s", windowssandbox.SetupErrorChain(err))
 		}
 	}
 	return nil
+}
+
+// setupModeProvisionsAccounts mirrors Rust SetupMode::provisions_accounts:
+// only account-provisioning runs take the machine-wide setup lock. ACL refresh
+// and read-only repair may still run beside an active sandbox.
+func setupModeProvisionsAccounts(mode setupMode, refreshOnly bool) bool {
+	switch mode {
+	case setupModeProvision, setupModeInteractiveProvision:
+		return true
+	case setupModeFull:
+		return !refreshOnly
+	default:
+		return false
+	}
+}
+
+// validateSetupRuntimeForProvisioning keeps registered Core accounts owned by
+// the packaged service; the helper must never provision them itself (Rust
+// setup_provisioning "registered Core requires service-owned provisioning").
+func validateSetupRuntimeForProvisioning(payload *setupPayload) error {
+	if payload == nil || payload.Runtime != string(windowssandbox.SetupRuntimeRegistered) {
+		return nil
+	}
+	if payload.Mode == setupModeReadACLsOnly || payload.RefreshOnly {
+		return nil
+	}
+	return setupFailuref(windowssandbox.SetupErrorHelperRequestArgsFailed, "registered Core requires service-owned provisioning")
 }
 
 func runReadACLOnly(payload *setupPayload, log io.Writer) error {
@@ -212,13 +296,16 @@ func runProvisionOnly(payload *setupPayload, log io.Writer, sbxDir string) error
 	if err := provisionAndHideSandboxUsers(payload, log, sbxDir); err != nil {
 		return err
 	}
+	if err := verifySandboxAccountPasswordsRepaired(payload.sandboxUsernames()); err != nil {
+		return setupFailuref(windowssandbox.SetupErrorHelperUserProvisionFailed, "%s", windowssandbox.SetupErrorChain(err))
+	}
 	offlineSID, err := resolveSIDString(payload.OfflineUsername)
 	if err != nil {
-		return setupFailuref(windowssandbox.SetupErrorHelperSIDResolveFailed, "resolve SID for offline user %s failed: %v", payload.OfflineUsername, err)
+		return setupFailuref(windowssandbox.SetupErrorHelperSIDResolveFailed, "resolve SID for offline user %s failed: %s", payload.OfflineUsername, windowssandbox.SetupErrorChain(err))
 	}
 	sandboxGroupSIDBytes, err := ResolveSandboxUsersGroupSID()
 	if err != nil {
-		return setupFailuref(windowssandbox.SetupErrorHelperSIDResolveFailed, "resolve sandbox users group SID failed: %v", err)
+		return setupFailuref(windowssandbox.SetupErrorHelperSIDResolveFailed, "resolve sandbox users group SID failed: %s", windowssandbox.SetupErrorChain(err))
 	}
 	if err := configureOfflineSandboxNetwork(payload, offlineSID, log); err != nil {
 		return err
@@ -234,18 +321,29 @@ func runProvisionOnly(payload *setupPayload, log io.Writer, sbxDir string) error
 }
 
 func runSetupFull(payload *setupPayload, log io.Writer, sbxDir string) error {
+	if payload.RefreshOnly {
+		// An ACL refresh cannot rotate account passwords or rewrite the stored
+		// credentials, so an account that needs full setup must fail the
+		// refresh instead of leaving unusable credentials behind (Rust #46043).
+		if err := rejectUnrepairableSandboxAccountsDuringRefresh(payload.sandboxUsernames()); err != nil {
+			return setupFailuref(windowssandbox.SetupErrorHelperUserCreateOrUpdateFailed, "%s", windowssandbox.SetupErrorChain(err))
+		}
+	}
 	if !payload.RefreshOnly {
 		if err := provisionAndHideSandboxUsers(payload, log, sbxDir); err != nil {
 			return err
 		}
+		if err := verifySandboxAccountPasswordsRepaired(payload.sandboxUsernames()); err != nil {
+			return setupFailuref(windowssandbox.SetupErrorHelperUserProvisionFailed, "%s", windowssandbox.SetupErrorChain(err))
+		}
 	}
 	offlineSID, err := resolveSIDString(payload.OfflineUsername)
 	if err != nil {
-		return setupFailuref(windowssandbox.SetupErrorHelperSIDResolveFailed, "resolve SID for offline user %s failed: %v", payload.OfflineUsername, err)
+		return setupFailuref(windowssandbox.SetupErrorHelperSIDResolveFailed, "resolve SID for offline user %s failed: %s", payload.OfflineUsername, windowssandbox.SetupErrorChain(err))
 	}
 	sandboxGroupSIDBytes, err := ResolveSandboxUsersGroupSID()
 	if err != nil {
-		return setupFailuref(windowssandbox.SetupErrorHelperSIDResolveFailed, "resolve sandbox users group SID failed: %v", err)
+		return setupFailuref(windowssandbox.SetupErrorHelperSIDResolveFailed, "resolve sandbox users group SID failed: %s", windowssandbox.SetupErrorChain(err))
 	}
 	sandboxGroupSID := windowssandbox.StringFromSIDBytes(sandboxGroupSIDBytes)
 	refreshErrors := []string{}
@@ -262,6 +360,11 @@ func runSetupFull(payload *setupPayload, log io.Writer, sbxDir string) error {
 	if len(appliedDenyReadPaths) > 0 {
 		setupLogLine(log, fmt.Sprintf("applied %d deny-read ACLs", len(appliedDenyReadPaths)))
 	}
+
+	// Rust #49690: a sandboxed PowerShell needs FILE_READ_ATTRIBUTES on the
+	// user profile root to keep its working directory and resolve relative
+	// paths when the project lives beneath that profile.
+	grantUserProfileReadAttributes(payload, sandboxGroupSID, log)
 
 	if len(payload.ReadRoots) == 0 {
 		setupLogLine(log, "no read roots to grant; skipping read ACL helper")
@@ -407,11 +510,11 @@ func readMaskAllowsOrLog(root string, sids []string, label string, readMask uint
 }
 
 func provisionAndHideSandboxUsers(payload *setupPayload, log io.Writer, sbxDir string) error {
-	if err := ProvisionSandboxUsers(payload.CodexHome, payload.OfflineUsername, payload.OnlineUsername, log); err != nil {
+	if err := ProvisionSandboxUsers(payload.CodexHome, payload.OfflineUsername, payload.OnlineUsername, log, payload.Mode == setupModeProvision); err != nil {
 		if extractSetupFailure(err) != nil {
 			return err
 		}
-		return setupFailuref(windowssandbox.SetupErrorHelperUserProvisionFailed, "provision sandbox users failed: %v", err)
+		return setupFailuref(windowssandbox.SetupErrorHelperUserProvisionFailed, "provision sandbox users failed: %s", windowssandbox.SetupErrorChain(err))
 	}
 	if err := windowssandbox.HideNewlyCreatedUsers([]string{payload.OfflineUsername, payload.OnlineUsername}, sbxDir); err != nil {
 		setupLogLine(log, fmt.Sprintf("hide newly created users failed: %v", err))
@@ -424,13 +527,13 @@ func configureOfflineSandboxNetwork(payload *setupPayload, offlineSID string, lo
 		if extractSetupFailure(err) != nil {
 			return err
 		}
-		return setupFailuref(windowssandbox.SetupErrorHelperFirewallRuleCreateOrAddFailed, "ensure offline proxy allowlist failed: %v", err)
+		return setupFailuref(windowssandbox.SetupErrorHelperFirewallRuleCreateOrAddFailed, "ensure offline proxy allowlist failed: %s", windowssandbox.SetupErrorChain(err))
 	}
 	if err := EnsureOfflineNetworkBlocks(offlineSID, log); err != nil {
 		if extractSetupFailure(err) != nil {
 			return err
 		}
-		return setupFailuref(windowssandbox.SetupErrorHelperFirewallRuleCreateOrAddFailed, "ensure offline network blocks failed: %v", err)
+		return setupFailuref(windowssandbox.SetupErrorHelperFirewallRuleCreateOrAddFailed, "ensure offline network blocks failed: %s", windowssandbox.SetupErrorChain(err))
 	}
 	windowssandbox.InstallWFPFilters(payload.CodexHome, payload.OfflineUsername, func(message string) {
 		setupLogLine(log, message)
@@ -557,29 +660,73 @@ func encodeSetupPayload(payload *setupPayload) (string, error) {
 	return base64.StdEncoding.EncodeToString(data), nil
 }
 
-func prepareSetupMarker(codexHome string, realUser string) error {
-	if err := os.MkdirAll(windowssandbox.SandboxDir(codexHome), 0o700); err != nil {
-		return setupFailuref(windowssandbox.SetupErrorHelperSandboxDirCreateFailed, "failed to create sandbox dir %s: %v", windowssandbox.SandboxDir(codexHome), err)
+// prepareSetupMarker mirrors Rust #42342: service provisioning creates a
+// protected marker relative to the pinned sandbox directory and keeps the
+// exclusive handle until commit, while legacy setup only clears the entry so
+// commitSetupMarker can rewrite it.
+func prepareSetupMarker(payload *setupPayload) (*os.File, error) {
+	if payload.Mode == setupModeProvision {
+		file, err := windowssandbox.PrepareProvisioningSetupMarker(payload.CodexHome, payload.RealUser)
+		if err != nil {
+			return nil, setupFailuref(windowssandbox.SetupErrorHelperSetupMarkerWriteFailed, "prepare setup marker failed: %s", windowssandbox.SetupErrorChain(err))
+		}
+		return file, nil
 	}
-	if err := os.Remove(windowssandbox.SetupMarkerPath(codexHome)); err != nil && !os.IsNotExist(err) {
-		return setupFailuref(windowssandbox.SetupErrorHelperSetupMarkerWriteFailed, "prepare setup marker failed: %v", err)
+	if err := os.MkdirAll(windowssandbox.SandboxDir(payload.CodexHome), 0o700); err != nil {
+		return nil, setupFailuref(windowssandbox.SetupErrorHelperSandboxDirCreateFailed, "failed to create sandbox dir %s: %s", windowssandbox.SandboxDir(payload.CodexHome), windowssandbox.SetupErrorChain(err))
 	}
-	return nil
+	if err := os.Remove(windowssandbox.SetupMarkerPath(payload.CodexHome)); err != nil && !os.IsNotExist(err) {
+		return nil, setupFailuref(windowssandbox.SetupErrorHelperSetupMarkerWriteFailed, "prepare setup marker failed: %s", windowssandbox.SetupErrorChain(err))
+	}
+	return nil, nil
 }
 
-func commitSetupMarker(codexHome string, offlineUsername string, onlineUsername string, proxyPorts []uint16, allowLocalBinding bool) error {
+func commitSetupMarker(retained *os.File, codexHome string, offlineUsername string, onlineUsername string, proxyPorts []uint16, allowLocalBinding bool) error {
 	createdAt := time.Now().UTC().Format(time.RFC3339)
-	return windowssandbox.WriteSetupMarker(codexHome, &windowssandbox.SetupMarker{
+	marker := &windowssandbox.SetupMarker{
 		Version:           windowssandbox.SetupVersion,
 		OfflineUsername:   offlineUsername,
 		OnlineUsername:    onlineUsername,
 		CreatedAt:         &createdAt,
 		ProxyPorts:        append([]uint16(nil), proxyPorts...),
 		AllowLocalBinding: allowLocalBinding,
-	})
+	}
+	if retained != nil {
+		return windowssandbox.WriteProvisioningSetupMarker(retained, marker)
+	}
+	return windowssandbox.WriteSetupMarker(codexHome, marker)
+}
+
+// grantUserProfileReadAttributes mirrors Rust #49690's non-inheriting
+// FILE_READ_ATTRIBUTES grant. Failures are logged and ignored so a profile the
+// setup helper cannot open never blocks the rest of the sandbox setup.
+func grantUserProfileReadAttributes(payload *setupPayload, sandboxGroupSID string, log io.Writer) {
+	profile := strings.TrimSpace(payload.UserProfile)
+	if profile == "" || !filepath.IsAbs(profile) || sandboxGroupSID == "" {
+		return
+	}
+	if !windowssandbox.WorkspaceWriteRootContainsPath(profile, payload.CommandCWD) {
+		return
+	}
+	granted, err := windowssandbox.GrantAllowMaskACEsWithInheritance(windowssandbox.ACLRequest{
+		Path: profile,
+		SID:  sandboxGroupSID,
+		Mask: uint32(windows.FILE_READ_ATTRIBUTES),
+	}, 0)
+	switch {
+	case err != nil:
+		setupLogLine(log, fmt.Sprintf("failed to grant non-inheriting read-attributes ACE on user profile %s: %v; continuing setup", profile, err))
+	case granted:
+		setupLogLine(log, fmt.Sprintf("granted non-inheriting read-attributes ACE on user profile %s", profile))
+	}
 }
 
 func lockSandboxBinDir(payload *setupPayload, sandboxGroupSID []byte, log io.Writer) error {
+	// Registered Core has no legacy bin directory to lock (Rust
+	// `lock_sandbox_bin_dir`).
+	if payload.Runtime == string(windowssandbox.SetupRuntimeRegistered) {
+		return nil
+	}
 	err := lockSandboxDir(
 		windowssandbox.SandboxBinDir(payload.CodexHome),
 		payload.RealUser,
@@ -587,6 +734,10 @@ func lockSandboxBinDir(payload *setupPayload, sandboxGroupSID []byte, log io.Wri
 		windows.SET_ACCESS,
 		uint32(windows.FILE_GENERIC_READ|windows.FILE_GENERIC_EXECUTE),
 		uint32(windows.FILE_GENERIC_READ|windows.FILE_GENERIC_WRITE|windows.FILE_GENERIC_EXECUTE|windows.DELETE),
+		// Rust #42330: the bin dir is often inside the workspace, so inherited
+		// write/delete ACEs would let the sandbox replace its own runner.
+		directoryACLApplyProtected,
+		payload.Mode == setupModeProvision,
 	)
 	if err != nil {
 		return setupFailuref(
@@ -600,6 +751,34 @@ func lockSandboxBinDir(payload *setupPayload, sandboxGroupSID []byte, log io.Wri
 }
 
 func lockPersistentSandboxDirs(payload *setupPayload, sandboxGroupSID []byte, log io.Writer) error {
+	// Rust #60943: a registered runtime only rewrites the persistent directory
+	// policies when verification fails. Reapplying them would change the
+	// permissions of files that were moved into the sandbox directory since the
+	// previous setup.
+	if !registeredPersistentDirectoriesConfigured(payload, sandboxGroupSID) {
+		if err := applyPersistentDirectoryPolicy(payload, sandboxGroupSID, directoryACLApplyInherited); err != nil {
+			return err
+		}
+	}
+	sandboxDir := windowssandbox.SandboxDir(payload.CodexHome)
+	legacyUsers := filepath.Join(sandboxDir, "sandbox_users.json")
+	if err := os.Remove(legacyUsers); err != nil && !os.IsNotExist(err) {
+		setupLogLine(log, fmt.Sprintf("remove legacy sandbox users file failed: %v", err))
+	}
+	return nil
+}
+
+// registeredPersistentDirectoriesConfigured reports whether both persistent
+// sandbox directories already carry exactly the explicit policy with only
+// inherited entries after it.
+func registeredPersistentDirectoriesConfigured(payload *setupPayload, sandboxGroupSID []byte) bool {
+	return payload != nil &&
+		payload.Mode == setupModeProvision &&
+		payload.Runtime == string(windowssandbox.SetupRuntimeRegistered) &&
+		applyPersistentDirectoryPolicy(payload, sandboxGroupSID, directoryACLVerifyInherited) == nil
+}
+
+func applyPersistentDirectoryPolicy(payload *setupPayload, sandboxGroupSID []byte, policy directoryACLPolicy) error {
 	sandboxDir := windowssandbox.SandboxDir(payload.CodexHome)
 	err := lockSandboxDir(
 		sandboxDir,
@@ -608,9 +787,11 @@ func lockPersistentSandboxDirs(payload *setupPayload, sandboxGroupSID []byte, lo
 		windows.SET_ACCESS,
 		uint32(windows.FILE_GENERIC_READ|windows.FILE_GENERIC_WRITE|windows.FILE_GENERIC_EXECUTE|windows.DELETE),
 		uint32(windows.FILE_GENERIC_READ|windows.FILE_GENERIC_WRITE|windows.FILE_GENERIC_EXECUTE),
+		policy,
+		payload.Mode == setupModeProvision,
 	)
 	if err != nil {
-		return setupFailuref(windowssandbox.SetupErrorHelperSandboxLockFailed, "lock sandbox dir %s failed: %v", sandboxDir, err)
+		return setupFailuref(windowssandbox.SetupErrorHelperSandboxLockFailed, "lock sandbox dir %s failed: %s", sandboxDir, windowssandbox.SetupErrorChain(err))
 	}
 	secretsDir := windowssandbox.SandboxSecretsDir(payload.CodexHome)
 	err = lockSandboxDir(
@@ -620,19 +801,125 @@ func lockPersistentSandboxDirs(payload *setupPayload, sandboxGroupSID []byte, lo
 		windows.DENY_ACCESS,
 		uint32(windows.FILE_GENERIC_READ|windows.FILE_GENERIC_WRITE|windows.FILE_GENERIC_EXECUTE|windows.DELETE),
 		uint32(windows.FILE_GENERIC_READ|windows.FILE_GENERIC_WRITE|windows.FILE_GENERIC_EXECUTE),
+		policy,
+		payload.Mode == setupModeProvision,
 	)
 	if err != nil {
-		return setupFailuref(windowssandbox.SetupErrorHelperSandboxLockFailed, "lock sandbox secrets dir %s failed: %v", secretsDir, err)
-	}
-	legacyUsers := filepath.Join(sandboxDir, "sandbox_users.json")
-	if err := os.Remove(legacyUsers); err != nil && !os.IsNotExist(err) {
-		setupLogLine(log, fmt.Sprintf("remove legacy sandbox users file failed: %v", err))
+		return setupFailuref(windowssandbox.SetupErrorHelperSandboxLockFailed, "lock sandbox secrets dir %s failed: %s", secretsDir, windowssandbox.SetupErrorChain(err))
 	}
 	return nil
 }
 
-func lockSandboxDir(dir string, realUser string, sandboxGroupSID []byte, sandboxGroupAccessMode windows.ACCESS_MODE, sandboxGroupMask uint32, realUserMask uint32) error {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+// directoryACLPolicy selects how a sandbox directory's DACL is handled
+// (Rust #60943 DirectoryAcl).
+type directoryACLPolicy int
+
+const (
+	// directoryACLVerifyInherited only reads the DACL and fails unless it
+	// already matches the explicit policy followed by inherited entries.
+	directoryACLVerifyInherited directoryACLPolicy = iota
+	// directoryACLApplyInherited writes the explicit policy, keeping inherited
+	// entries after it.
+	directoryACLApplyInherited
+	// directoryACLApplyProtected writes a protected policy that excludes
+	// inherited entries.
+	directoryACLApplyProtected
+)
+
+// errDirectoryPermissionsDiffer reports a DACL that does not carry exactly the
+// expected explicit policy followed by inherited entries.
+var errDirectoryPermissionsDiffer = errors.New("metadata directory permissions differ")
+
+// directoryDACLMatchesPolicy compares complete ACEs so extra explicit
+// permissions or a changed mask still require an update, while inherited
+// entries may follow the explicit policy (Rust #60943 metadata_policy_matches).
+func directoryDACLMatchesPolicy(handle windows.Handle, expected *windows.ACL) (bool, error) {
+	descriptor, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		return false, err
+	}
+	defer runtime.KeepAlive(descriptor)
+	current, _, err := descriptor.DACL()
+	if err != nil {
+		if err == windows.ERROR_OBJECT_NOT_FOUND {
+			return false, nil
+		}
+		return false, err
+	}
+	currentACEs, err := directoryDACLEntries(current)
+	if err != nil {
+		return false, err
+	}
+	explicitEntries, err := directoryDACLEntries(expected)
+	if err != nil {
+		return false, err
+	}
+	if len(currentACEs) < len(explicitEntries) {
+		return false, nil
+	}
+	for index := range explicitEntries {
+		if !bytes.Equal(currentACEs[index], explicitEntries[index]) {
+			return false, nil
+		}
+	}
+	for _, ace := range currentACEs[len(explicitEntries):] {
+		if len(ace) < 2 || ace[1]&byte(windows.INHERITED_ACE) == 0 {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// directoryDACLEntries returns each ACE as the exact bytes Windows stored, so
+// comparison covers flags, masks and trustees.
+func directoryDACLEntries(acl *windows.ACL) ([][]byte, error) {
+	if acl == nil {
+		return nil, nil
+	}
+	entries := make([][]byte, 0, int(acl.AceCount))
+	for index := uint32(0); index < uint32(acl.AceCount); index++ {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(acl, index, &ace); err != nil {
+			return nil, err
+		}
+		if ace == nil {
+			return nil, errors.New("nil access control entry")
+		}
+		size := int(ace.Header.AceSize)
+		if size < 4 {
+			return nil, fmt.Errorf("invalid access control entry size %d", size)
+		}
+		entries = append(entries, append([]byte(nil), unsafe.Slice((*byte)(unsafe.Pointer(ace)), size)...))
+	}
+	return entries, nil
+}
+
+func lockSandboxDir(dir string, realUser string, sandboxGroupSID []byte, sandboxGroupAccessMode windows.ACCESS_MODE, sandboxGroupMask uint32, realUserMask uint32, policy directoryACLPolicy, pinned bool) error {
+	var pinnedHandle windows.Handle
+	if pinned {
+		// Rust #42342: service provisioning applies the DACL through a pinned,
+		// reparse-free handle, so the mutation cannot be redirected after path
+		// validation.
+		// Verification only reads the DACL and must not create the directory
+		// (Rust #60943), so a missing directory falls back to the write path.
+		desiredAccess := uint32(windows.READ_CONTROL | windows.WRITE_DAC)
+		disposition := windowssandbox.DirectoryOpenOrCreate
+		if policy == directoryACLVerifyInherited {
+			desiredAccess = windows.READ_CONTROL
+			disposition = windowssandbox.DirectoryOpenExisting
+		}
+		handle, err := windowssandbox.OpenDirectoryNoReparse(
+			dir,
+			desiredAccess,
+			windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+			disposition,
+		)
+		if err != nil {
+			return err
+		}
+		pinnedHandle = handle
+		defer windows.CloseHandle(pinnedHandle)
+	} else if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	systemSID, err := resolveSIDString("SYSTEM")
@@ -647,13 +934,19 @@ func lockSandboxDir(dir string, realUser string, sandboxGroupSID []byte, sandbox
 	if err != nil {
 		return err
 	}
+	systemMask := uint32(windows.FILE_GENERIC_READ | windows.FILE_GENERIC_WRITE | windows.FILE_GENERIC_EXECUTE | windows.DELETE)
+	if policy == directoryACLApplyProtected {
+		// Rust #59745: the SYSTEM helper must be able to reapply the bin policy to
+		// existing children, so a protected bin DACL also grants inheritable WRITE_DAC.
+		systemMask |= windows.WRITE_DAC
+	}
 	entries := []struct {
 		sidString string
 		mask      uint32
 		mode      windows.ACCESS_MODE
 	}{
 		{sidString: windowssandbox.StringFromSIDBytes(sandboxGroupSID), mask: sandboxGroupMask, mode: sandboxGroupAccessMode},
-		{sidString: systemSID, mask: uint32(windows.FILE_GENERIC_READ | windows.FILE_GENERIC_WRITE | windows.FILE_GENERIC_EXECUTE | windows.DELETE), mode: windows.SET_ACCESS},
+		{sidString: systemSID, mask: systemMask, mode: windows.SET_ACCESS},
 		{sidString: adminsSID, mask: uint32(windows.FILE_GENERIC_READ | windows.FILE_GENERIC_WRITE | windows.FILE_GENERIC_EXECUTE | windows.DELETE), mode: windows.SET_ACCESS},
 		{sidString: realSID, mask: realUserMask, mode: windows.SET_ACCESS},
 	}
@@ -680,11 +973,37 @@ func lockSandboxDir(dir string, realUser string, sandboxGroupSID []byte, sandbox
 	if err != nil {
 		return err
 	}
-	if err := windows.SetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION, nil, nil, newACL, nil); err != nil {
+	if policy == directoryACLVerifyInherited {
+		if !pinned {
+			return errors.New("verification requires a service directory handle")
+		}
+		matches, err := directoryDACLMatchesPolicy(pinnedHandle, newACL)
 		runtime.KeepAlive(sids)
 		runtime.KeepAlive(explicitEntries)
 		runtime.KeepAlive(newACL)
-		return err
+		if err != nil {
+			return err
+		}
+		if !matches {
+			return errDirectoryPermissionsDiffer
+		}
+		return nil
+	}
+	securityInformation := windows.SECURITY_INFORMATION(windows.DACL_SECURITY_INFORMATION)
+	if policy == directoryACLApplyProtected {
+		securityInformation |= windows.PROTECTED_DACL_SECURITY_INFORMATION
+	}
+	var setErr error
+	if pinned {
+		setErr = windows.SetSecurityInfo(pinnedHandle, windows.SE_FILE_OBJECT, securityInformation, nil, nil, newACL, nil)
+	} else {
+		setErr = windows.SetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT, securityInformation, nil, nil, newACL, nil)
+	}
+	if setErr != nil {
+		runtime.KeepAlive(sids)
+		runtime.KeepAlive(explicitEntries)
+		runtime.KeepAlive(newACL)
+		return setErr
 	}
 	runtime.KeepAlive(sids)
 	runtime.KeepAlive(explicitEntries)
@@ -700,11 +1019,26 @@ func resolveSIDString(name string) (string, error) {
 	return windowssandbox.StringFromSIDBytes(sid), nil
 }
 
-func openSetupLog(sbxDir string) (*os.File, error) {
+// openSetupLog opens the daily sandbox log for legacy setup, while service
+// provisioning gets a fresh log created relative to the pinned sandbox
+// directory (Rust #42342 open_setup_log).
+func openSetupLog(sbxDir string, mode setupMode) (*os.File, error) {
 	if err := os.MkdirAll(sbxDir, 0o700); err != nil {
 		return nil, err
 	}
+	if mode == setupModeProvision {
+		return windowssandbox.OpenProvisioningSetupLog(sbxDir)
+	}
 	return os.OpenFile(windowssandbox.CurrentLogFilePathForBaseDir(sbxDir), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+}
+
+// writeSetupErrorReport keeps service provisioning from writing through a
+// caller-controlled report entry (Rust #42342).
+func writeSetupErrorReport(payload *setupPayload, report *windowssandbox.SetupErrorReport) error {
+	if payload.Mode == setupModeProvision {
+		return windowssandbox.WriteSetupErrorReportForProvisioning(payload.CodexHome, report)
+	}
+	return windowssandbox.WriteSetupErrorReport(payload.CodexHome, report)
 }
 
 func setupLogLine(log io.Writer, line string) {
@@ -757,27 +1091,10 @@ func recordSetupACLFailure(refreshErrors *[]string, operation setupACLRefreshOpe
 }
 
 // formatSetupErrorChain renders every distinct wrapped cause so native Windows
-// diagnostics survive the setup error report.
+// diagnostics survive the setup error report. The renderer lives in the shared
+// package so the orchestrator and the helper cannot drift (#46237).
 func formatSetupErrorChain(err error) string {
-	if err == nil {
-		return ""
-	}
-	var parts []string
-	for err != nil {
-		message := strings.TrimSpace(err.Error())
-		if message != "" && (len(parts) == 0 || parts[len(parts)-1] != message) {
-			parts = append(parts, message)
-		}
-		next := errors.Unwrap(err)
-		if next == nil {
-			break
-		}
-		if message != "" && strings.Contains(message, next.Error()) {
-			break
-		}
-		err = next
-	}
-	return strings.Join(parts, ": ")
+	return windowssandbox.SetupErrorChain(err)
 }
 
 func setupFailuref(code windowssandbox.SetupErrorCode, format string, args ...interface{}) *windowssandbox.SetupFailure {

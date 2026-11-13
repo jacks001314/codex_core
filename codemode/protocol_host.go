@@ -7,7 +7,54 @@ import (
 	"strings"
 )
 
-const MaxPendingDelegateCalls = 1024
+const (
+	// LegacyMaxPendingDelegateCalls is the callback budget used by clients and
+	// hosts that do not negotiate the larger shared-host capacity.
+	LegacyMaxPendingDelegateCalls = 1024
+
+	// MaxPendingDelegateCalls is the callback budget for a connection that
+	// supports delegate-capacity-4096.
+	MaxPendingDelegateCalls = 4096
+
+	// MaxActiveCells bounds live V8 isolates across every session sharing one
+	// code-mode host (Rust #59590).
+	MaxActiveCells = 2048
+
+	// MaxInFlightCompletions bounds result-delivery RPCs across a provider's
+	// sessions. A full completion burst can otherwise exhaust HTTP/2's small
+	// DATA-frame budget and disconnect every session sharing the transport.
+	MaxInFlightCompletions = 64
+)
+
+const (
+	// LargeDelegateCapacityCapability lets a stdio or framed transport client
+	// advertise that it can accept 4096 unresolved delegate callbacks.
+	LargeDelegateCapacityCapability = "delegate-capacity-4096"
+
+	// maxInFlightRequests leaves observation and control headroom during a full
+	// callback-completion burst.
+	maxInFlightRequests = MaxPendingDelegateCalls * 2
+
+	// outgoingChannelCapacity holds a complete callback burst plus concurrent
+	// control messages.
+	outgoingChannelCapacity = MaxPendingDelegateCalls * 2
+)
+
+// NormalizePendingDelegateCalls validates the optional gRPC session capacity.
+// Absence preserves the legacy budget, zero is invalid, and values above the
+// supported maximum are clamped (Rust #59590).
+func NormalizePendingDelegateCalls(requested *uint32) (int, error) {
+	if requested == nil {
+		return LegacyMaxPendingDelegateCalls, nil
+	}
+	if *requested == 0 {
+		return 0, fmt.Errorf("callback capacity must be positive")
+	}
+	if *requested > uint32(MaxPendingDelegateCalls) {
+		return MaxPendingDelegateCalls, nil
+	}
+	return int(*requested), nil
+}
 
 // DualWebSocketCapability is the optional host capability that pairs the
 // control WebSocket with a second bulk WebSocket carrying delegate callbacks
@@ -23,6 +70,23 @@ const SessionCellExecutionResourceLimitsCapability = "session-cell-execution-res
 // in-flight execute or wait observation can be yielded without cancelling its
 // cell (Rust #48123).
 const YieldObservationCapability = "yield-observation"
+
+// BoundedOutputCapability is the optional host capability advertising that the
+// host can apply observation output budgets itself (Rust #57272).
+const BoundedOutputCapability = "bounded-output-v1"
+
+// BoundedOutputMaxBytes is the maximum aggregate text bytes retained per
+// server-truncated observation (Rust #57848).
+const BoundedOutputMaxBytes = 1024 * 1024
+
+// BoundedOutputMaxImageBytes is the maximum aggregate inline image bytes
+// retained per server-truncated observation (Rust #57848).
+const BoundedOutputMaxImageBytes = 8 * 1024 * 1024
+
+// BoundedOutputMaxAudioBytes is the maximum aggregate encoded audio URL bytes
+// retained per server-truncated observation. The whole URL counts, including
+// any data URL prefix and base64 payload (Rust #57848).
+const BoundedOutputMaxAudioBytes = 62 * 1024 * 1024
 
 type RequestID int64
 
@@ -533,6 +597,11 @@ type HostRequest struct {
 	Wait                *WaitRequest         `json:"-"`
 	CellID              CellID               `json:"cellId,omitempty"`
 	CellExecutionLimits *CellExecutionLimits `json:"cellExecutionLimits,omitempty"`
+	// OutputTruncation is sent only when output-truncation support was agreed
+	// at connection hello; omission keeps the legacy wire shape (Rust #57272).
+	OutputTruncation *OutputTruncation `json:"outputTruncation,omitempty"`
+	// MaxOutputTokens bounds a wait or terminate observation in server mode.
+	MaxOutputTokens *int `json:"maxOutputTokens,omitempty"`
 }
 
 func (r *HostRequest) UnmarshalJSON(data []byte) error {
@@ -545,11 +614,13 @@ func (r *HostRequest) UnmarshalJSON(data []byte) error {
 		Request             json.RawMessage      `json:"request"`
 		CellID              CellID               `json:"cellId"`
 		CellExecutionLimits *CellExecutionLimits `json:"cellExecutionLimits"`
+		OutputTruncation    *OutputTruncation    `json:"outputTruncation"`
+		MaxOutputTokens     *int                 `json:"maxOutputTokens"`
 	}
 	if err := json.Unmarshal(data, &envelope); err != nil {
 		return err
 	}
-	*r = HostRequest{Method: envelope.Method, SessionID: envelope.SessionID, CellID: envelope.CellID, CellExecutionLimits: envelope.CellExecutionLimits}
+	*r = HostRequest{Method: envelope.Method, SessionID: envelope.SessionID, CellID: envelope.CellID, CellExecutionLimits: envelope.CellExecutionLimits, OutputTruncation: envelope.OutputTruncation, MaxOutputTokens: envelope.MaxOutputTokens}
 	if len(envelope.Request) == 0 || string(envelope.Request) == "null" {
 		return nil
 	}
@@ -558,6 +629,7 @@ func (r *HostRequest) UnmarshalJSON(data []byte) error {
 		if err := json.Unmarshal(envelope.Request, &request); err != nil {
 			return err
 		}
+		request.MaxOutputTokens = envelope.MaxOutputTokens
 		r.Wait = &request
 		return nil
 	}
@@ -585,6 +657,17 @@ func OpenSessionRequestWithLimits(sessionID SessionID, limits *CellExecutionLimi
 	return request
 }
 
+// OpenSessionRequestWithOptions adds the session's output truncation setting;
+// client truncation keeps the legacy wire shape.
+func OpenSessionRequestWithOptions(sessionID SessionID, options SessionOptions) HostRequest {
+	request := OpenSessionRequestWithLimits(sessionID, options.CellExecutionLimits)
+	if options.OutputTruncation != "" && options.OutputTruncation != OutputTruncationClient {
+		truncation := options.OutputTruncation
+		request.OutputTruncation = &truncation
+	}
+	return request
+}
+
 func ExecuteSessionRequest(sessionID SessionID, request ExecuteRequest) HostRequest {
 	return HostRequest{Method: "session/execute", SessionID: sessionID, Request: &request}
 }
@@ -597,6 +680,24 @@ func TerminateSessionRequest(sessionID SessionID, cellID CellID) HostRequest {
 	return HostRequest{Method: "session/terminate", SessionID: sessionID, CellID: cellID}
 }
 
+// WaitSessionRequestWithBudget carries the observation budget that a
+// server-truncation session applies on the host (Rust #58125).
+func WaitSessionRequestWithBudget(sessionID SessionID, request WaitRequest, maxOutputTokens *int) HostRequest {
+	hostRequest := WaitSessionRequest(sessionID, request)
+	hostRequest.MaxOutputTokens = maxOutputTokens
+	return hostRequest
+}
+
+// TerminateSessionRequestWithBudget carries an optional final-observation
+// budget for server-mode sessions (Rust #57272).
+func TerminateSessionRequestWithBudget(sessionID SessionID, request TerminateRequest) HostRequest {
+	hostRequest := HostRequest{Method: "session/terminate", SessionID: sessionID, CellID: request.CellID}
+	if request.MaxOutputTokens != nil {
+		hostRequest.MaxOutputTokens = request.MaxOutputTokens
+	}
+	return hostRequest
+}
+
 func ShutdownSessionRequest(sessionID SessionID) HostRequest {
 	return HostRequest{Method: "session/shutdown", SessionID: sessionID}
 }
@@ -605,10 +706,11 @@ func (r HostRequest) MarshalJSON() ([]byte, error) {
 	switch r.Method {
 	case "session/wait":
 		return json.Marshal(struct {
-			Method    string       `json:"method"`
-			SessionID SessionID    `json:"sessionId"`
-			Request   *WaitRequest `json:"request"`
-		}{Method: r.Method, SessionID: r.SessionID, Request: r.Wait})
+			Method          string       `json:"method"`
+			SessionID       SessionID    `json:"sessionId"`
+			Request         *WaitRequest `json:"request"`
+			MaxOutputTokens *int         `json:"maxOutputTokens,omitempty"`
+		}{Method: r.Method, SessionID: r.SessionID, Request: r.Wait, MaxOutputTokens: r.MaxOutputTokens})
 	default:
 		type alias HostRequest
 		return json.Marshal(alias(r))

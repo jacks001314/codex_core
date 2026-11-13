@@ -329,6 +329,13 @@ type MultiAgentHandlerOptions struct {
 	// stable name (`spawn_agent`, `send_message`, `followup_task`, `wait_agent`,
 	// `interrupt_agent`, `list_agents`).
 	ToolOverrides map[string]MultiAgentToolOverride
+	// ToolOverrideStore, when set, supplies the overrides instead of
+	// ToolOverrides and can be replaced when a mid-turn model change selects a
+	// different catalog (Rust #46505 step settings).
+	ToolOverrideStore *MultiAgentToolOverrideStore
+	// GuardianNativeMultiAgentReview opts state-changing MAv2 calls into
+	// synchronous Guardian review (Rust #57451).
+	GuardianNativeMultiAgentReview bool
 }
 
 // MultiAgentToolOverride carries one Multi-Agent V2 tool's catalog overrides:
@@ -336,6 +343,41 @@ type MultiAgentHandlerOptions struct {
 type MultiAgentToolOverride struct {
 	Description *string
 	Parameters  *string
+}
+
+// MultiAgentToolOverrideStore holds a turn's per-tool Multi-Agent V2 catalog
+// overrides. The tool specifications read it on every Spec call, so replacing
+// the catalog after a mid-turn model change refreshes their schemas on the next
+// sampling step (Rust #46505).
+type MultiAgentToolOverrideStore struct {
+	mu        sync.RWMutex
+	overrides map[string]MultiAgentToolOverride
+}
+
+// NewMultiAgentToolOverrideStore returns a store holding overrides.
+func NewMultiAgentToolOverrideStore(overrides map[string]MultiAgentToolOverride) *MultiAgentToolOverrideStore {
+	return &MultiAgentToolOverrideStore{overrides: overrides}
+}
+
+// Replace swaps the stored catalog overrides.
+func (s *MultiAgentToolOverrideStore) Replace(overrides map[string]MultiAgentToolOverride) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.overrides = overrides
+}
+
+// Get returns the override for a tool name.
+func (s *MultiAgentToolOverrideStore) Get(toolName string) (MultiAgentToolOverride, bool) {
+	if s == nil {
+		return MultiAgentToolOverride{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	override, ok := s.overrides[toolName]
+	return override, ok
 }
 
 // MultiAgentV2ToolNames lists the Multi-Agent V2 tools whose catalog overrides
@@ -468,7 +510,18 @@ func (e *MultiAgentToolExecutor) Execute(ctx context.Context, invocation *tool.I
 }
 
 func plaintextCollaborationInvocation(invocation *tool.Invocation) bool {
-	return invocation != nil && invocation.Source == "direct_plaintext_message"
+	if invocation == nil {
+		return false
+	}
+	// Rust #55633: a Code Mode collaboration call is classified as plaintext
+	// so its message receives the same plaintext context wrapper as a direct
+	// plaintext delivery, with sender and recipient attribution.
+	switch invocation.Source {
+	case "direct_plaintext_message", tool.InvocationSourceCodeMode:
+		return true
+	default:
+		return false
+	}
 }
 
 func (e *MultiAgentToolExecutor) PreToolUsePayload(invocation *tool.Invocation) (*tool.PreToolUsePayload, bool) {

@@ -225,7 +225,7 @@ func TestFallbackBundledCatalogCarriesGPT6FamilyLikeRust(t *testing.T) {
 	}
 	wantLeading := []string{
 		"gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
-		"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+		"gpt-5.6-sol", "gpt-6.1-terra", "gpt-5.6-terra", "gpt-5.6-luna",
 	}
 	if len(leading) < len(wantLeading) {
 		t.Fatalf("picker models = %#v, want at least %#v", leading, wantLeading)
@@ -243,22 +243,69 @@ func TestFallbackBundledCatalogCarriesGPT6FamilyLikeRust(t *testing.T) {
 	}
 }
 
-func TestFallbackBundledCatalogDropsGPT54LikeRust(t *testing.T) {
-	// Rust #47932 (694d8d45bd): gpt-5.4 is removed from the bundled catalog.
-	// The GPT-5.4 Mini entry stays because its migration target (GPT-6 Luna)
-	// still needs the saved-selection prompt.
-	presets := NewStaticModelsManager(fallbackBundledModelsResponse()).ListModels(RefreshOffline)
-	sawMini := false
-	for _, preset := range presets {
-		if preset.Model == "gpt-5.4" {
-			t.Fatalf("bundled catalog still lists %q", preset.Model)
-		}
-		if preset.Model == "gpt-5.4-mini" {
-			sawMini = true
+// TestFallbackBundledCatalogUsesShellCommandLikeRust pins Rust #47397 for the
+// offline fallback catalog: the bundled GPT-6, GPT-5.6, GPT-5.5 and
+// auto-review entries use `shell_command`, gpt-6-astra accepts reasoning-effort
+// updates without experimental context, and the other moved entries keep the
+// serde defaults for both flags.
+func TestFallbackBundledCatalogUsesShellCommandLikeRust(t *testing.T) {
+	manager := NewStaticModelsManager(fallbackBundledModelsResponse())
+	for _, slug := range []string{
+		"gpt-6-astra",
+		"gpt-6-sol",
+		"gpt-6-luna",
+		"gpt-5.6-sol",
+		"gpt-5.6-terra",
+		"gpt-5.6-luna",
+		"gpt-5.5",
+		"codex-auto-review",
+	} {
+		info := manager.GetModelInfo(slug, nil)
+		if info.ShellType != "shell_command" {
+			t.Fatalf("%s ShellType = %q, want shell_command", slug, info.ShellType)
 		}
 	}
-	if !sawMini {
-		t.Fatal("bundled catalog lost the gpt-5.4-mini entry")
+	astra := manager.GetModelInfo("gpt-6-astra", nil)
+	if !astra.SupportsReasoningEffortUpdates || astra.SupportsExperimentalContext {
+		t.Fatalf("gpt-6-astra flags = effortUpdates:%v experimentalContext:%v, want true/false",
+			astra.SupportsReasoningEffortUpdates, astra.SupportsExperimentalContext)
+	}
+	for _, slug := range []string{"gpt-5.6-sol", "gpt-5.5", "codex-auto-review"} {
+		info := manager.GetModelInfo(slug, nil)
+		if info.SupportsReasoningEffortUpdates || info.SupportsExperimentalContext {
+			t.Fatalf("%s flags = effortUpdates:%v experimentalContext:%v, want false/false",
+				slug, info.SupportsReasoningEffortUpdates, info.SupportsExperimentalContext)
+		}
+	}
+}
+
+func TestFallbackBundledCatalogDropsRetiredModelsLikeRust(t *testing.T) {
+	// Rust #47932 (694d8d45bd) removed gpt-5.4, and Rust #44250 (eb7bd64ef9)
+	// removed the remaining retired entries gpt-5.2 and gpt-5.4-mini from the
+	// bundled catalog. Saved selections of those slugs still migrate through the
+	// provider-scoped fallback prompt, which only needs the replacement model in
+	// the catalog.
+	presets := NewStaticModelsManager(fallbackBundledModelsResponse()).ListModels(RefreshOffline)
+	retired := map[string]bool{"gpt-5.4": true, "gpt-5.2": true, "gpt-5.4-mini": true}
+	sawReplacement := false
+	for _, preset := range presets {
+		if retired[preset.Model] {
+			t.Fatalf("bundled catalog still lists retired model %q", preset.Model)
+		}
+		if preset.Model == "gpt-6-luna" {
+			sawReplacement = true
+		}
+	}
+	if !sawReplacement {
+		t.Fatal("bundled catalog lost the GPT-6 Luna migration target")
+	}
+	// A saved retired slug still resolves Rust's model_info_from_slug descriptor
+	// when the catalog no longer carries it.
+	for _, slug := range []string{"gpt-5.2", "gpt-5.4-mini"} {
+		info := ModelInfoFromSlug(slug)
+		if info.Slug != slug || !info.SupportsReasoningSummaries {
+			t.Fatalf("retired slug %q descriptor = %#v", slug, info)
+		}
 	}
 }
 
@@ -290,9 +337,9 @@ func TestBedrockGPT56ModelsUseLongContextWindowLikeRust(t *testing.T) {
 	for _, model := range catalog.Models {
 		want := int64(272000)
 		switch model.Slug {
-		case AmazonBedrockGPT61SolModelID, AmazonBedrockGPT6AstraModelID, AmazonBedrockGPT6SolModelID,
-			AmazonBedrockGPT6LunaModelID, AmazonBedrockGPT56SolModelID, AmazonBedrockGPT56TerraModelID,
-			AmazonBedrockGPT56LunaModelID:
+		case AmazonBedrockGPT61SolModelID, AmazonBedrockGPT6AstraModelID, AmazonBedrockGPT61TerraModelID,
+			AmazonBedrockGPT6SolModelID, AmazonBedrockGPT6LunaModelID, AmazonBedrockGPT56SolModelID,
+			AmazonBedrockGPT56TerraModelID, AmazonBedrockGPT56LunaModelID:
 			want = 872000
 		}
 		if model.MaxContextWindow != want {
@@ -637,6 +684,64 @@ func TestModelMessagesMultiAgentToolOverridesLikeRust(t *testing.T) {
 	*clonedDescription = "rewritten"
 	if *messages.MultiAgentToolDescriptionOverride("spawn_agent") != "Catalog spawn text." {
 		t.Fatalf("mutating the clone changed the original: %#v", messages.Tools.MultiAgent.SpawnAgent)
+	}
+}
+
+// TestModelMessagesChannelToolOverridesLikeRust mirrors Rust #47670's
+// MultiAgentToolMessages::by_name: the nine channel tools resolve in the same
+// multi_agent catalog independently of their runtime namespace, a null entry
+// keeps the bundled text, and an empty string suppresses it.
+func TestModelMessagesChannelToolOverridesLikeRust(t *testing.T) {
+	document := `{
+		"tools": {
+			"multi_agent": {
+				"create_channel": {"description": "Catalog create_channel."},
+				"get_channels": {"description": "Catalog get_channels."},
+				"list_threads": {"description": "Catalog list_threads."},
+				"search_posts": {"description": "Catalog search_posts."},
+				"read_thread": {"description": null},
+				"read_post": {"description": "Catalog read_post.", "parameters": "{\"type\":\"object\"}"},
+				"subscribe": {"description": ""},
+				"unsubscribe": {"description": "Catalog unsubscribe."},
+				"post": {"description": "Catalog post."}
+			}
+		}
+	}`
+	var messages ModelMessages
+	if err := json.Unmarshal([]byte(document), &messages); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	want := map[string]string{
+		"create_channel": "Catalog create_channel.",
+		"get_channels":   "Catalog get_channels.",
+		"list_threads":   "Catalog list_threads.",
+		"search_posts":   "Catalog search_posts.",
+		"read_post":      "Catalog read_post.",
+		"subscribe":      "",
+		"unsubscribe":    "Catalog unsubscribe.",
+		"post":           "Catalog post.",
+	}
+	for name, expected := range want {
+		got := messages.MultiAgentToolDescriptionOverride(name)
+		if got == nil || *got != expected {
+			t.Fatalf("%s description = %#v, want %q", name, got, expected)
+		}
+	}
+	if got := messages.MultiAgentToolDescriptionOverride("read_thread"); got != nil {
+		t.Fatalf("read_thread description = %#v, want nil", got)
+	}
+	if got := messages.MultiAgentToolParametersOverride("read_post"); got == nil || *got != `{"type":"object"}` {
+		t.Fatalf("read_post parameters = %#v", got)
+	}
+	// The model-info clone deep-copies channel entries like the other tool
+	// message groups.
+	cloned := cloneModelInfo(ModelInfo{ModelMessages: &messages})
+	if cloned.ModelMessages == nil || cloned.ModelMessages.MultiAgentToolDescriptionOverride("post") == messages.MultiAgentToolDescriptionOverride("post") {
+		t.Fatal("the clone shares the channel description pointer")
+	}
+	*cloned.ModelMessages.MultiAgentToolDescriptionOverride("post") = "rewritten"
+	if got := messages.MultiAgentToolDescriptionOverride("post"); got == nil || *got != "Catalog post." {
+		t.Fatalf("mutating the clone changed the original: %#v", got)
 	}
 }
 
@@ -1536,6 +1641,7 @@ func TestAmazonBedrockModelCatalog(t *testing.T) {
 	want := []string{
 		AmazonBedrockGPT61SolModelID,
 		AmazonBedrockGPT6AstraModelID,
+		AmazonBedrockGPT61TerraModelID,
 		AmazonBedrockGPT6SolModelID,
 		AmazonBedrockGPT6LunaModelID,
 		AmazonBedrockGPT56SolModelID,
@@ -1563,6 +1669,7 @@ func TestAmazonBedrockModelCatalog(t *testing.T) {
 	wantVersion := map[string]string{
 		AmazonBedrockGPT61SolModelID:   "v2",
 		AmazonBedrockGPT6AstraModelID:  "v2",
+		AmazonBedrockGPT61TerraModelID: "v2",
 		AmazonBedrockGPT6SolModelID:    "v2",
 		AmazonBedrockGPT6LunaModelID:   "v2",
 		AmazonBedrockGPT56SolModelID:   "v2",
@@ -1656,6 +1763,7 @@ func TestBedrockCatalogKeepsUltraReasoningLikeRust(t *testing.T) {
 			}
 		}
 		want := model.Slug == AmazonBedrockGPT61SolModelID || model.Slug == AmazonBedrockGPT6AstraModelID ||
+			model.Slug == AmazonBedrockGPT61TerraModelID ||
 			model.Slug == AmazonBedrockGPT6SolModelID ||
 			model.Slug == AmazonBedrockGPT56SolModelID || model.Slug == AmazonBedrockGPT56TerraModelID
 		if hasUltra != want {
@@ -1879,6 +1987,15 @@ func TestModelInfoGuardianReviewPolicy(t *testing.T) {
 	if got := (*GuardianModelPolicy)(nil).ReviewMode(GuardianScopeShell); got != disabled {
 		t.Fatalf("nil policy review mode = %q, want %q", got, disabled)
 	}
+	// Rust #57433: native tool calls are always reviewed synchronously, even
+	// when the catalog omits every other scope.
+	if got := policy.ReviewMode(GuardianScopeNativeTool); got != synchronous {
+		t.Fatalf("native_tool review mode = %q, want %q", got, synchronous)
+	}
+	nativePolicy := &ModelInfo{Guardian: &GuardianModelPolicy{}}
+	if got := nativePolicy.GuardianReviewMode(GuardianScopeNativeTool); got == nil || *got != synchronous {
+		t.Fatalf("native_tool model review mode = %v, want %q", got, synchronous)
+	}
 
 	withPolicy := &ModelInfo{Guardian: policy}
 	if !withPolicy.ComputerUseReviewRequired() {
@@ -1981,12 +2098,13 @@ func TestAmazonBedrockModelCatalogLikeRust(t *testing.T) {
 	}{
 		{AmazonBedrockGPT61SolModelID, "GPT-6.1 Sol", 0},
 		{AmazonBedrockGPT6AstraModelID, "GPT-6-Astra", 1},
-		{AmazonBedrockGPT6SolModelID, "GPT-6 Sol", 2},
-		{AmazonBedrockGPT6LunaModelID, "GPT-6 Luna", 3},
-		{AmazonBedrockGPT56SolModelID, "GPT-5.6 Sol", 4},
-		{AmazonBedrockGPT56TerraModelID, "GPT-5.6 Terra", 5},
-		{AmazonBedrockGPT56LunaModelID, "GPT-5.6 Luna", 6},
-		{AmazonBedrockGPT55ModelID, "GPT-5.5", 7},
+		{AmazonBedrockGPT61TerraModelID, "GPT-6.1 Terra", 2},
+		{AmazonBedrockGPT6SolModelID, "GPT-6 Sol", 3},
+		{AmazonBedrockGPT6LunaModelID, "GPT-6 Luna", 4},
+		{AmazonBedrockGPT56SolModelID, "GPT-5.6 Sol", 5},
+		{AmazonBedrockGPT56TerraModelID, "GPT-5.6 Terra", 6},
+		{AmazonBedrockGPT56LunaModelID, "GPT-5.6 Luna", 7},
+		{AmazonBedrockGPT55ModelID, "GPT-5.5", 8},
 	}
 	if len(catalog.Models) != len(wantMetadata) {
 		t.Fatalf("bedrock catalog len = %d, want %d", len(catalog.Models), len(wantMetadata))
@@ -2006,14 +2124,18 @@ func TestAmazonBedrockModelCatalogLikeRust(t *testing.T) {
 		if model.WebSearchToolType != "text" {
 			t.Fatalf("%s WebSearchToolType = %q, want text", model.Slug, model.WebSearchToolType)
 		}
-		if model.ContextWindow != 272000 {
-			t.Fatalf("%s ContextWindow = %d, want 272000", model.Slug, model.ContextWindow)
+		wantContext := int64(272000)
+		if model.Slug == AmazonBedrockGPT61TerraModelID {
+			wantContext = 500000
+		}
+		if model.ContextWindow != wantContext {
+			t.Fatalf("%s ContextWindow = %d, want %d", model.Slug, model.ContextWindow, wantContext)
 		}
 		wantMax := int64(272000)
 		switch model.Slug {
-		case AmazonBedrockGPT61SolModelID, AmazonBedrockGPT6AstraModelID, AmazonBedrockGPT6SolModelID,
-			AmazonBedrockGPT6LunaModelID, AmazonBedrockGPT56SolModelID, AmazonBedrockGPT56TerraModelID,
-			AmazonBedrockGPT56LunaModelID:
+		case AmazonBedrockGPT61SolModelID, AmazonBedrockGPT6AstraModelID, AmazonBedrockGPT61TerraModelID,
+			AmazonBedrockGPT6SolModelID, AmazonBedrockGPT6LunaModelID, AmazonBedrockGPT56SolModelID,
+			AmazonBedrockGPT56TerraModelID, AmazonBedrockGPT56LunaModelID:
 			wantMax = 872000
 		}
 		if model.MaxContextWindow != wantMax {
@@ -2071,18 +2193,20 @@ func TestAmazonBedrockRuntimeModelCatalogLikeRust(t *testing.T) {
 	}{
 		{bedrockRuntimeGlobalSlugPrefix + AmazonBedrockGPT61SolModelID, "GPT-6.1 Sol (Global)", 0},
 		{bedrockRuntimeGlobalSlugPrefix + AmazonBedrockGPT6AstraModelID, "GPT-6-Astra (Global)", 1},
-		{bedrockRuntimeGlobalSlugPrefix + AmazonBedrockGPT6SolModelID, "GPT-6 Sol (Global)", 2},
-		{bedrockRuntimeGlobalSlugPrefix + AmazonBedrockGPT6LunaModelID, "GPT-6 Luna (Global)", 3},
-		{bedrockRuntimeGlobalSlugPrefix + AmazonBedrockGPT56SolModelID, "GPT-5.6 Sol (Global)", 4},
-		{bedrockRuntimeGlobalSlugPrefix + AmazonBedrockGPT56TerraModelID, "GPT-5.6 Terra (Global)", 5},
-		{bedrockRuntimeGlobalSlugPrefix + AmazonBedrockGPT56LunaModelID, "GPT-5.6 Luna (Global)", 6},
-		{bedrockRuntimeUSSlugPrefix + AmazonBedrockGPT61SolModelID, "GPT-6.1 Sol (US cross-region)", 7},
-		{bedrockRuntimeUSSlugPrefix + AmazonBedrockGPT6AstraModelID, "GPT-6-Astra (US cross-region)", 8},
-		{bedrockRuntimeUSSlugPrefix + AmazonBedrockGPT6SolModelID, "GPT-6 Sol (US cross-region)", 9},
-		{bedrockRuntimeUSSlugPrefix + AmazonBedrockGPT6LunaModelID, "GPT-6 Luna (US cross-region)", 10},
-		{bedrockRuntimeUSSlugPrefix + AmazonBedrockGPT56SolModelID, "GPT-5.6 Sol (US cross-region)", 11},
-		{bedrockRuntimeUSSlugPrefix + AmazonBedrockGPT56TerraModelID, "GPT-5.6 Terra (US cross-region)", 12},
-		{bedrockRuntimeUSSlugPrefix + AmazonBedrockGPT56LunaModelID, "GPT-5.6 Luna (US cross-region)", 13},
+		{bedrockRuntimeGlobalSlugPrefix + AmazonBedrockGPT61TerraModelID, "GPT-6.1 Terra (Global)", 2},
+		{bedrockRuntimeGlobalSlugPrefix + AmazonBedrockGPT6SolModelID, "GPT-6 Sol (Global)", 3},
+		{bedrockRuntimeGlobalSlugPrefix + AmazonBedrockGPT6LunaModelID, "GPT-6 Luna (Global)", 4},
+		{bedrockRuntimeGlobalSlugPrefix + AmazonBedrockGPT56SolModelID, "GPT-5.6 Sol (Global)", 5},
+		{bedrockRuntimeGlobalSlugPrefix + AmazonBedrockGPT56TerraModelID, "GPT-5.6 Terra (Global)", 6},
+		{bedrockRuntimeGlobalSlugPrefix + AmazonBedrockGPT56LunaModelID, "GPT-5.6 Luna (Global)", 7},
+		{bedrockRuntimeUSSlugPrefix + AmazonBedrockGPT61SolModelID, "GPT-6.1 Sol (US cross-region)", 8},
+		{bedrockRuntimeUSSlugPrefix + AmazonBedrockGPT6AstraModelID, "GPT-6-Astra (US cross-region)", 9},
+		{bedrockRuntimeUSSlugPrefix + AmazonBedrockGPT61TerraModelID, "GPT-6.1 Terra (US cross-region)", 10},
+		{bedrockRuntimeUSSlugPrefix + AmazonBedrockGPT6SolModelID, "GPT-6 Sol (US cross-region)", 11},
+		{bedrockRuntimeUSSlugPrefix + AmazonBedrockGPT6LunaModelID, "GPT-6 Luna (US cross-region)", 12},
+		{bedrockRuntimeUSSlugPrefix + AmazonBedrockGPT56SolModelID, "GPT-5.6 Sol (US cross-region)", 13},
+		{bedrockRuntimeUSSlugPrefix + AmazonBedrockGPT56TerraModelID, "GPT-5.6 Terra (US cross-region)", 14},
+		{bedrockRuntimeUSSlugPrefix + AmazonBedrockGPT56LunaModelID, "GPT-5.6 Luna (US cross-region)", 15},
 	}
 	if len(catalog.Models) != len(want) {
 		t.Fatalf("runtime catalog len = %d, want %d", len(catalog.Models), len(want))
@@ -2097,9 +2221,14 @@ func TestAmazonBedrockRuntimeModelCatalogLikeRust(t *testing.T) {
 			t.Fatalf("%s visibility = %q, want list", model.Slug, model.Visibility)
 		}
 		// The Runtime variants inherit the Mantle base metadata: GPT-5.5 has no
-		// cross-region variant, so every entry keeps the long-context window.
-		if model.ContextWindow != 272000 || model.MaxContextWindow != 872000 {
-			t.Fatalf("%s context window = %d/%d, want 272000/872000", model.Slug, model.ContextWindow, model.MaxContextWindow)
+		// cross-region variant, so every entry keeps the bundled long-context
+		// window; GPT-6.1 Terra's bundled window starts at 500k.
+		wantContext := int64(272000)
+		if strings.HasSuffix(model.Slug, AmazonBedrockGPT61TerraModelID) {
+			wantContext = 500000
+		}
+		if model.ContextWindow != wantContext || model.MaxContextWindow != 872000 {
+			t.Fatalf("%s context window = %d/%d, want %d/872000", model.Slug, model.ContextWindow, model.MaxContextWindow, wantContext)
 		}
 		if model.WebSearchToolType != "text" {
 			t.Fatalf("%s WebSearchToolType = %q, want text", model.Slug, model.WebSearchToolType)
@@ -2165,7 +2294,7 @@ func TestAmazonBedrockRuntimeCatalogDisablesWebSearchLikeRust(t *testing.T) {
 		// matching Rust's pinned runtime table.
 		wantVersion := ""
 		switch base {
-		case AmazonBedrockGPT61SolModelID, AmazonBedrockGPT6AstraModelID,
+		case AmazonBedrockGPT61SolModelID, AmazonBedrockGPT6AstraModelID, AmazonBedrockGPT61TerraModelID,
 			AmazonBedrockGPT6SolModelID, AmazonBedrockGPT6LunaModelID,
 			AmazonBedrockGPT56SolModelID, AmazonBedrockGPT56TerraModelID:
 			wantVersion = "v2"
@@ -2209,6 +2338,7 @@ func TestBundledFallbackCarriesCatalogJSONBooleans(t *testing.T) {
 	// to the entries the Go fallback catalog mirrors.
 	const catalogJSON = `{"models":[
 		{"slug":"gpt-6.1-sol","supports_reasoning_summary_parameter":true,"include_apps_usage_instructions":false},
+		{"slug":"gpt-6.1-terra","supports_reasoning_summary_parameter":true,"include_apps_usage_instructions":false},
 		{"slug":"gpt-6-astra","supports_reasoning_summary_parameter":true,"include_apps_usage_instructions":false},
 		{"slug":"gpt-6-sol","supports_reasoning_summary_parameter":true,"include_apps_usage_instructions":false},
 		{"slug":"gpt-6-luna","supports_reasoning_summary_parameter":true,"include_apps_usage_instructions":false},
@@ -2226,10 +2356,6 @@ func TestBundledFallbackCarriesCatalogJSONBooleans(t *testing.T) {
 	for _, model := range fromCatalogJSON.Models {
 		bySlug[model.Slug] = model
 	}
-	// Slugs the catalog JSON no longer carries resolve through Rust's
-	// model_info_from_slug descriptor instead.
-	goOnly := map[string]bool{"gpt-5.2": true, "gpt-5.4-mini": true}
-
 	fallback := fallbackBundledModelsResponse()
 	if len(fallback.Models) == 0 {
 		t.Fatal("fallback catalog is empty")
@@ -2237,10 +2363,7 @@ func TestBundledFallbackCarriesCatalogJSONBooleans(t *testing.T) {
 	for _, model := range fallback.Models {
 		source, ok := bySlug[model.Slug]
 		if !ok {
-			if !goOnly[model.Slug] {
-				t.Fatalf("fallback slug %q has no models.json counterpart", model.Slug)
-			}
-			source = ModelInfoFromSlug(model.Slug)
+			t.Fatalf("fallback slug %q has no models.json counterpart", model.Slug)
 		}
 		if model.SupportsReasoningSummaries != source.SupportsReasoningSummaries {
 			t.Fatalf("%s: supports_reasoning_summary_parameter = %v on the fallback path, %v on the models.json path",

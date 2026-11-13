@@ -136,6 +136,7 @@ type boardChannel struct {
 type boardPost struct {
 	metadata    PostMetadata
 	request     PostRequest
+	behavior    postBehavior
 	search      string
 	nChars      int
 	replies     []int
@@ -182,13 +183,13 @@ func (s *boardState) key(index int) (int64, int) {
 	return s.posts[index].metadata.CreatedAt.UnixMicro(), index
 }
 
-func (s *boardState) existingPost(caller string, request PostRequest) (*PostMetadata, bool, error) {
+func (s *boardState) existingPost(caller string, request PostRequest, behavior postBehavior) (*PostMetadata, bool, error) {
 	index, ok := s.requests[requestKey(caller, request.RequestID)]
 	if !ok {
 		return nil, false, nil
 	}
 	post := s.posts[index]
-	if !postRequestsEqual(post.request, request) {
+	if !postRequestsEqual(post.request, request) || post.behavior != behavior {
 		return nil, false, invalid("request ID was already used for a different post")
 	}
 	metadata := post.metadata
@@ -214,21 +215,23 @@ func postRequestsEqual(left, right PostRequest) bool {
 	return true
 }
 
-func (s *boardState) insertChannel(name string, author agent.AgentPath, now time.Time) error {
+func (s *boardState) insertChannel(name string, author agent.AgentPath, now time.Time, description *string) error {
 	if err := validateChannelName(name); err != nil {
 		return err
 	}
 	if _, ok := s.channels[name]; ok {
 		return invalid("channel already exists")
 	}
-	s.channels[name] = &boardChannel{
-		summary: ChannelSummary{
-			ChannelName: name,
-			CreatedAt:   now,
-			CreatedBy:   author,
-		},
-		search: foldCase(name),
+	summary := ChannelSummary{
+		ChannelName: name,
+		CreatedAt:   now,
+		CreatedBy:   author,
 	}
+	if description != nil {
+		value := *description
+		summary.Description = &value
+	}
+	s.channels[name] = &boardChannel{summary: summary, search: foldCase(name)}
 	return nil
 }
 
@@ -282,6 +285,9 @@ func IsInvalidRequest(err error) bool {
 
 // CreateChannel creates a channel and optionally subscribes the caller.
 func (b *InMemoryBoard) CreateChannel(ctx context.Context, caller string, request CreateChannelRequest) (*ChannelSummary, error) {
+	if err := validateOptionalChannelDescription(request.Description); err != nil {
+		return nil, err
+	}
 	author, err := b.host.AgentPath(ctx, caller)
 	if err != nil {
 		return nil, err
@@ -293,7 +299,7 @@ func (b *InMemoryBoard) CreateChannel(ctx context.Context, caller string, reques
 	state := b.ref.state
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if err := state.insertChannel(request.ChannelName, author, now); err != nil {
+	if err := state.insertChannel(request.ChannelName, author, now, request.Description); err != nil {
 		return nil, err
 	}
 	if request.Subscription == Subscribe {
@@ -303,8 +309,62 @@ func (b *InMemoryBoard) CreateChannel(ctx context.Context, caller string, reques
 	return &summary, nil
 }
 
+// UpsertChannel creates a channel or replaces only its description. Existing
+// posts, authorship, creation time, and subscriptions are preserved, and no
+// notifications are sent (Rust #56494).
+func (b *InMemoryBoard) UpsertChannel(ctx context.Context, caller string, request UpsertChannelRequest) error {
+	if err := validateChannelName(request.ChannelName); err != nil {
+		return err
+	}
+	if err := validateChannelDescription(request.Description); err != nil {
+		return err
+	}
+	author, err := b.host.AgentPath(ctx, caller)
+	if err != nil {
+		return err
+	}
+	state := b.ref.state
+	state.mu.Lock()
+	if channel, ok := state.channels[request.ChannelName]; ok {
+		description := request.Description
+		channel.summary.Description = &description
+		state.mu.Unlock()
+		return nil
+	}
+	state.mu.Unlock()
+	// Fetch insertion metadata without holding the state lock, then recheck in
+	// case another caller created the channel while the clock was pending.
+	now, err := b.host.CurrentTime(ctx, caller)
+	if err != nil {
+		return err
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if channel, ok := state.channels[request.ChannelName]; ok {
+		description := request.Description
+		channel.summary.Description = &description
+		return nil
+	}
+	description := request.Description
+	return state.insertChannel(request.ChannelName, author, now, &description)
+}
+
 // Post creates a post or reply and fans the notification out to recipients.
 func (b *InMemoryBoard) Post(ctx context.Context, caller string, request PostRequest) (*PostMetadata, error) {
+	return b.postInner(ctx, caller, request, postDiscussion)
+}
+
+// Append stores evidence without subscribing its author or notifying anyone
+// (Rust #56461).
+func (b *InMemoryBoard) Append(ctx context.Context, caller string, request AppendRequest) (*PostMetadata, error) {
+	return b.postInner(ctx, caller, PostRequest{
+		RequestID:   request.RequestID,
+		Destination: request.Destination,
+		Text:        request.Text,
+	}, postSilentAppend)
+}
+
+func (b *InMemoryBoard) postInner(ctx context.Context, caller string, request PostRequest, behavior postBehavior) (*PostMetadata, error) {
 	if err := validatePostRequest(request); err != nil {
 		return nil, err
 	}
@@ -314,7 +374,7 @@ func (b *InMemoryBoard) Post(ctx context.Context, caller string, request PostReq
 	}
 	state := b.ref.state
 	state.mu.Lock()
-	if existing, ok, err := state.existingPost(caller, request); err != nil {
+	if existing, ok, err := state.existingPost(caller, request, behavior); err != nil {
 		state.mu.Unlock()
 		return nil, err
 	} else if ok {
@@ -324,12 +384,14 @@ func (b *InMemoryBoard) Post(ctx context.Context, caller string, request PostReq
 	state.mu.Unlock()
 
 	recipients := map[string]struct{}{}
-	for _, path := range request.AgentsToNotify {
-		resolved, err := b.host.ResolveAgent(ctx, path)
-		if err != nil {
-			return nil, err
+	if behavior == postDiscussion {
+		for _, path := range request.AgentsToNotify {
+			resolved, err := b.host.ResolveAgent(ctx, path)
+			if err != nil {
+				return nil, err
+			}
+			recipients[resolved] = struct{}{}
 		}
-		recipients[resolved] = struct{}{}
 	}
 	now, err := b.host.CurrentTime(ctx, caller)
 	if err != nil {
@@ -337,7 +399,7 @@ func (b *InMemoryBoard) Post(ctx context.Context, caller string, request PostReq
 	}
 
 	state.mu.Lock()
-	if existing, ok, err := state.existingPost(caller, request); err != nil {
+	if existing, ok, err := state.existingPost(caller, request, behavior); err != nil {
 		state.mu.Unlock()
 		return nil, err
 	} else if ok {
@@ -349,15 +411,17 @@ func (b *InMemoryBoard) Post(ctx context.Context, caller string, request PostReq
 		state.mu.Unlock()
 		return nil, err
 	}
-	channelName, root, target, err := state.resolveDestination(request.Destination, author, now, caller, id)
+	channelName, root, target, err := state.resolveDestination(request.Destination, author, now, caller, id, behavior)
 	if err != nil {
 		state.mu.Unlock()
 		return nil, err
 	}
-	if subscribers, ok := state.subscriptions[target]; ok {
-		for member, change := range subscribers {
-			if change == Subscribe {
-				recipients[member] = struct{}{}
+	if behavior == postDiscussion {
+		if subscribers, ok := state.subscriptions[target]; ok {
+			for member, change := range subscribers {
+				if change == Subscribe {
+					recipients[member] = struct{}{}
+				}
 			}
 		}
 	}
@@ -375,6 +439,7 @@ func (b *InMemoryBoard) Post(ctx context.Context, caller string, request PostReq
 	state.posts = append(state.posts, &boardPost{
 		metadata: metadata,
 		request:  request,
+		behavior: behavior,
 		search:   foldCase(request.Text),
 		nChars:   len([]rune(request.Text)),
 	})
@@ -398,8 +463,10 @@ func (b *InMemoryBoard) Post(ctx context.Context, caller string, request PostReq
 			thread.latestReply = &replyIndex
 		}
 	}
-	state.subscribe(SubscriptionTarget{Kind: "thread", ThreadID: root}, caller)
-	if len(recipients) == 0 {
+	if behavior == postDiscussion {
+		state.subscribe(SubscriptionTarget{Kind: "thread", ThreadID: root}, caller)
+	}
+	if behavior == postSilentAppend || len(recipients) == 0 {
 		// Rust #48072: a post with no recipients skips the notification preview.
 		state.mu.Unlock()
 		return &metadata, nil
@@ -424,7 +491,7 @@ func (s *boardState) keyGreater(index int, messageID string) bool {
 	return sequence > otherSequence
 }
 
-func (s *boardState) resolveDestination(destination PostDestination, author agent.AgentPath, now time.Time, caller string, id string) (string, string, SubscriptionTarget, error) {
+func (s *boardState) resolveDestination(destination PostDestination, author agent.AgentPath, now time.Time, caller string, id string, behavior postBehavior) (string, string, SubscriptionTarget, error) {
 	switch destination.Kind {
 	case "channel":
 		if _, ok := s.channels[destination.Name]; !ok {
@@ -432,10 +499,12 @@ func (s *boardState) resolveDestination(destination PostDestination, author agen
 		}
 		return destination.Name, id, SubscriptionTarget{Kind: "channel", ChannelName: destination.Name}, nil
 	case "new_channel":
-		if err := s.insertChannel(destination.Name, author, now); err != nil {
+		if err := s.insertChannel(destination.Name, author, now, nil); err != nil {
 			return "", "", SubscriptionTarget{}, err
 		}
-		s.subscribe(SubscriptionTarget{Kind: "channel", ChannelName: destination.Name}, caller)
+		if behavior == postDiscussion {
+			s.subscribe(SubscriptionTarget{Kind: "channel", ChannelName: destination.Name}, caller)
+		}
 		return destination.Name, id, SubscriptionTarget{Kind: "channel", ChannelName: destination.Name}, nil
 	case "thread":
 		index, err := s.threadIndex(destination.ThreadID)

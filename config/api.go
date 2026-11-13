@@ -15,7 +15,9 @@ import (
 	"time"
 
 	"codex_core/apps"
+	"codex_core/execpolicy"
 	"codex_core/network"
+	"codex_core/plugin"
 	"codex_core/sandbox"
 )
 
@@ -229,6 +231,9 @@ type ConfigReadResponse struct {
 	Config  map[string]any           `json:"config"`
 	Origins map[string]LayerMetadata `json:"origins"`
 	Layers  []Layer                  `json:"layers,omitempty"`
+	// featureLayers carries the in-memory precedence sources for runtime
+	// views built with NewConfigFromRead. It is not part of the RPC contract.
+	featureLayers []Layer
 }
 
 func (r *ConfigReadResponse) MarshalJSON() ([]byte, error) {
@@ -264,6 +269,7 @@ var configRequiredNullableKeys = []string{
 	"forced_chatgpt_workspace_id",
 	"forced_login_method",
 	"web_search",
+	"client_search_provider",
 	"tools",
 	"instructions",
 	"developer_instructions",
@@ -288,6 +294,13 @@ func configValuesForJSON(values map[string]any) map[string]any {
 	}
 	normalizeSandboxWorkspaceWriteConfig(out)
 	normalizeToolsConfig(out)
+	// Rust #59033: the effective tools.client_search_provider hint is exposed
+	// at the top level; a model-selected provider takes precedence over it.
+	if tools, ok := out["tools"].(map[string]any); ok {
+		out["client_search_provider"] = tools["client_search_provider"]
+	} else {
+		out["client_search_provider"] = nil
+	}
 	normalizeAnalyticsConfig(out)
 	normalizeAppsConfig(out)
 	return out
@@ -392,6 +405,25 @@ func normalizeAppsConfig(values map[string]any) {
 			app["tools"] = tools
 		} else {
 			setDefaultJSONField(app, "tools", nil)
+		}
+		// Rust #42047: the protocol AppConfig serializes links as null when
+		// absent, and an explicitly empty `[apps.<id>.links]` table as {}.
+		// Each AppLinkConfig also serializes both optional fields as null.
+		if links, ok := app["links"].(map[string]any); ok {
+			links = cloneMap(links)
+			for linkID, linkValue := range links {
+				link, ok := linkValue.(map[string]any)
+				if !ok {
+					continue
+				}
+				link = cloneMap(link)
+				setDefaultJSONField(link, "approvals_reviewer", nil)
+				setDefaultJSONField(link, "default_tools_approval_mode", nil)
+				links[linkID] = link
+			}
+			app["links"] = links
+		} else {
+			setDefaultJSONField(app, "links", nil)
 		}
 		normalized[key] = app
 	}
@@ -568,32 +600,46 @@ type ConfigRequirements struct {
 	// Permissions carries the managed [permissions] profile catalog from
 	// requirements (Rust ConfigRequirementsToml.permissions, #39752). It is
 	// internal and not part of the app-server wire ConfigRequirements schema.
-	Permissions                     map[string]any            `json:"-"`
-	AllowedWebSearchModes           []WebSearchMode           `json:"allowedWebSearchModes,omitempty"`
-	AllowManagedHooksOnly           *bool                     `json:"allowManagedHooksOnly,omitempty"`
-	AllowBrowserAndComputerUse      *bool                     `json:"allowBrowserAndComputerUse,omitempty"`
-	AllowAppshots                   *bool                     `json:"allowAppshots,omitempty"`
-	AllowRemoteControl              *bool                     `json:"allowRemoteControl,omitempty"`
-	ComputerUse                     *ComputerUseRequirements  `json:"computerUse,omitempty"`
-	BrowserUse                      *BrowserUseRequirements   `json:"browserUse,omitempty"`
-	InAppBrowser                    *InAppBrowserRequirements `json:"inAppBrowser,omitempty"`
-	AutoReview                      *AutoReviewRequirements   `json:"autoReview,omitempty"`
-	FeatureRequirements             map[string]bool           `json:"featureRequirements,omitempty"`
-	Hooks                           *ManagedHooksRequirements `json:"hooks,omitempty"`
-	EnforceResidency                *ResidencyRequirement     `json:"enforceResidency,omitempty"`
-	Application                     *ApplicationRequirements  `json:"application,omitempty"`
-	Network                         *NetworkRequirements      `json:"network,omitempty"`
-	Models                          *ModelsRequirements       `json:"models,omitempty"`
-	AllowedLoginMethods             []ForcedLoginMethod       `json:"allowedLoginMethods,omitempty"`
-	AllowedChatGPTWorkspaces        []string                  `json:"allowedChatGPTWorkspaces,omitempty"`
-	CliAuthCredentialsStore         *AuthCredentialsStoreMode `json:"cliAuthCredentialsStore,omitempty"`
-	ChatgptBaseURL                  *string                   `json:"chatgptBaseUrl,omitempty"`
-	AdditionalDeveloperInstructions *string                   `json:"additionalDeveloperInstructions,omitempty"`
+	Permissions                map[string]any            `json:"-"`
+	AllowedWebSearchModes      []WebSearchMode           `json:"allowedWebSearchModes,omitempty"`
+	AllowManagedHooksOnly      *bool                     `json:"allowManagedHooksOnly,omitempty"`
+	AllowBrowserAndComputerUse *bool                     `json:"allowBrowserAndComputerUse,omitempty"`
+	AllowAppshots              *bool                     `json:"allowAppshots,omitempty"`
+	AllowRemoteControl         *bool                     `json:"allowRemoteControl,omitempty"`
+	ComputerUse                *ComputerUseRequirements  `json:"computerUse,omitempty"`
+	BrowserUse                 *BrowserUseRequirements   `json:"browserUse,omitempty"`
+	InAppBrowser               *InAppBrowserRequirements `json:"inAppBrowser,omitempty"`
+	AutoReview                 *AutoReviewRequirements   `json:"autoReview,omitempty"`
+	FeatureRequirements        map[string]bool           `json:"featureRequirements,omitempty"`
+	// RuntimeAuthMode pins `features.runtime_agent_instances.mode` (Rust
+	// FeatureRequirementsToml.runtime_auth_mode, #60014). It is internal and
+	// stays off the app-server wire schema.
+	RuntimeAuthMode          *RuntimeAuthModeRequirement `json:"-"`
+	Hooks                    *ManagedHooksRequirements   `json:"hooks,omitempty"`
+	EnforceResidency         *ResidencyRequirement       `json:"enforceResidency,omitempty"`
+	Application              *ApplicationRequirements    `json:"application,omitempty"`
+	Network                  *NetworkRequirements        `json:"network,omitempty"`
+	Models                   *ModelsRequirements         `json:"models,omitempty"`
+	AllowedLoginMethods      []ForcedLoginMethod         `json:"allowedLoginMethods,omitempty"`
+	AllowedChatGPTWorkspaces []string                    `json:"allowedChatGPTWorkspaces,omitempty"`
+	CliAuthCredentialsStore  *AuthCredentialsStoreMode   `json:"cliAuthCredentialsStore,omitempty"`
+	ChatgptBaseURL           *string                     `json:"chatgptBaseUrl,omitempty"`
+	// ConfigServer is the local managed requirement selecting a customer-hosted
+	// configuration server (Rust ConfigRequirementsToml.config_server). Only
+	// local managed requirements may configure it, so it stays off the
+	// app-server wire schema and is dropped from cloud-managed layers.
+	ConfigServer                    *ConfigServer `json:"-"`
+	AdditionalDeveloperInstructions *string       `json:"additionalDeveloperInstructions,omitempty"`
 	// GuardianPolicyConfig is the managed `guardian_policy_config` requirement
 	// (Rust ConfigRequirementsToml.guardian_policy_config): it replaces the
 	// `# Policy Configuration` section of the Guardian reviewer prompt. Like
 	// Permissions it is internal and not part of the app-server wire schema.
 	GuardianPolicyConfig *string `json:"-"`
+	// Rules is the managed `[rules]` exec-policy requirement (Rust #58045
+	// ConfigRequirementsToml.rules). It is internal, like Permissions, and stays
+	// off the app-server wire schema; the checkpoint decision `prompt-user` is
+	// only accepted here.
+	Rules *execpolicy.RequirementsPolicy `json:"-"`
 	// GuardianExtraPolicy is the managed `guardian_extra_policy` requirement
 	// (Rust ConfigRequirementsToml.guardian_extra_policy, #47125): it fills the
 	// Guardian template's `{{ extra_policy }}` slot and replaces the
@@ -609,16 +655,26 @@ type ConfigRequirements struct {
 	// SQLiteHome, LogDir, and ModelCatalogJSON are exact managed path
 	// requirements (Rust ConfigRequirementsToml sqlite_home/log_dir/
 	// model_catalog_json). They override the configured values.
-	SQLiteHome              *string `json:"sqliteHome,omitempty"`
-	LogDir                  *string `json:"logDir,omitempty"`
-	ModelCatalogJSON        *string `json:"modelCatalogJson,omitempty"`
-	CheckForUpdateOnStartup *bool   `json:"checkForUpdateOnStartup,omitempty"`
-	AllowLoginShell         *bool   `json:"allowLoginShell,omitempty"`
+	SQLiteHome *string `json:"sqliteHome,omitempty"`
+	// UnsafeEnforceSQLiteJournalMode is the managed
+	// `unsafe_enforce_sqlite_journal_mode` requirement (Rust #57225): existing
+	// WAL databases on NFS are migrated to DELETE before writable pools open.
+	UnsafeEnforceSQLiteJournalMode *bool   `json:"unsafeEnforceSqliteJournalMode,omitempty"`
+	LogDir                         *string `json:"logDir,omitempty"`
+	ModelCatalogJSON               *string `json:"modelCatalogJson,omitempty"`
+	CheckForUpdateOnStartup        *bool   `json:"checkForUpdateOnStartup,omitempty"`
+	AllowLoginShell                *bool   `json:"allowLoginShell,omitempty"`
 	// Feedback is the managed feedback-collection requirement (Rust
 	// ConfigRequirementsToml.feedback).
-	Feedback   *FeedbackRequirements           `json:"feedback,omitempty"`
+	Feedback *FeedbackRequirements `json:"feedback,omitempty"`
+	// Otel carries managed OpenTelemetry requirements (Rust #57638/#57649/#57658).
+	Otel       *OtelRequirements               `json:"otel,omitempty"`
 	MCPServers map[string]MCPServerRequirement `json:"-"`
 	Plugins    map[string]PluginRequirements   `json:"-"`
+	// Marketplaces carries the managed marketplace source allowlist (Rust
+	// ConfigRequirementsToml.marketplaces, #41953). It is internal policy and
+	// stays off the app-server wire schema.
+	Marketplaces *plugin.MarketplaceRequirements `json:"-"`
 	// Apps carries the managed app requirements (Rust
 	// ConfigRequirementsToml.apps): app disablement and per-tool approval
 	// modes enforced by Cloud/MDM layers. Internal, like MCPServers/Plugins.
@@ -656,11 +712,13 @@ func (r *ConfigRequirements) MarshalJSON() ([]byte, error) {
 		ModelProvider                        *string                        `json:"modelProvider"`
 		ModelProviders                       map[string]any                 `json:"modelProviders"`
 		SQLiteHome                           *string                        `json:"sqliteHome"`
+		UnsafeEnforceSQLiteJournalMode       *bool                          `json:"unsafeEnforceSqliteJournalMode"`
 		LogDir                               *string                        `json:"logDir"`
 		ModelCatalogJSON                     *string                        `json:"modelCatalogJson"`
 		CheckForUpdateOnStartup              *bool                          `json:"checkForUpdateOnStartup"`
 		AllowLoginShell                      *bool                          `json:"allowLoginShell"`
 		Feedback                             *FeedbackRequirements          `json:"feedback"`
+		Otel                                 *wireOtelRequirements          `json:"otel"`
 	}{
 		AllowedApprovalPolicies:              permissionPoliciesOrNil(r.AllowedApprovalPolicies),
 		AllowedApprovalsReviewers:            approvalsReviewersOrNil(r.AllowedApprovalsReviewers),
@@ -691,11 +749,13 @@ func (r *ConfigRequirements) MarshalJSON() ([]byte, error) {
 		ModelProvider:                        cloneStringPtr(r.ModelProvider),
 		ModelProviders:                       cloneAnyMapOrNil(r.ModelProviders),
 		SQLiteHome:                           cloneStringPtr(r.SQLiteHome),
+		UnsafeEnforceSQLiteJournalMode:       cloneBoolPtr(r.UnsafeEnforceSQLiteJournalMode),
 		LogDir:                               cloneStringPtr(r.LogDir),
 		ModelCatalogJSON:                     cloneStringPtr(r.ModelCatalogJSON),
 		CheckForUpdateOnStartup:              cloneBoolPtr(r.CheckForUpdateOnStartup),
 		AllowLoginShell:                      cloneBoolPtr(r.AllowLoginShell),
 		Feedback:                             cloneFeedbackRequirements(r.Feedback),
+		Otel:                                 otelRequirementsForWire(r.Otel),
 	})
 }
 
@@ -1074,6 +1134,7 @@ type NetworkRequirements struct {
 	DangerouslyAllowNonLoopbackProxy *bool                        `json:"dangerouslyAllowNonLoopbackProxy,omitempty"`
 	DangerouslyAllowAllUnixSockets   *bool                        `json:"dangerouslyAllowAllUnixSockets,omitempty"`
 	Domains                          map[string]NetworkPermission `json:"domains,omitempty"`
+	ReviewDomains                    []string                     `json:"reviewDomains,omitempty"`
 	ManagedAllowedDomainsOnly        *bool                        `json:"managedAllowedDomainsOnly,omitempty"`
 	AllowedDomains                   []string                     `json:"allowedDomains,omitempty"`
 	DeniedDomains                    []string                     `json:"deniedDomains,omitempty"`
@@ -1092,6 +1153,7 @@ func (r *NetworkRequirements) MarshalJSON() ([]byte, error) {
 		DangerouslyAllowNonLoopbackProxy *bool                        `json:"dangerouslyAllowNonLoopbackProxy"`
 		DangerouslyAllowAllUnixSockets   *bool                        `json:"dangerouslyAllowAllUnixSockets"`
 		Domains                          map[string]NetworkPermission `json:"domains"`
+		ReviewDomains                    []string                     `json:"reviewDomains"`
 		ManagedAllowedDomainsOnly        *bool                        `json:"managedAllowedDomainsOnly"`
 		AllowedDomains                   []string                     `json:"allowedDomains"`
 		DeniedDomains                    []string                     `json:"deniedDomains"`
@@ -1107,6 +1169,7 @@ func (r *NetworkRequirements) MarshalJSON() ([]byte, error) {
 		DangerouslyAllowNonLoopbackProxy: cloneBoolPtr(r.DangerouslyAllowNonLoopbackProxy),
 		DangerouslyAllowAllUnixSockets:   cloneBoolPtr(r.DangerouslyAllowAllUnixSockets),
 		Domains:                          cloneNetworkMap(r.Domains),
+		ReviewDomains:                    stringSliceOrNil(r.ReviewDomains),
 		ManagedAllowedDomainsOnly:        cloneBoolPtr(r.ManagedAllowedDomainsOnly),
 		AllowedDomains:                   stringSliceOrNil(r.AllowedDomains),
 		DeniedDomains:                    stringSliceOrNil(r.DeniedDomains),
@@ -1167,6 +1230,8 @@ func (r *ApplicationNetworkRequirements) MarshalJSON() ([]byte, error) {
 type ManagedHooksRequirements struct {
 	ManagedDir        *string               `json:"managedDir,omitempty"`
 	WindowsManagedDir *string               `json:"windowsManagedDir,omitempty"`
+	PreModelRequest   []ConfiguredHookGroup `json:"PreModelRequest"`
+	PostModelRequest  []ConfiguredHookGroup `json:"PostModelRequest"`
 	PreToolUse        []ConfiguredHookGroup `json:"PreToolUse"`
 	PermissionRequest []ConfiguredHookGroup `json:"PermissionRequest"`
 	PostToolUse       []ConfiguredHookGroup `json:"PostToolUse"`
@@ -1185,6 +1250,8 @@ func (r *ManagedHooksRequirements) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		ManagedDir        *string               `json:"managedDir"`
 		WindowsManagedDir *string               `json:"windowsManagedDir"`
+		PreModelRequest   []ConfiguredHookGroup `json:"PreModelRequest"`
+		PostModelRequest  []ConfiguredHookGroup `json:"PostModelRequest"`
 		PreToolUse        []ConfiguredHookGroup `json:"PreToolUse"`
 		PermissionRequest []ConfiguredHookGroup `json:"PermissionRequest"`
 		PostToolUse       []ConfiguredHookGroup `json:"PostToolUse"`
@@ -1200,6 +1267,8 @@ func (r *ManagedHooksRequirements) MarshalJSON() ([]byte, error) {
 	}{
 		ManagedDir:        cloneStringPtr(r.ManagedDir),
 		WindowsManagedDir: cloneStringPtr(r.WindowsManagedDir),
+		PreModelRequest:   hookGroupsForJSON(r.PreModelRequest),
+		PostModelRequest:  hookGroupsForJSON(r.PostModelRequest),
 		PreToolUse:        hookGroupsForJSON(r.PreToolUse),
 		PermissionRequest: hookGroupsForJSON(r.PermissionRequest),
 		PostToolUse:       hookGroupsForJSON(r.PostToolUse),
@@ -1855,19 +1924,40 @@ type ConfigService struct {
 	// and login traffic under the local policy while the effective one - which
 	// may depend on a cloud fetch - is still unknown.
 	localRequirements *ConfigRequirements
-	warnings          []ConfigWarningNotification
-	managedLayers     []Layer
+	// loginPolicyRequirements is the requirements snapshot the running login
+	// policy was built from. Rust's AuthManager keeps that policy for the life of
+	// the process, so configRequirements/read reports it even after requirement
+	// files change on disk (#45495).
+	loginPolicyRequirements *ConfigRequirements
+	warnings                []ConfigWarningNotification
+	managedLayers           []Layer
+	// managedLayersOverride records a host-installed managed layer stack; a
+	// file refresh must not replace it (Rust #57175).
+	managedLayersOverride bool
+	// managedReloadMu serializes managed-file reloads. A reload reads the file
+	// outside s.mu to keep IO off the read path, so without this lock two
+	// reloads could publish out of order and a slower reload could replace a
+	// newer file state with an older one.
+	managedReloadMu sync.Mutex
+	// cloudConfigLoader supplies the latest config-server bundle on each read
+	// (Rust ConfigManager::current_managed_config_loader).
+	cloudConfigLoader *CloudConfigLoader
 	featureDefaults   map[string]bool
 	importHistory     []ExternalAgentConfigImportHistory
 	nextImportID      int
 	externalAgentHome string
 	now               func() time.Time
+	// memoryImportMu guards the host-supplied external-memory pipeline settings
+	// (Rust #56414/#56462); they are read while the import mutex is held.
+	memoryImportMu sync.RWMutex
+	memoryImport   MemoryImportSettings
 }
 
 func NewConfigService(codexHome string) *ConfigService {
 	service := &ConfigService{codexHome: codexHome, externalAgentHome: defaultExternalAgentHome(), now: time.Now}
 	service.loadRequirementsFromHome()
-	service.loadManagedConfigLayerFromEnv()
+	service.loadManagedConfigLayerFromEnv(true)
+	service.captureLoginPolicyRequirements()
 	return service
 }
 
@@ -1920,6 +2010,7 @@ func (s *ConfigService) SetRequirements(requirements *ConfigRequirements) {
 	defer s.mu.Unlock()
 	s.requirements = cloneRequirements(requirements)
 	s.requirementsOverride = true
+	s.loginPolicyRequirements = cloneRequirements(s.requirements)
 }
 
 // SetRequirementsIfDifferentFromLoaded preserves file-backed requirements
@@ -1933,6 +2024,30 @@ func (s *ConfigService) SetRequirementsIfDifferentFromLoaded(requirements *Confi
 	}
 	s.requirements = cloneRequirements(requirements)
 	s.requirementsOverride = true
+	s.loginPolicyRequirements = cloneRequirements(s.requirements)
+}
+
+// captureLoginPolicyRequirements freezes the requirements the running login
+// policy is derived from.
+func (s *ConfigService) captureLoginPolicyRequirements() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.loginPolicyRequirements = cloneRequirements(s.requirements)
+}
+
+// LoginPolicyRequirements returns the requirements snapshot the running login
+// policy was built from, or the current requirements when the service has no
+// snapshot yet (Rust AuthManager::allowed_login_methods, #45495).
+func (s *ConfigService) LoginPolicyRequirements() *ConfigRequirements {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.loginPolicyRequirements != nil {
+		return cloneRequirements(s.loginPolicyRequirements)
+	}
+	return cloneRequirements(s.requirements)
 }
 
 func (s *ConfigService) ReloadRequirementsFromHome() error {
@@ -1957,6 +2072,17 @@ func (s *ConfigService) ReloadRequirementsFromHome() error {
 	return nil
 }
 
+// requirementsSnapshot copies the effective requirements for loaders that run
+// outside the lock, so a concurrent reload cannot race the merge.
+func (s *ConfigService) requirementsSnapshot() *ConfigRequirements {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return cloneRequirements(s.requirements)
+}
+
 // LocalRequirements returns the requirements the home's file supplied, without
 // any effective override a host installed afterwards, or nil when the load
 // failed. Rust's local application load reads the same pre-cloud sources, so the
@@ -1978,21 +2104,44 @@ func (s *ConfigService) loadRequirementsFromHome() {
 	requirements, err := LoadRequirementsFile(path)
 	if err != nil {
 		details := err.Error()
+		s.mu.Lock()
 		s.warnings = append(s.warnings, ConfigWarningNotification{
 			Summary: "Invalid managed requirements; ignoring.",
 			Details: &details,
 			Path:    &path,
 		})
+		s.mu.Unlock()
 		return
 	}
+	s.mu.Lock()
 	s.requirements = requirements
 	s.localRequirements = cloneRequirements(requirements)
+	s.mu.Unlock()
 }
 
-func (s *ConfigService) loadManagedConfigLayerFromEnv() {
+func (s *ConfigService) loadManagedConfigLayerFromEnv(reset bool) {
 	if s == nil || strings.TrimSpace(s.codexHome) == "" {
 		return
 	}
+	layer, warning := s.managedConfigLayerFromEnv()
+	// Drop and rebuild under one lock: a concurrent read must never observe the
+	// window where the previous layer is gone and the new one is not added yet.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if reset {
+		s.managedLayers = nil
+	}
+	if warning != nil {
+		s.warnings = append(s.warnings, *warning)
+	}
+	if layer != nil {
+		s.managedLayers = append(s.managedLayers, *layer)
+	}
+}
+
+// managedConfigLayerFromEnv reads the app-server managed configuration without
+// touching service state, so callers can swap the layer in atomically.
+func (s *ConfigService) managedConfigLayerFromEnv() (*Layer, *ConfigWarningNotification) {
 	override, ok := os.LookupEnv(appServerManagedConfigPathEnv)
 	if !ok || strings.TrimSpace(override) == "" {
 		// Rust #38947: on Windows the default CODEX_HOME/managed_config.toml is
@@ -2005,36 +2154,34 @@ func (s *ConfigService) loadManagedConfigLayerFromEnv() {
 					"Ignoring deprecated managed config file at %s; CODEX_HOME/managed_config.toml is no longer supported on Windows. Use %%ProgramData%%\\OpenAI\\Codex\\requirements.toml for enforced settings or config.toml for defaults.",
 					deprecated,
 				)
-				s.warnings = append(s.warnings, ConfigWarningNotification{
+				return nil, &ConfigWarningNotification{
 					Summary: "Ignoring deprecated managed config file.",
 					Details: &details,
 					Path:    &deprecated,
-				})
+				}
 			}
 		}
-		return
+		return nil, nil
 	}
 	path := managedConfigPath(s.codexHome, override)
 	values, exists, err := loadConfigFileIfExists(path)
 	if err != nil {
 		details := err.Error()
-		s.warnings = append(s.warnings, ConfigWarningNotification{
+		return nil, &ConfigWarningNotification{
 			Summary: "Invalid managed configuration; ignoring.",
 			Details: &details,
 			Path:    &path,
-		})
-		return
+		}
 	}
 	if !exists {
-		return
+		return nil, nil
 	}
-	s.managedLayers = append(s.managedLayers, Layer{
+	return &Layer{
 		Name:    LayerSource{Type: LayerSourceLegacyManagedConfigFromFile, File: path},
 		Version: configVersion(values),
 		Config:  cloneMap(values),
-	})
+	}, nil
 }
-
 func (s *ConfigService) SetWarnings(warnings []ConfigWarningNotification) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2054,6 +2201,99 @@ func (s *ConfigService) SetManagedLayers(layers []Layer) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.managedLayers = cloneLayers(layers)
+	s.managedLayersOverride = true
+}
+
+// SetCloudConfigLoader installs the managed-configuration loader whose latest
+// config-server bundle joins every read. Rust #57175 keeps the config server's
+// loader and its refresh worker for the app-server's lifetime, so protocol
+// clients observe refreshed managed values instead of the startup snapshot.
+func (s *ConfigService) SetCloudConfigLoader(loader *CloudConfigLoader) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cloudConfigLoader = loader
+}
+
+// refreshManagedConfigFromFiles re-reads requirements.toml and the app-server
+// managed configuration path before a read (Rust
+// ConfigManager::load_latest_config). Host-installed overrides win.
+func (s *ConfigService) refreshManagedConfigFromFiles() {
+	if s == nil {
+		return
+	}
+	s.managedReloadMu.Lock()
+	defer s.managedReloadMu.Unlock()
+	if err := s.ReloadRequirementsFromHome(); err != nil {
+		details := err.Error()
+		path := filepath.Join(s.CodexHome(), "requirements.toml")
+		s.appendConfigWarningOnce(ConfigWarningNotification{
+			Summary: "Invalid managed requirements; ignoring.",
+			Details: &details,
+			Path:    &path,
+		})
+	}
+	s.mu.Lock()
+	managedLayersOverride := s.managedLayersOverride
+	s.mu.Unlock()
+	if managedLayersOverride {
+		return
+	}
+	s.loadManagedConfigLayerFromEnv(true)
+}
+
+// applyCloudConfigBundle merges the loader's latest enterprise-managed values
+// and requirements into one read, mirroring the managed-configuration stage of
+// LoadWithOptions. The base requirements are the freshly reloaded file ones, so
+// repeated reads never compound the fetched policy.
+func (s *ConfigService) applyCloudConfigBundle(values map[string]any) error {
+	if s == nil || values == nil {
+		return nil
+	}
+	s.mu.Lock()
+	loader := s.cloudConfigLoader
+	requirements := cloneRequirements(s.requirements)
+	codexHome := s.codexHome
+	s.mu.Unlock()
+	if loader == nil {
+		return nil
+	}
+	snapshot := loader.GetSnapshot()
+	if snapshot.Err != nil {
+		return snapshot.Err
+	}
+	// Rust #56055 runtime_refresh: a refreshed bundle must still come from the
+	// configuration server the local requirements select, so a swapped
+	// endpoint cannot silently take over the managed policy.
+	var requiredServer *ConfigServer
+	if requirements != nil {
+		requiredServer = requirements.ConfigServer
+	}
+	if err := ValidateAppliedConfigServer(snapshot.ConfigServer, requiredServer); err != nil {
+		return err
+	}
+	bundle := snapshot.Bundle
+	if bundle == nil || bundle.IsEmpty() {
+		return nil
+	}
+	merged, _, err := applyCloudConfigBundleWithFilesystemSource(values, requirements, *bundle, codexHome)
+	if err != nil {
+		return err
+	}
+	applyManagedApprovalsReviewerGuardianV2Override(values, merged)
+	applyManagedAuthBackendOverride(values, merged)
+	applyManagedModelProviderOverride(values, merged)
+	applyManagedExactOverrides(values, merged)
+	applyManagedOtelOverrides(values, merged)
+	if err := applyManagedConstrainedOverrides(values, merged); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.requirements = cloneRequirements(merged)
+	s.mu.Unlock()
+	return nil
 }
 
 // SetPackagedDefaultsLayer installs an optional package-supplied configuration
@@ -2102,24 +2342,14 @@ func (s *ConfigService) Read(params *ConfigReadParams) (*ConfigReadResponse, err
 	if params == nil {
 		params = &ConfigReadParams{}
 	}
+	s.refreshManagedConfigFromFiles()
 	profile := s.currentProfile()
 	if cwd := configReadCWD(params); cwd != "" {
 		layers, err := s.readLayersForCWD(cwd, profile)
 		if err != nil {
 			return nil, err
 		}
-		values, origins := mergeConfigLayers(layers)
-		s.applyFeatureEnablementDefaults(values, origins)
-		applySupportedFeatureEnablement(values)
-		if err := s.validateMCPEMAAuthConfig(layers, values); err != nil {
-			return nil, err
-		}
-		s.recordStartupWarnings(values)
-		response := &ConfigReadResponse{Config: values, Origins: origins}
-		if params.IncludeLayers {
-			response.Layers = cloneLayers(rpcLayers(layers))
-		}
-		return response, nil
+		return s.readResponseForLayers(layers, params)
 	}
 	userConfigPath, err := s.currentUserConfigPath()
 	if err != nil {
@@ -2130,7 +2360,7 @@ func (s *ConfigService) Read(params *ConfigReadParams) (*ConfigReadResponse, err
 		return nil, err
 	}
 	if strings.TrimSpace(profile) != "" {
-		if err := applyProfileLayer(s.codexHome, userValues, profile); err != nil {
+		if _, _, err := applyProfileLayer(s.codexHome, userValues, profile); err != nil {
 			return nil, err
 		}
 	}
@@ -2140,15 +2370,43 @@ func (s *ConfigService) Read(params *ConfigReadParams) (*ConfigReadResponse, err
 		Config:  cloneMap(userValues),
 	}
 	layers := s.readLayers(userLayer)
+	return s.readResponseForLayers(layers, params)
+}
+
+// ReadDefaults mirrors Rust's ConfigManager::load_default_config for the
+// plugin startup tasks: user and project configuration are ignored, while
+// packaged defaults and enterprise-managed layers stay active. Rust selects
+// this loader when the initial app-server config load is invalid (#42149).
+func (s *ConfigService) ReadDefaults(cwd string) (*ConfigReadResponse, error) {
+	s.refreshManagedConfigFromFiles()
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
+		cwd = strings.TrimSpace(s.codexHome)
+	}
+	layers, err := s.readLayersForCWDOptions(cwd, "", true, true)
+	if err != nil {
+		return nil, err
+	}
+	return s.readResponseForLayers(layers, &ConfigReadParams{})
+}
+
+func (s *ConfigService) readResponseForLayers(layers []Layer, params *ConfigReadParams) (*ConfigReadResponse, error) {
 	values, origins := mergeConfigLayers(layers)
+	if err := s.applyCloudConfigBundle(values); err != nil {
+		return nil, err
+	}
 	s.applyFeatureEnablementDefaults(values, origins)
 	applySupportedFeatureEnablement(values)
 	if err := s.validateMCPEMAAuthConfig(layers, values); err != nil {
 		return nil, err
 	}
 	s.recordStartupWarnings(values)
-	response := &ConfigReadResponse{Config: values, Origins: origins}
-	if params.IncludeLayers {
+	response := &ConfigReadResponse{
+		Config:        values,
+		Origins:       origins,
+		featureLayers: cloneLayers(layers),
+	}
+	if params != nil && params.IncludeLayers {
 		response.Layers = cloneLayers(rpcLayers(layers))
 	}
 	return response, nil
@@ -2258,6 +2516,217 @@ func configReadCWD(params *ConfigReadParams) string {
 	return strings.TrimSpace(*params.CWD)
 }
 
+// ProviderSetting is one `model_providers.<id>.<key>` field in a provider
+// setup write. A nil Value clears the field from the user configuration.
+type ProviderSetting struct {
+	Key   string
+	Value *string
+}
+
+// PreparedProviderWrite is a validated provider setup write together with the
+// active user layer version it was previewed against.
+type PreparedProviderWrite struct {
+	Edits           []ConfigEdit
+	ExpectedVersion string
+}
+
+// PrepareProviderConfig mirrors Rust ConfigManager::prepare_provider_config
+// (#57394): it validates a provider setup against the effective layer stack
+// without writing, rejects settings pinned by requirements, and returns the
+// previewed provider table plus the user version to commit.
+func (s *ConfigService) PrepareProviderConfig(providerID string, settings []ProviderSetting) (*PreparedProviderWrite, map[string]any, error) {
+	return s.PrepareProviderConfigForCWD("", providerID, settings)
+}
+
+// PrepareProviderConfigForCWD is PrepareProviderConfig with the app-server's
+// startup working directory. Rust previews against the complete startup layer
+// stack (including packaged defaults and project config), which the RPC layer
+// list hides, and resolves project config relative to that cwd.
+func (s *ConfigService) PrepareProviderConfigForCWD(cwd string, providerID string, settings []ProviderSetting) (*PreparedProviderWrite, map[string]any, error) {
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		return nil, nil, fmt.Errorf("%w: provider id is required", ErrInvalidConfigRequest)
+	}
+	layers, err := s.startupConfigLayers(cwd, s.currentProfile())
+	if err != nil {
+		return nil, nil, err
+	}
+	s.mu.Lock()
+	requirements := cloneRequirements(s.requirements)
+	s.mu.Unlock()
+	requiredProvider := ""
+	if requirements != nil && requirements.ModelProvider != nil {
+		requiredProvider = strings.TrimSpace(*requirements.ModelProvider)
+	}
+	var edits []ConfigEdit
+	if requiredProvider == "" {
+		edits = append(edits, ConfigEdit{KeyPath: "model_provider", Value: providerID, MergeStrategy: MergeReplace})
+	} else if requiredProvider != providerID {
+		return nil, nil, configWriteErrorf(ConfigWriteRequirementReadonly, "Cannot select `%s` because requirements set `model_provider` to `%s`.", providerID, requiredProvider)
+	}
+	for _, setting := range settings {
+		keyPath := "model_providers." + providerID + "." + setting.Key
+		value := any(nil)
+		if setting.Value != nil {
+			value = *setting.Value
+		}
+		edits = append(edits, ConfigEdit{KeyPath: keyPath, Value: value, MergeStrategy: MergeReplace})
+	}
+	for i := range edits {
+		if err := validateWritableKeyPath(edits[i].KeyPath, edits[i].Value); err != nil {
+			return nil, nil, err
+		}
+		if err := rejectRequirementForPath(requirements, edits[i].KeyPath); err != nil {
+			return nil, nil, err
+		}
+	}
+	userIndex, userValues, expectedVersion := activeUserLayer(layers)
+	if userValues == nil {
+		userValues = map[string]any{}
+	}
+	pending := cloneMap(userValues)
+	for i := range edits {
+		applyEdit(pending, &edits[i])
+	}
+	previewLayers := cloneLayers(layers)
+	if userIndex >= 0 {
+		previewLayers[userIndex].Config = cloneMap(pending)
+	} else {
+		previewLayers = append(previewLayers, Layer{Name: LayerSource{Type: LayerSourceUser}, Version: expectedVersion, Config: cloneMap(pending)})
+	}
+	effective, _ := mergeConfigLayers(previewLayers)
+	for _, edit := range edits {
+		actual, present := valueAtPath(effective, edit.KeyPath)
+		expected := edit.Value
+		matches := expected == nil && !present
+		if expected != nil {
+			matches = present && valuesEqual(actual, expected)
+		}
+		if matches {
+			continue
+		}
+		source := overridingLayerForPath(previewLayers, edit.KeyPath)
+		if source == "" {
+			source = "Overridden by another configuration layer"
+		}
+		return nil, nil, configWriteErrorf(ConfigWriteLayerReadonly, "Cannot configure `%s`: %s", edit.KeyPath, source)
+	}
+	providers, _ := effective["model_providers"].(map[string]any)
+	providerTable, _ := providers[providerID].(map[string]any)
+	return &PreparedProviderWrite{Edits: edits, ExpectedVersion: expectedVersion}, cloneMap(providerTable), nil
+}
+
+func activeUserLayer(layers []Layer) (int, map[string]any, string) {
+	for i := len(layers) - 1; i >= 0; i-- {
+		if layers[i].Name.Type != LayerSourceUser {
+			continue
+		}
+		values, _ := layers[i].Config.(map[string]any)
+		return i, values, layers[i].Version
+	}
+	return -1, nil, configVersion(map[string]any{})
+}
+
+func rejectRequirementForPath(requirements *ConfigRequirements, keyPath string) error {
+	if requirements == nil {
+		return nil
+	}
+	parts := splitKeyPath(keyPath)
+	if len(parts) == 0 {
+		return nil
+	}
+	switch parts[0] {
+	case "model_provider":
+		if requirements.ModelProvider != nil {
+			return configWriteErrorf(ConfigWriteRequirementReadonly, "`model_provider` is managed by requirements and cannot be changed")
+		}
+	case "model_providers":
+		if len(parts) > 1 {
+			if _, ok := requirements.ModelProviders[parts[1]]; ok {
+				return configWriteErrorf(ConfigWriteRequirementReadonly, "`model_providers.%s` is managed by requirements and cannot be changed", parts[1])
+			}
+		}
+	}
+	return nil
+}
+
+// startupConfigLayers loads the complete layer stack Rust previews against:
+// packaged defaults, user, project (when cwd is a trusted project), profile,
+// and managed layers. Read's IncludeLayers response hides packaged defaults and
+// has no project layer without a cwd, so previewing from it would both omit a
+// real override source and misreport one.
+func (s *ConfigService) startupConfigLayers(cwd string, profile string) ([]Layer, error) {
+	if cwd = strings.TrimSpace(cwd); cwd != "" {
+		return s.readLayersForCWD(cwd, profile)
+	}
+	userConfigPath, err := s.currentUserConfigPath()
+	if err != nil {
+		return nil, err
+	}
+	userValues, err := loadConfigFile(ConfigPath(s.codexHome))
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(profile) != "" {
+		if _, _, err := applyProfileLayer(s.codexHome, userValues, profile); err != nil {
+			return nil, err
+		}
+	}
+	userLayer := Layer{
+		Name:    LayerSource{Type: LayerSourceUser, File: userConfigPath, Profile: stringPtrIfNotEmpty(profile)},
+		Version: configVersion(userValues),
+		Config:  cloneMap(userValues),
+	}
+	return s.readLayers(userLayer), nil
+}
+
+// overridingLayerForPath returns Rust's override_message for the
+// highest-precedence layer that supplies keyPath.
+func overridingLayerForPath(layers []Layer, keyPath string) string {
+	for i := len(layers) - 1; i >= 0; i-- {
+		values, ok := layers[i].Config.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, present := valueAtPath(values, keyPath); !present {
+			continue
+		}
+		return configOverrideMessage(layers[i].Name)
+	}
+	return ""
+}
+
+// configOverrideMessage mirrors Rust app-server override_message
+// (config_manager_service.rs).
+func configOverrideMessage(source LayerSource) string {
+	switch source.Type {
+	case LayerSourcePackagedDefaults:
+		return fmt.Sprintf("Overridden by packaged defaults: %s", source.File)
+	case LayerSourceMDM:
+		return fmt.Sprintf("Overridden by managed policy (MDM): %s", source.Domain)
+	case LayerSourceSystem:
+		return fmt.Sprintf("Overridden by managed config (system): %s", source.File)
+	case LayerSourceEnterpriseManaged:
+		return fmt.Sprintf("Overridden by enterprise-managed config: %s", source.Name)
+	case LayerSourceProject:
+		return fmt.Sprintf("Overridden by project config: %s/config.toml", source.DotCodexFolder)
+	case LayerSourceSessionFlags:
+		return "Overridden by session flags"
+	case LayerSourceUser:
+		return fmt.Sprintf("Overridden by user config: %s", source.File)
+	case LayerSourceLegacyManagedConfigFromFile:
+		return fmt.Sprintf("Overridden by legacy managed_config.toml: %s", source.File)
+	case LayerSourceLegacyManagedConfigFromMDM:
+		return "Overridden by legacy managed configuration from MDM"
+	default:
+		name := strings.TrimSpace(string(source.Type))
+		if name == "" {
+			name = "another configuration layer"
+		}
+		return fmt.Sprintf("Overridden by %s", name)
+	}
+}
+
 func (s *ConfigService) WriteValue(params *ConfigValueWriteParams) (*ConfigWriteResponse, error) {
 	if err := params.Validate(); err != nil {
 		return nil, err
@@ -2296,6 +2765,8 @@ func (s *ConfigService) BatchWrite(params *ConfigBatchWriteParams) (*ConfigWrite
 		return nil, err
 	}
 	values = cloneMap(values)
+	documentText := readConfigDocumentText(path)
+	previousOrder := tomlDocumentTopLevelOrder(documentText)
 	currentVersion := configVersion(values)
 	if params.ExpectedVersion != nil && *params.ExpectedVersion != currentVersion {
 		return nil, configWriteErrorf(ConfigWriteVersionConflict, "Configuration was modified since last read. Fetch latest version and retry.")
@@ -2318,7 +2789,17 @@ func (s *ConfigService) BatchWrite(params *ConfigBatchWriteParams) (*ConfigWrite
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(path, []byte(renderTOML(values)), 0o600); err != nil {
+	rendered := renderTOML(orderedConfigValues(values, previousOrder))
+	if editsReplaceOnlyMCPTables(params.Edits) {
+		// Rust edits the document in place (core/src/config/edit.rs
+		// replace_mcp_servers), so comments, multi-line strings and unrelated
+		// sections keep their exact bytes instead of being re-serialized.
+		servers := orderedMCPTable(values["mcp_servers"])
+		if spliced, ok := spliceMCPTablesIntoDocument(documentText, servers); ok {
+			rendered = spliced
+		}
+	}
+	if err := os.WriteFile(path, []byte(rendered), 0o600); err != nil {
 		return nil, err
 	}
 	response := &ConfigWriteResponse{
@@ -2333,21 +2814,70 @@ func (s *ConfigService) BatchWrite(params *ConfigBatchWriteParams) (*ConfigWrite
 	return response, nil
 }
 
+// orderedMCPTable returns the mcp_servers value in the ordered form the
+// document splicer expects. Configuration parsed from disk and tables written
+// by applyEdit are plain maps, so converting them keeps the in-place splice
+// path working instead of handing it a nil table (which drops every server).
+func orderedMCPTable(value any) *OrderedTable {
+	switch table := value.(type) {
+	case *OrderedTable:
+		return table
+	case map[string]any:
+		ordered := NewOrderedTable()
+		names := make([]string, 0, len(table))
+		for name := range table {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			ordered.Set(name, table[name])
+		}
+		return ordered
+	default:
+		return nil
+	}
+}
+
+// editsReplaceOnlyMCPTables reports whether a batch only rewrites the
+// mcp_servers table with a replace merge, the edit shape `codex mcp add` and
+// `codex mcp remove` issue.
+func editsReplaceOnlyMCPTables(edits []ConfigEdit) bool {
+	if len(edits) == 0 {
+		return false
+	}
+	for _, edit := range edits {
+		if strings.TrimSpace(edit.KeyPath) != "mcp_servers" || edit.MergeStrategy != MergeReplace {
+			return false
+		}
+	}
+	return true
+}
+
 // rejectManagedAuthWrite mirrors Rust config_processor write rejection for
 // exact managed requirements (#39043): cli_auth_credentials_store and
 // chatgpt_base_url become read-only through config write APIs when a managed
 // requirement pins them.
 func (s *ConfigService) rejectManagedAuthWrite(keyPath string) error {
-	if s == nil || s.requirements == nil {
+	requirements := s.requirementsSnapshot()
+	if requirements == nil {
 		return nil
 	}
 	parts := splitKeyPath(keyPath)
+	if len(parts) == 0 {
+		return nil
+	}
+	// Managed OTEL requirements pin exact fields, including individual
+	// span-attribute and tracestate entries, while unmanaged siblings stay
+	// writable (Rust #57658).
+	if field := otelRequirementForConfigPath(requirements.Otel, parts); field != "" {
+		return configWriteErrorf(ConfigWriteRequirementReadonly, "`%s` is managed by requirements and cannot be changed", field)
+	}
 	if len(parts) != 1 {
 		// Provider IDs may contain dots, so compare the remaining path against
 		// the managed provider IDs (Rust #44650).
-		if len(parts) > 1 && parts[0] == "model_providers" && len(s.requirements.ModelProviders) > 0 {
+		if len(parts) > 1 && parts[0] == "model_providers" && len(requirements.ModelProviders) > 0 {
 			rest := strings.Join(parts[1:], ".")
-			for id := range s.requirements.ModelProviders {
+			for id := range requirements.ModelProviders {
 				if rest == id || strings.HasPrefix(rest, id+".") {
 					return configWriteErrorf(ConfigWriteValidation, "model_providers.%s is managed by requirements and cannot be written", id)
 				}
@@ -2357,19 +2887,19 @@ func (s *ConfigService) rejectManagedAuthWrite(keyPath string) error {
 	}
 	switch parts[0] {
 	case "cli_auth_credentials_store":
-		if s.requirements.CliAuthCredentialsStore != nil {
+		if requirements.CliAuthCredentialsStore != nil {
 			return configWriteErrorf(ConfigWriteValidation, "cli_auth_credentials_store is managed by requirements and cannot be written")
 		}
 	case "chatgpt_base_url":
-		if s.requirements.ChatgptBaseURL != nil {
+		if requirements.ChatgptBaseURL != nil {
 			return configWriteErrorf(ConfigWriteValidation, "chatgpt_base_url is managed by requirements and cannot be written")
 		}
 	case "model_provider":
-		if s.requirements.ModelProvider != nil {
+		if requirements.ModelProvider != nil {
 			return configWriteErrorf(ConfigWriteValidation, "model_provider is managed by requirements and cannot be written")
 		}
 	case "model_providers":
-		if len(s.requirements.ModelProviders) > 0 {
+		if len(requirements.ModelProviders) > 0 {
 			return configWriteErrorf(ConfigWriteValidation, "model_providers is managed by requirements and cannot be written")
 		}
 	}
@@ -2419,7 +2949,8 @@ func (s *ConfigService) WriteSkillConfig(params *SkillConfigWriteParams) (*Confi
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(path, []byte(renderTOML(values)), 0o600); err != nil {
+	previousOrder := tomlDocumentTopLevelOrder(readConfigDocumentText(path))
+	if err := os.WriteFile(path, []byte(renderTOML(orderedConfigValues(values, previousOrder))), 0o600); err != nil {
 		return nil, err
 	}
 	return &ConfigWriteResponse{
@@ -2461,13 +2992,37 @@ func (s *ConfigService) overriddenMetadataAfterWrite(edits []ConfigEdit) *Overri
 		if origin.Name.Precedence() <= userPrecedence {
 			continue
 		}
+		effectiveValue := effective
+		if parts := splitKeyPath(keyPath); len(parts) > 0 && parts[0] == "otel" {
+			if redacted, ok := redactedOtelValueAtPath(read.Config, parts); ok {
+				effectiveValue = redacted
+			}
+		}
 		return &OverriddenMetadata{
 			Message:         fmt.Sprintf("%s was written but is overridden by a higher-priority config layer", keyPath),
 			OverridingLayer: origin,
-			EffectiveValue:  effective,
+			EffectiveValue:  effectiveValue,
 		}
 	}
 	return nil
+}
+
+// redactedOtelValueAtPath mirrors Rust #57654's write-override redaction: mask
+// the complete effective `otel` table before extracting the written path, so an
+// overridden exporter or an individual header credential (whose name may itself
+// contain dots) never reaches the response.
+func redactedOtelValueAtPath(values map[string]any, parts []string) (any, bool) {
+	otel, ok := values["otel"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	redacted := cloneMap(otel)
+	RedactOtelExporterHeaders(redacted)
+	value := getAtPath(map[string]any{"otel": redacted}, parts)
+	if value == nil {
+		return nil, false
+	}
+	return value, true
 }
 
 // credentialProviderSourceOverride mirrors #44241's override reporting: a write
@@ -2518,7 +3073,7 @@ func credentialProviderSourceOverride(read *ConfigReadResponse, keyPath string, 
 }
 
 func (s *ConfigService) readLayers(userLayer Layer) []Layer {
-	managed := cloneLayers(s.managedLayers)
+	managed := s.managedLayersForRead()
 	packagedDefaults := s.packagedDefaultsLayerForRead()
 	layers := make([]Layer, 0, 1+len(managed))
 	if packagedDefaults != nil {
@@ -2533,21 +3088,34 @@ func (s *ConfigService) readLayers(userLayer Layer) []Layer {
 }
 
 func (s *ConfigService) readLayersForCWD(cwd string, profile string) ([]Layer, error) {
+	return s.readLayersForCWDOptions(cwd, profile, false, false)
+}
+
+// readLayersForCWDOptions loads the effective layer stack for a workspace.
+// ignoreUserConfig and ignoreProjectConfig mirror Rust's LoaderOverrides used
+// by the plugin startup fallback loader (#42149).
+func (s *ConfigService) readLayersForCWDOptions(cwd string, profile string, ignoreUserConfig bool, ignoreProjectConfig bool) ([]Layer, error) {
 	userPath := ConfigPath(s.codexHome)
-	userValues, err := loadConfigFile(userPath)
-	if err != nil {
-		return nil, err
+	userValues := map[string]any{}
+	if !ignoreUserConfig {
+		var err error
+		userValues, err = loadConfigFile(userPath)
+		if err != nil {
+			return nil, err
+		}
 	}
 	packagedDefaults := s.packagedDefaultsLayerForRead()
 	layers := []Layer{}
 	if packagedDefaults != nil {
 		layers = append(layers, *packagedDefaults)
 	}
-	layers = append(layers, Layer{
-		Name:    LayerSource{Type: LayerSourceUser, File: userPath},
-		Version: configVersion(userValues),
-		Config:  cloneMap(userValues),
-	})
+	if !ignoreUserConfig {
+		layers = append(layers, Layer{
+			Name:    LayerSource{Type: LayerSourceUser, File: userPath},
+			Version: configVersion(userValues),
+			Config:  cloneMap(userValues),
+		})
+	}
 	managedLayers := s.managedLayersForRead()
 	// Rust #44241: the project sanitizer reads the credential-broker state and
 	// provider env bindings from the trusted layers (packaged defaults, user,
@@ -2567,9 +3135,9 @@ func (s *ConfigService) readLayersForCWD(cwd string, profile string) ([]Layer, e
 	// #52302: the broker state also honours the managed credential-masking
 	// requirement, so the project sanitizer protects shell settings exactly
 	// like the loader does (Rust config/src/loader/mod.rs:995-1031).
-	brokerState := CredentialBrokerProjectStateForValuesWithRequirements(trustedBrokerValues, s.requirements)
+	brokerState := CredentialBrokerProjectStateForValuesWithRequirements(trustedBrokerValues, s.requirementsSnapshot())
 	trustedProviderEnvKeys := CredentialBrokerProviderEnvKeys(trustedBrokerValues)
-	if ProjectConfigEnabled(userValues, cwd) {
+	if !ignoreProjectConfig && ProjectConfigEnabled(userValues, cwd) {
 		for _, dotCodexFolder := range ProjectDotCodexFolders(cwd) {
 			path := filepath.Join(dotCodexFolder, "config.toml")
 			projectValues, exists, err := loadConfigFileIfExists(path)
@@ -2592,7 +3160,7 @@ func (s *ConfigService) readLayersForCWD(cwd string, profile string) ([]Layer, e
 			})
 		}
 	}
-	if strings.TrimSpace(profile) != "" {
+	if !ignoreUserConfig && strings.TrimSpace(profile) != "" {
 		profileLayer, err := s.profileLayer(profile)
 		if err != nil {
 			return nil, err
@@ -2707,6 +3275,9 @@ func mergeConfigLayers(layers []Layer) (map[string]any, map[string]LayerMetadata
 		fillOrigins("", layerValues, LayerMetadata{Name: layers[i].Name, Version: layers[i].Version}, origins)
 	}
 	pruneDisplacedCredentialProviderOrigins(values, origins)
+	if mergePluginApps(values) {
+		projectPluginAppsOrigins(values, origins)
+	}
 	return values, origins
 }
 
@@ -2804,12 +3375,13 @@ func (s *ConfigService) DetectExternalAgentConfig(params *ExternalAgentConfigDet
 		params = &ExternalAgentConfigDetectParams{}
 	}
 	migrationSource := normalizeExternalMigrationSource(params.MigrationSource)
+	skillMode := externalSkillImportModeForSource(params.MigrationSource)
 	items := make([]ExternalAgentConfigMigrationItem, 0, len(params.CWDs)+1)
 	if params.IncludeHome {
 		if migrationSource == externalMigrationSourceCursor {
 			items = append(items, s.detectExternalCursorMigrations(externalMigrationScope{})...)
 		} else {
-			items = append(items, s.detectExternalCoreMigrations(externalMigrationScope{})...)
+			items = append(items, s.detectExternalCoreMigrations(externalMigrationScope{}, skillMode)...)
 		}
 		if item, ok := s.detectExternalSessionMigrationForSource(migrationSource, params); ok {
 			items = append(items, item)
@@ -2823,7 +3395,7 @@ func (s *ConfigService) DetectExternalAgentConfig(params *ExternalAgentConfigDet
 		if migrationSource == externalMigrationSourceCursor {
 			items = append(items, s.detectExternalCursorMigrations(externalMigrationScope{repoRoot: root})...)
 		} else {
-			items = append(items, s.detectExternalCoreMigrations(externalMigrationScope{repoRoot: root})...)
+			items = append(items, s.detectExternalCoreMigrations(externalMigrationScope{repoRoot: root}, skillMode)...)
 		}
 	}
 	if params.IncludeHome {
@@ -2920,6 +3492,7 @@ func (s *ConfigService) ImportExternalAgentConfigItems(params *ExternalAgentConf
 
 func (s *ConfigService) importExternalAgentConfigItemsLocked(params *ExternalAgentConfigImportParams, deferPlugins bool) []ExternalAgentConfigImportTypeResult {
 	migrationSource := normalizeExternalMigrationSource(params.MigrationSource)
+	skillMode := externalSkillImportModeForSource(params.MigrationSource)
 	var typeResults []ExternalAgentConfigImportTypeResult
 	for i := range params.MigrationItems {
 		item := params.MigrationItems[i]
@@ -2937,7 +3510,7 @@ func (s *ConfigService) importExternalAgentConfigItemsLocked(params *ExternalAge
 			continue
 		}
 		if item.ItemType == MigrationConfig || item.ItemType == MigrationSkills || item.ItemType == MigrationAgentsMD {
-			result := s.importExternalCoreMigration(item)
+			result := s.importExternalCoreMigration(item, skillMode)
 			typeResults = append(typeResults, result)
 			continue
 		}
@@ -3035,6 +3608,18 @@ func applyEdit(root map[string]any, edit *ConfigEdit) {
 		deleteAtPath(root, parts)
 		return
 	}
+	value := edit.Value
+	// Mirrors Rust ConfigDocument::apply (core/config/edit.rs): writing a
+	// boolean toggle to an existing structured feature table stores it as
+	// `<feature>.enabled` instead of replacing the table, preserving nested
+	// configuration such as `features.sleep_tool.mode` (#41243).
+	if _, ok := value.(bool); ok {
+		if _, structured := structuredFeatureName(parts); structured {
+			if _, isTable := getAtPath(root, parts).(map[string]any); isTable {
+				parts = append(parts, "enabled")
+			}
+		}
+	}
 	if strategy == MergeUpsert {
 		existing, ok := getAtPath(root, parts).(map[string]any)
 		incoming, incomingOK := edit.Value.(map[string]any)
@@ -3045,7 +3630,7 @@ func applyEdit(root map[string]any, edit *ConfigEdit) {
 			return
 		}
 	}
-	setAtPath(root, parts, edit.Value)
+	setAtPath(root, parts, value)
 }
 
 func deleteAtPath(root map[string]any, parts []string) bool {
@@ -3406,14 +3991,14 @@ func splitKeyPath(path string) []string {
 	return out
 }
 
-func getAtPath(root map[string]any, parts []string) any {
+func getAtPath(root any, parts []string) any {
 	var current any = root
 	for _, part := range parts {
-		next, ok := current.(map[string]any)
+		values, _, _, ok := tableView(current)
 		if !ok {
 			return nil
 		}
-		current = next[part]
+		current = values[part]
 	}
 	return current
 }
@@ -3556,32 +4141,230 @@ func fillOriginChildren(prefix string, value any, origin LayerMetadata, out map[
 	}
 }
 
-func renderTOML(values map[string]any) string {
-	var builder strings.Builder
-	renderScalarSection(&builder, "", values)
-	sections := collectSections(values, nil)
-	sort.Slice(sections, func(i int, j int) bool {
-		return formatTOMLPath(sections[i]) < formatTOMLPath(sections[j])
-	})
-	for _, section := range sections {
-		nested := getAtPath(values, section)
-		nestedMap, ok := nested.(map[string]any)
+// OrderedTable is a config table whose keys keep the order they were set in, so
+// a write renders it the way toml_edit renders an edited document instead of
+// sorting the keys. An implicit table has no header of its own: Rust inserts
+// `mcp_servers` as an implicit table (core/config/edit.rs replace_mcp_servers),
+// so only the per-server tables reach the file.
+type OrderedTable struct {
+	Keys     []string
+	Values   map[string]any
+	Implicit bool
+}
+
+func NewOrderedTable() *OrderedTable {
+	return &OrderedTable{Values: map[string]any{}}
+}
+
+func (t *OrderedTable) Set(key string, value any) *OrderedTable {
+	if t == nil {
+		return t
+	}
+	if t.Values == nil {
+		t.Values = map[string]any{}
+	}
+	if _, exists := t.Values[key]; !exists {
+		t.Keys = append(t.Keys, key)
+	}
+	t.Values[key] = value
+	return t
+}
+
+// MarshalJSON keeps the config fingerprint and the JSON views independent of the
+// rendering order, like the plain maps they replace.
+func (t *OrderedTable) MarshalJSON() ([]byte, error) {
+	if t == nil {
+		return []byte("null"), nil
+	}
+	return json.Marshal(t.Values)
+}
+
+// tableView resolves plain maps and ordered tables into the key order the
+// writer should follow, and reports whether the table hides its own header.
+func tableView(value any) (map[string]any, []string, bool, bool) {
+	switch typed := value.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		return typed, keys, false, true
+	case *OrderedTable:
+		if typed == nil {
+			return nil, nil, false, false
+		}
+		keys := make([]string, 0, len(typed.Values))
+		for _, key := range typed.Keys {
+			if _, ok := typed.Values[key]; ok {
+				keys = append(keys, key)
+			}
+		}
+		return typed.Values, keys, typed.Implicit, true
+	default:
+		return nil, nil, false, false
+	}
+}
+
+// readConfigDocumentText returns the config document as written on disk so a
+// write can keep the top-level key order it already had. A missing file simply
+// yields no order.
+func readConfigDocumentText(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return string(stripUTF8BOM(data))
+}
+
+// orderedConfigValues wraps the top-level config table so renderTOML follows the
+// order the document already used and appends new keys at the end, like
+// toml_edit editing a document in place (core/config/edit.rs). An empty order
+// keeps the sorted rendering.
+func orderedConfigValues(values map[string]any, order []string) any {
+	if len(order) == 0 || len(values) == 0 {
+		return values
+	}
+	ordered := NewOrderedTable()
+	seen := make(map[string]bool, len(values))
+	for _, key := range order {
+		if seen[key] {
+			continue
+		}
+		value, ok := values[key]
 		if !ok {
 			continue
 		}
+		seen[key] = true
+		ordered.Set(key, value)
+	}
+	rest := make([]string, 0, len(values))
+	for key := range values {
+		if !seen[key] {
+			rest = append(rest, key)
+		}
+	}
+	sort.Strings(rest)
+	for _, key := range rest {
+		ordered.Set(key, values[key])
+	}
+	return ordered
+}
+
+// tomlDocumentTopLevelOrder lists the document's top-level keys in
+// first-appearance order: root key-value lines before the first table header
+// and table headers, both in the order the file declares them.
+func tomlDocumentTopLevelOrder(text string) []string {
+	if text == "" {
+		return nil
+	}
+	var order []string
+	seen := map[string]bool{}
+	claim := func(key string) {
+		if key == "" || seen[key] {
+			return
+		}
+		seen[key] = true
+		order = append(order, key)
+	}
+	inTable := false
+	multi := ""
+	depth := 0
+	for _, rawLine := range strings.Split(text, "\n") {
+		line := strings.TrimSpace(strings.TrimSuffix(rawLine, "\r"))
+		if multi != "" {
+			if strings.Contains(line, multi) {
+				multi = ""
+			}
+			continue
+		}
+		if depth > 0 {
+			depth += strings.Count(line, "[") - strings.Count(line, "]")
+			if depth < 0 {
+				depth = 0
+			}
+			continue
+		}
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "[[") {
+			inTable = true
+			claim(tomlTableHeaderKey(line, "[[", "]]"))
+			continue
+		}
+		if strings.HasPrefix(line, "[") {
+			inTable = true
+			claim(tomlTableHeaderKey(line, "[", "]"))
+			continue
+		}
+		equals := strings.Index(line, "=")
+		if equals <= 0 {
+			continue
+		}
+		if !inTable {
+			claim(tomlUnquoteKey(strings.TrimSpace(line[:equals])))
+		}
+		multi, depth = tomlValueContinuation(line[equals+1:])
+	}
+	return order
+}
+
+// tomlTableHeaderKey reads the first key of a table header, dropping any nested
+// path, so `[mcp_servers.alpha.env]` reports `mcp_servers`.
+func tomlTableHeaderKey(line string, open string, close string) string {
+	body := strings.TrimPrefix(line, open)
+	if end := strings.Index(body, close); end >= 0 {
+		body = body[:end]
+	}
+	return tomlUnquoteKey(strings.TrimSpace(body))
+}
+
+// tomlUnquoteKey returns the first dotted segment of a TOML key, unquoted.
+func tomlUnquoteKey(key string) string {
+	if strings.HasPrefix(key, "\"") {
+		if end := strings.Index(key[1:], "\""); end >= 0 {
+			return key[1 : 1+end]
+		}
+		return ""
+	}
+	if idx := strings.Index(key, "."); idx >= 0 {
+		key = key[:idx]
+	}
+	return strings.TrimSpace(key)
+}
+
+// tomlValueContinuation reports whether a value keeps the line open: a
+// multi-line string delimiter or an unclosed array.
+func tomlValueContinuation(value string) (string, int) {
+	for _, delimiter := range []string{"\"\"\"", "'''"} {
+		if strings.Count(value, delimiter)%2 == 1 {
+			return delimiter, 0
+		}
+	}
+	depth := strings.Count(value, "[") - strings.Count(value, "]")
+	if depth < 0 {
+		depth = 0
+	}
+	return "", depth
+}
+
+func renderTOML(values any) string {
+	var builder strings.Builder
+	renderScalarSection(&builder, values)
+	// Sections render in the order collectSections walks the tables: sorted keys
+	// for plain maps and insertion order for OrderedTable, which is what
+	// toml_edit keeps for a document that an edit only touched in place.
+	for _, section := range collectSections(values, nil) {
 		if builder.Len() > 0 && !strings.HasSuffix(builder.String(), "\n\n") {
 			builder.WriteByte('\n')
 		}
 		builder.WriteString("[")
 		builder.WriteString(formatTOMLPath(section))
 		builder.WriteString("]\n")
-		renderScalarSection(&builder, formatTOMLPath(section), nestedMap)
+		renderScalarSection(&builder, getAtPath(values, section))
 	}
-	arraySections := collectArrayTableSections(values, nil)
-	sort.Slice(arraySections, func(i int, j int) bool {
-		return formatTOMLPath(arraySections[i]) < formatTOMLPath(arraySections[j])
-	})
-	for _, section := range arraySections {
+	for _, section := range collectArrayTableSections(values, nil) {
 		tables, ok := tomlArrayTables(getAtPath(values, section))
 		if !ok {
 			continue
@@ -3593,58 +4376,79 @@ func renderTOML(values map[string]any) string {
 			builder.WriteString("[[")
 			builder.WriteString(formatTOMLPath(section))
 			builder.WriteString("]]\n")
-			renderScalarSection(&builder, formatTOMLPath(section), table)
+			renderScalarSection(&builder, table)
 		}
 	}
 	return builder.String()
 }
 
-func renderScalarSection(builder *strings.Builder, prefix string, values map[string]any) {
-	keys := make([]string, 0, len(values))
-	for key, value := range values {
-		if _, nested := value.(map[string]any); nested {
+func renderScalarSection(builder *strings.Builder, table any) {
+	values, keys, _, ok := tableView(table)
+	if !ok {
+		return
+	}
+	for _, key := range keys {
+		value := values[key]
+		if _, _, _, nested := tableView(value); nested {
 			continue
 		}
 		if _, nested := tomlArrayTables(value); nested {
 			continue
 		}
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
 		builder.WriteString(key)
 		builder.WriteString(" = ")
-		builder.WriteString(formatTOMLValue(values[key]))
+		builder.WriteString(formatTOMLValue(value))
 		builder.WriteByte('\n')
 	}
 }
 
-func collectSections(values map[string]any, prefix []string) [][]string {
-	var sections [][]string
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
+func collectSections(table any, prefix []string) [][]string {
+	values, keys, _, ok := tableView(table)
+	if !ok {
+		return nil
 	}
-	sort.Strings(keys)
+	var sections [][]string
 	for _, key := range keys {
-		nested, ok := values[key].(map[string]any)
-		if !ok {
-			continue
+		child := values[key]
+		if _, _, implicit, nested := tableView(child); nested {
+			path := append(append([]string(nil), prefix...), key)
+			// toml_edit only writes a header for a table that owns key-values:
+			// a table that exists purely to parent sub-tables stays implicit,
+			// so `[features.network_proxy]` keeps no `[features]` header.
+			if !implicit && hasDirectValues(child) {
+				sections = append(sections, path)
+			}
+			sections = append(sections, collectSections(child, path)...)
 		}
-		path := append(append([]string(nil), prefix...), key)
-		sections = append(sections, path)
-		sections = append(sections, collectSections(nested, path)...)
 	}
 	return sections
 }
 
-func collectArrayTableSections(values map[string]any, prefix []string) [][]string {
-	var sections [][]string
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
+// hasDirectValues reports whether the table holds a key-value of its own, as
+// opposed to only nesting other tables.
+func hasDirectValues(table any) bool {
+	values, keys, _, ok := tableView(table)
+	if !ok {
+		return false
 	}
-	sort.Strings(keys)
+	for _, key := range keys {
+		if _, _, _, nested := tableView(values[key]); nested {
+			continue
+		}
+		if _, arrayTable := tomlArrayTables(values[key]); arrayTable {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func collectArrayTableSections(table any, prefix []string) [][]string {
+	values, keys, _, ok := tableView(table)
+	if !ok {
+		return nil
+	}
+	var sections [][]string
 	for _, key := range keys {
 		value := values[key]
 		path := append(append([]string(nil), prefix...), key)
@@ -3652,8 +4456,8 @@ func collectArrayTableSections(values map[string]any, prefix []string) [][]strin
 			sections = append(sections, path)
 			continue
 		}
-		if nested, ok := value.(map[string]any); ok {
-			sections = append(sections, collectArrayTableSections(nested, path)...)
+		if _, _, _, nested := tableView(value); nested {
+			sections = append(sections, collectArrayTableSections(value, path)...)
 		}
 	}
 	return sections
@@ -3780,6 +4584,7 @@ func cloneRequirements(requirements *ConfigRequirements) *ConfigRequirements {
 	clone.AdditionalDeveloperInstructions = cloneStringPtr(requirements.AdditionalDeveloperInstructions)
 	clone.GuardianPolicyConfig = cloneStringPtr(requirements.GuardianPolicyConfig)
 	clone.GuardianExtraPolicy = cloneStringPtr(requirements.GuardianExtraPolicy)
+	clone.Rules = requirements.Rules.Clone()
 	clone.AllowManagedHooksOnly = cloneBoolPtr(requirements.AllowManagedHooksOnly)
 	clone.AllowBrowserAndComputerUse = cloneBoolPtr(requirements.AllowBrowserAndComputerUse)
 	clone.AllowAppshots = cloneBoolPtr(requirements.AllowAppshots)
@@ -3794,17 +4599,21 @@ func cloneRequirements(requirements *ConfigRequirements) *ConfigRequirements {
 	clone.Models = cloneModels(requirements.Models)
 	clone.MCPServers = cloneMCPServerRequirements(requirements.MCPServers)
 	clone.Plugins = clonePluginRequirements(requirements.Plugins)
+	clone.Marketplaces = plugin.CloneMarketplaceRequirements(requirements.Marketplaces)
 	clone.Apps = apps.CloneAppsRequirements(requirements.Apps)
 	clone.CliAuthCredentialsStore = cloneAuthCredentialsStoreMode(requirements.CliAuthCredentialsStore)
 	clone.ChatgptBaseURL = cloneStringPtr(requirements.ChatgptBaseURL)
+	clone.ConfigServer = cloneConfigServer(requirements.ConfigServer)
 	clone.ModelProvider = cloneStringPtr(requirements.ModelProvider)
 	clone.ModelProviders = cloneAnyMapOrNil(requirements.ModelProviders)
 	clone.SQLiteHome = cloneStringPtr(requirements.SQLiteHome)
+	clone.UnsafeEnforceSQLiteJournalMode = cloneBoolPtr(requirements.UnsafeEnforceSQLiteJournalMode)
 	clone.LogDir = cloneStringPtr(requirements.LogDir)
 	clone.ModelCatalogJSON = cloneStringPtr(requirements.ModelCatalogJSON)
 	clone.CheckForUpdateOnStartup = cloneBoolPtr(requirements.CheckForUpdateOnStartup)
 	clone.AllowLoginShell = cloneBoolPtr(requirements.AllowLoginShell)
 	clone.Feedback = cloneFeedbackRequirements(requirements.Feedback)
+	clone.Otel = cloneOtelRequirements(requirements.Otel)
 	return &clone
 }
 
@@ -4023,12 +4832,15 @@ func cloneManagedHooks(value *ManagedHooksRequirements) *ManagedHooksRequirement
 	return &ManagedHooksRequirements{
 		ManagedDir:        cloneStringPtr(value.ManagedDir),
 		WindowsManagedDir: cloneStringPtr(value.WindowsManagedDir),
+		PreModelRequest:   hookGroupsForJSON(value.PreModelRequest),
+		PostModelRequest:  hookGroupsForJSON(value.PostModelRequest),
 		PreToolUse:        hookGroupsForJSON(value.PreToolUse),
 		PermissionRequest: hookGroupsForJSON(value.PermissionRequest),
 		PostToolUse:       hookGroupsForJSON(value.PostToolUse),
 		PreCompact:        hookGroupsForJSON(value.PreCompact),
 		PostCompact:       hookGroupsForJSON(value.PostCompact),
 		SessionStart:      hookGroupsForJSON(value.SessionStart),
+		SessionEnd:        hookGroupsForJSON(value.SessionEnd),
 		UserPromptSubmit:  hookGroupsForJSON(value.UserPromptSubmit),
 		SubagentStart:     hookGroupsForJSON(value.SubagentStart),
 		SubagentStop:      hookGroupsForJSON(value.SubagentStop),
@@ -4057,6 +4869,7 @@ func cloneNetwork(value *NetworkRequirements) *NetworkRequirements {
 	clone.DangerouslyAllowNonLoopbackProxy = cloneBoolPtr(value.DangerouslyAllowNonLoopbackProxy)
 	clone.DangerouslyAllowAllUnixSockets = cloneBoolPtr(value.DangerouslyAllowAllUnixSockets)
 	clone.Domains = cloneNetworkMap(value.Domains)
+	clone.ReviewDomains = stringSliceOrNil(value.ReviewDomains)
 	clone.ManagedAllowedDomainsOnly = cloneBoolPtr(value.ManagedAllowedDomainsOnly)
 	clone.AllowedDomains = stringSliceOrNil(value.AllowedDomains)
 	clone.DeniedDomains = stringSliceOrNil(value.DeniedDomains)

@@ -20,6 +20,33 @@ func TestExtractResponseDebugContext(t *testing.T) {
 	}
 }
 
+// Mirrors Rust #57452's response-debug-context mapping: the telemetry label
+// names the policy-restricted capacity failure without including the body.
+func TestTelemetryPolicyCapacityMessageLikeRust(t *testing.T) {
+	api := &ResponseAPIError{Kind: ResponseAPIPolicyCapacityUnavailable}
+	if got := TelemetryResponseAPIErrorMessage(api); got != "policy-restricted capacity unavailable" {
+		t.Fatalf("TelemetryResponseAPIErrorMessage() = %q", got)
+	}
+}
+
+// Rust #47353 maps ApiError::InvalidPrompt onto the same response-debug
+// telemetry label as InvalidRequest without exposing the provider body.
+func TestTelemetryInvalidPromptMessageLikeRust(t *testing.T) {
+	api := &ResponseAPIError{Kind: ResponseAPIInvalidPrompt, Message: "secret detail"}
+	if got := TelemetryResponseAPIErrorMessage(api); got != "invalid request" {
+		t.Fatalf("TelemetryResponseAPIErrorMessage() = %q", got)
+	}
+}
+
+// Rust #58434 groups InvalidAudioInput with invalid requests in telemetry
+// without exposing the provider body.
+func TestTelemetryInvalidAudioInputMessageLikeRust(t *testing.T) {
+	api := &ResponseAPIError{Kind: ResponseAPIInvalidAudioInput, Message: "secret detail"}
+	if got := TelemetryResponseAPIErrorMessage(api); got != "invalid request" {
+		t.Fatalf("TelemetryResponseAPIErrorMessage() = %q", got)
+	}
+}
+
 func TestTelemetryMessagesOmitHTTPBody(t *testing.T) {
 	transport := &ResponseTransportError{Kind: ResponseTransportHTTP, Status: 401, Message: "secret body"}
 	if got := TelemetryResponseTransportErrorMessage(transport); got != "http 401" {

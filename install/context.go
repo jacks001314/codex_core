@@ -16,6 +16,9 @@ import (
 
 const (
 	binDirname                = "bin"
+	bundleAppDirname          = "CodexCLI.app"
+	bundleContentsDirname     = "Contents"
+	bundleMacOSDirname        = "MacOS"
 	packageMetadataFilename   = "codex-package.json"
 	pathDirname               = "codex-path"
 	releasesDirname           = "releases"
@@ -63,6 +66,9 @@ type CodexPackageLayout struct {
 // runtime package (codex-package.json).
 type CodexPackageManifest struct {
 	Version string `json:"version"`
+	// ExecServer is the package-relative standalone executor path advertised by
+	// newer packages (Rust #57590). Older packages leave it empty.
+	ExecServer string `json:"execServer,omitempty"`
 }
 
 type InstallMethod struct {
@@ -303,7 +309,8 @@ func (c *InstallContext) PackageManifest() *CodexPackageManifest {
 		return nil
 	}
 	var manifest struct {
-		Version string `json:"version"`
+		Version    string `json:"version"`
+		ExecServer string `json:"execServer"`
 	}
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return nil
@@ -311,7 +318,23 @@ func (c *InstallContext) PackageManifest() *CodexPackageManifest {
 	if !validPackageManifestVersion(manifest.Version) {
 		return nil
 	}
-	return &CodexPackageManifest{Version: manifest.Version}
+	return &CodexPackageManifest{Version: manifest.Version, ExecServer: strings.TrimSpace(manifest.ExecServer)}
+}
+
+// ExecServerPath resolves the advertised standalone executor for this package.
+// It reports false when the package predates the advertisement or the named
+// file is missing, which installers treat as "no executor to verify".
+func (c *InstallContext) ExecServerPath() (string, bool) {
+	manifest := c.PackageManifest()
+	if manifest == nil || manifest.ExecServer == "" || c.PackageLayout == nil {
+		return "", false
+	}
+	path := filepath.Join(c.PackageLayout.PackageDir, filepath.FromSlash(manifest.ExecServer))
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return "", false
+	}
+	return path, true
 }
 
 func validPackageManifestVersion(version string) bool {
@@ -443,6 +466,19 @@ func PackageLayoutFromExe(exePath string) *CodexPackageLayout {
 		// The executable lives in the package codex-resources/ directory;
 		// resolve the sibling bin/ directory and require it to exist.
 		binDir = filepath.Join(filepath.Dir(exeDir), binDirname)
+		if existingDir(binDir) == nil {
+			return nil
+		}
+	case bundleMacOSDirname:
+		// A provisioned CLI keeps helpers and metadata in the outer package;
+		// the executable points inside CodexCLI.app/Contents/MacOS rather than
+		// at bin/codex (Rust #42068).
+		contentsDir := filepath.Dir(exeDir)
+		bundleDir := filepath.Dir(contentsDir)
+		if filepath.Base(contentsDir) != bundleContentsDirname || filepath.Base(bundleDir) != bundleAppDirname {
+			return nil
+		}
+		binDir = filepath.Join(filepath.Dir(bundleDir), binDirname)
 		if existingDir(binDir) == nil {
 			return nil
 		}

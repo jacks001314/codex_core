@@ -4,14 +4,26 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
+	"fmt"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
 
 	"codex_core/network"
+	"codex_core/shell"
 	"codex_core/utils"
 )
+
+func shellSnapshotTestCaptureSource(state string, descriptor bool) []byte {
+	flag := byte('0')
+	if descriptor {
+		flag = '1'
+	}
+	marker := append([]byte{0}, shellSnapshotSourceMarker...)
+	marker = append(marker, 0, flag, 0)
+	return append(marker, state...)
+}
 
 func TestShellSnapshotRequestRoundTripAndCapability(t *testing.T) {
 	params := ExecParams{
@@ -38,8 +50,8 @@ func TestShellSnapshotRequestRoundTripAndCapability(t *testing.T) {
 	if decoded.ShellSnapshot == nil || decoded.ShellSnapshot.ScopeID != "attachment-1" {
 		t.Fatalf("decoded shell snapshot = %#v", decoded.ShellSnapshot)
 	}
-	if got := localEnvironmentInfo().Capabilities.ShellSnapshotV2; got {
-		t.Fatal("local exec-server must not advertise shellSnapshotV2")
+	if got, want := localEnvironmentInfo().Capabilities.ShellSnapshotV2, runtime.GOOS != "windows"; got != want {
+		t.Fatalf("local shellSnapshotV2 capability = %v, want %v (Rust #40376)", got, want)
 	}
 }
 
@@ -51,7 +63,7 @@ func TestShellSnapshotManagerRewritesAndCachesLikeRust(t *testing.T) {
 	manager := newShellSnapshotManager()
 	manager.capture = func(context.Context, []string, string, map[string]string) ([]byte, error) {
 		calls.Add(1)
-		return []byte("# Snapshot file\nexport TOKEN=\"sk-real-secret\"\n\x00\x00\x00"), nil
+		return shellSnapshotTestCaptureSource("# Snapshot file\nexport TOKEN=\"sk-real-secret\"\n\x00\x00\x00", false), nil
 	}
 	cwd, err := utils.FromHostNativePath(t.TempDir())
 	if err != nil {
@@ -72,42 +84,47 @@ func TestShellSnapshotManagerRewritesAndCachesLikeRust(t *testing.T) {
 		},
 	}
 	pairs := []network.CredentialMaskPair{{Real: "sk-real-secret", Dummy: "sk-dummy-value"}}
-	rewritten, err := manager.rewrite(context.Background(), params, params.Env, pairs)
+	rewritten, reader, err := manager.rewrite(context.Background(), params, params.Env, pairs, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	script := rewritten.Argv[2]
-	if !strings.HasPrefix(script, ". '") || !strings.Contains(script, "|| exit 1\n") || !strings.HasSuffix(script, "echo ok") {
+	if rewritten.Argv[1] != "-fc" {
+		t.Fatalf("zsh snapshot launch flag = %q, want -fc", rewritten.Argv[1])
+	}
+	if !strings.HasPrefix(script, "setopt RCS\nif ! ") || !strings.HasSuffix(script, "echo ok") {
 		t.Fatalf("rewritten script = %q", script)
+	}
+	if reader == nil && !shellSnapshotReplaysThroughState(script) {
+		t.Fatalf("rewritten script = %q, want a snapshot replay", script)
+	}
+	state := shellSnapshotReplayState(t, rewritten, reader)
+	if !strings.Contains(state, "sk-dummy-value") || strings.Contains(state, "sk-real-secret") {
+		t.Fatalf("in-memory snapshot state = %q", state)
 	}
 	if !strings.Contains(script, "\\builtin export HTTP_PROXY='http://127.0.0.1:8080'") ||
 		!strings.Contains(script, "\\builtin export "+network.CredentialBrokerActiveEnvKey+"='1'") ||
 		!strings.Contains(script, "\\builtin export TOKEN='sk-dummy-value'") {
 		t.Fatalf("launch environment was not restored after snapshot: %q", script)
 	}
-	again, err := manager.rewrite(context.Background(), params, params.Env, pairs)
+	again, againReader, err := manager.rewrite(context.Background(), params, params.Env, pairs, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls.Load() != 1 || again.Argv[2] != script {
-		t.Fatalf("snapshot cache calls=%d script=%q", calls.Load(), again.Argv[2])
+	// A protected capture belongs to one launch (Rust never caches it), so the
+	// repeat capture yields the same replay text instead of a cache hit.
+	if calls.Load() != 2 || again.Argv[2] != script {
+		t.Fatalf("protected snapshot calls=%d script=%q", calls.Load(), again.Argv[2])
 	}
-	path := strings.TrimSpace(strings.Split(script, "|| exit 1")[0])
-	path = strings.TrimSpace(strings.TrimPrefix(path, ". '"))
-	path = strings.TrimSpace(strings.TrimSuffix(path, "'"))
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("snapshot file = %q: %v", path, err)
-	}
-	contents, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(contents), "sk-real-secret") || !strings.Contains(string(contents), "sk-dummy-value") {
-		t.Fatalf("snapshot credentials were not masked: %s", contents)
+	if againState := shellSnapshotReplayState(t, again, againReader); againState != state {
+		t.Fatalf("cached snapshot state = %q, want %q", againState, state)
 	}
 	manager.close()
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("snapshot file survived close: %v", err)
+	manager.mu.Lock()
+	cached := len(manager.cache)
+	manager.mu.Unlock()
+	if cached != 0 {
+		t.Fatalf("snapshot cache survived close: %d entries", cached)
 	}
 }
 
@@ -130,7 +147,7 @@ func TestShellSnapshotCaptureFailureRestoresCredentialsLikeRust(t *testing.T) {
 		Env: map[string]string{"TOKEN": "sk-dummy-value"},
 	}
 	pairs := []network.CredentialMaskPair{{Real: "sk-real-secret", Dummy: "sk-dummy-value"}}
-	rewritten, err := manager.rewrite(context.Background(), params, params.Env, pairs)
+	rewritten, _, err := manager.rewrite(context.Background(), params, params.Env, pairs, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,6 +155,225 @@ func TestShellSnapshotCaptureFailureRestoresCredentialsLikeRust(t *testing.T) {
 		t.Fatalf("fallback env = %#v", rewritten.Env)
 	}
 	if !strings.Contains(rewritten.Argv[2], "Credential masking is unavailable") || !strings.HasSuffix(rewritten.Argv[2], "echo ok") {
+		t.Fatalf("fallback script = %q", rewritten.Argv[2])
+	}
+}
+
+// TestShellSnapshotCacheIsBoundedLikeRust covers Rust's MAX_CACHED_SNAPSHOTS:
+// the executor keeps at most 16 captures and removes the file a file-backed
+// capture materialized when it evicts that entry (#39957).
+func TestShellSnapshotCacheIsBoundedLikeRust(t *testing.T) {
+	previous := shellSnapshotPlatformSupported
+	shellSnapshotPlatformSupported = true
+	t.Cleanup(func() { shellSnapshotPlatformSupported = previous })
+	manager := newShellSnapshotManager()
+	t.Cleanup(manager.close)
+	// The state exceeds the 512 KiB environment replay budget, so every capture
+	// is replayed through an unnamed file rather than the environment.
+	output := []byte("# Snapshot file\n" + strings.Repeat("export BIG=\"value\"\n", 48*1024) + "\x00\x00\x00")
+	manager.capture = func(context.Context, []string, string, map[string]string) ([]byte, error) {
+		return shellSnapshotTestCaptureSource(string(output), true), nil
+	}
+	cwd, err := utils.FromHostNativePath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var oldestState string
+	for index := 0; index < maxCachedShellSnapshots+1; index++ {
+		params := &ExecParams{
+			ProcessID: "bounded-snapshot",
+			Argv:      []string{"/bin/bash", "-lc", "echo ok"},
+			CWD:       cwd.String(),
+			ShellSnapshot: &ShellSnapshotRequest{
+				ScopeID: fmt.Sprintf("scope-%d", index),
+				Shell:   ShellInfo{Name: "bash", Path: "/bin/bash"},
+			},
+			Env: map[string]string{"PATH": "/bin"},
+		}
+		entry, err := manager.snapshotEntry(context.Background(), params, shell.ShellBash, params.Env, nil, nil)
+		if err != nil {
+			t.Fatalf("capture %d: %v", index, err)
+		}
+		if entry == nil || len(entry.state) == 0 {
+			t.Fatalf("capture %d did not keep the captured state: %#v", index, entry)
+		}
+		if index == 0 {
+			oldestState = entry.state
+		}
+	}
+	manager.mu.Lock()
+	cached := len(manager.cache)
+	manager.mu.Unlock()
+	if cached != maxCachedShellSnapshots {
+		t.Fatalf("cached snapshots = %d, want %d", cached, maxCachedShellSnapshots)
+	}
+	if oldestState == "" {
+		t.Fatal("the oldest capture did not carry state")
+	}
+}
+
+func TestShellSnapshotCaptureProbeScriptAndMarkerLikeRust(t *testing.T) {
+	script := shellSnapshotCaptureProbeScript("printf capture", true)
+	if !strings.Contains(script, "</dev/fd/3") || !strings.Contains(script, shellSnapshotSourceMarker) {
+		t.Fatalf("probe script = %q", script)
+	}
+	if !strings.HasSuffix(script, "\nprintf capture") {
+		t.Fatalf("probe must run before the capture script: %q", script)
+	}
+	fileSource, captured, err := parseShellSnapshotCaptureSource(shellSnapshotTestCaptureSource("# Snapshot file\n", true))
+	if err != nil || !fileSource || string(captured) != "# Snapshot file\n" {
+		t.Fatalf("descriptor marker = (%v, %q, %v)", fileSource, captured, err)
+	}
+	fileSource, captured, err = parseShellSnapshotCaptureSource(shellSnapshotTestCaptureSource("# Snapshot file\n", false))
+	if err != nil || fileSource || string(captured) != "# Snapshot file\n" {
+		t.Fatalf("environment marker = (%v, %q, %v)", fileSource, captured, err)
+	}
+	if _, _, err := parseShellSnapshotCaptureSource([]byte("# Snapshot file\n")); err == nil {
+		t.Fatal("a capture without the source probe was accepted")
+	}
+	if _, _, err := parseShellSnapshotCaptureSource([]byte{0, 'C', 'O', 'D', 'E', 'X', '_', 'S', 'N', 'A', 'P', 'S', 'H', 'O', 'T', '_', 'S', 'O', 'U', 'R', 'C', 'E', 0}); err == nil {
+		t.Fatal("an incomplete source probe was accepted")
+	}
+}
+
+// TestShellSnapshotBashReplayUsesPrivilegedFlagLikeRust covers Rust's bash
+// startup suppression: the restored snapshot launches with -pc and clears the
+// privileged mode so automatic startup files do not re-run (#39957).
+func TestShellSnapshotBashReplayUsesPrivilegedFlagLikeRust(t *testing.T) {
+	previous := shellSnapshotPlatformSupported
+	shellSnapshotPlatformSupported = true
+	t.Cleanup(func() { shellSnapshotPlatformSupported = previous })
+	manager := newShellSnapshotManager()
+	manager.capture = func(context.Context, []string, string, map[string]string) ([]byte, error) {
+		return shellSnapshotTestCaptureSource("# Snapshot file\nexport TOKEN=\"value\"\n\x00\x00\x00", false), nil
+	}
+	cwd, err := utils.FromHostNativePath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := &ExecParams{
+		ProcessID: "bash-snapshot",
+		Argv:      []string{"/bin/bash", "-lc", "echo ok"},
+		CWD:       cwd.String(),
+		ShellSnapshot: &ShellSnapshotRequest{
+			ScopeID: "bash-scope",
+			Shell:   ShellInfo{Name: "bash", Path: "/bin/bash"},
+		},
+		Env: map[string]string{"PATH": "/bin"},
+	}
+	rewritten, _, err := manager.rewrite(context.Background(), params, params.Env, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rewritten.Argv[1] != "-pc" {
+		t.Fatalf("bash snapshot launch flag = %q, want -pc", rewritten.Argv[1])
+	}
+	if !strings.HasPrefix(rewritten.Argv[2], "set +o privileged\nif ! ") {
+		t.Fatalf("bash snapshot script = %q", rewritten.Argv[2])
+	}
+}
+
+// TestValidateMaskedShellSnapshotLikeRust covers Rust #54432's credential
+// re-check for executor-owned snapshots: masking must leave no real broker
+// value in the replay script, even one an alias rebuilds from quoted
+// fragments.
+func TestValidateMaskedShellSnapshotLikeRust(t *testing.T) {
+	pairs := []network.CredentialMaskPair{{Real: "sk-real-secret", Dummy: "sk-dummy-value"}}
+	unsafe := func(text string) bool { return strings.Contains(text, "sk-real-secret") }
+	if err := validateMaskedShellSnapshot("export TOKEN='sk-dummy-value'\n", shell.ShellBash, pairs, nil); err != nil {
+		t.Fatalf("masked snapshot rejected: %v", err)
+	}
+	if err := validateMaskedShellSnapshot("export TOKEN='sk-real-secret'\n", shell.ShellBash, pairs, nil); err == nil {
+		t.Fatal("verbatim credential accepted")
+	}
+	if err := validateMaskedShellSnapshot("export TOKEN='sk-re''al-secret'\n", shell.ShellBash, pairs, nil); err == nil {
+		t.Fatal("reassembled credential accepted")
+	}
+	if err := validateMaskedShellSnapshot("export TOKEN='sk-re''al-secret'\n", shell.ShellBash, nil, nil); err != nil {
+		t.Fatalf("unprotected snapshot checked for credentials: %v", err)
+	}
+	if err := validateMaskedShellSnapshot("export DROP='sk-real-secret'\n", shell.ShellBash, nil, unsafe); err == nil {
+		t.Fatal("broker text check was not consulted")
+	}
+	if err := validateMaskedShellSnapshot("export DROP='sk-re''al-secret'\n", shell.ShellBash, nil, unsafe); err == nil {
+		t.Fatal("broker text check missed a reassembled credential")
+	}
+	if err := validateMaskedShellSnapshot("export DROP='sk-dummy-value'\n", shell.ShellBash, nil, unsafe); err != nil {
+		t.Fatalf("clean snapshot rejected by the broker check: %v", err)
+	}
+}
+
+// TestShellSnapshotReassembledCredentialFallsBackLikeRust pulls the check
+// through the manager: a capture whose replay text still reconstructs the real
+// credential is discarded, and the launch keeps the unmasked environment with
+// the explicit warning instead of replaying a leaky snapshot.
+func TestShellSnapshotReassembledCredentialFallsBackLikeRust(t *testing.T) {
+	previous := shellSnapshotPlatformSupported
+	shellSnapshotPlatformSupported = true
+	t.Cleanup(func() { shellSnapshotPlatformSupported = previous })
+	manager := newShellSnapshotManager()
+	t.Cleanup(manager.close)
+	manager.capture = func(context.Context, []string, string, map[string]string) ([]byte, error) {
+		return shellSnapshotTestCaptureSource("# Snapshot file\nexport TOKEN=\"sk-re\"\"al-secret\"\n\x00\x00\x00", false), nil
+	}
+	params := &ExecParams{
+		ProcessID: "reassembled-process",
+		Argv:      []string{"/bin/bash", "-lc", "echo ok"},
+		CWD:       "file:///repo",
+		ShellSnapshot: &ShellSnapshotRequest{
+			ScopeID: "attachment-1",
+			Shell:   ShellInfo{Name: "bash", Path: "/bin/bash"},
+		},
+		Env: map[string]string{"TOKEN": "sk-dummy-value"},
+	}
+	pairs := []network.CredentialMaskPair{{Real: "sk-real-secret", Dummy: "sk-dummy-value"}}
+	rewritten, _, err := manager.rewrite(context.Background(), params, params.Env, pairs, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rewritten.Env["TOKEN"] != "sk-real-secret" {
+		t.Fatalf("fallback env = %#v", rewritten.Env)
+	}
+	if !strings.Contains(rewritten.Argv[2], "Credential masking is unavailable") {
+		t.Fatalf("fallback script = %q", rewritten.Argv[2])
+	}
+	manager.mu.Lock()
+	cached := len(manager.cache)
+	manager.mu.Unlock()
+	if cached != 0 {
+		t.Fatalf("rejected capture was cached: %d entries", cached)
+	}
+}
+
+// TestShellSnapshotBrokerTextCheckFallsBackLikeRust covers the executor's use
+// of the broker's own text check (Rust's proxy.virtualize_brokered_text): a
+// credential the broker recognizes by pattern, but which is not in the mask
+// pairs, still disqualifies the capture.
+func TestShellSnapshotBrokerTextCheckFallsBackLikeRust(t *testing.T) {
+	previous := shellSnapshotPlatformSupported
+	shellSnapshotPlatformSupported = true
+	t.Cleanup(func() { shellSnapshotPlatformSupported = previous })
+	manager := newShellSnapshotManager()
+	t.Cleanup(manager.close)
+	manager.capture = func(context.Context, []string, string, map[string]string) ([]byte, error) {
+		return shellSnapshotTestCaptureSource("# Snapshot file\nexport DROP=\"ghp_patterncredential\"\n\x00\x00\x00", false), nil
+	}
+	params := &ExecParams{
+		ProcessID: "pattern-process",
+		Argv:      []string{"/bin/bash", "-lc", "echo ok"},
+		CWD:       "file:///repo",
+		ShellSnapshot: &ShellSnapshotRequest{
+			ScopeID: "attachment-1",
+			Shell:   ShellInfo{Name: "bash", Path: "/bin/bash"},
+		},
+		Env: map[string]string{"TOKEN": "sk-dummy-value"},
+	}
+	unsafe := func(text string) bool { return strings.Contains(text, "ghp_patterncredential") }
+	rewritten, _, err := manager.rewrite(context.Background(), params, params.Env, nil, unsafe, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rewritten.Argv[2], "Credential masking is unavailable") {
 		t.Fatalf("fallback script = %q", rewritten.Argv[2])
 	}
 }

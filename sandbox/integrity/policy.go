@@ -99,38 +99,27 @@ func PreparePolicy(entries []sandbox.FileSystemSandboxEntry, cwd string) (*Prepa
 // fallback, matching Rust #51840.
 func PreparePolicyWithEnvironment(entries []sandbox.FileSystemSandboxEntry, cwd string, env map[string]string) (*PreparedPolicy, error) {
 	normalizedEntries := append([]sandbox.FileSystemSandboxEntry(nil), entries...)
+	resolvedEntries := make([]sandbox.FileSystemSandboxEntry, 0, len(normalizedEntries))
+	for _, entry := range normalizedEntries {
+		if entry.Path.Type != "special" || entry.Path.Value == nil ||
+			!strings.EqualFold(strings.TrimSpace(entry.Path.Value.Kind), "tmpdir") {
+			resolvedEntries = append(resolvedEntries, entry)
+			continue
+		}
+		for _, tmpdir := range policyTemporaryDirectories(env) {
+			resolved, err := resolvePolicyTemporaryPath(tmpdir, cwd, env)
+			if err != nil {
+				return nil, err
+			}
+			materialized := entry
+			materialized.Path = sandbox.FileSystemPath{Type: "path", Path: resolved}
+			resolvedEntries = append(resolvedEntries, materialized)
+		}
+	}
+	normalizedEntries = resolvedEntries
 	globEntries := make([]sandbox.FileSystemSandboxEntry, 0, len(normalizedEntries))
 	for index := 0; index < len(normalizedEntries); index++ {
 		entry := &normalizedEntries[index]
-		if entry.Path.Type == "special" && entry.Path.Value != nil &&
-			strings.EqualFold(strings.TrimSpace(entry.Path.Value.Kind), "tmpdir") {
-			tmpdir := ""
-			if env != nil {
-				tmpdir = strings.TrimSpace(env["TMPDIR"])
-			}
-			if tmpdir == "" {
-				normalizedEntries = append(normalizedEntries[:index], normalizedEntries[index+1:]...)
-				index--
-				continue
-			}
-			if strings.HasPrefix(tmpdir, "~/") || strings.HasPrefix(tmpdir, `~\`) {
-				home := ""
-				if env != nil {
-					home = strings.TrimSpace(env["HOME"])
-				}
-				if home == "" {
-					home, _ = os.UserHomeDir()
-				}
-				if home == "" {
-					return nil, fmt.Errorf("%w: unable to resolve TMPDIR %q without executor home", ErrInvalidPolicy, tmpdir)
-				}
-				tmpdir = filepath.Join(home, tmpdir[2:])
-			}
-			if !filepath.IsAbs(tmpdir) {
-				tmpdir = filepath.Join(cwd, tmpdir)
-			}
-			entry.Path = sandbox.FileSystemPath{Type: "path", Path: filepath.Clean(tmpdir)}
-		}
 		if entry.Path.Type != "glob_pattern" || entry.Access != sandbox.FileSystemAccessDeny {
 			// Upstream keeps non-deny entries in glob_policy but its deny matcher
 			// only consumes deny entries (permissions.rs:1185-1191).
@@ -171,6 +160,27 @@ func PreparePolicyWithEnvironment(entries []sandbox.FileSystemSandboxEntry, cwd 
 	}
 	roots := writableRoots(normalizedEntries, cwd)
 	return &PreparedPolicy{Roots: roots, GlobDenials: globDenials}, nil
+}
+
+func resolvePolicyTemporaryPath(tmpdir string, cwd string, env map[string]string) (string, error) {
+	tmpdir = strings.TrimSpace(tmpdir)
+	if strings.HasPrefix(tmpdir, "~/") || strings.HasPrefix(tmpdir, `~\`) {
+		home := ""
+		if env != nil {
+			home = strings.TrimSpace(env["HOME"])
+		}
+		if home == "" {
+			home, _ = os.UserHomeDir()
+		}
+		if home == "" {
+			return "", fmt.Errorf("%w: unable to resolve TMPDIR %q without executor home", ErrInvalidPolicy, tmpdir)
+		}
+		tmpdir = filepath.Join(home, tmpdir[2:])
+	}
+	if !filepath.IsAbs(tmpdir) {
+		tmpdir = filepath.Join(cwd, tmpdir)
+	}
+	return filepath.Clean(tmpdir), nil
 }
 
 // materializeGlobPattern resolves a deny-read glob against cwd the same way the
@@ -285,28 +295,53 @@ func explicitCarveouts(entries []sandbox.FileSystemSandboxEntry, cwd string) []s
 
 // protectedMetadataNames mirrors upstream
 // `protected_metadata_names_for_writable_root` (permissions.rs:2526-2549): a
-// workspace metadata name stays protected under the root until the policy grants
-// a write rule for that metadata path itself.
+// workspace metadata name stays protected under `root` unless the policy grants
+// write access to that exact metadata path. Upstream asks the local matcher's
+// `can_write_path`, which resolves the policy access and then only lifts the
+// metadata denial when a write entry names the metadata path itself; a broader
+// writable root above it and a nested rule below it both keep the name
+// protected (permissions.rs:1051-1086).
+//
+// Go's writable-root list is keyed by resolved entry path, so upstream's
+// `raw_writable_roots` aliases collapse into `root` itself and every candidate
+// metadata path is joined once per root.
 func protectedMetadataNames(entries []sandbox.FileSystemSandboxEntry, root string, cwd string) []string {
 	var protected []string
 	for _, name := range sandboxpath.DefaultProtectedMetadataNames() {
-		metadataPath := filepath.Join(root, name)
-		granted := false
-		for _, entry := range entries {
-			if entry.Access != sandbox.FileSystemAccessWrite || entry.Path.Type == "glob_pattern" {
-				continue
-			}
-			resolved := sandbox.ResolveFileSystemEntryPath(entry.Path, cwd)
-			if resolved != "" && sandboxpath.PathWithin(resolved, metadataPath) {
-				granted = true
-				break
-			}
-		}
-		if !granted {
+		if !metadataPathWriteGranted(entries, filepath.Join(root, name), cwd) {
 			protected = append(protected, name)
 		}
 	}
 	return protected
+}
+
+// metadataPathWriteGranted mirrors `can_write_path` for a writable root's
+// metadata path: the resolved policy access must be write and some write entry
+// must name that path. The comparison is URI-native so Windows case and
+// separator spellings fold together while POSIX paths stay byte-exact, and a
+// metadata path that has no URI representation stays protected.
+func metadataPathWriteGranted(entries []sandbox.FileSystemSandboxEntry, metadataPath string, cwd string) bool {
+	if sandbox.ResolveFileSystemEntryAccess(entries, metadataPath, cwd) != sandbox.FileSystemAccessWrite {
+		return false
+	}
+	metadataURI, ok := utils.InferredPathURI(metadataPath)
+	if !ok {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.Access != sandbox.FileSystemAccessWrite || entry.Path.Type == "glob_pattern" {
+			continue
+		}
+		resolved := sandbox.ResolveFileSystemEntryPath(entry.Path, cwd)
+		if resolved == "" {
+			continue
+		}
+		entryURI, ok := utils.InferredPathURI(resolved)
+		if ok && entryURI.Equal(metadataURI) {
+			return true
+		}
+	}
+	return false
 }
 
 // dropListedPaths removes the paths an explicit entry already governs, matching

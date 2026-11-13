@@ -32,6 +32,14 @@ func TestAPIErrorDisplayMatchesRustLikeRust(t *testing.T) {
 			want: "Selected model is at capacity. Please try a different model.",
 		},
 		{
+			// Rust #57452 distinguishes a policy-restricted capacity failure
+			// from an ordinary overload even though both keep overload retry
+			// advice.
+			name: "policy capacity unavailable",
+			err:  &APIError{Kind: ErrorPolicyCapacityUnavailable},
+			want: "Policy-restricted capacity is unavailable. Please try again later.",
+		},
+		{
 			name: "flex unavailable",
 			err:  &APIError{Kind: ErrorFlexUnavailable},
 			want: "Flex capacity unavailable.",
@@ -67,6 +75,11 @@ func TestAPIErrorDisplayMatchesRustLikeRust(t *testing.T) {
 			want: "bad prompt",
 		},
 		{
+			name: "invalid prompt",
+			err:  &APIError{Kind: ErrorInvalidPrompt, Message: "bad prompt detail"},
+			want: "bad prompt detail",
+		},
+		{
 			name: "cyber policy",
 			err:  &APIError{Kind: ErrorCyberPolicy, Message: "blocked for cyber risk"},
 			want: "blocked for cyber risk",
@@ -80,6 +93,21 @@ func TestAPIErrorDisplayMatchesRustLikeRust(t *testing.T) {
 			name: "misalignment policy",
 			err:  &APIError{Kind: ErrorMisalignmentPolicyViolation, Message: "blocked for misalignment"},
 			want: "blocked for misalignment",
+		},
+		{
+			name: "model not found",
+			err:  &APIError{Kind: ErrorModelNotFound, Message: "Access to this deployment ended."},
+			want: "Access to this deployment ended.",
+		},
+		{
+			name: "model not found blank message",
+			err:  &APIError{Kind: ErrorModelNotFound},
+			want: "model_not_found",
+		},
+		{
+			name: "invalid audio input",
+			err:  &APIError{Kind: ErrorInvalidAudioInput, Message: "Invalid recording."},
+			want: "Invalid recording.",
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {

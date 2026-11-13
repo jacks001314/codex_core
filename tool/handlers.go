@@ -220,6 +220,11 @@ type UserInputResponse struct {
 
 type UserInputResponder func(context.Context, *RequestUserInputArgs) (*UserInputResponse, error)
 
+// UserInputCallIDResponder is the call-ID-aware form of UserInputResponder. The
+// request_user_input handler prefers it so the host can attribute the human wait
+// to the owning tool invocation (Rust #57207).
+type UserInputCallIDResponder func(context.Context, string, *RequestUserInputArgs) (*UserInputResponse, error)
+
 // VerifiedAnswerRecorder receives the host-verified answers of an accepted
 // `request_user_input` call (Rust request_user_input.rs records a
 // `RetainedContextEvent::VerifiedAnswer` for the Guardian review evidence). It
@@ -227,9 +232,10 @@ type UserInputResponder func(context.Context, *RequestUserInputArgs) (*UserInput
 type VerifiedAnswerRecorder func(callID string, questions []retainedctx.VerifiedQuestionAnswer)
 
 type RequestUserInputHandler struct {
-	responder      UserInputResponder
-	availableModes []string
-	verifiedAnswer VerifiedAnswerRecorder
+	responder       UserInputResponder
+	callIDResponder UserInputCallIDResponder
+	availableModes  []string
+	verifiedAnswer  VerifiedAnswerRecorder
 }
 
 func NewRequestUserInputHandler(responder UserInputResponder) *RequestUserInputHandler {
@@ -292,7 +298,14 @@ func (h *RequestUserInputHandler) Execute(ctx context.Context, invocation *Invoc
 	}
 	response := &UserInputResponse{Answers: map[string]string{}}
 	var err error
-	if h.responder != nil {
+	if h.callIDResponder != nil {
+		// Rust #57207: the host binds the human wait to the owning tool
+		// invocation, so it needs the call ID before the request is issued.
+		response, err = h.callIDResponder(ctx, strings.TrimSpace(invocation.CallID), &args)
+		if err != nil {
+			return nil, err
+		}
+	} else if h.responder != nil {
 		response, err = h.responder(ctx, &args)
 		if err != nil {
 			return nil, err
@@ -380,15 +393,22 @@ func containsSubmittedAnswer(answers []string, value string) bool {
 }
 
 type GetContextRemainingHandler struct {
-	status func() compact.TokenStatus
+	status  func() compact.TokenStatus
+	catalog *CatalogToolOverride
 }
 
 func NewGetContextRemainingHandler(status func() compact.TokenStatus) *GetContextRemainingHandler {
 	return &GetContextRemainingHandler{status: status}
 }
 
+// NewGetContextRemainingHandlerWithCatalog mirrors Rust get_context_remaining
+// catalog overrides (#56313).
+func NewGetContextRemainingHandlerWithCatalog(status func() compact.TokenStatus, catalog *CatalogToolOverride) *GetContextRemainingHandler {
+	return &GetContextRemainingHandler{status: status, catalog: catalog}
+}
+
 func (h *GetContextRemainingHandler) Spec() Spec {
-	return Spec{Name: PlainName("get_context_remaining"), Description: "Returns context tokens left before compaction.", Parallel: true}
+	return ApplyCatalogToolOverride(Spec{Name: PlainName("get_context_remaining"), Description: "Returns context tokens left before compaction.", Parallel: true}, h.catalog)
 }
 
 func (h *GetContextRemainingHandler) Execute(ctx context.Context, invocation *Invocation) (*Output, error) {
@@ -411,17 +431,24 @@ func (h *GetContextRemainingHandler) Execute(ctx context.Context, invocation *In
 // The request callback performs the window reset through the turn runtime.
 type ContextWindowHandler struct {
 	request func()
+	catalog *CatalogToolOverride
 }
 
 func NewContextWindowHandler(request func()) *ContextWindowHandler {
 	return &ContextWindowHandler{request: request}
 }
 
+// NewContextWindowHandlerWithCatalog mirrors Rust new_context_window catalog
+// overrides (#56313).
+func NewContextWindowHandlerWithCatalog(request func(), catalog *CatalogToolOverride) *ContextWindowHandler {
+	return &ContextWindowHandler{request: request, catalog: catalog}
+}
+
 func (h *ContextWindowHandler) Spec() Spec {
-	return Spec{
+	return ApplyCatalogToolOverride(Spec{
 		Name:        PlainName("new_context"),
 		Description: "Start a new context window. Does not clear, reset, or otherwise affect environment state.",
-	}
+	}, h.catalog)
 }
 
 func (h *ContextWindowHandler) Execute(ctx context.Context, invocation *Invocation) (*Output, error) {
@@ -607,15 +634,46 @@ func (h *ClockSleepHandler) Execute(ctx context.Context, invocation *Invocation)
 		return nil, fmt.Errorf("duration_ms must be between 1 and %d", maxSleepToolDurationMS)
 	}
 	started := time.Now()
-	if err := h.clockProvider().Sleep(ctx, h.threadID, time.Duration(args.DurationMS)*time.Millisecond); err != nil {
-		if h != nil && h.nonfatalClockReadErrors {
-			return nil, RespondToModel(contextfrag.CurrentTimeUnavailableMessage)
+	// Rust #55644: the sleep handler subscribes to the turn's input-queue
+	// activity, so input that arrived before the sleep or while it runs ends the
+	// wait. Passive context alone leaves the sleep running.
+	signal := StepActivityFromContext(ctx)
+	if signal == nil {
+		signal = ActivitySignalFromInvocation(invocation)
+	}
+	interrupted := signal.Cancelled()
+	if !interrupted {
+		sleepCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		if signal != nil {
+			stop := make(chan struct{})
+			defer close(stop)
+			go func() {
+				select {
+				case <-signal.Done():
+					cancel()
+				case <-stop:
+				}
+			}()
 		}
-		return nil, Fatal("failed to sleep: " + err.Error())
+		err := h.clockProvider().Sleep(sleepCtx, h.threadID, time.Duration(args.DurationMS)*time.Millisecond)
+		// A provider that honours the cancelled context reports an error; the
+		// activity signal is what distinguishes an interruption from a failure.
+		interrupted = signal.Cancelled()
+		if err != nil && !interrupted {
+			if h != nil && h.nonfatalClockReadErrors {
+				return nil, RespondToModel(contextfrag.CurrentTimeUnavailableMessage)
+			}
+			return nil, Fatal("failed to sleep: " + err.Error())
+		}
+	}
+	message := "Sleep completed."
+	if interrupted {
+		message = "Sleep interrupted by new input."
 	}
 	return &Output{
 		Success: true,
-		Body:    fmt.Sprintf("Wall time: %.4f seconds\nSleep completed.", time.Since(started).Seconds()),
+		Body:    fmt.Sprintf("Wall time: %.4f seconds\n%s", time.Since(started).Seconds(), message),
 	}, nil
 }
 
@@ -631,6 +689,9 @@ type CoreHandlerOptions struct {
 	ContextStatus                  func() compact.TokenStatus
 	UserInputResponder             UserInputResponder
 	RequestUserInputAvailableModes []string
+	// UserInputCallIDResponder takes precedence over UserInputResponder so the
+	// host can attribute the user wait to the calling tool (Rust #57207).
+	UserInputCallIDResponder UserInputCallIDResponder
 	// DisableRequestUserInput omits the direct request_user_input handler
 	// (Rust tools.experimental_request_user_input.enabled, #51908).
 	DisableRequestUserInput bool
@@ -653,6 +714,10 @@ type CoreHandlerOptions struct {
 	// tool errors.
 	NonfatalClockReadErrors bool
 	NewContextWindow        func()
+	// NewContextCatalog and GetContextRemainingCatalog carry the acting model
+	// catalog entries for the context-management tools (Rust #56313).
+	NewContextCatalog          *CatalogToolOverride
+	GetContextRemainingCatalog *CatalogToolOverride
 }
 
 func RegisterCoreHandlers(registry *Registry, planStore *PlanStore, status func() compact.TokenStatus, responder UserInputResponder) error {
@@ -671,11 +736,12 @@ func RegisterCoreHandlersWithOptions(registry *Registry, options *CoreHandlerOpt
 	handlers := []Executor{}
 	if !options.DisableRequestUserInput {
 		handler := NewRequestUserInputHandlerWithModes(options.UserInputResponder, options.RequestUserInputAvailableModes)
+		handler.callIDResponder = options.UserInputCallIDResponder
 		handler.verifiedAnswer = options.VerifiedAnswerRecorder
 		handlers = append(handlers, handler)
 	}
 	if !options.DisableGetContextRemaining {
-		handlers = append(handlers, NewGetContextRemainingHandler(options.ContextStatus))
+		handlers = append(handlers, NewGetContextRemainingHandlerWithCatalog(options.ContextStatus, options.GetContextRemainingCatalog))
 	}
 	if !options.DisableUpdatePlan {
 		handlers = append(handlers, NewPlanHandler(options.PlanStore))
@@ -690,7 +756,7 @@ func RegisterCoreHandlersWithOptions(registry *Registry, options *CoreHandlerOpt
 		handlers = append(handlers, NewClockSleepHandlerWithOptions(options.ClockProvider, options.ThreadID, options.NonfatalClockReadErrors))
 	}
 	if options.NewContextWindow != nil {
-		handlers = append(handlers, NewContextWindowHandler(options.NewContextWindow))
+		handlers = append(handlers, NewContextWindowHandlerWithCatalog(options.NewContextWindow, options.NewContextCatalog))
 	}
 	for _, handler := range handlers {
 		if err := registry.Register(handler); err != nil {

@@ -11,6 +11,7 @@ import (
 	"github.com/pelletier/go-toml/v2"
 
 	"codex_core/apps"
+	"codex_core/plugin"
 	"codex_core/sandbox"
 )
 
@@ -51,7 +52,14 @@ func ParseRequirementsTOMLWithPathContext(data []byte, context *ConfigPathContex
 			return nil, err
 		}
 	}
-	return configRequirementsFromValidatedMap(values)
+	requirements, err := configRequirementsFromValidatedMap(values)
+	if err != nil {
+		return nil, err
+	}
+	if err := resolveOtelRequirementPaths(requirements, context); err != nil {
+		return nil, err
+	}
+	return requirements, nil
 }
 
 func parseRequirementsTOMLValues(data []byte) (map[string]any, error) {
@@ -62,11 +70,39 @@ func parseRequirementsTOMLValues(data []byte) (map[string]any, error) {
 	return values, nil
 }
 
+// normalizeNetworkRequirementAliases mirrors Rust #57286: `network_proxy` is
+// the canonical managed network requirements table and `experimental_network`
+// remains a compatibility alias. A single layer may not declare both (Rust's
+// serde duplicate-field error), and either spelling is renamed before layers
+// are merged so precedence and source tracking stay intact.
+func normalizeNetworkRequirementAliases(values map[string]any) error {
+	if values == nil {
+		return nil
+	}
+	_, hasCanonical := values["network_proxy"]
+	legacy, hasLegacy := values["experimental_network"]
+	if hasCanonical && hasLegacy {
+		return fmt.Errorf("duplicate field `network_proxy`")
+	}
+	if !hasLegacy {
+		return nil
+	}
+	values["network_proxy"] = legacy
+	delete(values, "experimental_network")
+	return nil
+}
+
 func configRequirementsFromValidatedMap(values map[string]any) (*ConfigRequirements, error) {
-	if raw, ok := values["experimental_network"]; ok {
+	if err := normalizeNetworkRequirementAliases(values); err != nil {
+		return nil, err
+	}
+	if err := liftPermissionsNetworkRequirement(values); err != nil {
+		return nil, err
+	}
+	if raw, ok := values["network_proxy"]; ok {
 		networkValues, ok := raw.(map[string]any)
 		if !ok {
-			return nil, fmt.Errorf("invalid type for experimental_network: expected table")
+			return nil, fmt.Errorf("invalid type for network_proxy: expected table")
 		}
 		if err := validateNetworkRequirementsTOML(networkValues); err != nil {
 			return nil, err
@@ -80,6 +116,49 @@ func configRequirementsFromValidatedMap(values map[string]any) (*ConfigRequireme
 		return nil, err
 	}
 	return requirements, nil
+}
+
+// permissionsNetworkReservedProfileError mirrors Rust #58182: in
+// requirements.toml `permissions.network` is reserved for shared network
+// constraints and cannot name a permission profile.
+const permissionsNetworkReservedProfileError = "`permissions.network` in requirements.toml is reserved for shared network constraints; rename the managed profile (for example, to `network-access`) and update `default_permissions`, `allowed_permission_profiles`, and `extends`; check saved session profile references. Profiles named `network` in config.toml remain valid"
+
+// liftPermissionsNetworkRequirement moves a `permissions.network` constraint
+// table to the top-level managed network requirement (Rust #58182), rejecting
+// the reserved profile spellings and a second managed-network surface.
+func liftPermissionsNetworkRequirement(values map[string]any) error {
+	if values == nil {
+		return nil
+	}
+	permissions, ok := values["permissions"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	raw, present := permissions["network"]
+	if !present {
+		return nil
+	}
+	table, ok := raw.(map[string]any)
+	if !ok {
+		return fmt.Errorf("invalid type for permissions.network: expected table")
+	}
+	if len(table) == 0 {
+		return fmt.Errorf("%s", permissionsNetworkReservedProfileError)
+	}
+	for _, key := range []string{"description", "extends", "workspace_roots", "filesystem", "network"} {
+		if _, reserved := table[key]; reserved {
+			return fmt.Errorf("%s", permissionsNetworkReservedProfileError)
+		}
+	}
+	if _, topLevel := values["network_proxy"]; topLevel {
+		return fmt.Errorf("`permissions.network` cannot be combined with top-level managed network requirements; specify managed network requirements through exactly one surface")
+	}
+	values["network_proxy"] = table
+	delete(permissions, "network")
+	if len(permissions) == 0 {
+		delete(values, "permissions")
+	}
+	return nil
 }
 
 // validatePermissionProfileRequirements mirrors Rust's
@@ -295,6 +374,9 @@ func configRequirementsFromMapWithResolver(values map[string]any, remoteConfigs 
 	if len(values) == 0 {
 		return nil, nil
 	}
+	if err := normalizeNetworkRequirementAliases(values); err != nil {
+		return nil, err
+	}
 	var out ConfigRequirements
 	if values, ok := stringListAnyKey(values, "allowed_approval_policies", "allowedApprovalPolicies"); ok {
 		out.AllowedApprovalPolicies = make([]sandbox.AskForApproval, 0, len(values))
@@ -356,6 +438,9 @@ func configRequirementsFromMapWithResolver(values map[string]any, remoteConfigs 
 	if value, ok := stringAnyKey(values, "sqlite_home", "sqliteHome"); ok {
 		out.SQLiteHome = &value
 	}
+	if value, ok := boolAnyKey(values, "unsafe_enforce_sqlite_journal_mode", "unsafeEnforceSqliteJournalMode"); ok {
+		out.UnsafeEnforceSQLiteJournalMode = &value
+	}
 	if value, ok := stringAnyKey(values, "log_dir", "logDir"); ok {
 		out.LogDir = &value
 	}
@@ -378,6 +463,13 @@ func configRequirementsFromMapWithResolver(values map[string]any, remoteConfigs 
 	}
 	if value, ok := stringAnyKey(values, "guardian_policy_config", "guardianPolicyConfig"); ok {
 		out.GuardianPolicyConfig = &value
+	}
+	if raw, ok := mapAnyKey(values, "rules"); ok {
+		policy, err := rulesRequirementFromAny(raw)
+		if err != nil {
+			return nil, err
+		}
+		out.Rules = policy
 	}
 	if value, ok := stringAnyKey(values, "guardian_extra_policy", "guardianExtraPolicy"); ok {
 		out.GuardianExtraPolicy = &value
@@ -413,13 +505,18 @@ func configRequirementsFromMapWithResolver(values map[string]any, remoteConfigs 
 		out.AllowedLoginMethods = make([]ForcedLoginMethod, 0, len(values))
 		for _, value := range values {
 			method := ForcedLoginMethod(strings.ToLower(strings.TrimSpace(value)))
-			if method == ForcedLoginMethodAPI || method == ForcedLoginMethodChatGPT {
-				out.AllowedLoginMethods = append(out.AllowedLoginMethods, method)
+			if method != ForcedLoginMethodAPI && method != ForcedLoginMethodChatGPT {
+				// Rust deserializes the enum, so an unknown method fails the whole
+				// requirements load instead of silently narrowing the policy (#45495).
+				return nil, fmt.Errorf("invalid allowed_login_methods value %q: expected api or chatgpt", value)
 			}
+			out.AllowedLoginMethods = append(out.AllowedLoginMethods, method)
 		}
 	}
 	if values, ok := stringListAnyKey(values, "allowed_chatgpt_workspaces", "allowedChatGPTWorkspaces"); ok {
-		out.AllowedChatGPTWorkspaces = append([]string(nil), values...)
+		// An explicit empty list restricts ChatGPT logins to no workspace, which
+		// differs from an absent key (#45495), so keep it non-nil.
+		out.AllowedChatGPTWorkspaces = append([]string{}, values...)
 	}
 	// Rust 0f21cb3413 (#39043): exact managed authentication backend settings.
 	// These are local-only requirements and are dropped from cloud layers in
@@ -436,6 +533,15 @@ func configRequirementsFromMapWithResolver(values map[string]any, remoteConfigs 
 	if value, ok := stringAnyKey(values, "chatgpt_base_url", "chatgptBaseUrl"); ok && strings.TrimSpace(value) != "" {
 		baseURL := strings.TrimSpace(value)
 		out.ChatgptBaseURL = &baseURL
+	}
+	// Rust ConfigRequirementsToml.config_server: a customer-hosted managed
+	// configuration server is a local administration requirement.
+	if nested, ok := mapAnyKey(values, "config_server", "configServer"); ok {
+		server, err := ConfigServerFromMap(nested)
+		if err != nil {
+			return nil, fmt.Errorf("config_server: %w", err)
+		}
+		out.ConfigServer = server
 	}
 	// Rust #44650: managed model provider selection and definitions.
 	if value, ok := stringAnyKey(values, "model_provider", "modelProvider"); ok && strings.TrimSpace(value) != "" {
@@ -461,6 +567,19 @@ func configRequirementsFromMapWithResolver(values map[string]any, remoteConfigs 
 	if values, ok := boolMapAnyKey(values, "feature_requirements", "featureRequirements", "features"); ok {
 		out.FeatureRequirements = values
 	}
+	runtimeAuthMode, runtimeEnabled, err := runtimeAuthModeRequirementFromMap(values)
+	if err != nil {
+		return nil, err
+	}
+	if runtimeAuthMode != nil {
+		out.RuntimeAuthMode = runtimeAuthMode
+	}
+	if runtimeEnabled != nil {
+		if out.FeatureRequirements == nil {
+			out.FeatureRequirements = map[string]bool{}
+		}
+		out.FeatureRequirements["runtime_agent_instances"] = *runtimeEnabled
+	}
 	if nested, ok := mapAnyKey(values, "hooks"); ok {
 		out.Hooks = managedHooksRequirementsFromMap(nested)
 	}
@@ -468,7 +587,7 @@ func configRequirementsFromMapWithResolver(values map[string]any, remoteConfigs 
 		residency := ResidencyRequirement(value)
 		out.EnforceResidency = &residency
 	}
-	if nested, ok := mapAnyKey(values, "experimental_network"); ok {
+	if nested, ok := mapAnyKey(values, "network_proxy"); ok {
 		out.Network = networkRequirementsFromMap(nested)
 	}
 	if nested, ok := mapAnyKey(values, "application"); ok {
@@ -494,6 +613,20 @@ func configRequirementsFromMapWithResolver(values map[string]any, remoteConfigs 
 			return nil, err
 		}
 		out.Plugins = parsed
+	}
+	if nested, ok := mapAnyKey(values, "marketplaces"); ok {
+		parsed, err := marketplaceRequirementsFromMap(nested)
+		if err != nil {
+			return nil, err
+		}
+		out.Marketplaces = parsed
+	}
+	if nested, ok := mapAnyKey(values, "otel"); ok {
+		parsed, err := otelRequirementsFromMap(nested)
+		if err != nil {
+			return nil, err
+		}
+		out.Otel = parsed
 	}
 	if nested, ok := mapAnyKey(values, "apps"); ok {
 		parsed, err := apps.AppsRequirementsFromMap(nested)
@@ -557,6 +690,97 @@ func pluginRequirementsFromMap(values map[string]any) (map[string]PluginRequirem
 			requirement.MCPServers = &parsed
 		}
 		out[pluginID] = requirement
+	}
+	return out, nil
+}
+
+func marketplaceRequirementsFromMap(values map[string]any) (*plugin.MarketplaceRequirements, error) {
+	out := &plugin.MarketplaceRequirements{
+		AllowedSources:    map[string]plugin.MarketplaceAllowedSource{},
+		RequirementSource: managedRequirementSource,
+	}
+	for key := range values {
+		switch key {
+		case "restrict_to_allowed_sources", "restrictToAllowedSources", "allowed_sources", "allowedSources":
+		default:
+			return nil, fmt.Errorf("marketplaces has unknown field `%s`", key)
+		}
+	}
+	if raw, ok := anyKey(values, "restrict_to_allowed_sources", "restrictToAllowedSources"); ok {
+		restricted, ok := raw.(bool)
+		if !ok {
+			return nil, fmt.Errorf("marketplaces.restrict_to_allowed_sources must be a boolean")
+		}
+		out.RestrictToAllowedSources = &restricted
+	}
+	allowedSources, ok := mapAnyKey(values, "allowed_sources", "allowedSources")
+	if !ok {
+		if _, present := anyKey(values, "allowed_sources", "allowedSources"); present {
+			return nil, fmt.Errorf("marketplaces.allowed_sources must be a table")
+		}
+		return out, nil
+	}
+	for key, raw := range allowedSources {
+		table, ok := raw.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("invalid marketplace allowed source `%s`: expected table", key)
+		}
+		allowed, err := marketplaceAllowedSourceFromMap(key, table)
+		if err != nil {
+			return nil, err
+		}
+		out.AllowedSources[key] = allowed
+	}
+	return out, nil
+}
+
+func marketplaceAllowedSourceFromMap(key string, values map[string]any) (plugin.MarketplaceAllowedSource, error) {
+	var out plugin.MarketplaceAllowedSource
+	for field := range values {
+		switch field {
+		case "source", "url", "ref", "host_pattern", "hostPattern", "path":
+		default:
+			return plugin.MarketplaceAllowedSource{}, fmt.Errorf("invalid marketplace allowed source `%s`: unknown field `%s`", key, field)
+		}
+	}
+	if raw, ok := anyKey(values, "source"); ok {
+		text, ok := raw.(string)
+		if !ok {
+			return plugin.MarketplaceAllowedSource{}, fmt.Errorf("invalid marketplace allowed source `%s`: source must be a string", key)
+		}
+		kind := plugin.MarketplaceAllowedSourceKind(strings.TrimSpace(text))
+		switch kind {
+		case plugin.MarketplaceAllowedSourceGit, plugin.MarketplaceAllowedSourceHostPattern, plugin.MarketplaceAllowedSourceLocal:
+			out.Source = &kind
+		default:
+			return plugin.MarketplaceAllowedSource{}, fmt.Errorf("invalid marketplace allowed source `%s`: unsupported source `%s`", key, text)
+		}
+	}
+	assignString := func(target **string, names ...string) error {
+		raw, ok := anyKey(values, names...)
+		if !ok {
+			return nil
+		}
+		text, ok := raw.(string)
+		if !ok {
+			return fmt.Errorf("invalid marketplace allowed source `%s`: %s must be a string", key, names[0])
+		}
+		value := text
+		*target = &value
+		return nil
+	}
+	for _, field := range []struct {
+		target **string
+		names  []string
+	}{
+		{&out.URL, []string{"url"}},
+		{&out.RefName, []string{"ref"}},
+		{&out.HostPattern, []string{"host_pattern", "hostPattern"}},
+		{&out.Path, []string{"path"}},
+	} {
+		if err := assignString(field.target, field.names...); err != nil {
+			return plugin.MarketplaceAllowedSource{}, err
+		}
 	}
 	return out, nil
 }
@@ -759,6 +983,9 @@ func networkRequirementsFromMap(values map[string]any) *NetworkRequirements {
 	if value, ok := networkPermissionMapAnyKey(values, "domains"); ok {
 		out.Domains = value
 	}
+	if value, ok := stringListAnyKey(values, "review_domains", "reviewDomains"); ok {
+		out.ReviewDomains = value
+	}
 	if value, ok := boolAnyKey(values, "managed_allowed_domains_only", "managedAllowedDomainsOnly"); ok {
 		out.ManagedAllowedDomainsOnly = &value
 	}
@@ -828,15 +1055,15 @@ func networkHeaderInjectionFromMap(values map[string]any) NetworkHeaderInjection
 func validateNetworkRequirementsTOML(values map[string]any) error {
 	if _, hasDomains := values["domains"]; hasDomains {
 		if _, hasAllowed := values["allowed_domains"]; hasAllowed {
-			return fmt.Errorf("`experimental_network.domains` cannot be combined with legacy `allowed_domains` or `denied_domains`")
+			return fmt.Errorf("`domains` cannot be combined with legacy `allowed_domains` or `denied_domains` in managed network requirements")
 		}
 		if _, hasDenied := values["denied_domains"]; hasDenied {
-			return fmt.Errorf("`experimental_network.domains` cannot be combined with legacy `allowed_domains` or `denied_domains`")
+			return fmt.Errorf("`domains` cannot be combined with legacy `allowed_domains` or `denied_domains` in managed network requirements")
 		}
 	}
 	if _, hasUnixSockets := values["unix_sockets"]; hasUnixSockets {
 		if _, hasLegacy := values["allow_unix_sockets"]; hasLegacy {
-			return fmt.Errorf("`experimental_network.unix_sockets` cannot be combined with legacy `allow_unix_sockets`")
+			return fmt.Errorf("`unix_sockets` cannot be combined with legacy `allow_unix_sockets` in managed network requirements")
 		}
 	}
 
@@ -850,21 +1077,21 @@ func validateNetworkRequirementsTOML(values map[string]any) error {
 	} {
 		if raw, ok := values[key]; ok {
 			if _, ok := raw.(bool); !ok {
-				return fmt.Errorf("invalid type for experimental_network.%s: expected boolean", key)
+				return fmt.Errorf("invalid type for network_proxy.%s: expected boolean", key)
 			}
 		}
 	}
 	for _, key := range []string{"http_port", "socks_port"} {
 		if raw, ok := values[key]; ok {
 			if _, ok := strictTOMLUint16(raw); !ok {
-				return fmt.Errorf("invalid value for experimental_network.%s: expected an integer from 0 through 65535", key)
+				return fmt.Errorf("invalid value for network_proxy.%s: expected an integer from 0 through 65535", key)
 			}
 		}
 	}
 	for _, key := range []string{"allowed_domains", "denied_domains", "allow_unix_sockets"} {
 		if raw, ok := values[key]; ok {
 			if !strictTOMLStringList(raw) {
-				return fmt.Errorf("invalid type for experimental_network.%s: expected an array of strings", key)
+				return fmt.Errorf("invalid type for network_proxy.%s: expected an array of strings", key)
 			}
 		}
 	}
@@ -881,12 +1108,12 @@ func validateNetworkRequirementsTOML(values map[string]any) error {
 func validateNetworkPermissionTable(key string, raw any) error {
 	values, ok := raw.(map[string]any)
 	if !ok {
-		return fmt.Errorf("invalid type for experimental_network.%s: expected table", key)
+		return fmt.Errorf("invalid type for network_proxy.%s: expected table", key)
 	}
 	for pattern, rawPermission := range values {
 		permission, ok := rawPermission.(string)
 		if !ok || (permission != string(NetworkAllow) && permission != string(NetworkDeny)) {
-			return fmt.Errorf("invalid value for experimental_network.%s.%s: expected `allow` or `deny`", key, pattern)
+			return fmt.Errorf("invalid value for network_proxy.%s.%s: expected `allow` or `deny`", key, pattern)
 		}
 	}
 	return nil
@@ -1134,6 +1361,7 @@ func configRequirementsEmpty(value *ConfigRequirements) bool {
 			value.AdditionalDeveloperInstructions == nil &&
 			value.GuardianPolicyConfig == nil &&
 			value.GuardianExtraPolicy == nil &&
+			value.Rules == nil &&
 			value.Permissions == nil &&
 			value.AllowedWebSearchModes == nil &&
 			value.AllowManagedHooksOnly == nil &&
@@ -1150,13 +1378,16 @@ func configRequirementsEmpty(value *ConfigRequirements) bool {
 			value.Application == nil &&
 			value.Network == nil &&
 			value.Models == nil &&
+			otelRequirementsEmpty(value.Otel) &&
 			value.AllowedLoginMethods == nil &&
 			value.AllowedChatGPTWorkspaces == nil &&
 			value.CliAuthCredentialsStore == nil &&
 			value.ChatgptBaseURL == nil &&
+			value.ConfigServer == nil &&
 			value.ModelProvider == nil &&
 			value.ModelProviders == nil &&
 			value.SQLiteHome == nil &&
+			value.UnsafeEnforceSQLiteJournalMode == nil &&
 			value.LogDir == nil &&
 			value.ModelCatalogJSON == nil &&
 			value.CheckForUpdateOnStartup == nil &&
@@ -1164,6 +1395,7 @@ func configRequirementsEmpty(value *ConfigRequirements) bool {
 			value.Feedback == nil &&
 			value.MCPServers == nil &&
 			value.Plugins == nil &&
+			value.Marketplaces.IsEmpty() &&
 			len(value.Apps) == 0)
 }
 

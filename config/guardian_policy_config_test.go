@@ -3,14 +3,15 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
 // TestGuardianPolicyConfigLikeRust mirrors Rust Config::guardian_policy_config:
 // the managed `guardian_policy_config` requirement wins over `[auto_review]
-// policy`, a value that normalizes to empty is treated as unset so the
-// lower-priority layer still applies, and `[auto_review]
-// experimental_policy_template` is the reviewer prompt template.
+// policy`, and a value that normalizes to empty is treated as unset so the
+// lower-priority layer still applies. #60646 retired the config.toml policy
+// template.
 func TestGuardianPolicyConfigLikeRust(t *testing.T) {
 	managed := "  Managed policy.  "
 	cfg := &Config{
@@ -23,8 +24,8 @@ func TestGuardianPolicyConfigLikeRust(t *testing.T) {
 	if got, ok := cfg.GuardianPolicyConfig(); !ok || got != "Managed policy." {
 		t.Fatalf("GuardianPolicyConfig() = %q, %v, want the managed policy", got, ok)
 	}
-	if got, ok := cfg.GuardianPolicyTemplate(); !ok || got != "Template: {{ tenant_policy_config }}" {
-		t.Fatalf("GuardianPolicyTemplate() = %q, %v", got, ok)
+	if got, ok := cfg.GuardianPolicyTemplate(); ok || got != "" {
+		t.Fatalf("GuardianPolicyTemplate() = %q, %v, want the retired config value ignored", got, ok)
 	}
 
 	// A requirement that normalizes to empty falls back to the config value.
@@ -58,10 +59,9 @@ func TestRequirementsFileParsesGuardianPolicyConfig(t *testing.T) {
 	}
 }
 
-// TestGuardianExtraPolicyConfigLikeRust mirrors Rust #47125's
-// Config::guardian_extra_policy precedence: the managed `guardian_extra_policy`
-// requirement wins over `[auto_review] extra_policy`, and a blank value in
-// either layer is ignored.
+// TestGuardianExtraPolicyConfigLikeRust mirrors Rust #47125/#60646:
+// Config::guardian_extra_policy is supplied only by the managed requirement;
+// the retired `[auto_review] extra_policy` value is ignored.
 func TestGuardianExtraPolicyConfigLikeRust(t *testing.T) {
 	managed := "  Managed extra policy.  "
 	cfg := &Config{
@@ -74,13 +74,13 @@ func TestGuardianExtraPolicyConfigLikeRust(t *testing.T) {
 
 	empty := " \n\t "
 	cfg.Requirements.GuardianExtraPolicy = &empty
-	if got, ok := cfg.GuardianExtraPolicy(); !ok || got != "Config extra policy." {
-		t.Fatalf("GuardianExtraPolicy() with an empty requirement = %q, %v", got, ok)
+	if got, ok := cfg.GuardianExtraPolicy(); ok || got != "" {
+		t.Fatalf("GuardianExtraPolicy() with an empty requirement = %q, %v, want unset", got, ok)
 	}
 
-	cfg.Values = map[string]any{"auto_review": map[string]any{"extra_policy": "   "}}
+	cfg.Values = map[string]any{"auto_review": map[string]any{"extra_policy": "Config extra policy."}}
 	if got, ok := cfg.GuardianExtraPolicy(); ok || got != "" {
-		t.Fatalf("GuardianExtraPolicy() with a blank config value = %q, %v, want unset", got, ok)
+		t.Fatalf("GuardianExtraPolicy() with the retired config value = %q, %v, want unset", got, ok)
 	}
 	if got, ok := (&Config{}).GuardianExtraPolicy(); ok || got != "" {
 		t.Fatalf("GuardianExtraPolicy() = %q, %v, want unset", got, ok)
@@ -146,5 +146,72 @@ func TestLoadGuardianConversationHistoryConfigLikeRust(t *testing.T) {
 	}
 	if got := cfg.GuardianConversationHistoryMaxOutputTokens(4000); got != 900 {
 		t.Fatalf("loaded max output tokens = %d, want 900", got)
+	}
+}
+
+// TestGuardianCircuitBreakActionLikeRust covers Rust #48796's opt-in strict
+// action. The default, including an absent or unknown value, keeps legacy
+// interrupted turns without a structured error.
+func TestGuardianCircuitBreakActionLikeRust(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *Config
+		want string
+	}{
+		{name: "nil config", want: "default"},
+		{name: "absent", cfg: &Config{Values: map[string]any{}}, want: "default"},
+		{name: "explicit default", cfg: &Config{Values: map[string]any{"auto_review": map[string]any{"circuit_break_action": "default"}}}, want: "default"},
+		{name: "strict", cfg: &Config{Values: map[string]any{"auto_review": map[string]any{"circuit_break_action": "strict"}}}, want: "strict"},
+		{name: "strict case insensitive", cfg: &Config{Values: map[string]any{"auto_review": map[string]any{"circuit_break_action": "STRICT"}}}, want: "strict"},
+		{name: "unknown", cfg: &Config{Values: map[string]any{"auto_review": map[string]any{"circuit_break_action": "unknown"}}}, want: "default"},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := testCase.cfg.GuardianCircuitBreakAction(); got != testCase.want {
+				t.Fatalf("GuardianCircuitBreakAction() = %q, want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
+// Rust #59107: the denial reconsideration prompt is trimmed, blank values are
+// unset, and a prompt above 1,000 UTF-8 bytes is rejected at load time.
+func TestGuardianDenialReconsiderationPromptLikeRust(t *testing.T) {
+	cfg := &Config{Values: map[string]any{"auto_review": map[string]any{
+		"experimental_denial_reconsideration_prompt": "  Reconsider this denial.  ",
+	}}}
+	if got, ok := cfg.GuardianDenialReconsiderationPrompt(); !ok || got != "Reconsider this denial." {
+		t.Fatalf("GuardianDenialReconsiderationPrompt() = %q, %v", got, ok)
+	}
+	if err := cfg.ValidateGuardianDenialReconsiderationPrompt(); err != nil {
+		t.Fatalf("ValidateGuardianDenialReconsiderationPrompt() error = %v", err)
+	}
+
+	cfg.Values = map[string]any{"auto_review": map[string]any{
+		"experimental_denial_reconsideration_prompt": "   ",
+	}}
+	if got, ok := cfg.GuardianDenialReconsiderationPrompt(); ok {
+		t.Fatalf("blank prompt = %q, true, want unset", got)
+	}
+
+	oversized := strings.Repeat("x", 1001)
+	cfg.Values = map[string]any{"auto_review": map[string]any{
+		"experimental_denial_reconsideration_prompt": oversized,
+	}}
+	// Rust #59659 retired the key: an oversized legacy value stays
+	// parse-compatible and no longer fails configuration loading.
+	if err := cfg.ValidateGuardianDenialReconsiderationPrompt(); err != nil {
+		t.Fatalf("retired prompt validation error = %v", err)
+	}
+	if err := ValidateConfigValues(cfg.Values); err != nil {
+		t.Fatalf("ValidateConfigValues() error = %v", err)
+	}
+
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte("[auto_review]\nexperimental_denial_reconsideration_prompt = \""+strings.Repeat("y", 1001)+"\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(home); err != nil {
+		t.Fatalf("Load() error = %v, want the retired key ignored", err)
 	}
 }

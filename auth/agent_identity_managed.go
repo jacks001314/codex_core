@@ -375,17 +375,46 @@ func cloneAgentIdentityBootstrapUnavailableError(err *AgentIdentityBootstrapUnav
 }
 
 func persistManagedAgentIdentityRecord(opts *AgentIdentityBootstrapOptions, snapshot *AuthDotJSON, record *AgentIdentityAuthRecord) (*AuthDotJSON, error) {
-	next := cloneAuthDotJSON(snapshot)
-	if next == nil {
-		next = &AuthDotJSON{AuthMode: "chatgpt"}
-	}
-	next.AgentIdentity = cloneAgentIdentityRecord(record)
 	if strings.TrimSpace(opts.CodexHome) != "" {
-		if err := NewStoreWithOptions(opts.CodexHome, opts.StoreOptions).Save(*next); err != nil {
+		store := NewStoreWithOptions(opts.CodexHome, opts.StoreOptions)
+		if err := persistAgentIdentityRecord(store, snapshot, record); err != nil {
 			return nil, err
 		}
 	}
 	return FromAgentIdentityRecord(record), nil
+}
+
+// persistAgentIdentityRecord verifies that the stored login still matches the
+// cached credential before attaching an agent identity record. A concurrent
+// login replacement must not be overwritten by an older registration
+// (Rust #55646 persist_agent_identity_record).
+func persistAgentIdentityRecord(store *Store, cached *AuthDotJSON, record *AgentIdentityAuthRecord) error {
+	guard, err := store.lockForWrite()
+	if err != nil {
+		return err
+	}
+	defer guard.release()
+	stored, err := store.loadLocked()
+	if err != nil {
+		return err
+	}
+	cachedTokens := nilSafeTokens(cached)
+	if stored != nil && !sameLoginForPersistence(cachedTokens, stored.Tokens) {
+		return errors.New("Account changed during agent identity registration.")
+	}
+	base := stored
+	if base == nil {
+		// The caller supplied an in-memory credential that has not been written
+		// yet; persist the identity alongside it.
+		base = cloneAuthDotJSON(cached)
+	}
+	if base == nil {
+		return errors.New("auth data is not available")
+	}
+	next := *base
+	next.Tokens = cloneAnyMap(base.Tokens)
+	next.AgentIdentity = cloneAgentIdentityRecord(record)
+	return store.saveLocked(next)
 }
 
 func cloneAgentIdentityRecord(record *AgentIdentityAuthRecord) *AgentIdentityAuthRecord {

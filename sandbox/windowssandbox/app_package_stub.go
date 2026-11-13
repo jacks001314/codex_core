@@ -7,3 +7,13 @@ package windowssandbox
 func CurrentProcessHasPackageIdentity() (bool, error) {
 	return false, nil
 }
+
+// CurrentProcessPackageFullName reports no package identity off Windows.
+func CurrentProcessPackageFullName() (string, bool, error) {
+	return "", false, nil
+}
+
+// CurrentProcessPackageFamilyName reports no package identity off Windows.
+func CurrentProcessPackageFamilyName() (string, bool, error) {
+	return "", false, nil
+}

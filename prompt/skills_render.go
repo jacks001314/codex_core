@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 )
 
 const (
@@ -78,6 +79,19 @@ type SkillMetadataBudget struct {
 type AvailableSkillsRenderOptions struct {
 	Budget                   SkillMetadataBudget
 	IncludeUsageInstructions bool
+	// AliasScope identifies the live thread whose append-only alias assignments
+	// are shared by consecutive catalogs (Rust #55330). An empty scope is a
+	// one-shot catalog and receives a fresh alias numbering.
+	AliasScope string
+	// CloudSkillsComplete reports that the cloud catalog loaded without
+	// warnings. Only then may unmatched remote executor skills be disabled
+	// (Rust #55322 merge_catalogs).
+	CloudSkillsComplete bool
+	// OmitDescriptions renders names and locators only (Rust #57500
+	// `omit_skill_descriptions`). Descriptions still participate in discovery;
+	// they are removed from the model-visible catalog and from its budget and
+	// fingerprint accounting.
+	OmitDescriptions bool
 }
 
 type AvailableSkills struct {
@@ -86,6 +100,33 @@ type AvailableSkills struct {
 	SkillLines     []string
 	Report         *SkillRenderReport
 	WarningMessage *string
+	// Entries carries one comparison record per catalog entry in render order
+	// (Rust #57262 PreparedSkillCatalog::entries_for_render). It lets the
+	// incremental catalog publish additions and edits without repeating
+	// unchanged rows.
+	Entries []SkillCatalogEntryRender
+	// OmitDescriptions records the description policy this catalog was
+	// rendered with, so a snapshot can detect a policy change.
+	OmitDescriptions bool
+}
+
+// SkillCatalogEntryRender is the per-entry comparison metadata retained by an
+// incremental skills catalog snapshot (Rust #57262 CatalogSkill).
+type SkillCatalogEntryRender struct {
+	// ID identifies the skill across turns: the authority kind, authority id,
+	// and the package or resource id Rust calls `entry.id`.
+	ID string
+	// Fingerprint covers the fields the model can see. Description is empty
+	// when descriptions are omitted, which is what makes description-only
+	// edits invisible to a delta (Rust #57500).
+	Fingerprint string
+	// Line is the full row the catalog would render for this entry.
+	Line string
+	// RootName and RootValue are set when the row uses a skill root alias.
+	RootName  string
+	RootValue string
+	// Shown reports whether the row made it into the rendered catalog.
+	Shown bool
 }
 
 type SkillRenderReport struct {
@@ -94,6 +135,19 @@ type SkillRenderReport struct {
 	OmittedCount                   int
 	TruncatedDescriptionChars      int
 	TruncatedDescriptionSkillCount int
+}
+
+// skillCatalogPolicy is the description policy shared by rendering and budget
+// accounting (Rust #57500 SkillPrompt).
+type skillCatalogPolicy struct {
+	omitDescriptions bool
+}
+
+func (p skillCatalogPolicy) description(description string) string {
+	if p.omitDescriptions {
+		return ""
+	}
+	return description
 }
 
 type skillRenderLine struct {
@@ -105,6 +159,8 @@ type skillRenderLine struct {
 	scope        string
 	rootOrder    int
 	hasRootOrder bool
+	id           string
+	mainPrompt   string
 }
 
 type skillAliasPlan struct {
@@ -112,6 +168,76 @@ type skillAliasPlan struct {
 	rootAliases     map[string]string
 	aliasRootByPath map[string]string
 	tableCost       int
+}
+
+const (
+	skillAliasMaxRoots     = 2048
+	skillAliasMaxTableSize = 16 * 1024
+)
+
+// skillAliasRegistry keeps alias assignments append-only for the lifetime of
+// the process. Rust #55330 retains the same property in each thread's skills
+// state; a process-wide assignment has identical stability semantics for a
+// client because aliases are never reused for a different root.
+var skillAliasRegistry = struct {
+	sync.Mutex
+	scopes map[string]*skillAliasScopeState
+}{
+	scopes: map[string]*skillAliasScopeState{},
+}
+
+type skillAliasScopeState struct {
+	next  map[string]int
+	byKey map[string]string
+	count int
+}
+
+func skillAliasScope(scope string, reset bool) *skillAliasScopeState {
+	scope = strings.TrimSpace(scope)
+	state := skillAliasRegistry.scopes[scope]
+	if state == nil || reset {
+		state = &skillAliasScopeState{next: map[string]int{}, byKey: map[string]string{}}
+		skillAliasRegistry.scopes[scope] = state
+	}
+	return state
+}
+
+func assignSkillAlias(scope string, kind string, root string) (string, bool) {
+	kind = strings.TrimSpace(kind)
+	root = strings.TrimSpace(root)
+	if kind == "" || root == "" {
+		return "", false
+	}
+	key := kind + "\x00" + root
+	skillAliasRegistry.Lock()
+	defer skillAliasRegistry.Unlock()
+	state := skillAliasScope(scope, false)
+	if alias := state.byKey[key]; alias != "" {
+		return alias, true
+	}
+	if state.count >= skillAliasMaxRoots {
+		return "", false
+	}
+	index := state.next[kind]
+	state.next[kind] = index + 1
+	alias := fmt.Sprintf("%s%d", kind, index)
+	state.byKey[key] = alias
+	state.count++
+	return alias, true
+}
+
+func resetSkillAliasScope(scope string) {
+	skillAliasRegistry.Lock()
+	defer skillAliasRegistry.Unlock()
+	skillAliasScope(scope, true)
+}
+
+func skillAliasTableBytes(lines []string) int {
+	total := 0
+	for _, line := range lines {
+		total += len(line) + 1
+	}
+	return total
 }
 
 type skillLineAllocation struct {
@@ -125,6 +251,8 @@ type combinedAvailableSkillsRender struct {
 	hostReport         *SkillRenderReport
 	executorSkillLines []string
 	executorReport     *SkillRenderReport
+	hostEntries        []SkillCatalogEntryRender
+	executorEntries    []SkillCatalogEntryRender
 }
 
 func DefaultSkillMetadataBudget(contextWindow int64) SkillMetadataBudget {
@@ -163,7 +291,11 @@ func RenderAvailableSkills(skills []InstructionsSkillMetadata, budget SkillMetad
 }
 
 func RenderAvailableSkillsWithOptions(skills []InstructionsSkillMetadata, options AvailableSkillsRenderOptions) *AvailableSkills {
-	lines := orderedSkillRenderLines(skills)
+	if strings.TrimSpace(options.AliasScope) == "" {
+		resetSkillAliasScope("")
+	}
+	policy := skillCatalogPolicy{omitDescriptions: options.OmitDescriptions}
+	lines := orderedSkillRenderLinesWithPolicy(skills, policy)
 	if len(lines) == 0 {
 		return nil
 	}
@@ -171,14 +303,16 @@ func RenderAvailableSkillsWithOptions(skills []InstructionsSkillMetadata, option
 	if budget.Limit <= 0 {
 		budget = SkillMetadataBudget{Kind: SkillMetadataBudgetCharacters, Limit: DefaultSkillMetadataCharBudget}
 	}
-	skillLines, report, skillRootLines := renderBestSkillLines(lines, budget)
-	warning := skillRenderWarning(report, budget)
+	selected := renderBestSkillCatalogForScope(lines, budget, options.AliasScope, policy)
+	warning := skillRenderWarningWithPolicy(selected.report, budget, false)
 	return &AvailableSkills{
-		Body:           renderAvailableSkillsBody(skillRootLines, skillLines, options.IncludeUsageInstructions),
-		SkillRootLines: skillRootLines,
-		SkillLines:     skillLines,
-		Report:         report,
-		WarningMessage: warning,
+		Body:             renderAvailableSkillsBodyWithPolicy(selected.rootLines, selected.skillLines, options.IncludeUsageInstructions, policy),
+		SkillRootLines:   selected.rootLines,
+		SkillLines:       selected.skillLines,
+		Report:           selected.report,
+		WarningMessage:   warning,
+		Entries:          selected.entries,
+		OmitDescriptions: policy.omitDescriptions,
 	}
 }
 
@@ -190,19 +324,23 @@ func RenderExtensionAvailableSkills(skills []InstructionsSkillMetadata, includeU
 }
 
 func RenderExtensionAvailableSkillsWithOptions(skills []InstructionsSkillMetadata, options AvailableSkillsRenderOptions) *AvailableSkills {
-	lines := extensionSkillRenderLines(skills)
+	policy := skillCatalogPolicy{omitDescriptions: options.OmitDescriptions}
+	lines := extensionSkillRenderLinesWithPolicy(skills, policy)
 	if len(lines) == 0 {
 		return nil
 	}
 	budget := normalizedSkillMetadataBudget(options.Budget)
-	skillLines, report := renderSkillLines(lines, budget)
+	allocations := allocateSkillLines(lines, budget)
+	skillLines, report := renderAllocatedSkillLines(lines, allocations)
 	skillLines = appendExtensionOmissionMarker(skillLines, report, budget)
-	warning := skillRenderWarning(report, budget)
+	warning := skillRenderWarningWithPolicy(report, budget, false)
 	return &AvailableSkills{
-		Body:           renderAvailableSkillsBody(nil, skillLines, options.IncludeUsageInstructions),
-		SkillLines:     skillLines,
-		Report:         report,
-		WarningMessage: warning,
+		Body:             renderAvailableSkillsBodyWithPolicy(nil, skillLines, options.IncludeUsageInstructions, policy),
+		SkillLines:       skillLines,
+		Report:           report,
+		WarningMessage:   warning,
+		Entries:          skillCatalogEntriesForRender(lines, lines, allocations, nil, policy),
+		OmitDescriptions: policy.omitDescriptions,
 	}
 }
 
@@ -210,56 +348,64 @@ func RenderExtensionAvailableSkillsWithOptions(skills []InstructionsSkillMetadat
 // executor catalogs. Executor entries are allocated first to match the runtime
 // extension surface, while host entries can still use path aliases under pressure.
 func RenderCombinedAvailableSkills(hostSkills []InstructionsSkillMetadata, executorSkills []InstructionsSkillMetadata, options AvailableSkillsRenderOptions) (*AvailableSkills, *AvailableSkills) {
-	hostLines := orderedSkillRenderLines(hostSkills)
+	if strings.TrimSpace(options.AliasScope) == "" {
+		resetSkillAliasScope("")
+	}
+	policy := skillCatalogPolicy{omitDescriptions: options.OmitDescriptions}
+	hostLines := orderedSkillRenderLinesWithPolicy(hostSkills, policy)
 	// Rust #49127 (ext/skills/src/render_dedup.rs): the executor alias plan is
 	// built from the full visible executor inventory before duplicates are
 	// removed, so deduplication never renumbers the aliases of the packages
 	// that remain (PreparedSkillCatalog::new builds alias_plan first, and
 	// prefer_cloud_skills filters entries afterwards).
-	fullExecutorLines := extensionSkillRenderLines(executorSkills)
-	executorSkills = deduplicateCloudAndExecutorSkillsLikeRust(executorSkills)
-	executorLines := extensionSkillRenderLines(executorSkills)
+	fullExecutorLines := extensionSkillRenderLinesWithPolicy(executorSkills, policy)
+	executorSkills = deduplicateCloudAndExecutorSkills(executorSkills, options.CloudSkillsComplete)
+	executorLines := extensionSkillRenderLinesWithPolicy(executorSkills, policy)
 	budget := normalizedSkillMetadataBudget(options.Budget)
 	if len(hostLines) == 0 || len(executorLines) == 0 {
 		return RenderAvailableSkillsWithOptions(hostSkills, options), RenderExtensionAvailableSkillsWithOptions(executorSkills, options)
 	}
 
-	absolute := renderCombinedSkillLines(hostLines, executorLines, budget, nil)
+	absolute := renderCombinedSkillCatalog(hostLines, executorLines, budget, nil, nil, policy)
 	selected := absolute
 	// Rust #41011: evaluate aliased catalogs regardless of budget pressure and
 	// select them when they preserve inclusion/description while reducing size.
-	if plan, ok := buildSkillAliasPlan(hostLines, budget); ok && plan.tableCost < budget.Limit {
+	if plan, ok := buildSkillAliasPlanForScope(hostLines, budget, options.AliasScope); ok && plan.tableCost < budget.Limit {
 		adjustedBudget := budget
 		adjustedBudget.Limit -= plan.tableCost
-		aliased := renderCombinedSkillLines(applySkillAliases(hostLines, plan), executorLines, adjustedBudget, plan.rootLines)
-		if combinedSkillsRenderIsBetter(aliased, absolute, budget) {
+		aliased := renderCombinedSkillCatalog(hostLines, executorLines, adjustedBudget, plan, nil, policy)
+		if combinedSkillsRenderIsBetterWithPolicy(aliased, absolute, budget, policy) {
 			selected = aliased
 		}
 	}
 	// Rust ce22ea9712: executor locators are compacted with provider-specific
 	// `e` aliases alongside host `r` aliases under metadata pressure.
-	if plan, ok := buildExtensionAliasPlan(fullExecutorLines, budget); ok && plan.tableCost < budget.Limit {
+	if plan, ok := buildExtensionAliasPlanForScope(fullExecutorLines, budget, options.AliasScope); ok && plan.tableCost < budget.Limit {
 		adjustedBudget := budget
 		adjustedBudget.Limit -= plan.tableCost
-		aliased := renderCombinedSkillLines(applySkillAliases(hostLines, nil), applySkillAliases(executorLines, plan), adjustedBudget, nil)
-		if combinedSkillsRenderIsBetter(aliased, selected, budget) {
+		aliased := renderCombinedSkillCatalog(hostLines, executorLines, adjustedBudget, nil, plan, policy)
+		if combinedSkillsRenderIsBetterWithPolicy(aliased, selected, budget, policy) {
 			selected = aliased
 		}
 	}
 
-	hostWarning := skillRenderWarning(selected.hostReport, budget)
-	executorWarning := skillRenderWarning(selected.executorReport, budget)
+	hostWarning := skillRenderWarningWithPolicy(selected.hostReport, budget, false)
+	executorWarning := skillRenderWarningWithPolicy(selected.executorReport, budget, false)
 	return &AvailableSkills{
-			Body:           renderAvailableSkillsBody(selected.hostSkillRootLines, selected.hostSkillLines, options.IncludeUsageInstructions),
-			SkillRootLines: selected.hostSkillRootLines,
-			SkillLines:     selected.hostSkillLines,
-			Report:         selected.hostReport,
-			WarningMessage: hostWarning,
+			Body:             renderAvailableSkillsBodyWithPolicy(selected.hostSkillRootLines, selected.hostSkillLines, options.IncludeUsageInstructions, policy),
+			SkillRootLines:   selected.hostSkillRootLines,
+			SkillLines:       selected.hostSkillLines,
+			Report:           selected.hostReport,
+			WarningMessage:   hostWarning,
+			Entries:          selected.hostEntries,
+			OmitDescriptions: policy.omitDescriptions,
 		}, &AvailableSkills{
-			Body:           renderAvailableSkillsBody(nil, selected.executorSkillLines, options.IncludeUsageInstructions),
-			SkillLines:     selected.executorSkillLines,
-			Report:         selected.executorReport,
-			WarningMessage: executorWarning,
+			Body:             renderAvailableSkillsBodyWithPolicy(nil, selected.executorSkillLines, options.IncludeUsageInstructions, policy),
+			SkillLines:       selected.executorSkillLines,
+			Report:           selected.executorReport,
+			WarningMessage:   executorWarning,
+			Entries:          selected.executorEntries,
+			OmitDescriptions: policy.omitDescriptions,
 		}
 }
 
@@ -277,13 +423,28 @@ func RenderCombinedAvailableSkills(hostSkills []InstructionsSkillMetadata, execu
 // retired Rust "orchestrator" labels, Rust f3037cafd3/#47074), so the cloud and
 // executor halves are separated by locator kind here.
 func deduplicateCloudAndExecutorSkillsLikeRust(skills []InstructionsSkillMetadata) []InstructionsSkillMetadata {
+	return deduplicateCloudAndExecutorSkills(skills, false)
+}
+
+func deduplicateCloudAndExecutorSkills(skills []InstructionsSkillMetadata, cloudComplete bool) []InstructionsSkillMetadata {
 	cloudNames := cloudSkillNamesLikeRust(skills)
-	if len(cloudNames) == 0 {
+	cloudRemoteKeys := cloudRemoteSkillKeysLikeRust(skills)
+	if len(cloudNames) == 0 && len(cloudRemoteKeys) == 0 {
 		return skills
 	}
 	out := make([]InstructionsSkillMetadata, 0, len(skills))
 	for _, skill := range skills {
 		if isExecutorSkillMetadata(skill) {
+			if key := remoteSkillKey(skill); key != "" {
+				if _, shadowed := cloudRemoteKeys[key]; shadowed {
+					continue
+				}
+				if cloudComplete {
+					// A complete cloud catalog is authoritative for remote
+					// plugins: an executor-only remote skill is not enabled.
+					continue
+				}
+			}
 			if _, shadowed := cloudNames[skill.Name]; shadowed {
 				continue
 			}
@@ -291,6 +452,28 @@ func deduplicateCloudAndExecutorSkillsLikeRust(skills []InstructionsSkillMetadat
 		out = append(out, skill)
 	}
 	return out
+}
+
+func remoteSkillKey(skill InstructionsSkillMetadata) string {
+	remote := strings.TrimSpace(skill.RemotePluginID)
+	name := strings.TrimSpace(skill.Name)
+	if remote == "" || name == "" {
+		return ""
+	}
+	return remote + "\x00" + name
+}
+
+func cloudRemoteSkillKeysLikeRust(skills []InstructionsSkillMetadata) map[string]struct{} {
+	keys := map[string]struct{}{}
+	for _, skill := range skills {
+		if !isCloudSkillMetadata(skill) || !skill.AllowsImplicitInvocation() {
+			continue
+		}
+		if key := remoteSkillKey(skill); key != "" {
+			keys[key] = struct{}{}
+		}
+	}
+	return keys
 }
 
 // cloudSkillNamesLikeRust collects the names the cloud catalog contributes to
@@ -344,6 +527,10 @@ func isExecutorSkillMetadata(skill InstructionsSkillMetadata) bool {
 }
 
 func extensionSkillRenderLines(skills []InstructionsSkillMetadata) []skillRenderLine {
+	return extensionSkillRenderLinesWithPolicy(skills, skillCatalogPolicy{})
+}
+
+func extensionSkillRenderLinesWithPolicy(skills []InstructionsSkillMetadata, policy skillCatalogPolicy) []skillRenderLine {
 	lines := make([]skillRenderLine, 0, len(skills))
 	for _, skill := range skills {
 		if !skill.AllowsImplicitInvocation() {
@@ -353,7 +540,14 @@ func extensionSkillRenderLines(skills []InstructionsSkillMetadata) []skillRender
 		if locatorKind == "" {
 			locatorKind = "file"
 		}
-		lines = append(lines, skillRenderLine{name: skill.Name, description: truncateSkillDescription(skill.Description), path: skillRenderLocator(skill), locatorKind: locatorKind})
+		lines = append(lines, skillRenderLine{
+			name:        skill.Name,
+			description: policy.description(truncateSkillDescription(skill.Description)),
+			path:        skillRenderLocator(skill),
+			locatorKind: locatorKind,
+			id:          skillCatalogEntryID(skill),
+			mainPrompt:  firstNonEmptyString(skill.LocatorPath, skill.Path),
+		})
 	}
 	return lines
 }
@@ -398,6 +592,10 @@ func appendExtensionOmissionMarker(skillLines []string, report *SkillRenderRepor
 }
 
 func orderedSkillRenderLines(skills []InstructionsSkillMetadata) []skillRenderLine {
+	return orderedSkillRenderLinesWithPolicy(skills, skillCatalogPolicy{})
+}
+
+func orderedSkillRenderLinesWithPolicy(skills []InstructionsSkillMetadata, policy skillCatalogPolicy) []skillRenderLine {
 	lines := make([]skillRenderLine, 0, len(skills))
 	for _, skill := range skills {
 		if !skill.AllowsImplicitInvocation() {
@@ -409,13 +607,15 @@ func orderedSkillRenderLines(skills []InstructionsSkillMetadata) []skillRenderLi
 		}
 		lines = append(lines, skillRenderLine{
 			name:         skill.Name,
-			description:  truncateSkillDescription(skill.Description),
+			description:  policy.description(truncateSkillDescription(skill.Description)),
 			path:         skillRenderLocator(skill),
 			locatorKind:  locatorKind,
 			root:         cleanSkillAliasRoot(skill.Root),
 			scope:        skill.Scope,
 			rootOrder:    skill.RootOrder,
 			hasRootOrder: skill.HasRootOrder,
+			id:           skillCatalogEntryID(skill),
+			mainPrompt:   firstNonEmptyString(skill.LocatorPath, skill.Path),
 		})
 	}
 	sort.SliceStable(lines, func(i int, j int) bool {
@@ -431,23 +631,12 @@ func orderedSkillRenderLines(skills []InstructionsSkillMetadata) []skillRenderLi
 }
 
 func renderBestSkillLines(lines []skillRenderLine, budget SkillMetadataBudget) ([]string, *SkillRenderReport, []string) {
-	absoluteLines, absoluteReport := renderSkillLines(lines, budget)
+	return renderBestSkillLinesForScope(lines, budget, "")
+}
 
-	// Rust #41011: evaluate the aliased catalog regardless of budget pressure
-	// and select it whenever it preserves skill inclusion and description
-	// content while reducing prompt size. Previously aliases were only tried
-	// when the unaliased catalog was not fully rendered.
-	plan, ok := buildSkillAliasPlan(lines, budget)
-	if !ok || plan.tableCost >= budget.Limit {
-		return absoluteLines, absoluteReport, nil
-	}
-	adjustedBudget := budget
-	adjustedBudget.Limit -= plan.tableCost
-	aliasedLines, aliasedReport := renderSkillLines(applySkillAliases(lines, plan), adjustedBudget)
-	if aliasedRenderIsBetter(aliasedLines, aliasedReport, plan.rootLines, absoluteLines, absoluteReport, nil, budget) {
-		return aliasedLines, aliasedReport, plan.rootLines
-	}
-	return absoluteLines, absoluteReport, nil
+func renderBestSkillLinesForScope(lines []skillRenderLine, budget SkillMetadataBudget, scope string) ([]string, *SkillRenderReport, []string) {
+	selected := renderBestSkillCatalogForScope(lines, budget, scope, skillCatalogPolicy{})
+	return selected.skillLines, selected.report, selected.rootLines
 }
 
 func renderSkillLines(lines []skillRenderLine, budget SkillMetadataBudget) ([]string, *SkillRenderReport) {
@@ -520,6 +709,13 @@ func renderAllocatedSkillLines(lines []skillRenderLine, allocations []skillLineA
 }
 
 func renderCombinedSkillLines(hostLines []skillRenderLine, executorLines []skillRenderLine, budget SkillMetadataBudget, hostRootLines []string) *combinedAvailableSkillsRender {
+	return renderCombinedSkillCatalogWithRootLines(hostLines, executorLines, budget, hostRootLines, nil)
+}
+
+// renderCombinedSkillCatalogWithRootLines preserves the pre-#57262 helper shape
+// used by tests: already-aliased lines plus the root table they were rendered
+// with.
+func renderCombinedSkillCatalogWithRootLines(hostLines []skillRenderLine, executorLines []skillRenderLine, budget SkillMetadataBudget, hostRootLines []string, executorRootLines []string) *combinedAvailableSkillsRender {
 	allLines := append(append([]skillRenderLine(nil), executorLines...), hostLines...)
 	allocations := allocateSkillLines(allLines, budget)
 	marker := reserveExecutorOmissionMarker(allLines, len(executorLines), budget, allocations)
@@ -534,6 +730,37 @@ func renderCombinedSkillLines(hostLines []skillRenderLine, executorLines []skill
 		hostReport:         hostReport,
 		executorSkillLines: executorRendered,
 		executorReport:     executorReport,
+		hostEntries:        skillCatalogEntriesForRender(hostLines, hostLines, allocations[len(executorLines):], nil, skillCatalogPolicy{}),
+		executorEntries:    skillCatalogEntriesForRender(executorLines, executorLines, allocations[:len(executorLines)], nil, skillCatalogPolicy{}),
+	}
+}
+
+// renderCombinedSkillCatalog renders both catalogs under one budget, applying
+// the alias plans inside so per-entry comparison metadata sees the original
+// locator for each row (Rust #57262 PreparedSkillCatalog::entries_for_render).
+func renderCombinedSkillCatalog(hostLines []skillRenderLine, executorLines []skillRenderLine, budget SkillMetadataBudget, hostPlan *skillAliasPlan, executorPlan *skillAliasPlan, policy skillCatalogPolicy) *combinedAvailableSkillsRender {
+	hostApplied := applySkillAliases(hostLines, hostPlan)
+	executorApplied := applySkillAliases(executorLines, executorPlan)
+	allLines := append(append([]skillRenderLine(nil), executorApplied...), hostApplied...)
+	allocations := allocateSkillLines(allLines, budget)
+	marker := reserveExecutorOmissionMarker(allLines, len(executorApplied), budget, allocations)
+	executorRendered, executorReport := renderAllocatedSkillLines(executorApplied, allocations[:len(executorApplied)])
+	if marker != "" {
+		executorRendered = append(executorRendered, marker)
+	}
+	hostRendered, hostReport := renderAllocatedSkillLines(hostApplied, allocations[len(executorApplied):])
+	var hostRootLines []string
+	if hostPlan != nil {
+		hostRootLines = hostPlan.rootLines
+	}
+	return &combinedAvailableSkillsRender{
+		hostSkillLines:     hostRendered,
+		hostSkillRootLines: hostRootLines,
+		hostReport:         hostReport,
+		executorSkillLines: executorRendered,
+		executorReport:     executorReport,
+		hostEntries:        skillCatalogEntriesForRender(hostLines, hostApplied, allocations[len(executorApplied):], hostPlan, policy),
+		executorEntries:    skillCatalogEntriesForRender(executorLines, executorApplied, allocations[:len(executorApplied)], executorPlan, policy),
 	}
 }
 
@@ -586,6 +813,10 @@ func allocatedSkillLinesCost(lines []skillRenderLine, allocations []skillLineAll
 }
 
 func combinedSkillsRenderIsBetter(candidate *combinedAvailableSkillsRender, current *combinedAvailableSkillsRender, budget SkillMetadataBudget) bool {
+	return combinedSkillsRenderIsBetterWithPolicy(candidate, current, budget, skillCatalogPolicy{})
+}
+
+func combinedSkillsRenderIsBetterWithPolicy(candidate *combinedAvailableSkillsRender, current *combinedAvailableSkillsRender, budget SkillMetadataBudget, policy skillCatalogPolicy) bool {
 	if candidate.executorReport.IncludedCount != current.executorReport.IncludedCount {
 		return candidate.executorReport.IncludedCount > current.executorReport.IncludedCount
 	}
@@ -599,11 +830,15 @@ func combinedSkillsRenderIsBetter(candidate *combinedAvailableSkillsRender, curr
 	if candidateTruncated != currentTruncated {
 		return candidateTruncated < currentTruncated
 	}
-	return combinedSkillsCost(candidate, budget) < combinedSkillsCost(current, budget)
+	return combinedSkillsCostWithPolicy(candidate, budget, policy) < combinedSkillsCostWithPolicy(current, budget, policy)
 }
 
 func combinedSkillsCost(rendered *combinedAvailableSkillsRender, budget SkillMetadataBudget) int {
-	return availableSkillsCost(budget, rendered.hostSkillRootLines, rendered.hostSkillLines) + linesCost(budget, rendered.executorSkillLines)
+	return combinedSkillsCostWithPolicy(rendered, budget, skillCatalogPolicy{})
+}
+
+func combinedSkillsCostWithPolicy(rendered *combinedAvailableSkillsRender, budget SkillMetadataBudget, policy skillCatalogPolicy) int {
+	return availableSkillsCostWithPolicy(budget, rendered.hostSkillRootLines, rendered.hostSkillLines, policy) + linesCost(budget, rendered.executorSkillLines)
 }
 
 func extensionOmissionMarker(omitted int) string {
@@ -622,6 +857,11 @@ func normalizedSkillMetadataBudget(budget SkillMetadataBudget) SkillMetadataBudg
 }
 
 func buildSkillAliasPlan(lines []skillRenderLine, budget SkillMetadataBudget) (*skillAliasPlan, bool) {
+	resetSkillAliasScope("")
+	return buildSkillAliasPlanForScope(lines, budget, "")
+}
+
+func buildSkillAliasPlanForScope(lines []skillRenderLine, budget SkillMetadataBudget, scope string) (*skillAliasPlan, bool) {
 	aliasLines := append([]skillRenderLine(nil), lines...)
 	sort.SliceStable(aliasLines, func(i int, j int) bool {
 		if aliasLines[i].hasRootOrder != aliasLines[j].hasRootOrder {
@@ -665,10 +905,16 @@ func buildSkillAliasPlan(lines []skillRenderLine, budget SkillMetadataBudget) (*
 
 	rootAliases := make(map[string]string, len(aliasRoots))
 	rootLines := make([]string, 0, len(aliasRoots))
-	for i, root := range aliasRoots {
-		alias := fmt.Sprintf("r%d", i)
+	for _, root := range aliasRoots {
+		alias, ok := assignSkillAlias(scope, "r", root)
+		if !ok {
+			return nil, false
+		}
 		rootAliases[root] = alias
 		rootLines = append(rootLines, fmt.Sprintf("- `%s` = `%s`", alias, root))
+		if skillAliasTableBytes(rootLines) > skillAliasMaxTableSize {
+			return nil, false
+		}
 	}
 
 	aliasRootByPath := make(map[string]string, len(lines))
@@ -696,6 +942,11 @@ func buildSkillAliasPlan(lines []skillRenderLine, budget SkillMetadataBudget) (*
 // locators using provider-specific `e`/`o` prefixes (Rust ce22ea9712 aliases.rs).
 // Locator roots are derived from the locator path's leading URI segments.
 func buildExtensionAliasPlan(lines []skillRenderLine, budget SkillMetadataBudget) (*skillAliasPlan, bool) {
+	resetSkillAliasScope("")
+	return buildExtensionAliasPlanForScope(lines, budget, "")
+}
+
+func buildExtensionAliasPlanForScope(lines []skillRenderLine, budget SkillMetadataBudget, scope string) (*skillAliasPlan, bool) {
 	usedRoots := make([]string, 0, len(lines))
 	seen := map[string]bool{}
 	for _, line := range lines {
@@ -714,10 +965,16 @@ func buildExtensionAliasPlan(lines []skillRenderLine, budget SkillMetadataBudget
 	}
 	rootAliases := make(map[string]string, len(usedRoots))
 	rootLines := make([]string, 0, len(usedRoots))
-	for i, root := range usedRoots {
-		alias := fmt.Sprintf("e%d", i)
+	for _, root := range usedRoots {
+		alias, ok := assignSkillAlias(scope, "e", root)
+		if !ok {
+			return nil, false
+		}
 		rootAliases[root] = alias
 		rootLines = append(rootLines, fmt.Sprintf("- `%s` = `%s`", alias, root))
+		if skillAliasTableBytes(rootLines) > skillAliasMaxTableSize {
+			return nil, false
+		}
 	}
 	aliasRootByPath := make(map[string]string, len(lines))
 	for _, line := range lines {
@@ -816,19 +1073,27 @@ func extensionSkillPathRelativeToRoot(path string, root string) (string, bool) {
 }
 
 func aliasedRenderIsBetter(aliasedLines []string, aliasedReport *SkillRenderReport, aliasedRootLines []string, absoluteLines []string, absoluteReport *SkillRenderReport, absoluteRootLines []string, budget SkillMetadataBudget) bool {
+	return aliasedRenderIsBetterWithPolicy(aliasedLines, aliasedReport, aliasedRootLines, absoluteLines, absoluteReport, absoluteRootLines, budget, skillCatalogPolicy{})
+}
+
+func aliasedRenderIsBetterWithPolicy(aliasedLines []string, aliasedReport *SkillRenderReport, aliasedRootLines []string, absoluteLines []string, absoluteReport *SkillRenderReport, absoluteRootLines []string, budget SkillMetadataBudget, policy skillCatalogPolicy) bool {
 	if aliasedReport.IncludedCount != absoluteReport.IncludedCount {
 		return aliasedReport.IncludedCount > absoluteReport.IncludedCount
 	}
 	if aliasedReport.TruncatedDescriptionChars != absoluteReport.TruncatedDescriptionChars {
 		return aliasedReport.TruncatedDescriptionChars < absoluteReport.TruncatedDescriptionChars
 	}
-	return availableSkillsCost(budget, aliasedRootLines, aliasedLines) < availableSkillsCost(budget, absoluteRootLines, absoluteLines)
+	return availableSkillsCostWithPolicy(budget, aliasedRootLines, aliasedLines, policy) < availableSkillsCostWithPolicy(budget, absoluteRootLines, absoluteLines, policy)
 }
 
 func availableSkillsCost(budget SkillMetadataBudget, rootLines []string, skillLines []string) int {
+	return availableSkillsCostWithPolicy(budget, rootLines, skillLines, skillCatalogPolicy{})
+}
+
+func availableSkillsCostWithPolicy(budget SkillMetadataBudget, rootLines []string, skillLines []string, policy skillCatalogPolicy) int {
 	cost := linesCost(budget, skillLines)
 	if len(rootLines) > 0 {
-		cost += aliasedMetadataOverheadCost(budget, rootLines)
+		cost += aliasedMetadataOverheadCostWithPolicy(budget, rootLines, policy)
 	}
 	return cost
 }
@@ -842,8 +1107,12 @@ func linesCost(budget SkillMetadataBudget, lines []string) int {
 }
 
 func aliasedMetadataOverheadCost(budget SkillMetadataBudget, skillRootLines []string) int {
-	absoluteCost := budget.cost(renderAvailableSkillsBudgetBody(nil, nil))
-	aliasedCost := budget.cost(renderAvailableSkillsBudgetBody(skillRootLines, nil))
+	return aliasedMetadataOverheadCostWithPolicy(budget, skillRootLines, skillCatalogPolicy{})
+}
+
+func aliasedMetadataOverheadCostWithPolicy(budget SkillMetadataBudget, skillRootLines []string, policy skillCatalogPolicy) int {
+	absoluteCost := budget.cost(renderAvailableSkillsBudgetBodyWithPolicy(nil, nil, policy))
+	aliasedCost := budget.cost(renderAvailableSkillsBudgetBodyWithPolicy(skillRootLines, nil, policy))
 	if aliasedCost < absoluteCost {
 		return 0
 	}
@@ -851,12 +1120,16 @@ func aliasedMetadataOverheadCost(budget SkillMetadataBudget, skillRootLines []st
 }
 
 func renderAvailableSkillsBudgetBody(skillRootLines []string, skillLines []string) string {
+	return renderAvailableSkillsBudgetBodyWithPolicy(skillRootLines, skillLines, skillCatalogPolicy{})
+}
+
+func renderAvailableSkillsBudgetBodyWithPolicy(skillRootLines []string, skillLines []string, policy skillCatalogPolicy) string {
 	var lines []string
 	lines = append(lines, "## Skills")
 	if len(skillRootLines) == 0 {
-		lines = append(lines, SkillsIntroWithAbsolutePaths)
+		lines = append(lines, skillCatalogIntro(SkillsIntroWithAbsolutePaths, policy))
 	} else {
-		lines = append(lines, SkillsIntroWithAliases)
+		lines = append(lines, skillCatalogIntro(SkillsIntroWithAliases, policy))
 		lines = append(lines, "### Skill roots")
 		lines = append(lines, skillRootLines...)
 	}
@@ -895,11 +1168,19 @@ func allocateDescriptionBudget(lines []skillRenderLine, budget SkillMetadataBudg
 }
 
 func renderAvailableSkillsBody(skillRootLines []string, skillLines []string, includeUsageInstructions bool) string {
+	return renderAvailableSkillsBodyWithPolicy(skillRootLines, skillLines, includeUsageInstructions, skillCatalogPolicy{})
+}
+
+func renderAvailableSkillsBodyWithPolicy(skillRootLines []string, skillLines []string, includeUsageInstructions bool, policy skillCatalogPolicy) string {
 	intro := SkillsIntroWithAbsolutePaths
 	howToUse := SkillsHowToUseWithAbsolutePaths
 	if len(skillRootLines) > 0 {
 		intro = SkillsIntroWithAliases
 		howToUse = SkillsHowToUseWithAliases
+	}
+	intro = skillCatalogIntro(intro, policy)
+	if policy.omitDescriptions {
+		howToUse = skillCatalogUsageInstructionsWithoutDescriptions(howToUse)
 	}
 
 	var builder strings.Builder
@@ -1038,10 +1319,18 @@ func pluginVersionBase(path string) (string, bool) {
 }
 
 func skillRenderWarning(report *SkillRenderReport, budget SkillMetadataBudget) *string {
+	return skillRenderWarningWithPolicy(report, budget, false)
+}
+
+func skillRenderWarningWithPolicy(report *SkillRenderReport, budget SkillMetadataBudget, catalogDeltas bool) *string {
 	if report == nil {
 		return nil
 	}
 	if report.OmittedCount > 0 {
+		if catalogDeltas {
+			message := "Exceeded skills context budget. Some skills were not included in the model-visible skills list."
+			return &message
+		}
 		word := "skills"
 		verb := "were"
 		if report.OmittedCount == 1 {

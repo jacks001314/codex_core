@@ -15,6 +15,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/bmatcuk/doublestar/v4"
 	seccomp "github.com/elastic/go-seccomp-bpf"
@@ -24,6 +26,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"codex_core/codexuds"
+	"codex_core/sandbox/sandboxpath"
 )
 
 const (
@@ -508,41 +511,69 @@ func (p *linuxFilesystemPolicy) includePlatformDefaults() bool {
 	return false
 }
 
+// resolveForEnforcement projects this policy through the shared resolver
+// (Rust #59009). The Linux backend owns only the parts that are genuinely
+// Linux-specific: special paths, literal deny masks and glob expansion.
+func (p *linuxFilesystemPolicy) resolveForEnforcement(cwd string, expandGlobs bool) (sandboxpath.ResolvedFileSystemPermissions, error) {
+	if p == nil {
+		return sandboxpath.ResolvedFileSystemPermissions{}, nil
+	}
+	req := sandboxpath.EnforcementRequest{
+		CWD:                      cwd,
+		HasFullDiskReadAccess:    p.hasFullDiskReadAccess(),
+		HasFullDiskWriteAccess:   p.hasFullDiskWriteAccess(),
+		IncludePlatformDefaults:  p.includePlatformDefaults(),
+		PlatformDefaultReadRoots: linuxPlatformDefaultReadRoots,
+		Entries:                  p.enforcementEntries(cwd),
+		GlobScanMaxDepth:         p.GlobScanMaxDepth,
+		Projection:               sandboxpath.ProjectionLinuxMounts,
+		DecorateWritableRoots: func(roots []string) []sandboxpath.WritableRoot {
+			return sandboxpath.WritableRootsWithProtectedSubpaths(roots)
+		},
+	}
+	if expandGlobs {
+		req.ExpandGlob = func(pattern string, maxDepth *int) ([]string, error) {
+			return expandLinuxDenyGlob(pattern, cwd, maxDepth)
+		}
+	}
+	return sandboxpath.ResolveForEnforcement(req)
+}
+
+func (p *linuxFilesystemPolicy) enforcementEntries(cwd string) []sandboxpath.EnforcementEntry {
+	if p == nil {
+		return nil
+	}
+	var entries []sandboxpath.EnforcementEntry
+	for _, entry := range p.Entries {
+		if pattern := strings.TrimSpace(entry.Pattern); pattern != "" {
+			if entry.Access == "deny" {
+				entries = append(entries, sandboxpath.EnforcementEntry{Access: entry.Access, Pattern: pattern})
+			}
+			continue
+		}
+		for _, path := range entry.resolvedPaths(cwd) {
+			if path = cleanLinuxPath(path, cwd); path != "" {
+				entries = append(entries, sandboxpath.EnforcementEntry{Access: entry.Access, Path: path})
+			}
+		}
+	}
+	return entries
+}
+
 // readableRoots returns the roots a restricted-read policy may read, mirroring
 // Rust `get_readable_roots_with_cwd` (`permissions.rs:1455-1478`) plus the
-// platform-default and procfs augmentation `create_filesystem_args`
-// (`bwrap.rs:522-556`) applies before layering the scoped mounts. A policy with
-// unrestricted reads has no roots to layer: the caller binds `/` instead.
+// platform-default augmentation `create_filesystem_args` (`bwrap.rs:522-556`)
+// applies before layering the scoped mounts. A policy with unrestricted reads
+// has no roots to layer: the caller binds `/` instead.
 func (p *linuxFilesystemPolicy) readableRoots(cwd string) []string {
 	if p == nil || p.hasFullDiskReadAccess() {
 		return nil
 	}
-	seen := map[string]bool{}
-	roots := []string{}
-	add := func(path string) {
-		path = cleanLinuxPath(path, cwd)
-		if path == "" || seen[path] {
-			return
-		}
-		seen[path] = true
-		roots = append(roots, path)
+	resolved, err := p.resolveForEnforcement(cwd, false)
+	if err != nil {
+		return nil
 	}
-	for _, entry := range p.Entries {
-		if !entry.canRead() {
-			continue
-		}
-		for _, path := range entry.resolvedPaths(cwd) {
-			add(path)
-		}
-	}
-	if p.includePlatformDefaults() {
-		for _, path := range linuxPlatformDefaultReadRoots {
-			add(path)
-		}
-		// Rust also reuses the caller's procfs here, but only when the pid
-		// namespace is inherited; this CLI always unshares pid and mounts a
-		// fresh procfs after the filesystem arguments instead.
-	}
+	roots := append([]string(nil), resolved.ReadableRoots...)
 	sort.Strings(roots)
 	return roots
 }
@@ -568,22 +599,13 @@ func (p *linuxFilesystemPolicy) writableRoots(cwd string) []string {
 	if p == nil || p.hasFullDiskWriteAccess() {
 		return []string{"/"}
 	}
-	seen := map[string]bool{}
-	var roots []string
-	add := func(path string) {
-		path = cleanLinuxPath(path, cwd)
-		if path != "" && !seen[path] {
-			seen[path] = true
-			roots = append(roots, path)
-		}
+	resolved, err := p.resolveForEnforcement(cwd, false)
+	if err != nil {
+		return nil
 	}
-	for _, entry := range p.Entries {
-		if !entry.canWrite() {
-			continue
-		}
-		for _, path := range entry.resolvedPaths(cwd) {
-			add(path)
-		}
+	roots := make([]string, 0, len(resolved.WritableRoots))
+	for _, root := range resolved.WritableRoots {
+		roots = append(roots, root.Root)
 	}
 	return roots
 }
@@ -640,34 +662,11 @@ func (p *linuxFilesystemPolicy) unreadableRoots(cwd string) ([]string, error) {
 	if p == nil {
 		return nil, nil
 	}
-	seen := map[string]bool{}
-	var paths []string
-	add := func(path string) {
-		path = cleanLinuxPath(path, cwd)
-		if path != "" && !seen[path] {
-			seen[path] = true
-			paths = append(paths, path)
-		}
+	resolved, err := p.resolveForEnforcement(cwd, true)
+	if err != nil {
+		return nil, err
 	}
-	for _, entry := range p.Entries {
-		if entry.Access != "deny" {
-			continue
-		}
-		if strings.TrimSpace(entry.Pattern) != "" {
-			matches, err := expandLinuxDenyGlob(entry.Pattern, cwd, p.GlobScanMaxDepth)
-			if err != nil {
-				return nil, err
-			}
-			for _, match := range matches {
-				add(match)
-			}
-			continue
-		}
-		for _, path := range entry.resolvedPaths(cwd) {
-			add(path)
-		}
-	}
-	return paths, nil
+	return resolved.UnreadableRoots, nil
 }
 
 func (e *linuxFilesystemEntry) canRead() bool {
@@ -784,15 +783,13 @@ func pathComponentDepth(path string) int {
 }
 
 func ensureLegacyLandlockSupportsPolicy(cmd *linuxSandboxCommand) error {
-	return ensureLegacyLandlockSupportsPolicyWithInterop(cmd, wslInteropDir)
-}
-
-func ensureLegacyLandlockSupportsPolicyWithInterop(cmd *linuxSandboxCommand, interopDir string) error {
 	if !cmd.UseLegacyLandlock || cmd.PermissionProfile == nil || cmd.PermissionProfile.Filesystem == nil {
 		return nil
 	}
-	fs := cmd.PermissionProfile.Filesystem
-	if !fs.hasFullDiskWriteAccess() {
+	// Rust #45984 requires bubblewrap for filesystem-restricted execution, so
+	// legacy Landlock may only run the full-disk policy; masking WSL interop is
+	// bubblewrap's job (mask_wsl_n in bwrap.rs).
+	if !cmd.PermissionProfile.Filesystem.hasFullDiskWriteAccess() {
 		return errors.New("filesystem-restricted execution requires bubblewrap to isolate app-server sockets; disable features.use_legacy_landlock")
 	}
 	return nil
@@ -1050,37 +1047,35 @@ func execBubblewrap(cmd *linuxSandboxCommand, inner []string) error {
 			args = append(args, "--ro-bind", root, root)
 		}
 	}
-	for _, root := range fs.writableRoots(cmd.SandboxPolicyCWD) {
-		if root == "/" {
-			// Rebinding `/` shadows that device tree, so Rust recreates it
-			// together with shared memory (`bwrap.rs:650-657`).
-			args = append(args, "--bind", "/", "/")
-			args = append(args, "--dev", "/dev", "--bind-try", "/dev/shm", "/dev/shm")
-			continue
-		}
-		if _, err := os.Stat(root); err == nil {
-			args = append(args, "--bind", root, root)
-		}
-	}
+	// Rust binds writable roots shallowest-first (`sorted_writable_roots`) and
+	// re-applies each root's read-only carveouts right after that bind, so a
+	// deeper writable root is bound over its parent's read-only view. Mounting
+	// every carveout after every bind would let a parent carveout shadow a
+	// nested writable root (#47623).
+	writableRoots := fs.writableRoots(cmd.SandboxPolicyCWD)
+	sort.SliceStable(writableRoots, func(left, right int) bool {
+		return linuxSandboxPathDepth(writableRoots[left]) < linuxSandboxPathDepth(writableRoots[right])
+	})
+	fullWriteRoot := containsPath(writableRoots, "/")
 	// Rust re-applies read-only protections only for subpaths a writable
 	// root would otherwise expose (`append_read_only_subpath_args`,
 	// `bwrap.rs:1243-1257`): the read baseline is already read-only, and an
 	// extra `--ro-bind / /` re-mounts the host root over the device tree and
 	// over the writable roots bound above. Ordinary read entries that no
 	// writable root covers keep the baseline protection.
-	writableRoots := fs.writableRoots(cmd.SandboxPolicyCWD)
-	fullWriteRoot := false
+	protectedReadOnlySubpaths := fs.protectedReadOnlySubpaths(cmd.SandboxPolicyCWD)
 	for _, root := range writableRoots {
 		if root == "/" {
-			fullWriteRoot = true
-			break
-		}
-	}
-	for _, path := range fs.protectedReadOnlySubpaths(cmd.SandboxPolicyCWD) {
-		if !fullWriteRoot && !linuxSandboxPathWithin(writableRoots, path) {
+			// Rebinding `/` shadows that device tree, so Rust recreates it
+			// together with shared memory (`bwrap.rs:650-657`).
+			args = append(args, "--bind", "/", "/")
+			args = append(args, "--dev", "/dev", "--bind-try", "/dev/shm", "/dev/shm")
+		} else if _, err := os.Stat(root); err == nil {
+			args = append(args, "--bind", root, root)
+		} else {
 			continue
 		}
-		args = append(args, "--ro-bind", path, path)
+		args = appendProtectedReadOnlySubpathArgs(args, protectedReadOnlySubpaths, writableRoots, root, fullWriteRoot)
 	}
 	wslgMaskedByAncestor := false
 	if fs != nil {
@@ -1112,11 +1107,22 @@ func execBubblewrap(cmd *linuxSandboxCommand, inner []string) error {
 		if err != nil {
 			return err
 		}
+		device, mountID, filesystem, err := daemonSocketIdentity(daemonDirectory)
+		if err != nil {
+			return fmt.Errorf("cannot establish app-server socket mount isolation: %w", err)
+		}
 		mountinfo, err := os.ReadFile("/proc/self/mountinfo")
 		if err != nil {
 			return fmt.Errorf("cannot establish app-server socket mount isolation: %w", err)
 		}
-		if err := validateDaemonSocketMountIsolation(daemonDirectory, mountinfo); err != nil {
+		// The WSLg duplicate view is masked separately below, so an alias there is
+		// not exposed. Rust only passes masked_root when the WSLg distro mask is
+		// actually in effect (`bwrap.rs:426`), so an unmasked view still rejects.
+		maskedRoot := ""
+		if wslgMask {
+			maskedRoot = wslgDistroRoot
+		}
+		if err := validateDaemonSocketMountIsolation(daemonDirectory, device, filesystem, mountID, mountinfo, maskedRoot); err != nil {
 			return err
 		}
 		args = append(args, "--tmpfs", daemonDirectory)
@@ -1153,6 +1159,49 @@ func linuxSandboxPathWithin(roots []string, path string) bool {
 		}
 	}
 	return false
+}
+
+// linuxSandboxPathDepth counts path components, mirroring Rust `path_depth`
+// (`bwrap.rs`) so writable roots bind shallowest-first.
+func linuxSandboxPathDepth(path string) int {
+	cleaned := filepath.Clean(path)
+	if cleaned == string(filepath.Separator) {
+		return 0
+	}
+	return strings.Count(cleaned, string(filepath.Separator))
+}
+
+// linuxSandboxDeepestWritableRoot returns the deepest writable root containing
+// path. Rust attributes a read-only carveout to the writable root that mounts
+// immediately before it, which is that deepest root.
+func linuxSandboxDeepestWritableRoot(roots []string, path string) string {
+	deepest := ""
+	for _, root := range roots {
+		if !pathWithinRoot(path, root) {
+			continue
+		}
+		if deepest == "" || linuxSandboxPathDepth(root) > linuxSandboxPathDepth(deepest) {
+			deepest = root
+		}
+	}
+	return deepest
+}
+
+// appendProtectedReadOnlySubpathArgs mounts the read-only carveouts owned by
+// root directly after its writable bind (Rust `append_read_only_subpath_args`
+// per writable root). Carveouts under a deeper writable root are deferred to
+// that root so its bind is not shadowed by a parent's read-only view (#47623).
+func appendProtectedReadOnlySubpathArgs(args []string, subpaths []string, writableRoots []string, root string, fullWriteRoot bool) []string {
+	for _, path := range subpaths {
+		if !fullWriteRoot && !linuxSandboxPathWithin(writableRoots, path) {
+			continue
+		}
+		if linuxSandboxDeepestWritableRoot(writableRoots, path) != root {
+			continue
+		}
+		args = append(args, "--ro-bind", path, path)
+	}
+	return args
 }
 
 func appendUnreadableRootBwrapArgs(args *[]string, path string) (int, error) {
@@ -1431,7 +1480,6 @@ func proxySocketParentDir() string {
 func spawnProxyBridgeProcess(mode string, firstArg string, secondArg string) error {
 	bridgePath := os.Args[0]
 	cmd := exec.Command(bridgePath, mode, firstArg, secondArg)
-	cmd.SysProcAttr = &unix.SysProcAttr{Pdeathsig: unix.SIGTERM}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -1455,7 +1503,6 @@ func spawnProxyBridgeProcess(mode string, firstArg string, secondArg string) err
 func spawnProxyLocalBridge(udsPath string) (uint16, error) {
 	bridgePath := os.Args[0]
 	cmd := exec.Command(bridgePath, "--proxy-local-bridge", udsPath)
-	cmd.SysProcAttr = &unix.SysProcAttr{Pdeathsig: unix.SIGTERM}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return 0, err
@@ -1477,10 +1524,30 @@ func spawnProxyLocalBridge(udsPath string) (uint16, error) {
 	return uint16(port64), nil
 }
 
+// watchBridgeParent exits a proxy bridge once its parent process goes away.
+//
+// The spawn sites used SysProcAttr.Pdeathsig, but Linux delivers that signal
+// when the forking *thread* dies: the Go runtime retires threads freely, and
+// the sandbox helper later execs into the sandboxed command, which can kill the
+// bridge mid-request (observed as ECONNRESET through the managed-proxy chain).
+// Polling the parent pid tracks the parent *process* instead.
+func watchBridgeParent() {
+	parent := os.Getppid()
+	go func() {
+		for {
+			time.Sleep(250 * time.Millisecond)
+			if os.Getppid() != parent {
+				os.Exit(0)
+			}
+		}
+	}()
+}
+
 func runProxyHostBridgeHelper(args []string, stdout io.Writer) error {
 	if len(args) != 2 {
 		return errors.New("host bridge requires ENDPOINT and UDS_PATH")
 	}
+	watchBridgeParent()
 	endpoint := args[0]
 	udsPath := args[1]
 	_ = os.Remove(udsPath)
@@ -1501,6 +1568,7 @@ func runProxyHostBridgeHelper(args []string, stdout io.Writer) error {
 			defer unixConn.Close()
 			tcpConn, err := net.Dial("tcp", endpoint)
 			if err != nil {
+				fmt.Fprintf(os.Stderr, "codex-linux-sandbox host proxy bridge: dial %s: %v\n", endpoint, err)
 				return
 			}
 			defer tcpConn.Close()
@@ -1513,6 +1581,7 @@ func runProxyLocalBridgeHelper(args []string, stdout io.Writer) error {
 	if len(args) != 1 {
 		return errors.New("local bridge requires UDS_PATH")
 	}
+	watchBridgeParent()
 	udsPath := args[0]
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -1532,6 +1601,7 @@ func runProxyLocalBridgeHelper(args []string, stdout io.Writer) error {
 			defer tcpConn.Close()
 			unixConn, err := net.Dial("unix", udsPath)
 			if err != nil {
+				fmt.Fprintf(os.Stderr, "codex-linux-sandbox local proxy bridge: dial %s: %v\n", udsPath, err)
 				return
 			}
 			defer unixConn.Close()
@@ -1541,16 +1611,27 @@ func runProxyLocalBridgeHelper(args []string, stdout io.Writer) error {
 }
 
 func proxyBidirectional(left net.Conn, right net.Conn) {
-	done := make(chan struct{}, 2)
+	// Mirror tokio's copy_bidirectional: relay until *both* directions reach
+	// EOF. Returning after the first one lets the caller close a connection the
+	// other direction is still writing to, which resets the peer and drops the
+	// last response (seen as ECONNRESET through the managed-proxy chain).
+	var wg sync.WaitGroup
+	wg.Add(2)
 	go func() {
+		defer wg.Done()
 		_, _ = io.Copy(left, right)
-		done <- struct{}{}
+		if closer, ok := left.(interface{ CloseWrite() error }); ok {
+			_ = closer.CloseWrite()
+		}
 	}()
 	go func() {
+		defer wg.Done()
 		_, _ = io.Copy(right, left)
-		done <- struct{}{}
+		if closer, ok := right.(interface{ CloseWrite() error }); ok {
+			_ = closer.CloseWrite()
+		}
 	}()
-	<-done
+	wg.Wait()
 }
 
 func cloneIntPtr(value *int) *int {

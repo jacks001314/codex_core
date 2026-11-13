@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -192,6 +193,28 @@ func TestShellResultHookResponseSeparatesStderr(t *testing.T) {
 	withStderr := ShellResultHookResponse(&ShellResult{Stdout: "out\n", Stderr: "err\n"}, nil)
 	if withStderr != "out\n\nstderr:\nerr\n" {
 		t.Fatalf("withStderr = %q", withStderr)
+	}
+}
+
+// Rust #57185: the collection omission notice survives model-facing truncation
+// and is never duplicated.
+func TestShellResultHookResponsePreservesCollectionOmissionNoticeLikeRust(t *testing.T) {
+	marker := unifiedExecOmissionMarker(123)
+	raw := "head\n" + marker + "\ntail"
+	result := &ShellResult{Stdout: raw, OmittedBytes: 123}
+	if got := ShellResultHookResponse(result, intPtr(1000)); got != raw {
+		t.Fatalf("uncapped output = %q, want %q", got, raw)
+	}
+	truncated := ShellResultHookResponse(result, intPtr(2))
+	if !strings.Contains(truncated, "Warning: truncated output") {
+		t.Fatalf("truncated output missing warning: %q", truncated)
+	}
+	if count := strings.Count(truncated, marker); count != 1 {
+		t.Fatalf("truncated output marker count = %d in %q", count, truncated)
+	}
+	short := &ShellResult{Stdout: marker + "\nbody", OmittedBytes: 7}
+	if count := strings.Count(ShellResultHookResponse(short, intPtr(2)), unifiedExecOmissionMarker(7)); count != 1 {
+		t.Fatalf("surviving marker duplicated: count = %d", count)
 	}
 }
 
@@ -688,6 +711,78 @@ func TestShellExecutorPrePostHookPayload(t *testing.T) {
 	}
 }
 
+// Rust #57198: tool hooks receive the local command's resolved execution
+// directory, not the host turn cwd, while remote commands keep the host cwd.
+func TestShellExecutorHookToolCWDReportsExecutionDirectory(t *testing.T) {
+	hostCWD := t.TempDir()
+	otherCWD := t.TempDir()
+	executor := NewShellExecutor(&ShellExecutorOptions{
+		Validation: ShellValidationOptions{CWD: hostCWD, ApprovalPolicy: sandbox.ApprovalOnRequest},
+		UnifiedExecEnvironments: []UnifiedExecEnvironment{
+			{ID: "local", CWD: hostCWD},
+			{ID: "local-2", CWD: otherCWD},
+			{ID: "remote", CWD: "/remote/repo", ExecServerURL: "ws://127.0.0.1:1"},
+		},
+	})
+	cases := []struct {
+		name string
+		args string
+		want *string
+	}{
+		{name: "default", args: `{"cmd":"echo hi"}`, want: hookCWDStringPtr(hostCWD)},
+		{name: "empty workdir", args: `{"cmd":"echo hi","workdir":""}`, want: hookCWDStringPtr(hostCWD)},
+		{name: "relative workdir", args: `{"cmd":"echo hi","workdir":"nested/../target"}`, want: hookCWDStringPtr(filepath.Join(hostCWD, "target"))},
+		{name: "absolute workdir", args: `{"cmd":"echo hi","workdir":` + strconv.Quote(otherCWD) + `}`, want: hookCWDStringPtr(otherCWD)},
+		{name: "selected local environment", args: `{"cmd":"echo hi","environment_id":"local-2","workdir":"sub"}`, want: hookCWDStringPtr(filepath.Join(otherCWD, "sub"))},
+		{name: "remote environment", args: `{"cmd":"echo hi","environment_id":"remote","workdir":"sub"}`, want: nil},
+		{name: "unknown environment", args: `{"cmd":"echo hi","environment_id":"missing"}`, want: nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			invocation := &Invocation{
+				CallID:   "call-cwd",
+				ToolName: PlainName(DefaultExecCommandToolName),
+				Payload:  Payload{Kind: PayloadFunction, Arguments: tc.args},
+			}
+			pre, ok := executor.PreToolUsePayload(invocation)
+			if !ok {
+				t.Fatal("PreToolUsePayload() ok = false")
+			}
+			if !equalOptionalString(pre.ToolCWD, tc.want) {
+				t.Fatalf("PreToolUsePayload ToolCWD = %v, want %v", optionalString(pre.ToolCWD), optionalString(tc.want))
+			}
+			post, ok := executor.PostToolUsePayload(invocation, &Output{
+				Body: "ok",
+				Data: map[string]any{"hook_response": "ok"},
+			})
+			if !ok {
+				t.Fatal("PostToolUsePayload() ok = false")
+			}
+			if !equalOptionalString(post.ToolCWD, tc.want) {
+				t.Fatalf("PostToolUsePayload ToolCWD = %v, want %v", optionalString(post.ToolCWD), optionalString(tc.want))
+			}
+		})
+	}
+}
+
+func hookCWDStringPtr(value string) *string {
+	return &value
+}
+
+func equalOptionalString(left, right *string) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func optionalString(value *string) string {
+	if value == nil {
+		return "<nil>"
+	}
+	return *value
+}
+
 func TestShellExecutorUpdatedHookInputRewritesCmd(t *testing.T) {
 	executor := NewShellExecutor(&ShellExecutorOptions{})
 	updated, err := executor.WithUpdatedHookInput(&Invocation{
@@ -1152,5 +1247,135 @@ func TestOneShotExecReportsExit124OnTimeoutLikeRust(t *testing.T) {
 	data, _ := output.Data["exit_code"].(int)
 	if data != 124 {
 		t.Fatalf("one-shot timed-out exit code = %v, want 124", output.Data["exit_code"])
+	}
+}
+
+// TestShellExecutorTelemetryTagsSnapshotModeLikeRust mirrors Rust #57235: the
+// executor reports its configured shell snapshot mode, independent of whether
+// an individual command used a snapshot.
+func TestShellExecutorTelemetryTagsSnapshotModeLikeRust(t *testing.T) {
+	for _, mode := range []string{"disabled", "v1", "v2"} {
+		tags := NewShellExecutor(&ShellExecutorOptions{ShellSnapshotMode: mode}).TelemetryTags(&Invocation{ToolName: PlainName("exec_command")})
+		if tags["shell_snapshot_mode"] != mode {
+			t.Fatalf("mode %q tags = %#v", mode, tags)
+		}
+	}
+	if tags := NewShellExecutor(&ShellExecutorOptions{}).TelemetryTags(nil); len(tags) != 0 {
+		t.Fatalf("unconfigured tags = %#v", tags)
+	}
+}
+
+// TestShellExecutorRejectsCredentialBrokerWithZshForkLikeRust covers Rust
+// #43909: brokerage and shell_zsh_fork cannot be combined because the broker
+// needs a protected snapshot the fork path cannot replay.
+func TestShellExecutorRejectsCredentialBrokerWithZshForkLikeRust(t *testing.T) {
+	runner := &fakeShellRunner{result: &ShellResult{ExitCode: 0}}
+	executor := NewShellExecutor(&ShellExecutorOptions{
+		Runner: runner,
+		Shell:  &Shell{Type: ShellBash, Path: "/bin/sh"},
+		Validation: ShellValidationOptions{
+			ApprovalPolicy: sandbox.ApprovalOnRequest,
+			CWD:            t.TempDir(),
+			ShellMode:      UnifiedExecShellModeZshFork,
+			ZshForkShell:   &Shell{Type: ShellZsh, Path: "/bin/zsh"},
+		},
+		ManagedNetworkResolver: func(environmentID string, remote bool) (*ManagedNetworkResolution, error) {
+			return &ManagedNetworkResolution{
+				Env: map[string]string{network.CredentialBrokerActiveEnvKey: "1"},
+			}, nil
+		},
+	})
+	_, err := executor.Execute(context.Background(), &Invocation{
+		CallID:   "call-broker-zsh-fork",
+		ToolName: PlainName(DefaultExecCommandToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"cmd":"echo hi"}`},
+	})
+	if err == nil || !strings.Contains(err.Error(), "credential brokerage does not yet support shell_zsh_fork") {
+		t.Fatalf("Execute() error = %v, want the broker/zsh-fork rejection", err)
+	}
+	if runner.request != nil {
+		t.Fatalf("rejected launch reached the runner: %#v", runner.request)
+	}
+}
+
+// TestShellExecutorRestoresUnbrokeredPowerShellEnvironmentLikeRust covers Rust
+// #43909: shells that cannot replay a protected snapshot get the real
+// credentials back and lose the broker activation marker for that child.
+func TestShellExecutorRestoresUnbrokeredPowerShellEnvironmentLikeRust(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("PowerShell/Cmd brokerage behaviour is Windows-specific")
+	}
+	runner := &fakeShellRunner{result: &ShellResult{ExitCode: 0}}
+	restored := false
+	executor := NewShellExecutor(&ShellExecutorOptions{
+		Runner: runner,
+		Shell:  &Shell{Type: ShellPowerShell, Path: "powershell"},
+		Validation: ShellValidationOptions{
+			ApprovalPolicy: sandbox.ApprovalOnRequest,
+			CWD:            t.TempDir(),
+		},
+		ManagedNetworkResolver: func(environmentID string, remote bool) (*ManagedNetworkResolution, error) {
+			return &ManagedNetworkResolution{
+				Env: map[string]string{
+					network.CredentialBrokerActiveEnvKey: "1",
+					network.BrokeredCredentialsEnvKey:    `[["OPENAI_API_KEY","dummy-key"]]`,
+					"OPENAI_API_KEY":                     "dummy-key",
+				},
+				RestoreUnbrokeredEnvironment: func(env map[string]string) {
+					restored = true
+					env["OPENAI_API_KEY"] = "real-key"
+					delete(env, network.CredentialBrokerActiveEnvKey)
+					delete(env, network.BrokeredCredentialsEnvKey)
+				},
+			}, nil
+		},
+	})
+	if _, err := executor.Execute(context.Background(), &Invocation{
+		CallID:   "call-broker-powershell",
+		ToolName: PlainName(DefaultExecCommandToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"cmd":"Write-Output hi"}`},
+	}); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !restored {
+		t.Fatal("PowerShell launch did not ask for the unbrokered environment")
+	}
+	if runner.request == nil || runner.request.Env["OPENAI_API_KEY"] != "real-key" {
+		t.Fatalf("PowerShell launch environment = %#v", runner.request)
+	}
+	if _, ok := runner.request.Env[network.CredentialBrokerActiveEnvKey]; ok {
+		t.Fatalf("PowerShell launch kept broker activation: %#v", runner.request.Env)
+	}
+}
+
+// TestShellExecutorRejectsBrokeredPosixWithoutProtectedSnapshotLikeRust covers
+// Rust #43909: a broker-active POSIX launch with no protected snapshot is
+// rejected instead of running startup files that could restore real creds.
+func TestShellExecutorRejectsBrokeredPosixWithoutProtectedSnapshotLikeRust(t *testing.T) {
+	runner := &fakeShellRunner{result: &ShellResult{ExitCode: 0}}
+	executor := NewShellExecutor(&ShellExecutorOptions{
+		Runner: runner,
+		Shell:  &Shell{Type: ShellBash, Path: "/bin/sh"},
+		Validation: ShellValidationOptions{
+			ApprovalPolicy: sandbox.ApprovalOnRequest,
+			CWD:            t.TempDir(),
+		},
+		ManagedNetworkResolver: func(environmentID string, remote bool) (*ManagedNetworkResolution, error) {
+			return &ManagedNetworkResolution{Env: map[string]string{network.CredentialBrokerActiveEnvKey: "1"}}, nil
+		},
+		SnapshotProvider: func(context.Context, SnapshotProviderRequest) SnapshotProviderResult {
+			return SnapshotProviderResult{}
+		},
+	})
+	_, err := executor.Execute(context.Background(), &Invocation{
+		CallID:   "call-broker-missing-snapshot",
+		ToolName: PlainName(DefaultExecCommandToolName),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"cmd":"echo hi"}`},
+	})
+	if err == nil || !strings.Contains(err.Error(), "credential brokerage could not create a protected shell snapshot") {
+		t.Fatalf("Execute() error = %v, want the missing protected snapshot rejection", err)
+	}
+	if runner.request != nil {
+		t.Fatalf("rejected launch reached the runner: %#v", runner.request)
 	}
 }

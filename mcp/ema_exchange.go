@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	managedconfig "codex_core/config"
 )
 
 // Enterprise ID-JAG exchange grant types mirror Rust
@@ -56,15 +59,42 @@ type MCPEMAIDJAGExchangeRequest struct {
 	IDPTokenEndpoint                 string
 	IDPIssuer                        string
 	IDPClientID                      string
-	RefreshToken                     string
-	IDPHTTPClient                    *http.Client
-	ResourceHTTPClient               *http.Client
+	// IDPClientAuthentication and ResourceClientAuthentication carry the
+	// approved confidential-client methods resolved from published metadata
+	// (Rust #56001). A zero Method selects the public-client form.
+	IDPClientAuthentication      mcpEMAClientAuthentication
+	ResourceClientAuthentication mcpEMAClientAuthentication
+	RefreshToken                 string
+	IDPHTTPClient                *http.Client
+	ResourceHTTPClient           *http.Client
 }
 
 // ExchangeMCPEMAIDJAG mirrors Rust exchange_id_jag: an enterprise IdP
 // credential is exchanged for an ID-JAG, which is then traded for a
-// resource-bound MCP bearer token.
+// resource-bound MCP bearer token. The caller releases any credential lease
+// before the resource request through ExchangeMCPEMAIDJAGWithCredentials.
 func ExchangeMCPEMAIDJAG(ctx context.Context, request MCPEMAIDJAGExchangeRequest) (*MCPEMAAccessToken, error) {
+	token, _, err := ExchangeMCPEMAIDJAGWithCredentials(ctx, request, struct{}{}, func(struct{}) struct{} {
+		return struct{}{}
+	})
+	return token, err
+}
+
+// ExchangeMCPEMAIDJAGWithCredentials mirrors Rust exchange_id_jag's
+// caller-owned credential boundary (#55685): only the IdP receives the refresh
+// token, so finishIDP runs once after the IdP exchange and before any resource
+// authorization server I/O. Its receipt is returned even when the resource
+// exchange fails.
+func ExchangeMCPEMAIDJAGWithCredentials[L, R any](
+	ctx context.Context,
+	request MCPEMAIDJAGExchangeRequest,
+	credentials L,
+	finishIDP func(L) R,
+) (*MCPEMAAccessToken, R, error) {
+	var zero R
+	if finishIDP == nil {
+		return nil, zero, errors.New("enterprise IdP exchange requires a credential release callback")
+	}
 	for _, endpoint := range []struct {
 		value       string
 		description string
@@ -76,17 +106,36 @@ func ExchangeMCPEMAIDJAG(ctx context.Context, request MCPEMAIDJAGExchangeRequest
 		{request.IDPTokenEndpoint, "enterprise IdP token endpoint"},
 	} {
 		if err := validateMCPEMAOAuthEndpoint(endpoint.value, endpoint.description); err != nil {
-			return nil, err
+			return nil, zero, err
 		}
 	}
 	if request.AuthorizationServerIssuer == request.IDPIssuer {
-		return nil, errors.New("enterprise IdP and MCP authorization server issuers must be different for ID-JAG")
+		return nil, zero, errors.New("enterprise IdP and MCP authorization server issuers must be different for ID-JAG")
 	}
 	if strings.TrimSpace(request.MCPClientID) == "" || strings.TrimSpace(request.IDPClientID) == "" {
-		return nil, errors.New("enterprise authorization requires the registered IdP and MCP client IDs")
+		return nil, zero, errors.New("enterprise authorization requires the registered IdP and MCP client IDs")
 	}
 	if strings.TrimSpace(request.RefreshToken) == "" {
-		return nil, errors.New("enterprise IdP refresh token must not be empty")
+		return nil, zero, errors.New("enterprise IdP refresh token must not be empty")
+	}
+	idpAuth := request.IDPClientAuthentication
+	if idpAuth.ClientID == "" {
+		idpAuth.ClientID = strings.TrimSpace(request.IDPClientID)
+	}
+	resourceAuth := request.ResourceClientAuthentication
+	if resourceAuth.ClientID == "" {
+		resourceAuth.ClientID = strings.TrimSpace(request.MCPClientID)
+	}
+	for _, auth := range []mcpEMAClientAuthentication{idpAuth, resourceAuth} {
+		if auth.Method != "" && !auth.Method.IsValid() {
+			return nil, zero, fmt.Errorf("unknown value %q for token endpoint authentication method", auth.Method)
+		}
+		if auth.Method != "" && strings.TrimSpace(auth.ClientSecret) == "" {
+			return nil, zero, errors.New("client secret must not be empty")
+		}
+	}
+	if (idpAuth.ClientSecret != "" || resourceAuth.ClientSecret != "") && strings.TrimSpace(request.AuthorizationServerIssuer) == "" {
+		return nil, zero, errors.New("confidential ema_auth requires a configured authorization server issuer")
 	}
 	requestedScopes := make(map[string]struct{}, len(request.Scopes))
 	validScopes := true
@@ -103,7 +152,7 @@ func ExchangeMCPEMAIDJAG(ctx context.Context, request MCPEMAIDJAGExchangeRequest
 		validScopes = false
 	}
 	if !validScopes {
-		return nil, errors.New("enterprise MCP authorization scopes must be distinct, non-empty scope tokens")
+		return nil, zero, errors.New("enterprise MCP authorization scopes must be distinct, non-empty scope tokens")
 	}
 	params := [][2]string{
 		{"grant_type", mcpEMATokenExchangeGrantType},
@@ -121,12 +170,12 @@ func ExchangeMCPEMAIDJAG(ctx context.Context, request MCPEMAIDJAGExchangeRequest
 		request.IDPHTTPClient,
 		request.IDPTokenEndpoint,
 		params,
-		request.IDPClientID,
+		idpAuth,
 		EMAInvalidGrantSourceEnterpriseIdentity,
 		"enterprise IdP ID-JAG exchange",
 	)
 	if err != nil {
-		return nil, err
+		return nil, zero, err
 	}
 	grantedScopes, err := idJag.Validate(MCPEMAIDJAGBinding{
 		Issuer:          request.IDPIssuer,
@@ -136,8 +185,11 @@ func ExchangeMCPEMAIDJAG(ctx context.Context, request MCPEMAIDJAGExchangeRequest
 		RequestedScopes: requestedScopes,
 	})
 	if err != nil {
-		return nil, err
+		return nil, zero, err
 	}
+	// Only the IdP receives the refresh token. Release its lease before the
+	// resource authorization server sees any request.
+	receipt := finishIDP(credentials)
 	// Only the signed assertion carries authority to the Resource AS. Repeating
 	// the requested resource or scopes could undo enterprise policy narrowing.
 	accessToken, err := postMCPEMAForm[mcpEMAMCPAccessTokenResponse](
@@ -148,14 +200,18 @@ func ExchangeMCPEMAIDJAG(ctx context.Context, request MCPEMAIDJAGExchangeRequest
 			{"grant_type", mcpEMAJWTBearerGrantType},
 			{"assertion", idJag.AccessToken},
 		},
-		request.MCPClientID,
+		resourceAuth,
 		EMAInvalidGrantSourceResourceAuthorization,
 		"MCP JWT bearer exchange",
 	)
 	if err != nil {
-		return nil, err
+		return nil, receipt, err
 	}
-	return accessToken.Validate(request.Resource, grantedScopes)
+	token, err := accessToken.Validate(request.Resource, grantedScopes)
+	if err != nil {
+		return nil, receipt, err
+	}
+	return token, receipt, nil
 }
 
 func mcpEMAIsASCIIWhitespace(r rune) bool {
@@ -178,14 +234,14 @@ func postMCPEMAForm[T any](
 	client *http.Client,
 	endpoint string,
 	params [][2]string,
-	clientID string,
+	auth mcpEMAClientAuthentication,
 	invalidGrantSource EMAInvalidGrantSource,
 	operation string,
 ) (*T, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	body := mcpEMAEncodeForm(params, clientID)
+	body := mcpEMAEncodeForm(params, auth)
 	postClient := mcpHTTPClientWithDefaultHeaders(client, nil)
 	cloned := *postClient
 	cloned.CheckRedirect = func(*http.Request, []*http.Request) error {
@@ -199,6 +255,11 @@ func postMCPEMAForm[T any](
 	}
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("Accept", "application/json")
+	if auth.Method == managedconfig.MCPEMATokenEndpointAuthClientSecretBasic {
+		// RFC 6749 2.3.1: form-encode both parts before Basic encoding.
+		credentials := url.QueryEscape(auth.ClientID) + ":" + url.QueryEscape(auth.ClientSecret)
+		request.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(credentials)))
+	}
 	response, err := cloned.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("%s request failed: %w", operation, err)
@@ -221,9 +282,20 @@ func postMCPEMAForm[T any](
 			}
 		case string(EMAAuthFailureInsufficientUserAuthn):
 			return nil, &EMAAuthFailure{
-				Code:    EMAAuthFailureInsufficientUserAuthn,
-				Context: fmt.Sprintf("%s returned HTTP %d: insufficient_user_authentication", operation, response.StatusCode),
+				Code:        EMAAuthFailureInsufficientUserAuthn,
+				GrantSource: invalidGrantSource,
+				Context:     fmt.Sprintf("%s returned HTTP %d: insufficient_user_authentication", operation, response.StatusCode),
 			}
+		case "unauthorized_client", "invalid_client":
+			// Only the IdP stage binds this client registration. A resource
+			// authorization rejection stays a provider failure (Rust #55691).
+			if invalidGrantSource == EMAInvalidGrantSourceEnterpriseIdentity {
+				return nil, &EMAAuthFailure{
+					Code:    EMAAuthFailureIdentityClientRejected,
+					Context: fmt.Sprintf("%s returned HTTP %d: %s", operation, response.StatusCode, code),
+				}
+			}
+			return nil, fmt.Errorf("%s returned HTTP %d: %s", operation, response.StatusCode, code)
 		default:
 			return nil, fmt.Errorf("%s returned HTTP %d: %s", operation, response.StatusCode, code)
 		}
@@ -237,9 +309,10 @@ func postMCPEMAForm[T any](
 
 const mcpEMAMaxResponseBytes = 1 << 20
 
-// mcpEMAEncodeForm serializes fields in order and appends client_id, matching
-// Rust's form serializer.
-func mcpEMAEncodeForm(params [][2]string, clientID string) string {
+// mcpEMAEncodeForm serializes fields in order and appends the client
+// credentials selected by the resolved authentication, matching Rust's form
+// serializer (Rust #56001).
+func mcpEMAEncodeForm(params [][2]string, auth mcpEMAClientAuthentication) string {
 	var builder strings.Builder
 	writePair := func(name string, value string) {
 		if builder.Len() > 0 {
@@ -252,6 +325,14 @@ func mcpEMAEncodeForm(params [][2]string, clientID string) string {
 	for _, pair := range params {
 		writePair(pair[0], pair[1])
 	}
-	writePair("client_id", clientID)
+	switch auth.Method {
+	case managedconfig.MCPEMATokenEndpointAuthClientSecretBasic:
+		// The Authorization header carries both credentials.
+	case managedconfig.MCPEMATokenEndpointAuthClientSecretPost:
+		writePair("client_id", auth.ClientID)
+		writePair("client_secret", auth.ClientSecret)
+	default:
+		writePair("client_id", auth.ClientID)
+	}
 	return builder.String()
 }

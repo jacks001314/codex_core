@@ -6,6 +6,7 @@ package shell
 
 import (
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -15,6 +16,7 @@ type TerminalName string
 const (
 	TerminalAppleTerminal   TerminalName = "appleTerminal"
 	TerminalGhostty         TerminalName = "ghostty"
+	TerminalRex             TerminalName = "rex"
 	TerminalIterm2          TerminalName = "iterm2"
 	TerminalWarp            TerminalName = "warpTerminal"
 	TerminalVSCode          TerminalName = "vscode"
@@ -41,12 +43,33 @@ type Multiplexer struct {
 	Version *string         `json:"version,omitempty"`
 }
 
+// TerminalBackendKind identifies a rendering backend discovered from the
+// environment independently of the terminal application identity.
+type TerminalBackendKind string
+
+const (
+	// TerminalBackendVTE covers VTE-based terminals such as GNOME Terminal.
+	TerminalBackendVTE TerminalBackendKind = "vte"
+)
+
+// TerminalBackend is backend metadata observed independently of the terminal
+// application identity (Rust #57612). Version uses VTE's own encoding
+// (major*10_000 + minor*100 + micro) and is nil when the environment value is
+// missing or malformed.
+type TerminalBackend struct {
+	Kind    TerminalBackendKind `json:"kind"`
+	Version *uint32             `json:"version,omitempty"`
+}
+
 type TerminalInfo struct {
 	Name        TerminalName `json:"name"`
 	TermProgram *string      `json:"termProgram,omitempty"`
 	Version     *string      `json:"version,omitempty"`
 	Term        *string      `json:"term,omitempty"`
 	Multiplexer *Multiplexer `json:"multiplexer,omitempty"`
+	// Backend is set independently of Name: GNOME Terminal and other
+	// applications still report their VTE backend version.
+	Backend *TerminalBackend `json:"backend,omitempty"`
 }
 
 func (t *TerminalInfo) UserAgentToken() string {
@@ -121,6 +144,40 @@ func Detect(env Environment) *TerminalInfo {
 	if env == nil {
 		env = &ProcessEnvironment{}
 	}
+	terminal := detectTerminalIdentity(env)
+	// Identity probes can return before VTE is considered. Keep its backend
+	// metadata even when GNOME or another TERM_PROGRAM identifies the
+	// application (Rust #57612).
+	vteVersion, hasVTEVersion := env.Var("VTE_VERSION")
+	if hasVTEVersion || terminal.Name == TerminalVTE {
+		backend := &TerminalBackend{Kind: TerminalBackendVTE}
+		raw, hasRaw := vteVersion, hasVTEVersion
+		if !hasRaw && terminal.Version != nil {
+			// The raw VTE_VERSION keeps precedence over the terminal version so
+			// a malformed value stays unknown instead of falling back.
+			raw, hasRaw = *terminal.Version, true
+		}
+		if hasRaw {
+			if version, ok := parseVTEVersion(raw); ok {
+				backend.Version = &version
+			}
+		}
+		terminal.Backend = backend
+	}
+	return terminal
+}
+
+// parseVTEVersion mirrors Rust's `str::parse::<u32>()` on VTE_VERSION: an
+// optional leading `+` is accepted, any other non-numeric input is unknown.
+func parseVTEVersion(value string) (uint32, bool) {
+	parsed, err := strconv.ParseUint(strings.TrimPrefix(value, "+"), 10, 32)
+	if err != nil {
+		return 0, false
+	}
+	return uint32(parsed), true
+}
+
+func detectTerminalIdentity(env Environment) *TerminalInfo {
 	multiplexer := detectMultiplexer(env)
 	if termProgram := nonEmptyEnv(env, "TERM_PROGRAM"); termProgram != nil && !strings.EqualFold(*termProgram, "tmux") {
 		return fromTermProgram(terminalNameFromTermProgram(*termProgram), *termProgram, nonEmptyEnv(env, "TERM_PROGRAM_VERSION"), multiplexer)
@@ -181,6 +238,8 @@ func fromTerm(term string, multiplexer *Multiplexer) *TerminalInfo {
 	switch term {
 	case "dumb":
 		name = TerminalDumb
+	case "xterm-rex":
+		name = TerminalRex
 	case "wezterm", "wezterm-mux":
 		name = TerminalWezTerm
 	}
@@ -208,6 +267,8 @@ func terminalNameFromTermProgram(value string) TerminalName {
 		return TerminalAppleTerminal
 	case "ghostty":
 		return TerminalGhostty
+	case "rex":
+		return TerminalRex
 	case "iterm", "iterm2", "itermapp":
 		return TerminalIterm2
 	case "warp", "warpterminal":
@@ -242,6 +303,8 @@ func terminalDisplayToken(name TerminalName, version *string) string {
 		base = "Apple_Terminal"
 	case TerminalGhostty:
 		base = "Ghostty"
+	case TerminalRex:
+		base = "rex"
 	case TerminalIterm2:
 		base = "iTerm.app"
 	case TerminalWarp:
@@ -342,5 +405,18 @@ func cloneInfo(value *TerminalInfo) *TerminalInfo {
 		Version:     cloneString(value.Version),
 		Term:        cloneString(value.Term),
 		Multiplexer: cloneMultiplexer(value.Multiplexer),
+		Backend:     cloneTerminalBackend(value.Backend),
 	}
+}
+
+func cloneTerminalBackend(value *TerminalBackend) *TerminalBackend {
+	if value == nil {
+		return nil
+	}
+	cloned := &TerminalBackend{Kind: value.Kind}
+	if value.Version != nil {
+		version := *value.Version
+		cloned.Version = &version
+	}
+	return cloned
 }

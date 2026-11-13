@@ -206,6 +206,15 @@ func TestStdioInitializeAndEnvironmentInfo(t *testing.T) {
 }
 
 func TestLocalEnvironmentInfoReportsTemporaryDirectoriesAndCapability(t *testing.T) {
+	// Rust 92fb33b758 maps TMPDIR on Unix and TEMP/TMP on Windows, so the test
+	// sets the variable it is about instead of assuming the host exports one.
+	tempDir := t.TempDir()
+	if runtime.GOOS == "windows" {
+		t.Setenv("TEMP", tempDir)
+		t.Setenv("TMP", tempDir)
+	} else {
+		t.Setenv("TMPDIR", tempDir)
+	}
 	info := localEnvironmentInfo()
 	if info == nil {
 		t.Fatal("localEnvironmentInfo() = nil")
@@ -221,24 +230,36 @@ func TestLocalEnvironmentInfoReportsTemporaryDirectoriesAndCapability(t *testing
 	if !info.Capabilities.FileWriteStreaming {
 		t.Fatalf("FileWriteStreaming = false, want true (Rust #50177)")
 	}
-	if len(info.TemporaryDirectories) == 0 {
-		t.Fatalf("TemporaryDirectories empty, want TEMP/TMP (Rust 92fb33b758)")
+	wantURI, uriErr := utils.FromHostNativePath(tempDir)
+	if uriErr != nil {
+		t.Fatalf("FromHostNativePath(%q) error = %v", tempDir, uriErr)
 	}
-	seen := map[string]bool{}
-	for _, dir := range info.TemporaryDirectories {
-		if seen[dir] {
-			t.Fatalf("duplicate temporary directory %q", dir)
-		}
-		seen[dir] = true
-		if !strings.HasPrefix(dir, "file://") {
-			t.Fatalf("temporary directory %q is not a file URI", dir)
-		}
+	if len(info.TemporaryDirectories) != 1 || info.TemporaryDirectories[0] != wantURI.String() {
+		t.Fatalf("TemporaryDirectories = %#v, want [%s]", info.TemporaryDirectories, wantURI.String())
 	}
 	// Rust #41204: the local executor reports its user home directory.
 	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
 		if strings.TrimSpace(info.UserHomeDir) == "" {
 			t.Fatalf("UserHomeDir empty, want %q (Rust #41204)", home)
 		}
+	}
+}
+
+// Rust 92fb33b758 compares the raw environment value, so a temporary
+// directory that ends in whitespace must survive into the reported URI.
+func TestLocalTemporaryDirectoriesKeepsTrailingWhitespaceLikeRust(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows strips trailing whitespace from paths")
+	}
+	tempDir := t.TempDir() + " "
+	t.Setenv("TMPDIR", tempDir)
+	wantURI, uriErr := utils.FromHostNativePath(tempDir)
+	if uriErr != nil {
+		t.Fatalf("FromHostNativePath(%q) error = %v", tempDir, uriErr)
+	}
+	got := localTemporaryDirectories("")
+	if len(got) != 1 || got[0] != wantURI.String() {
+		t.Fatalf("localTemporaryDirectories() = %#v, want [%s]", got, wantURI.String())
 	}
 }
 
@@ -1452,6 +1473,45 @@ func TestFilesystemConcurrentDuplicateHandleIDsLikeRust(t *testing.T) {
 	if len(server.fileSlots) != 1 {
 		t.Fatalf("slots in use = %d, want 1", len(server.fileSlots))
 	}
+	response, err := server.readBlock(&FSReadBlockParams{HandleID: "race", Len: 6})
+	if err != nil || response.Chunk != base64.StdEncoding.EncodeToString([]byte("abcdef")) || response.EOF {
+		t.Fatalf("readBlock(race) = %#v, %v", response, err)
+	}
+}
+
+// Mirrors Rust #50162's retained-descriptor coverage: closing a handle frees
+// its capacity immediately, while an operation that already pinned the file
+// finishes on the still-open descriptor and only then releases it.
+func TestFilesystemCloseReleasesCapacityWhileReadUsesFileLikeRust(t *testing.T) {
+	server := NewServer()
+	path := filepath.Join(t.TempDir(), "value.txt")
+	if err := os.WriteFile(path, []byte("abcdef"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if _, err := server.openFile(&FSOpenParams{HandleID: "live", Path: path}); err != nil {
+		t.Fatalf("openFile(live) error = %v", err)
+	}
+	entry, err := server.acquireFileHandle("live")
+	if err != nil {
+		t.Fatalf("acquireFileHandle(live) error = %v", err)
+	}
+	if _, err := server.closeFile(&FSCloseParams{HandleID: "live"}); err != nil {
+		t.Fatalf("closeFile(live) error = %v", err)
+	}
+	if len(server.fileSlots) != 0 {
+		t.Fatalf("slots in use after close = %d, want 0", len(server.fileSlots))
+	}
+	if _, err := server.openFile(&FSOpenParams{HandleID: "next", Path: path}); err != nil {
+		t.Fatalf("openFile(next) error = %v", err)
+	}
+	buffer := make([]byte, 3)
+	if count, readErr := entry.file.ReadAt(buffer, 1); readErr != nil || count != 3 || string(buffer) != "bcd" {
+		t.Fatalf("retained read = %q, %v", buffer, readErr)
+	}
+	server.releaseFileHandle(entry)
+	if _, readErr := entry.file.ReadAt(make([]byte, 1), 0); readErr == nil {
+		t.Fatal("descriptor still open after the last pin was released")
+	}
 }
 
 func TestFilesystemSandboxContextRunsThroughHelperLikeRust(t *testing.T) {
@@ -1895,8 +1955,10 @@ func TestGetMetadataIncludesCreatedAtOnWindows(t *testing.T) {
 func TestNoFollowSymlinkComponentRejectsLinkedPaths(t *testing.T) {
 	// Rust #39659/#39666: no-follow operations reject links in any path
 	// component.
-	dir := t.TempDir()
-	outside := t.TempDir()
+	// Rust resolves the fixture root before no-follow operations; a temp path
+	// under a symlinked ancestor such as macOS /var would otherwise be rejected.
+	dir := canonicalTempDir(t)
+	outside := canonicalTempDir(t)
 	if err := os.WriteFile(filepath.Join(outside, "target.txt"), []byte("target"), 0o600); err != nil {
 		t.Fatal(err)
 	}

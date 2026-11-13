@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"codex_core/auth"
 	"codex_core/metrics"
 )
 
@@ -26,10 +28,6 @@ const modelsCacheFilename = "models_cache.json"
 // #46570), tagged by the authentication mode used for the fetch.
 const remoteModelsFetchUpdateDurationMetric = "codex.remote_models.fetch_update.duration_ms"
 
-// modelsCatalogMaxBytes bounds an explicitly configured provider catalog before
-// decoding or caching it (Rust MAX_MODEL_CATALOG_BYTES).
-const modelsCatalogMaxBytes = 1024 * 1024
-
 type ModelsEndpoint interface {
 	ListModels(ctx context.Context, etag string) (*ModelsEndpointResponse, error)
 }
@@ -38,6 +36,41 @@ type ModelsEndpointResponse struct {
 	Models      []ModelInfo
 	ETag        string
 	NotModified bool
+}
+
+// modelsEndpointHTTPError keeps a failed catalog response's HTTP status
+// available to refresh policy without changing the diagnostic text.
+type modelsEndpointHTTPError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *modelsEndpointHTTPError) Error() string {
+	if e == nil {
+		return "models API request failed"
+	}
+	if e.Body == "" {
+		return fmt.Sprintf("models API request failed with status %d", e.StatusCode)
+	}
+	return fmt.Sprintf("models API request failed with status %d: %s", e.StatusCode, e.Body)
+}
+
+// modelsCatalogRefreshRejected reports whether a failed catalog refresh means
+// the current credentials were rejected. Transient and malformed-response
+// errors preserve the prior successful catalog (Rust #55958).
+func modelsCatalogRefreshRejected(err error) bool {
+	if err == nil {
+		return false
+	}
+	var statusErr *modelsEndpointHTTPError
+	if errors.As(err, &statusErr) && (statusErr.StatusCode == http.StatusUnauthorized || statusErr.StatusCode == http.StatusForbidden) {
+		return true
+	}
+	if errors.Is(err, auth.ErrGatewayLoginRequired) {
+		return true
+	}
+	var refreshErr *auth.RefreshTokenFailedError
+	return errors.As(err, &refreshErr)
 }
 
 type HTTPModelsEndpoint struct {
@@ -65,18 +98,14 @@ func (m *RemoteModelsManager) SetAPIKeyModelDiscoveryEnabled(enabled bool) {
 	if m == nil {
 		return
 	}
-	m.mu.Lock()
-	m.apiKeyModelDiscoveryEnabled = enabled
-	m.mu.Unlock()
+	m.apiKeyModelDiscoveryPolicy().set(enabled)
 }
 
 func (m *RemoteModelsManager) apiKeyModelDiscoveryEnabledValue() bool {
 	if m == nil {
 		return false
 	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.apiKeyModelDiscoveryEnabled
+	return m.apiKeyModelDiscoveryPolicy().get()
 }
 
 // SupportsAPIKeyDiscovery reports whether the current provider/auth combination
@@ -151,24 +180,22 @@ func (e *HTTPModelsEndpoint) ListModels(ctx context.Context, etag string) (*Mode
 			NotModified: true,
 		}, nil
 	}
-	reader := io.Reader(response.Body)
-	if catalogURL != "" {
-		reader = io.LimitReader(response.Body, int64(modelsCatalogMaxBytes)+1)
-	}
-	body, err := io.ReadAll(reader)
+	// Rust #56525: an explicitly configured catalog has no response-body size
+	// limit. The native response is still validated after decoding, and
+	// provider diagnostics never include raw values.
+	body, err := io.ReadAll(response.Body)
 	if err != nil {
 		return nil, err
 	}
-	if catalogURL != "" && len(body) > modelsCatalogMaxBytes {
-		return nil, fmt.Errorf("model catalog response exceeds %d bytes", modelsCatalogMaxBytes)
-	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		statusErr := &modelsEndpointHTTPError{StatusCode: response.StatusCode}
 		if catalogURL != "" {
 			// Suppress response diagnostics that could expose credentials
 			// (Rust #46561).
-			return nil, fmt.Errorf("models API request failed with status %d", response.StatusCode)
+			return nil, statusErr
 		}
-		return nil, fmt.Errorf("models API request failed with status %d: %s", response.StatusCode, strings.TrimSpace(string(body)))
+		statusErr.Body = strings.TrimSpace(string(body))
+		return nil, statusErr
 	}
 	models, err := decodeModelsEndpointResponse(body)
 	if err != nil {
@@ -254,10 +281,24 @@ type RemoteModelsManager struct {
 	commandAuth             bool
 	// apiKeyDiscoveryDisabled mirrors Rust #46561: a custom inference base URL
 	// without an explicit model_catalog_url must not opt into remote discovery.
-	apiKeyDiscoveryDisabled     bool
-	apiKeyModelDiscoveryEnabled bool
-	explicitProviderCatalog     bool
-	now                         func() time.Time
+	apiKeyDiscoveryDisabled bool
+	// apiKeyModelDiscovery is shared by this manager and every originator
+	// partition so a runtime policy change reaches existing catalogs (#56284).
+	apiKeyModelDiscovery    *apiKeyModelDiscoveryPolicy
+	explicitProviderCatalog bool
+	now                     func() time.Time
+	// providerModelIDs holds the slugs the provider response, or the catalog
+	// loaded from its cache, advertised before merging, so catalog origins
+	// survive merges, cache reloads, and empty responses (Rust #57770
+	// CatalogState::provider_model_ids).
+	providerModelIDs map[string]struct{}
+
+	// initialModels is the catalog seed used when partitioning an originator.
+	initialModels []ModelInfo
+	// originatorManagers caches one isolated manager per supported originator
+	// (Rust OpenAiModelsManager::originator_managers).
+	originatorManagersMu sync.Mutex
+	originatorManagers   map[ModelCatalogOriginator]*RemoteModelsManager
 }
 
 type modelsCache struct {
@@ -331,9 +372,78 @@ func NewRemoteModelsManagerWithOptions(options *RemoteModelsManagerOptions) *Rem
 		metricsAuthModeOverride:         strings.TrimSpace(options.MetricsAuthMode),
 		commandAuth:                     options.CommandAuth,
 		apiKeyDiscoveryDisabled:         options.DisableAPIKeyDiscovery,
+		apiKeyModelDiscovery:            &apiKeyModelDiscoveryPolicy{},
 		explicitProviderCatalog:         options.ExplicitProviderCatalog,
 		now:                             time.Now,
+		initialModels:                   cloneModelInfos(models),
+		originatorManagers:              map[ModelCatalogOriginator]*RemoteModelsManager{},
 	}
+}
+
+func (m *RemoteModelsManager) apiKeyModelDiscoveryPolicy() *apiKeyModelDiscoveryPolicy {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.apiKeyModelDiscovery == nil {
+		m.apiKeyModelDiscovery = &apiKeyModelDiscoveryPolicy{}
+	}
+	return m.apiKeyModelDiscovery
+}
+
+// ForOriginator returns the cached catalog partition for a supported caller.
+// A backend that cannot apply the originator header yields no partition, so it
+// can never overwrite the default catalog (#56284).
+func (m *RemoteModelsManager) ForOriginator(originator string) (ModelsManager, bool) {
+	if m == nil {
+		return nil, false
+	}
+	partition, ok := ParseModelCatalogOriginator(originator)
+	if !ok {
+		return nil, false
+	}
+	m.originatorManagersMu.Lock()
+	defer m.originatorManagersMu.Unlock()
+	if existing := m.originatorManagers[partition]; existing != nil {
+		return existing, true
+	}
+	endpointClient, ok := m.endpoint.(OriginatorModelsEndpoint)
+	if !ok {
+		return nil, false
+	}
+	endpoint, ok := endpointClient.ForOriginator(partition)
+	if !ok || endpoint == nil {
+		return nil, false
+	}
+	m.mu.RLock()
+	options := &RemoteModelsManagerOptions{
+		ModelCatalog:                    &ModelsResponse{Models: cloneModelInfos(m.initialModels)},
+		Endpoint:                        endpoint,
+		UseRemoteCatalogAsSourceOfTruth: m.useRemoteCatalogAsSourceOfTruth,
+		Identity:                        m.identity,
+		SupportsAPIKeyModels:            m.supportsAPIKeyModels,
+		APIKeyAuth:                      m.apiKeyAuth,
+		HasAuth:                         m.hasAuth,
+		MetricsAuthMode:                 m.metricsAuthModeOverride,
+		CommandAuth:                     m.commandAuth,
+		DisableAPIKeyDiscovery:          m.apiKeyDiscoveryDisabled,
+		ExplicitProviderCatalog:         m.explicitProviderCatalog,
+	}
+	cachePath := m.cachePath
+	cacheTTL := m.cacheTTL
+	cacheClientVersion := m.cacheClientVersion
+	now := m.now
+	discovery := m.apiKeyModelDiscovery
+	m.mu.RUnlock()
+	manager := NewRemoteModelsManagerWithOptions(options)
+	manager.apiKeyModelDiscovery = discovery
+	manager.now = now
+	if cachePath != "" {
+		manager.setCachePath(modelsOriginatorCachePath(cachePath, partition), cacheTTL, cacheClientVersion)
+	}
+	m.originatorManagers[partition] = manager
+	return manager, true
 }
 
 // APIKeyModelDiscoverySetter is implemented by model managers that can toggle
@@ -356,17 +466,42 @@ func (m *RemoteModelsManager) ConfigureCache(codexHome string) {
 		return
 	}
 	codexHome = strings.TrimSpace(codexHome)
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if codexHome == "" {
-		m.cachePath = ""
-		m.cacheTTL = 0
-		m.cacheClientVersion = ""
+	cachePath := ""
+	cacheTTL := time.Duration(0)
+	cacheClientVersion := ""
+	if codexHome != "" {
+		cachePath = filepath.Join(codexHome, modelsCacheFilename)
+		cacheTTL = defaultModelsCacheTTL
+		cacheClientVersion = modelsEndpointClientVersion
+	}
+	m.setCachePath(cachePath, cacheTTL, cacheClientVersion)
+
+	// Existing originator partitions keep their separate cache file and inherit
+	// the same TTL/client-version policy as the default catalog.
+	m.originatorManagersMu.Lock()
+	children := make(map[ModelCatalogOriginator]*RemoteModelsManager, len(m.originatorManagers))
+	for originator, manager := range m.originatorManagers {
+		children[originator] = manager
+	}
+	m.originatorManagersMu.Unlock()
+	for originator, manager := range children {
+		path := ""
+		if cachePath != "" {
+			path = modelsOriginatorCachePath(cachePath, originator)
+		}
+		manager.setCachePath(path, cacheTTL, cacheClientVersion)
+	}
+}
+
+func (m *RemoteModelsManager) setCachePath(cachePath string, cacheTTL time.Duration, cacheClientVersion string) {
+	if m == nil {
 		return
 	}
-	m.cachePath = filepath.Join(codexHome, modelsCacheFilename)
-	m.cacheTTL = defaultModelsCacheTTL
-	m.cacheClientVersion = modelsEndpointClientVersion
+	m.mu.Lock()
+	m.cachePath = cachePath
+	m.cacheTTL = cacheTTL
+	m.cacheClientVersion = cacheClientVersion
+	m.mu.Unlock()
 }
 
 func (m *RemoteModelsManager) ListModels(strategy RefreshStrategy) []ModelPreset {
@@ -383,8 +518,57 @@ func (m *RemoteModelsManager) GetRemoteModels() []ModelInfo {
 		return nil
 	}
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return cloneModelInfos(m.remoteModels)
+	models := m.remoteModels
+	initialModels := m.initialModels
+	apiKeyAuth := m.apiKeyAuth
+	commandAuth := m.commandAuth
+	discoveryDisabled := m.apiKeyDiscoveryDisabled
+	supportsAPIKeyModels := m.supportsAPIKeyModels
+	policy := m.apiKeyModelDiscovery
+	m.mu.RUnlock()
+	// With API-key discovery off, a catalog fetched while it was enabled must
+	// not leak through the in-memory state (Rust `models_for_entry`). Command
+	// auth keeps its existing discovery behavior.
+	if apiKeyAuth && !commandAuth && (discoveryDisabled || !supportsAPIKeyModels || policy == nil || !policy.get()) {
+		return cloneModelInfos(initialModels)
+	}
+	return cloneModelInfos(models)
+}
+
+// ModelCatalogWithOrigins mirrors Rust model_catalog_with_origins: every entry
+// the provider response advertised is Provider, everything else in the merged
+// catalog is Bundled.
+func (m *RemoteModelsManager) ModelCatalogWithOrigins(strategy RefreshStrategy) []CatalogModel {
+	if m == nil {
+		return nil
+	}
+	m.refreshAvailableModels(strategy)
+	models := m.GetRemoteModels()
+	m.mu.RLock()
+	providerIDs := m.providerModelIDs
+	m.mu.RUnlock()
+	catalog := make([]CatalogModel, 0, len(models))
+	for _, info := range models {
+		origin := ModelOriginBundled
+		if _, ok := providerIDs[strings.TrimSpace(info.Slug)]; ok {
+			origin = ModelOriginProvider
+		}
+		catalog = append(catalog, CatalogModel{Model: info, Origin: origin})
+	}
+	return catalog
+}
+
+func modelSlugSet(models []ModelInfo) map[string]struct{} {
+	if len(models) == 0 {
+		return nil
+	}
+	ids := make(map[string]struct{}, len(models))
+	for _, info := range models {
+		if slug := strings.TrimSpace(info.Slug); slug != "" {
+			ids[slug] = struct{}{}
+		}
+	}
+	return ids
 }
 
 func (m *RemoteModelsManager) GetDefaultModel(model string, allowProviderModelFallback bool, strategy RefreshStrategy) string {
@@ -402,10 +586,44 @@ func (m *RemoteModelsManager) GetDefaultModel(model string, allowProviderModelFa
 }
 
 func (m *RemoteModelsManager) GetModelInfo(model string, config *ModelsManagerConfig) ModelInfo {
+	return m.GetCatalogModel(model, config).Model
+}
+
+// GetCatalogModel resolves metadata with the origin of the catalog entry it
+// came from (Rust #58361): provider-advertised entries keep Provider through
+// cache reloads, merged bundled entries stay Bundled, and a slug with no entry
+// is Synthetic even after config overrides.
+func (m *RemoteModelsManager) GetCatalogModel(model string, config *ModelsManagerConfig) CatalogModel {
+	origin := m.modelOrigin(model)
 	if m != nil && m.explicitProviderCatalog {
-		return ConstructModelInfoFromExactCandidate(model, m.GetRemoteModels(), config)
+		return ConstructCatalogModelFromExactCandidate(model, m.GetRemoteModels(), origin, config)
 	}
-	return ConstructModelInfoFromCandidates(model, m.GetRemoteModels(), config)
+	return ConstructCatalogModelFromCandidates(model, m.GetRemoteModels(), origin, config)
+}
+
+// modelOrigin reports the catalog state that owns the requested slug.
+func (m *RemoteModelsManager) modelOrigin(model string) ModelOrigin {
+	if m == nil {
+		return ModelOriginSynthetic
+	}
+	model = strings.TrimSpace(model)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if _, ok := m.providerModelIDs[model]; ok {
+		return ModelOriginProvider
+	}
+	for _, info := range m.remoteModels {
+		if strings.TrimSpace(info.Slug) == model {
+			return ModelOriginBundled
+		}
+	}
+	if candidate, ok := findModelByNamespacedSuffix(model, m.remoteModels); ok {
+		if _, provider := m.providerModelIDs[strings.TrimSpace(candidate.Slug)]; provider {
+			return ModelOriginProvider
+		}
+		return ModelOriginBundled
+	}
+	return ModelOriginSynthetic
 }
 
 func (m *RemoteModelsManager) RefreshIfNewETag(etag string) {
@@ -494,6 +712,11 @@ func (m *RemoteModelsManager) refreshAvailableModels(strategy RefreshStrategy) {
 	if m == nil || m.endpoint == nil {
 		return
 	}
+	// Rust #57789: InMemory never loads the cache or fetches, so a catalog
+	// recovered by an explicit refresh survives a failed disk-cache write.
+	if strategy == RefreshInMemory {
+		return
+	}
 	// Gate cache loading as well as requests (Rust #44392/#46561): API-key auth
 	// must have an enabled, supported catalog before a remote catalog is reused,
 	// so a custom base URL without `model_catalog_url` keeps the bundled models
@@ -541,10 +764,15 @@ func (m *RemoteModelsManager) fetchAndUpdateModels() {
 			m.mu.Unlock()
 			m.renewCacheTTLIfNeeded()
 		}
-		if err != nil && m.explicitProviderCatalog {
+		// A failed fetch is not an authoritative empty catalog. Keep the last
+		// successful provider snapshot (with its ETag and freshness) unless the
+		// access was explicitly rejected (Rust #55958).
+		if err != nil && m.explicitProviderCatalog && modelsCatalogRefreshRejected(err) {
 			m.mu.Lock()
 			m.remoteModels = nil
+			m.providerModelIDs = nil
 			m.etag = ""
+			m.fetched = false
 			cachePath := m.cachePath
 			clientVersion := m.cacheClientVersion
 			identity := m.identity
@@ -561,6 +789,7 @@ func (m *RemoteModelsManager) fetchAndUpdateModels() {
 	m.mu.Lock()
 	m.fetched = true
 	m.fetchedIdentity = m.identity
+	m.providerModelIDs = modelSlugSet(response.Models)
 	if len(response.Models) > 0 || m.explicitProviderCatalog {
 		if m.explicitProviderCatalog || (m.remoteCatalogAuthoritative() && hasRemoteSourceOfTruthModel(response.Models)) {
 			m.remoteModels = cloneModelInfos(response.Models)
@@ -616,6 +845,7 @@ func (m *RemoteModelsManager) tryLoadFreshCache() bool {
 	m.fetched = true
 	m.etag = strings.TrimSpace(cache.ETag)
 	m.fetchedIdentity = m.identity
+	m.providerModelIDs = modelSlugSet(cache.Models)
 	if len(cache.Models) > 0 || m.explicitProviderCatalog {
 		if m.explicitProviderCatalog || (m.remoteCatalogAuthoritative() && hasRemoteSourceOfTruthModel(cache.Models)) {
 			m.remoteModels = cloneModelInfos(cache.Models)

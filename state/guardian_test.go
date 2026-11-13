@@ -72,6 +72,63 @@ func TestEventLifecycle(t *testing.T) {
 	}
 }
 
+func TestGuardianReviewReasonMatchesRust(t *testing.T) {
+	for _, testCase := range []struct {
+		reason  GuardianReviewReason
+		encoded string
+	}{
+		{GuardianReviewReasonPolicy, `"policy"`},
+		{GuardianReviewReasonFreshRequired, `"fresh_required"`},
+		{GuardianReviewReasonMissingScore, `"missing_score"`},
+		{GuardianReviewReasonStaleScore, `"stale_score"`},
+		{GuardianReviewReasonInvalidScore, `"invalid_score"`},
+		{GuardianReviewReasonIncompatibleCompaction, `"incompatible_compaction"`},
+		{GuardianReviewReasonElevatedRisk, `"elevated_risk"`},
+		{GuardianReviewReasonScoringFailure, `"scoring_failure"`},
+		{GuardianReviewReasonAuthorizationChanged, `"authorization_changed"`},
+		{GuardianReviewReasonUnknown, `"unknown"`},
+	} {
+		data, err := json.Marshal(testCase.reason)
+		if err != nil || string(data) != testCase.encoded {
+			t.Fatalf("Marshal(%q) = %s, %v; want %s", testCase.reason, data, err, testCase.encoded)
+		}
+		var decoded GuardianReviewReason
+		if err := json.Unmarshal(data, &decoded); err != nil || decoded != testCase.reason {
+			t.Fatalf("Unmarshal(%s) = %q, %v", data, decoded, err)
+		}
+	}
+
+	var unknown GuardianReviewReason
+	if err := json.Unmarshal([]byte(`"future_review_reason"`), &unknown); err != nil || unknown != GuardianReviewReasonUnknown {
+		t.Fatalf("unknown reason = %q, %v", unknown, err)
+	}
+
+	store := NewReviewStore()
+	store.SetClock(fixedGuardianTime)
+	event, err := store.StartWithReason("turn-a", "item-a", Action{
+		Type: "command", Command: "ls", CWD: "/repo", Source: CommandSourceShell,
+	}, GuardianReviewReasonElevatedRisk)
+	if err != nil {
+		t.Fatalf("StartWithReason() error = %v", err)
+	}
+	if event.ReviewReason == nil || *event.ReviewReason != GuardianReviewReasonElevatedRisk {
+		t.Fatalf("started review reason = %#v", event.ReviewReason)
+	}
+	completed, err := store.Complete(event.ID, Assessment{
+		RiskLevel: RiskHigh, UserAuthorization: AuthorizationLow, Outcome: OutcomeDeny, Rationale: "too risky",
+	})
+	if err != nil {
+		t.Fatalf("Complete() error = %v", err)
+	}
+	if completed.ReviewReason == nil || *completed.ReviewReason != GuardianReviewReasonElevatedRisk {
+		t.Fatalf("completed review reason = %#v", completed.ReviewReason)
+	}
+	data, err := json.Marshal(completed)
+	if err != nil || !strings.Contains(string(data), `"reviewReason":"elevated_risk"`) {
+		t.Fatalf("completed event JSON = %s, %v", data, err)
+	}
+}
+
 func TestTimeoutAndAbort(t *testing.T) {
 	event, err := NewInProgressEvent("review-a", "turn-a", "", Action{Type: "network_access", Host: "example.com", Protocol: "https", Port: 443}, fixedGuardianTime())
 	if err != nil {
@@ -212,6 +269,63 @@ func TestParseAssessmentAndPrompt(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "Planned action JSON:") || !strings.Contains(prompt, "user: list files") {
 		t.Fatalf("prompt = %s", prompt)
+	}
+}
+
+func TestParseAssessmentToleratesEmbeddedJSONAndDefaultsLikeRust(t *testing.T) {
+	tests := []struct {
+		name    string
+		text    string
+		want    Assessment
+		wantErr bool
+	}{
+		{
+			name: "embedded json",
+			text: "preface {\"riskLevel\":\"medium\",\"userAuthorization\":\"low\",\"outcome\":\"allow\",\"rationale\":\"ok\"}",
+			want: Assessment{RiskLevel: RiskMedium, UserAuthorization: AuthorizationLow, Outcome: OutcomeAllow, Rationale: "ok"},
+		},
+		{
+			name: "bare allow",
+			text: `{"outcome":"allow"}`,
+			want: Assessment{RiskLevel: RiskLow, UserAuthorization: AuthorizationUnknown, Outcome: OutcomeAllow, Rationale: "Auto-review returned a low-risk allow decision."},
+		},
+		{
+			name: "bare deny",
+			text: `{"outcome":"deny"}`,
+			want: Assessment{RiskLevel: RiskHigh, UserAuthorization: AuthorizationUnknown, Outcome: OutcomeDeny, Rationale: "Auto-review returned a deny decision without a rationale."},
+		},
+		{
+			name: "empty rationale",
+			text: `{"outcome":"deny","rationale":"   "}`,
+			want: Assessment{RiskLevel: RiskHigh, UserAuthorization: AuthorizationUnknown, Outcome: OutcomeDeny, Rationale: "Auto-review returned a deny decision without a rationale."},
+		},
+		{
+			name:    "no json",
+			text:    "not json",
+			wantErr: true,
+		},
+		{
+			name:    "missing outcome",
+			text:    `{"riskLevel":"low"}`,
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseAssessment([]byte(tt.text))
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ParseAssessment(%q) = %+v, want error", tt.text, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseAssessment(%q) error = %v", tt.text, err)
+			}
+			if *got != tt.want {
+				t.Fatalf("ParseAssessment(%q) = %+v, want %+v", tt.text, *got, tt.want)
+			}
+		})
 	}
 }
 
@@ -462,7 +576,7 @@ func TestGuardianActionJSONMatchesRust(t *testing.T) {
 				Type: "write_stdin", EnvironmentID: "local", SessionID: &sessionID, Chars: "ls\n",
 				CWD: "/repo", SandboxPermissions: "use_default",
 			},
-			want: "{\n  \"chars\": \"ls\\n\",\n  \"cwd\": \"/repo\",\n  \"environment_id\": \"local\",\n  \"sandbox_permissions\": \"use_default\",\n  \"session_id\": 7,\n  \"tool\": \"write_stdin\",\n  \"tty\": false\n}",
+			want: "{\n  \"chars\": \"ls\\n\",\n  \"cwd\": \"/repo\",\n  \"environment_id\": \"local\",\n  \"original_command\": \"\",\n  \"sandbox_permissions\": \"use_default\",\n  \"session_id\": 7,\n  \"tool\": \"write_stdin\",\n  \"tty\": false\n}",
 		},
 	}
 	for _, testCase := range tests {

@@ -47,6 +47,10 @@ type StreamableHTTPOAuthDiscovery struct {
 	Issuer                            string
 	ClientIDMetadataDocumentSupported bool
 	PublicClientTokenAuthSupported    bool
+	// TokenEndpointAuthMethodsSupported is the authorization server's published
+	// authenticated-client methods. Nil means absent, so a confidential
+	// registration defaults to Basic (Rust #56001).
+	TokenEndpointAuthMethodsSupported []string
 	// CallbackMode is the OAuth mix-up defense advertised by the authorization
 	// server (Rust #40691).
 	CallbackMode MCPOAuthCallbackMode
@@ -61,6 +65,51 @@ type oauthAuthorizationServerMetadata struct {
 	ClientIDMetadataDocumentSupported          bool     `json:"client_id_metadata_document_supported"`
 	TokenEndpointAuthMethodsSupported          []string `json:"token_endpoint_auth_methods_supported"`
 	AuthorizationResponseIssParameterSupported bool     `json:"authorization_response_iss_parameter_supported"`
+	// IdentityChainingRequestedTokenTypesSupported and GrantTypesSupported are
+	// ID-JAG token-exchange capabilities. Enterprise identity resolution keeps
+	// them as raw JSON so an absent list differs from a published one (Rust
+	// #55685).
+	IdentityChainingRequestedTokenTypesSupported json.RawMessage            `json:"identity_chaining_requested_token_types_supported"`
+	GrantTypesSupported                          json.RawMessage            `json:"grant_types_supported"`
+	AdditionalFields                             map[string]json.RawMessage `json:"-"`
+}
+
+// OAuthAuthorizationMetadata is the published authorization-server metadata
+// returned by DiscoverAuthorizationMetadata (Rust #60578). AdditionalFields
+// carries published extensions such as device_authorization_endpoint.
+type OAuthAuthorizationMetadata struct {
+	Issuer                                     string
+	AuthorizationEndpoint                      string
+	TokenEndpoint                              string
+	RegistrationEndpoint                       string
+	ScopesSupported                            []string
+	TokenEndpointAuthMethodsSupported          []string
+	ClientIDMetadataDocumentSupported          bool
+	AuthorizationResponseIssParameterSupported bool
+	AdditionalFields                           map[string]json.RawMessage
+}
+
+func (m *oauthAuthorizationServerMetadata) UnmarshalJSON(data []byte) error {
+	type alias oauthAuthorizationServerMetadata
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var all map[string]json.RawMessage
+	if err := json.Unmarshal(data, &all); err != nil {
+		return err
+	}
+	for _, key := range []string{
+		"issuer", "authorization_endpoint", "token_endpoint", "registration_endpoint",
+		"scopes_supported", "client_id_metadata_document_supported",
+		"token_endpoint_auth_methods_supported", "authorization_response_iss_parameter_supported",
+		"identity_chaining_requested_token_types_supported", "grant_types_supported",
+	} {
+		delete(all, key)
+	}
+	decoded.AdditionalFields = all
+	*m = oauthAuthorizationServerMetadata(decoded)
+	return nil
 }
 
 type oauthProtectedResourceMetadata struct {
@@ -131,6 +180,84 @@ func DiscoverStreamableHTTPOAuth(ctx context.Context, serverURL string, client *
 		return discovery, nil
 	}
 	return nil, nil
+}
+
+// DiscoverAuthorizationMetadata resolves published OAuth authorization-server
+// metadata for a direct issuer or through its protected-resource document
+// (Rust #60578). It returns nil when no usable document is published and never
+// fabricates legacy endpoints. Discovery errors, including issuer mismatches,
+// are returned to the caller. A nil client uses net/http defaults.
+func DiscoverAuthorizationMetadata(ctx context.Context, rawURL string, client *http.Client) (*OAuthAuthorizationMetadata, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return nil, errors.New("OAuth discovery URL is required")
+	}
+	if _, err := parseMCPHTTPURL(rawURL); err != nil {
+		return nil, err
+	}
+	if client == nil {
+		client = http.DefaultClient
+	}
+	client = mcpOAuthDiscoveryHTTPClient(mcpHTTPClientWithDefaultHeaders(client, nil))
+
+	if metadata, found, err := resolveMCPOAuthAuthorizationServerMetadata(ctx, client, rawURL); err != nil {
+		return nil, err
+	} else if found {
+		return publishedOAuthAuthorizationMetadata(rawURL, metadata)
+	}
+
+	challenge := &mcpOAuthChallengeProbe{ctx: ctx, client: client, serverURL: rawURL}
+	metadataURL, _, err := challenge.resolve()
+	if err != nil {
+		return nil, err
+	}
+	resource, err := discoverMCPOAuthProtectedResource(ctx, client, rawURL, metadataURL)
+	if err != nil {
+		return nil, err
+	}
+	if resource == nil {
+		return nil, nil
+	}
+	for _, authorizationServer := range resource.AuthorizationServers {
+		metadata, found, err := resolveMCPOAuthAuthorizationServerMetadata(ctx, client, authorizationServer)
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			return publishedOAuthAuthorizationMetadata(authorizationServer, metadata)
+		}
+	}
+	return nil, nil
+}
+
+func publishedOAuthAuthorizationMetadata(expectedIssuer string, metadata *oauthAuthorizationServerMetadata) (*OAuthAuthorizationMetadata, error) {
+	if metadata == nil {
+		return nil, nil
+	}
+	if publishedIssuer := strings.TrimRight(strings.TrimSpace(metadata.Issuer), "/"); publishedIssuer != "" {
+		expected := strings.TrimRight(strings.TrimSpace(expectedIssuer), "/")
+		if expected != "" && !strings.EqualFold(publishedIssuer, expected) {
+			return nil, fmt.Errorf("OAuth authorization metadata issuer mismatch: expected %s, got %s", expectedIssuer, metadata.Issuer)
+		}
+	}
+	additional := make(map[string]json.RawMessage, len(metadata.AdditionalFields))
+	for key, value := range metadata.AdditionalFields {
+		additional[key] = append(json.RawMessage(nil), value...)
+	}
+	return &OAuthAuthorizationMetadata{
+		Issuer:                                     metadata.Issuer,
+		AuthorizationEndpoint:                      metadata.AuthorizationEndpoint,
+		TokenEndpoint:                              metadata.TokenEndpoint,
+		RegistrationEndpoint:                       metadata.RegistrationEndpoint,
+		ScopesSupported:                            append([]string(nil), metadata.ScopesSupported...),
+		TokenEndpointAuthMethodsSupported:          append([]string(nil), metadata.TokenEndpointAuthMethodsSupported...),
+		ClientIDMetadataDocumentSupported:          metadata.ClientIDMetadataDocumentSupported,
+		AuthorizationResponseIssParameterSupported: metadata.AuthorizationResponseIssParameterSupported,
+		AdditionalFields:                           additional,
+	}, nil
 }
 
 // mcpOAuthChallengeProbe resolves the MCP resource URL's initial
@@ -319,6 +446,18 @@ func buildMCPOAuthAuthorizeURL(endpoint string, config *ServerConfig, scopes []s
 }
 
 func discoverMCPOAuthAuthorizationServer(ctx context.Context, client *http.Client, serverURL string) (*StreamableHTTPOAuthDiscovery, bool, error) {
+	metadata, ok, err := resolveMCPOAuthAuthorizationServerMetadata(ctx, client, serverURL)
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	return discoveryFromMCPOAuthAuthorizationMetadata(serverURL, metadata), true, nil
+}
+
+// resolveMCPOAuthAuthorizationServerMetadata returns the published metadata
+// document for one authorization server. It keeps the raw fields needed by
+// DiscoverAuthorizationMetadata while applying the same OIDC fallback and
+// endpoint binding checks as the login discovery path.
+func resolveMCPOAuthAuthorizationServerMetadata(ctx context.Context, client *http.Client, serverURL string) (*oauthAuthorizationServerMetadata, bool, error) {
 	candidates, err := mcpOAuthAuthorizationServerMetadataURLs(serverURL)
 	if err != nil {
 		return nil, false, err
@@ -337,7 +476,7 @@ func discoverMCPOAuthAuthorizationServer(ctx context.Context, client *http.Clien
 				if err := validateMCPOAuthAuthorizationServerEndpoints(fallback); err != nil {
 					return nil, false, err
 				}
-				return discoveryFromMCPOAuthAuthorizationMetadata(serverURL, fallback), true, nil
+				return fallback, true, nil
 			}
 			lastErr = err
 			continue
@@ -350,7 +489,7 @@ func discoverMCPOAuthAuthorizationServer(ctx context.Context, client *http.Clien
 			if err := validateMCPOAuthAuthorizationServerEndpoints(metadata); err != nil {
 				return nil, false, err
 			}
-			return discoveryFromMCPOAuthAuthorizationMetadata(serverURL, metadata), true, nil
+			return metadata, true, nil
 		}
 	}
 	if lastErr != nil {
@@ -565,6 +704,18 @@ func mcpOAuthProbeChallenge(ctx context.Context, client *http.Client, serverURL 
 	if response.Body != nil {
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1024))
 	}
+	// Rust (rmcp AuthorizationManager::resolve_metadata) classifies the initial
+	// probe before looking for a challenge: transient server-side failures are
+	// discovery errors, which surface as McpOAuthLoginSupport::Unknown so `mcp
+	// add` hints at a possible login, while 4xx answers mean "no authorization
+	// support" and stay silent.
+	if mcpOAuthProbeIsTransientFailure(response.StatusCode) {
+		return "", nil, &mcpOAuthMetadataHTTPStatusError{
+			URL:        strings.TrimSpace(serverURL),
+			StatusCode: response.StatusCode,
+			Status:     response.Status,
+		}
+	}
 	metadataURL := ""
 	var scopes []string
 	for _, challenge := range response.Header.Values("WWW-Authenticate") {
@@ -576,6 +727,16 @@ func mcpOAuthProbeChallenge(ctx context.Context, client *http.Client, serverURL 
 		}
 	}
 	return metadataURL, scopes, nil
+}
+
+// mcpOAuthProbeIsTransientFailure reports the statuses rmcp treats as a
+// transient OAuth discovery failure rather than a definitive "no OAuth support".
+func mcpOAuthProbeIsTransientFailure(statusCode int) bool {
+	switch statusCode {
+	case http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests:
+		return true
+	}
+	return statusCode >= 500
 }
 
 func fetchMCPOAuthAuthorizationServerMetadata(ctx context.Context, client *http.Client, metadataURL string) (*oauthAuthorizationServerMetadata, bool, error) {
@@ -681,6 +842,7 @@ func discoveryFromMCPOAuthAuthorizationMetadata(serverURL string, metadata *oaut
 		Issuer:                             authorizationServer,
 		ClientIDMetadataDocumentSupported:  metadata.ClientIDMetadataDocumentSupported,
 		PublicClientTokenAuthSupported:     metadataHasPublicClientTokenAuth(metadata.TokenEndpointAuthMethodsSupported),
+		TokenEndpointAuthMethodsSupported:  metadata.TokenEndpointAuthMethodsSupported,
 		CallbackMode:                       callbackMode,
 	}
 }

@@ -14,12 +14,18 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	modernsqlite "modernc.org/sqlite"
+	sqlitelib "modernc.org/sqlite/lib"
 )
 
+// MinimumSQLiteVersion is the oldest SQLite the state layer accepts. Rust
+// #60432 raises the bundled floor to 3.54: that release fixes
+// RUSTSEC-2026-0459 for databases opened with a WAL while keeping the
+// WAL-reset corruption fix.
 const (
-	MinimumSQLiteVersion   = "3.51.3"
+	MinimumSQLiteVersion   = "3.54.0"
 	StateSQLiteFilename    = "state_5.sqlite"
 	LogsSQLiteFilename     = "logs_2.sqlite"
 	GoalsSQLiteFilename    = "goals_1.sqlite"
@@ -27,6 +33,7 @@ const (
 	// MemoriesV2SQLiteFilename is the lazily-created isolated v2 memories DB
 	// (Rust #43797 MEMORIES_V2_DB); the thread catalog stays in the state DB.
 	MemoriesV2SQLiteFilename    = "memories_v2_1.sqlite"
+	QueueSQLiteFilename         = "queue_1.sqlite"
 	ThreadHistorySQLiteFilename = "thread_history_1.sqlite"
 	SQLiteMaxOpenConnections    = 5
 
@@ -106,6 +113,10 @@ func (p *sqliteFilesystemProbe) isNFS(path string) (bool, error) {
 // freshly constructed config validates the same files independently.
 type SqliteConfig struct {
 	sqliteHome string
+	// logsHome is the explicitly configured directory for logs_2.sqlite
+	// (Rust #55978 `with_local_logs_home`). Empty keeps logs beside the other
+	// runtime databases.
+	logsHome   string
 	quickCheck *sqliteQuickCheckManager
 	// recoveryCollector receives the backups taken when a damaged database is
 	// rebuilt (Rust `collect_runtime_db_backups`, upstream 3620b2caf8 / #49701).
@@ -121,6 +132,14 @@ type SqliteConfig struct {
 	// filesystem is the probe shared with every copy of this config; a pass skips
 	// a home on NFS (Rust #54417 `9c84e89c`).
 	filesystem *sqliteFilesystemProbe
+	// logsFilesystem is the independent probe for a configured logs home
+	// (Rust #55978 logs_is_nfs); nil when logs share the SQLite home.
+	logsFilesystem *sqliteFilesystemProbe
+	// enforceDeleteOnNFS mirrors the managed
+	// `unsafe_enforce_sqlite_journal_mode` requirement (Rust #57225): existing
+	// WAL databases on NFS are migrated before a writable pool opens, and every
+	// connection must then report DELETE journaling.
+	enforceDeleteOnNFS bool
 }
 
 // WithRecoveryCollector returns a copy that reports the backups taken while
@@ -144,6 +163,41 @@ func (c SqliteConfig) WithCorruptionMetrics(metrics *TaskMetrics) SqliteConfig {
 func (c SqliteConfig) WithReclamationMetrics(metrics *TaskMetrics) SqliteConfig {
 	c.reclamationMetrics = metrics
 	return c
+}
+
+// WithLocalLogsHome selects the directory for logs_2.sqlite without accessing
+// it until the database is opened (Rust #55978). An empty home keeps the
+// default location beside the other runtime databases.
+func (c SqliteConfig) WithLocalLogsHome(home string) SqliteConfig {
+	home = strings.TrimSpace(home)
+	if home == "" {
+		return c
+	}
+	absolute, err := filepath.Abs(home)
+	if err != nil {
+		return c
+	}
+	c.logsHome = filepath.Clean(absolute)
+	probe := isNFSPath
+	if c.filesystem != nil && c.filesystem.probe != nil {
+		probe = c.filesystem.probe
+	}
+	c.logsFilesystem = newSqliteFilesystemProbe(probe)
+	return c
+}
+
+// WithNFSDeleteEnforcement returns a copy that migrates WAL databases on NFS
+// before opening them and requires DELETE journaling on every connection
+// (Rust `SqliteConfig::from_sqlite_home_with_nfs_enforcement`, #57225).
+func (c SqliteConfig) WithNFSDeleteEnforcement(enforce bool) SqliteConfig {
+	c.enforceDeleteOnNFS = enforce
+	return c
+}
+
+// EnforcesNFSDelete reports whether the managed DELETE journaling requirement
+// is active for this config.
+func (c SqliteConfig) EnforcesNFSDelete() bool {
+	return c.enforceDeleteOnNFS
 }
 
 func NewSqliteConfig(sqliteHome string) (SqliteConfig, error) {
@@ -174,6 +228,15 @@ func sqliteConfigWithFilesystemProbe(sqliteHome string, probe func(path string) 
 // every copy of the config that resolved the same home.
 func (c SqliteConfig) IsNFS() (bool, error) {
 	return c.filesystem.isNFS(c.sqliteHome)
+}
+
+// LogsAreOnNFS probes the selected logs directory independently from the
+// SQLite home (Rust #55978 `logs_are_on_nfs`).
+func (c SqliteConfig) LogsAreOnNFS() (bool, error) {
+	if c.logsFilesystem == nil || samePath(c.LogsHome(), c.sqliteHome) {
+		return c.IsNFS()
+	}
+	return c.logsFilesystem.isNFS(c.LogsHome())
 }
 
 func SqliteConfigForCodexHome(codexHome string) (SqliteConfig, error) {
@@ -207,7 +270,26 @@ func (c SqliteConfig) StateDBPath() string {
 }
 
 func (c SqliteConfig) LogsDBPath() string {
-	return filepath.Join(c.sqliteHome, LogsSQLiteFilename)
+	return filepath.Join(c.LogsHome(), LogsSQLiteFilename)
+}
+
+// LogsHome is the directory that holds logs_2.sqlite.
+func (c SqliteConfig) LogsHome() string {
+	if strings.TrimSpace(c.logsHome) != "" {
+		return c.logsHome
+	}
+	return c.sqliteHome
+}
+
+// LegacyLogsDBPath returns the previous logs database location when an
+// explicit logs home moved it. The second result is false when logs still live
+// in the SQLite home (Rust #55978 `legacy_logs_db_path`).
+func (c SqliteConfig) LegacyLogsDBPath() (string, bool) {
+	legacy := filepath.Join(c.sqliteHome, LogsSQLiteFilename)
+	if samePath(legacy, c.LogsDBPath()) {
+		return "", false
+	}
+	return legacy, true
 }
 
 func (c SqliteConfig) GoalsDBPath() string {
@@ -227,8 +309,13 @@ func (c SqliteConfig) ThreadHistoryDBPath() string {
 	return filepath.Join(c.sqliteHome, ThreadHistorySQLiteFilename)
 }
 
+// QueueDBPath is the durable agent queue database path (Rust `QUEUE_DB`).
+func (c SqliteConfig) QueueDBPath() string {
+	return filepath.Join(c.sqliteHome, QueueSQLiteFilename)
+}
+
 func (c SqliteConfig) RuntimeDBPaths() []RuntimeDBPath {
-	paths := make([]RuntimeDBPath, 0, len(runtimeDBSpecs)+1)
+	paths := make([]RuntimeDBPath, 0, len(runtimeDBSpecs)+3)
 	for _, spec := range runtimeDBSpecs {
 		paths = append(paths, RuntimeDBPath{
 			Label:                 spec.label,
@@ -236,8 +323,29 @@ func (c SqliteConfig) RuntimeDBPaths() []RuntimeDBPath {
 			BackgroundReclamation: spec.backgroundReclamation,
 		})
 	}
-	// Thread history is opened lazily and never opts into reclamation.
-	paths = append(paths, RuntimeDBPath{Label: "thread history DB", Path: c.ThreadHistoryDBPath()})
+	// The v2 memories, queue and thread-history databases are created lazily
+	// and never opt into reclamation (Rust `RUNTIME_DBS` order).
+	paths = append(paths,
+		RuntimeDBPath{Label: "memories v2 DB", Path: c.MemoriesV2DBPath()},
+		RuntimeDBPath{Label: "queue DB", Path: c.QueueDBPath()},
+		RuntimeDBPath{Label: "thread history DB", Path: c.ThreadHistoryDBPath()},
+	)
+	return paths
+}
+
+// ReclamationDBPaths returns the databases the background worker maintains:
+// every opted-in runtime database plus the legacy logs database when an
+// explicit logs home left one behind (Rust #55978).
+func (c SqliteConfig) ReclamationDBPaths() []RuntimeDBPath {
+	paths := make([]RuntimeDBPath, 0, len(runtimeDBSpecs)+1)
+	for _, spec := range runtimeDBSpecs {
+		if spec.backgroundReclamation {
+			paths = append(paths, RuntimeDBPath{Label: spec.label, Path: spec.path(c), BackgroundReclamation: true})
+		}
+	}
+	if legacy, ok := c.LegacyLogsDBPath(); ok {
+		paths = append(paths, RuntimeDBPath{Label: "legacy log DB", Path: legacy, BackgroundReclamation: true})
+	}
 	return paths
 }
 
@@ -260,10 +368,13 @@ func OpenSQLite(ctx context.Context, dataSourceName string) (*sql.DB, error) {
 type writableSQLiteConnector struct {
 	driver *modernsqlite.Driver
 	dsn    string
+	// requireDelete rejects connections that are not in DELETE journal mode
+	// (Rust JournalModePolicy::RequireDelete, #57225).
+	requireDelete bool
 }
 
-func newWritableSQLiteConnector(dsn string) writableSQLiteConnector {
-	return writableSQLiteConnector{driver: &modernsqlite.Driver{}, dsn: dsn}
+func newWritableSQLiteConnector(dsn string, requireDelete bool) writableSQLiteConnector {
+	return writableSQLiteConnector{driver: &modernsqlite.Driver{}, dsn: dsn, requireDelete: requireDelete}
 }
 
 func (c writableSQLiteConnector) Connect(ctx context.Context) (driver.Conn, error) {
@@ -271,7 +382,7 @@ func (c writableSQLiteConnector) Connect(ctx context.Context) (driver.Conn, erro
 	if err != nil {
 		return nil, err
 	}
-	if err := initializeConnectionSettings(ctx, conn); err != nil {
+	if err := initializeConnectionSettings(ctx, conn, c.requireDelete); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("sqlite connection hook: %w", err)
 	}
@@ -286,7 +397,7 @@ func (c writableSQLiteConnector) Driver() driver.Driver { return c.driver }
 // `synchronous(NORMAL)`. Connections that open later need only settings that
 // apply to each connection, because the journal and vacuum modes are already
 // persisted on disk.
-func initializeConnectionSettings(ctx context.Context, conn driver.Conn) error {
+func initializeConnectionSettings(ctx context.Context, conn driver.Conn, requireDelete bool) error {
 	queryer, ok := conn.(driver.QueryerContext)
 	if !ok {
 		return fmt.Errorf("sqlite connection does not support contextual queries")
@@ -312,6 +423,9 @@ func initializeConnectionSettings(ctx context.Context, conn driver.Conn) error {
 			journal = strings.ToLower(strings.TrimSpace(text))
 		}
 	}
+	if requireDelete && journal != sqliteJournalModeDelete {
+		return fmt.Errorf("NFS database requires DELETE journaling, found %s", journal)
+	}
 	if journal != sqliteJournalModeDelete {
 		return nil
 	}
@@ -330,6 +444,9 @@ func initializeConnectionSettings(ctx context.Context, conn driver.Conn) error {
 // the journal and vacuum modes are database-scoped, so they are initialized once
 // by the opener and otherwise preserved (#54389 `1ef30bcb`).
 func (c SqliteConfig) OpenReadWrite(ctx context.Context, path string) (*sql.DB, error) {
+	if err := c.prepareLogsDirectory(path); err != nil {
+		return nil, err
+	}
 	dsn, err := sqliteFileDSN(path, false)
 	if err != nil {
 		return nil, err
@@ -339,13 +456,34 @@ func (c SqliteConfig) OpenReadWrite(ctx context.Context, path string) (*sql.DB, 
 	// upstream c2d2f422e6), and retries a busy opener before that error surfaces
 	// (#54369 `7ae8319917`). Each failed attempt closes its pool, which releases
 	// the connection and its locks before the next attempt.
+	// Probe the database's own directory: a separately configured logs home can
+	// sit on a different filesystem than the state home (Rust #56552).
+	nfs, err := c.isNFSDirectory(path)
+	if err != nil {
+		return nil, err
+	}
+	var migration *NFSDBMigration
+	policy := sqliteJournalModeInitializeWAL
+	if c.enforceDeleteOnNFS && nfs {
+		// Keep the migration lock through pool initialization so another
+		// managed startup cannot open the old inode or initialize the
+		// database during cutover (Rust #57225).
+		migration, err = c.prepareNFSMigration(ctx, path)
+		if err != nil {
+			return nil, err
+		}
+		defer migration.Close()
+		policy = sqliteJournalModeRequireDelete
+	} else if nfs {
+		policy = sqliteJournalModeInitializeDelete
+	}
 	return retryOnSQLiteBusy(func() (*sql.DB, error) {
-		db := sql.OpenDB(newWritableSQLiteConnector(dsn))
+		db := sql.OpenDB(newWritableSQLiteConnector(dsn, policy == sqliteJournalModeRequireDelete))
 		if err := RequireSQLiteVersion(ctx, db); err != nil {
 			_ = db.Close()
 			return nil, err
 		}
-		if err := initializeDatabaseSettings(ctx, db); err != nil {
+		if err := initializeDatabaseSettings(ctx, db, policy); err != nil {
 			_ = db.Close()
 			return nil, err
 		}
@@ -355,17 +493,112 @@ func (c SqliteConfig) OpenReadWrite(ctx context.Context, path string) (*sql.DB, 
 	})
 }
 
+// isNFSDirectory probes the database's own directory, which is the sqlite home
+// for runtime databases and may be a separate logs directory.
+func (c SqliteConfig) isNFSDirectory(path string) (bool, error) {
+	directory := filepath.Dir(path)
+	absoluteHome, err := filepath.Abs(c.sqliteHome)
+	if err != nil {
+		return false, err
+	}
+	absoluteLogsHome, err := filepath.Abs(c.LogsHome())
+	if err != nil {
+		return false, err
+	}
+	absoluteDirectory, err := filepath.Abs(directory)
+	if err != nil {
+		return false, err
+	}
+	if absoluteDirectory == absoluteLogsHome {
+		return c.LogsAreOnNFS()
+	}
+	if absoluteDirectory == absoluteHome {
+		return c.IsNFS()
+	}
+	return isNFSPath(absoluteDirectory)
+}
+
+// prepareNFSMigration migrates the database (and, for the state database, every
+// runtime database in the same home) while holding the directory lock.
+func (c SqliteConfig) prepareNFSMigration(ctx context.Context, path string) (*NFSDBMigration, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	home := filepath.Dir(absolute)
+	deadline := time.Now().Add(5 * time.Second)
+	var migration *NFSDBMigration
+	for {
+		migration, err = LockNFSDBMigration(home)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, errNFSMigrationLocked) || time.Now().After(deadline) {
+			return nil, err
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	paths := []string{absolute}
+	if samePath(absolute, c.StateDBPath()) {
+		for _, database := range c.RuntimeDBPaths() {
+			if samePath(filepath.Dir(database.Path), home) {
+				paths = append(paths, database.Path)
+			}
+		}
+	}
+	for _, database := range paths {
+		if _, err := migration.Migrate(ctx, database, os.TempDir()); err != nil {
+			_ = migration.Close()
+			return nil, nfsMigrationFailure(database, err)
+		}
+	}
+	return migration, nil
+}
+
+// nfsMigrationFailure reports a failed required migration without exposing the
+// SQLite error chain. Rust's `sqlite::nfs::prepare_database` re-creates the error
+// the same way (codex-rs/state/src/sqlite/nfs.rs): an interrupted cutover must be
+// resumed by the migration implementation, and automatic corruption recovery
+// must never discard the preserved WAL backup.
+func nfsMigrationFailure(database string, err error) error {
+	return fmt.Errorf("required NFS database migration failed for %s: %v. Stop Codex instances on all hosts and rerun codex migrate-nfs-db", database, err)
+}
+
+func samePath(first, second string) bool {
+	firstAbsolute, err := filepath.Abs(first)
+	if err != nil {
+		return false
+	}
+	secondAbsolute, err := filepath.Abs(second)
+	if err != nil {
+		return false
+	}
+	return firstAbsolute == secondAbsolute
+}
+
+// sqliteJournalModePolicy mirrors Rust `connection::JournalModePolicy`
+// (Rust #56552/#57225): new databases adopt WAL except on NFS, where they adopt
+// DELETE, and managed enforcement additionally rejects any other mode on every
+// connection.
+type sqliteJournalModePolicy int
+
+const (
+	sqliteJournalModeInitializeWAL sqliteJournalModePolicy = iota
+	sqliteJournalModeInitializeDelete
+	sqliteJournalModeRequireDelete
+)
+
 // initializeDatabaseSettings applies the database-scoped PRAGMAs the Rust opener
 // applies once before the pool is used (#54389 `1ef30bcb`):
 //
 //   - a database without a schema is initialized with incremental auto-vacuum and
-//     WAL, including a file an interrupted initialization left with a header but
-//     no schema;
+//     the policy's journal mode (WAL off NFS, DELETE on NFS), including a file an
+//     interrupted initialization left with a header but no schema;
 //   - the journal and vacuum modes of an initialized database are preserved, so
 //     opening a DELETE database never takes the writer lock;
 //   - `synchronous` follows the journal mode the connection ended up with, since
 //     another process can initialize WAL after this connection selected EXTRA.
-func initializeDatabaseSettings(ctx context.Context, db *sql.DB) error {
+func initializeDatabaseSettings(ctx context.Context, db *sql.DB, policy sqliteJournalModePolicy) error {
 	if db == nil {
 		return fmt.Errorf("sqlite database is nil")
 	}
@@ -397,7 +630,13 @@ func initializeDatabaseSettings(ctx context.Context, db *sql.DB) error {
 				return err
 			}
 		}
-		if _, err := conn.ExecContext(ctx, `PRAGMA journal_mode = WAL`); err != nil {
+		// NFS initializes empty databases as DELETE, and managed enforcement
+		// initializes them as DELETE even when the probe cannot run (#57225).
+		journalMode := "PRAGMA journal_mode = WAL"
+		if policy != sqliteJournalModeInitializeWAL {
+			journalMode = "PRAGMA journal_mode = DELETE"
+		}
+		if _, err := conn.ExecContext(ctx, journalMode); err != nil {
 			return err
 		}
 	}
@@ -413,8 +652,44 @@ func initializeDatabaseSettings(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
+// prepareLogsDirectory defers creating the configured logs directory until its
+// database is opened, so login/logout and config reads never touch an
+// unavailable log_dir (Rust #55978).
+func (c SqliteConfig) prepareLogsDirectory(path string) error {
+	if strings.TrimSpace(c.logsHome) == "" || !samePath(path, c.LogsDBPath()) {
+		return nil
+	}
+	if err := os.MkdirAll(c.logsHome, 0o700); err != nil {
+		return fmt.Errorf("create logs directory: %w", err)
+	}
+	return nil
+}
+
+// OpenExistingReadWrite opens an existing database for maintenance without
+// creating it and without initializing its journal or vacuum modes (Rust #55978
+// `open_legacy_logs_for_cleanup`).
+func (c SqliteConfig) OpenExistingReadWrite(ctx context.Context, path string) (*sql.DB, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("stat sqlite database: %w", err)
+	}
+	dsn, err := sqliteFileDSNWithMode(path, "rw", false)
+	if err != nil {
+		return nil, err
+	}
+	db, err := OpenSQLite(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	return db, nil
+}
+
 // OpenReadOnly opens an existing database without creating or modifying it.
 func (c SqliteConfig) OpenReadOnly(ctx context.Context, path string) (*sql.DB, error) {
+	if err := c.prepareLogsDirectory(path); err != nil {
+		return nil, err
+	}
 	dsn, err := sqliteFileDSN(path, true)
 	if err != nil {
 		return nil, err
@@ -429,6 +704,19 @@ func (c SqliteConfig) OpenReadOnly(ctx context.Context, path string) (*sql.DB, e
 }
 
 func sqliteFileDSN(path string, readOnly bool) (string, error) {
+	mode := "rwc"
+	if readOnly {
+		mode = "ro"
+	}
+	return sqliteFileDSNWithMode(path, mode, !readOnly)
+}
+
+// sqliteFileDSNWithMode builds a `file:` DSN for an explicit SQLite open mode
+// ("ro", "rw", or "rwc"). pragmas adds the connection-scoped settings every
+// writable Codex pool uses; maintenance connections leave them off so a busy
+// legacy database never blocks the background sweep (Rust #55978 opens legacy
+// cleanup with a zero busy timeout).
+func sqliteFileDSNWithMode(path string, mode string, pragmas bool) (string, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return "", fmt.Errorf("sqlite database path is required")
@@ -443,9 +731,14 @@ func sqliteFileDSN(path string, readOnly bool) (string, error) {
 	}
 	u := &url.URL{Scheme: "file", Path: uriPath}
 	query := u.Query()
-	if readOnly {
-		query.Set("mode", "ro")
-	} else {
+	query.Set("mode", mode)
+	if mode == "ro" {
+		// sqlx defaults read-only pools to a 5s busy timeout (Rust
+		// `open_read_only_pool` with `busy_timeout: None`), which lets feedback
+		// reads wait for a concurrent maintenance connection.
+		query.Add("_pragma", "busy_timeout(5000)")
+	}
+	if pragmas {
 		// Connection-scoped PRAGMAs only: `journal_mode` and `auto_vacuum` are
 		// database-scoped and are initialized by initializeDatabaseSettings so an
 		// existing database keeps its journal and vacuum modes without taking the
@@ -457,6 +750,27 @@ func sqliteFileDSN(path string, readOnly bool) (string, error) {
 	}
 	u.RawQuery = query.Encode()
 	return u.String(), nil
+}
+
+// bundledSQLiteVersion is the SQLite amalgamation compiled into
+// modernc.org/sqlite at build time. Rust asserts the same invariant at compile
+// time via `libsqlite3_sys::SQLITE_VERSION_NUMBER` (#60432). Go cannot compare
+// version strings during compilation, so the equivalent check runs while the
+// package is initialized: a driver that regresses below the floor panics
+// instead of silently shipping an older WAL implementation.
+const bundledSQLiteVersion = sqlitelib.SQLITE_VERSION
+
+var _ = mustMeetBundledSQLiteFloor(bundledSQLiteVersion)
+
+func mustMeetBundledSQLiteFloor(version string) struct{} {
+	ok, err := SQLiteVersionAtLeast(version, MinimumSQLiteVersion)
+	if err != nil {
+		panic(fmt.Sprintf("invalid bundled sqlite version %q: %v", version, err))
+	}
+	if !ok {
+		panic(fmt.Sprintf("bundled sqlite %s must be >= %s for the WAL-reset and WAL page-size fixes", version, MinimumSQLiteVersion))
+	}
+	return struct{}{}
 }
 
 func RequireSQLiteVersion(ctx context.Context, db *sql.DB) error {

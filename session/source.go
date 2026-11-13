@@ -14,6 +14,14 @@ import (
 // form is "subagent_guardian".
 const GuardianReviewSource = "subagent_guardian"
 
+// Guardian review display metadata (Rust #47302, codex-rs/state/src/extract.rs).
+// Guardian review threads use synthetic approval prompts as user messages, so
+// thread listings show compact metadata instead of the prompt text.
+const (
+	GuardianThreadTitle   = "Guardian review"
+	GuardianThreadPreview = "Approval review"
+)
+
 // IsGuardianReviewSource mirrors codex_state::is_guardian_review_source
 // (codex-rs/state/src/extract.rs): only the legacy subagent "other" source
 // named "guardian" identifies a Guardian review thread.
@@ -120,5 +128,25 @@ func SubAgentSourceWire(source string) (any, bool) {
 		return map[string]any{"other": "guardian"}, true
 	default:
 		return nil, false
+	}
+}
+
+// InternalSessionSourceWire returns the Serialize form of a canonical internal
+// session source's payload (the value carried under the "internal" key). Rust
+// serializes SessionSource::Internal(InternalSessionSource::Guardian) as
+// {"internal":"guardian"}; Go stores the same source in Display form as
+// "internal_guardian".
+func InternalSessionSourceWire(source string) (string, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(source))
+	normalized = strings.NewReplacer("-", "_", ":", "_", "/", "_").Replace(normalized)
+	const prefix = "internal_"
+	if !strings.HasPrefix(normalized, prefix) {
+		return "", false
+	}
+	switch name := strings.TrimPrefix(normalized, prefix); name {
+	case "memory_consolidation", "guardian":
+		return name, true
+	default:
+		return "", false
 	}
 }

@@ -3,13 +3,15 @@
 package windowssandbox
 
 import (
-	"errors"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
 
-var getPackageFullName = windows.NewLazySystemDLL("kernel32.dll").NewProc("GetPackageFullName")
+var (
+	getPackageFullName   = windows.NewLazySystemDLL("kernel32.dll").NewProc("GetPackageFullName")
+	getPackageFamilyName = windows.NewLazySystemDLL("kernel32.dll").NewProc("GetCurrentPackageFamilyName")
+)
 
 // PackageFullNameForProcess ports Rust's `process_package_name`: it queries the
 // OS package full name for the process, distinguishing absence from failure.
@@ -34,8 +36,23 @@ func CurrentProcessHasPackageIdentity() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if !hasIdentity && RegisteredCoreRequested() {
-		return false, errors.New("registered Core process has no package identity")
-	}
-	return hasIdentity, nil
+	return PackageIdentityDecision(hasIdentity, RegisteredCoreRequested())
+}
+
+// CurrentProcessPackageFullName reports the package version the running process
+// was launched from (Rust current_package_full_name).
+func CurrentProcessPackageFullName() (string, bool, error) {
+	return PackageFullNameForProcess(windows.CurrentProcess())
+}
+
+// CurrentProcessPackageFamilyName reports the package family the running
+// process was launched from (Rust Package::Current().Id().FamilyName()).
+func CurrentProcessPackageFamilyName() (string, bool, error) {
+	return QueryPackageName(func(length *uint32, buffer *uint16) uint32 {
+		status, _, _ := getPackageFamilyName.Call(
+			uintptr(unsafe.Pointer(length)),
+			uintptr(unsafe.Pointer(buffer)),
+		)
+		return uint32(status)
+	}, packageNameMaxLength)
 }

@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net/url"
 	"os"
 	"reflect"
 	"sort"
@@ -14,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	managedconfig "codex_core/config"
 	"codex_core/sandbox"
 )
 
@@ -177,6 +180,10 @@ type MCPListServerStatusParams struct {
 	RequiredPlugins      []string      `json:"-"`
 	NonBlockingOptional  bool          `json:"-"`
 	OptionalStartupGrace time.Duration `json:"-"`
+	// SkipDeferredStartup makes an aggregate resource-discovery read report a
+	// server that still needs a live start as deferred instead of launching it
+	// (Rust #60423: discovery leaves dormant servers unstarted).
+	SkipDeferredStartup bool `json:"-"`
 }
 
 type MCPServerInfo struct {
@@ -273,7 +280,15 @@ type MCPServerStatus struct {
 	RuntimeStatus *MCPConnectionStatus `json:"runtimeStatus,omitempty"`
 	// PluginID reports the owning plugin for plugin-contributed servers and is
 	// nil for servers from other sources (Rust 78d3665d15).
-	PluginID   *string        `json:"pluginId,omitempty"`
+	PluginID *string `json:"pluginId,omitempty"`
+	// pluginHostRoot is the installed root of the plugin registration that won
+	// this server name (Rust #58378 AgentMcpMetadataRecipient matching).
+	// Internal-only: the wire status does not expose it.
+	pluginHostRoot string
+	// HTTPOrigin is the effective configured endpoint's HTTP(S) origin without
+	// credentials, path, query, or fragment; nil for stdio and non-HTTP URLs
+	// (Rust #47159).
+	HTTPOrigin *string        `json:"httpOrigin,omitempty"`
 	ServerInfo *MCPServerInfo `json:"serverInfo,omitempty"`
 	// ServerCapabilities carries the initialized server's advertised
 	// capabilities object, or null when unavailable (Rust #44826).
@@ -315,6 +330,7 @@ func (s *MCPServerStatus) MarshalJSON() ([]byte, error) {
 		Name               string                            `json:"name"`
 		RuntimeStatus      *MCPConnectionStatus              `json:"runtimeStatus"`
 		PluginID           *string                           `json:"pluginId"`
+		HTTPOrigin         *string                           `json:"httpOrigin"`
 		ServerInfo         *MCPServerInfo                    `json:"serverInfo"`
 		ServerCapabilities json.RawMessage                   `json:"serverCapabilities"`
 		ToolListMeta       json.RawMessage                   `json:"toolListMeta"`
@@ -330,6 +346,7 @@ func (s *MCPServerStatus) MarshalJSON() ([]byte, error) {
 		Name:               name,
 		RuntimeStatus:      cloneMCPConnectionStatus(s.RuntimeStatus),
 		PluginID:           cloneStringPtr(s.PluginID),
+		HTTPOrigin:         cloneStringPtr(s.HTTPOrigin),
 		ServerInfo:         serverInfo,
 		ServerCapabilities: cloneMCPRawMessage(s.ServerCapabilities),
 		ToolListMeta:       cloneMCPRawMessage(s.ToolListMeta),
@@ -348,6 +365,37 @@ type MCPListServerStatusResponse struct {
 	Data       []MCPServerStatus `json:"data"`
 	NextCursor *string           `json:"nextCursor"`
 	Servers    []MCPServerStatus `json:"servers,omitempty"`
+}
+
+// mcpServerHTTPOrigin mirrors Rust's Url::origin().ascii_serialization for an
+// effective configured endpoint (#47159): HTTP(S) only, no credentials, path,
+// query, fragment, or default port. Nil means the server is stdio or the URL is
+// invalid/non-HTTP.
+func mcpServerHTTPOrigin(config *ServerConfig) *string {
+	if config == nil || strings.TrimSpace(config.URL) == "" {
+		return nil
+	}
+	parsed, err := url.Parse(strings.TrimSpace(config.URL))
+	if err != nil || parsed.Hostname() == "" {
+		return nil
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return nil
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	port := parsed.Port()
+	if scheme == "http" && port == "80" || scheme == "https" && port == "443" {
+		port = ""
+	}
+	origin := scheme + "://" + host
+	if port != "" {
+		origin += ":" + port
+	}
+	return &origin
 }
 
 func (r *MCPListServerStatusResponse) MarshalJSON() ([]byte, error) {
@@ -463,6 +511,9 @@ type MCPResourceReadParams struct {
 	Server     string  `json:"server,omitempty"`
 	ServerName string  `json:"serverName,omitempty"`
 	URI        string  `json:"uri"`
+	// Meta is caller-provided MCP request metadata forwarded on resources/read.
+	// Account and turn-routing keys are reserved for the host.
+	Meta map[string]any `json:"_meta,omitempty"`
 	// OriginCallID scopes the read to the app tool call that produced the
 	// widget (Rust #39187): the app, account link, and policy context of the
 	// originating call are used when reading the associated resource.
@@ -474,6 +525,10 @@ type MCPResourceReadParams struct {
 	// (Rust #47248). The backend supports it only for `codex_apps`; omitting it
 	// keeps the legacy discovery behavior.
 	Target *MCPResourceReadTarget `json:"target,omitempty"`
+	// Context carries the caller's request context into the MCP transport so the
+	// outbound HTTP request keeps its W3C trace context when tracing is disabled
+	// (Rust #60506). It is never serialized.
+	Context context.Context `json:"-"`
 }
 
 // MCPResourceReadTarget is a direct hosted app/account resource target
@@ -528,6 +583,7 @@ func (p MCPResourceReadParams) MarshalJSON() ([]byte, error) {
 		ThreadID     *string                `json:"threadId,omitempty"`
 		Server       string                 `json:"server"`
 		URI          string                 `json:"uri"`
+		Meta         map[string]any         `json:"_meta,omitempty"`
 		OriginCallID string                 `json:"originCallId,omitempty"`
 		ConnectorID  string                 `json:"connectorId,omitempty"`
 		Target       *MCPResourceReadTarget `json:"target,omitempty"`
@@ -536,6 +592,7 @@ func (p MCPResourceReadParams) MarshalJSON() ([]byte, error) {
 		ThreadID:     cloneStringPtr(p.ThreadID),
 		Server:       firstNonEmptyMCP(p.Server, p.ServerName),
 		URI:          p.URI,
+		Meta:         cloneAnyMap(p.Meta),
 		OriginCallID: strings.TrimSpace(p.OriginCallID),
 		ConnectorID:  strings.TrimSpace(p.ConnectorID),
 		Target:       p.Target,
@@ -739,31 +796,67 @@ func (c *MCPToolCallContent) Map() map[string]any {
 }
 
 type MCPService struct {
-	mu            sync.Mutex
-	servers       map[string]MCPServerStatus
-	configs       map[string]ServerConfig
-	dynamicConfig map[string]bool
-	required      map[string]bool
-	starting      map[string]int
-	httpClients   map[string]*cachedMCPHTTPClient
-	stdioClients  map[string]*cachedMCPStdioClient
-	oauthLogins   map[string]*OAuthLoginServer
-	oauth         *OAuthStore
-	resourceCache *MCPResourceCache
-	elicitation   MCPElicitationHandler
-	progress      MCPProgressHandler
-	roots         MCPRootsProvider
-	oauthComplete MCPOAuthLoginCompletionHandler
-	invocations   *MCPInvocationRegistry
+	mu      sync.Mutex
+	servers map[string]MCPServerStatus
+	configs map[string]ServerConfig
+	// disabledConfigs retains disabled registrations so login and diagnostics can
+	// report why they are unavailable (Rust #56266).
+	disabledConfigs map[string]ServerConfig
+	dynamicConfig   map[string]bool
+	required        map[string]bool
+	starting        map[string]int
+	httpClients     map[string]*cachedMCPHTTPClient
+	stdioClients    map[string]*cachedMCPStdioClient
+	// discoverLocalStdio mirrors Rust McpConfig::discover_local_stdio: it gates
+	// both local stdio protocol discovery (#57210) and connection sharing
+	// (#57211).
+	discoverLocalStdio bool
+	// toolCatalogCache is the process-scoped catalog cache a new chat reuses to
+	// start without launching the server (Rust ToolCatalogCache). It is an
+	// interface so a later batch can persist entries to disk.
+	toolCatalogCache ToolCatalogCacheStore
+	// toolCatalogClock supplies read/publish timestamps; nil means time.Now.
+	toolCatalogClock func() time.Time
+	// lazyStdioStartup mirrors Rust's `mcp_lazy_stdio_startup` feature (#60039):
+	// a regular chat may start an eligible stdio server on first use instead of
+	// eagerly, as long as a warm tool catalog already covers it.
+	lazyStdioStartup bool
+	// networkPolicyMetadata, when set, supplies call-scoped network policy
+	// metadata to trusted ChatGPT MCP servers (Rust
+	// NetworkPolicyMetadataProvider, #56278). A nil provider disables the
+	// capability advertisement.
+	networkPolicyMetadata NetworkPolicyMetadataProvider
+	// chatGPTBaseURL is the configured ChatGPT origin used to decide whether a
+	// staging MCP server is trusted for policy metadata.
+	chatGPTBaseURL string
+	oauthLogins    map[string]*OAuthLoginServer
+	oauth          *OAuthStore
+	resourceCache  *MCPResourceCache
+	elicitation    MCPElicitationHandler
+	progress       MCPProgressHandler
+	roots          MCPRootsProvider
+	oauthComplete  MCPOAuthLoginCompletionHandler
+	invocations    *MCPInvocationRegistry
 	// oauthCompleteListeners let multiple in-process consumers observe the same
 	// login completion while the app-server handler remains installed.
 	oauthCompleteListeners map[uint64]MCPOAuthLoginCompletionHandlerFunc
 	nextOAuthListenerID    uint64
 	openAIForm             bool
+	userVerification       bool
 	generation             uint64
+	// appsRefreshInFlight tracks Apps catalog fetches that run outside the
+	// runtime publication lock (Rust #60639). Waiters block until the current
+	// batch drains so model tool capture and shutdown never observe a partial
+	// refresh.
+	appsRefreshInFlight int
+	appsRefreshIdle     chan struct{}
+	closed              bool
 	// resourceGeneration advances when resource catalogs and contents must be
 	// refreshed even if the connection set is reused (Rust #46033).
 	resourceGeneration uint64
+	// sharedDefinitions shares immutable normalized tool definitions within this
+	// manager without keeping completed sessions alive (Rust #55724).
+	sharedDefinitions *sharedMCPDefinitions
 	// authChangeSource, when set, lets opted-in stdio servers receive auth
 	// change notifications (Rust #43428).
 	authChangeSource    MCPAuthChangeSource
@@ -773,6 +866,7 @@ type MCPService struct {
 	// with this runtime (Rust #40728).
 	permissionProfile        *sandbox.PermissionProfile
 	serverPermissionProfiles map[string]*sandbox.PermissionProfile
+	serverPermissionSources  map[string]MCPServerPermissionSource
 	// codexSelfExe is the host-supplied re-exec binary advertised as a sandbox
 	// launcher after a capability probe (Rust McpConfig::codex_self_exe).
 	codexSelfExe string
@@ -831,10 +925,17 @@ type cachedMCPStdioClient struct {
 	key            string
 	client         *stdioClient
 	startupTimeout time.Duration
+	// release returns a shared connection to the process-wide pool (Rust
+	// #57211). It is nil for private connections, which Close owns.
+	release func()
+	// lease is this chat's server-side lease handle on a shared connection. It
+	// stays closed unless the helper negotiated codex/connection-lease (Rust
+	// #57978).
+	lease *mcpChatLease
 }
 
 func NewMCPService(runtime *RuntimeConfig) *MCPService {
-	service := &MCPService{servers: map[string]MCPServerStatus{}, configs: map[string]ServerConfig{}, dynamicConfig: map[string]bool{}, required: map[string]bool{}, starting: map[string]int{}, httpClients: map[string]*cachedMCPHTTPClient{}, stdioClients: map[string]*cachedMCPStdioClient{}, oauthLogins: map[string]*OAuthLoginServer{}, resourceCache: NewMCPResourceCache(nil), generation: 1, appsMCPProductSKU: DefaultCodexAppsMCPProductSKU, invocations: NewMCPInvocationRegistry()}
+	service := &MCPService{servers: map[string]MCPServerStatus{}, configs: map[string]ServerConfig{}, disabledConfigs: map[string]ServerConfig{}, dynamicConfig: map[string]bool{}, required: map[string]bool{}, starting: map[string]int{}, httpClients: map[string]*cachedMCPHTTPClient{}, stdioClients: map[string]*cachedMCPStdioClient{}, oauthLogins: map[string]*OAuthLoginServer{}, resourceCache: NewMCPResourceCache(nil), generation: 1, appsMCPProductSKU: DefaultCodexAppsMCPProductSKU, invocations: NewMCPInvocationRegistry(), sharedDefinitions: newSharedMCPDefinitions()}
 	if runtime != nil {
 		// Rust reads `config.apps_mcp_product_sku.as_deref().unwrap_or(..)`; Go's
 		// runtime config cannot distinguish an absent SKU from an empty one, so
@@ -859,6 +960,11 @@ func NewMCPService(runtime *RuntimeConfig) *MCPService {
 		service.environmentUseMXC = cloneBoolMap(runtime.EnvironmentUseMXC)
 		service.sharedHTTPClientKey = mcpHTTPDoerIdentity(runtime.HTTPClient)
 		service.refreshToolListOnNotifications = runtime.RefreshToolListOnNotifications
+		service.discoverLocalStdio = runtime.DiscoverLocalStdio
+		service.lazyStdioStartup = runtime.LazyStdioStartup
+		service.toolCatalogCache = defaultToolCatalogCacheStore
+		service.networkPolicyMetadata = runtime.NetworkPolicyMetadata
+		service.chatGPTBaseURL = strings.TrimSpace(runtime.ChatGPTBaseURL)
 		if strings.TrimSpace(runtime.CodexHome) != "" {
 			service.oauth = NewOAuthStoreWithMode(runtime.CodexHome, runtime.OAuthCredentialsStoreMode)
 		}
@@ -873,6 +979,13 @@ func NewMCPService(runtime *RuntimeConfig) *MCPService {
 			info := MCPServerInfo{Name: name, Command: firstNonEmptyMCP(registration.Config.Command, registration.Config.URL), Args: append([]string(nil), registration.Config.Args...)}
 			config := cloneServerConfig(&registration.Config)
 			config.ProtocolMode = effectiveMCPProtocolMode(runtime, name, registration)
+			// Rust #57210: with mcp_connection_sharing enabled, an eligible local
+			// stdio server probes its protocol before falling back to the legacy
+			// handshake. An explicit registration override stays authoritative.
+			if runtime.DiscoverLocalStdio && config.ProtocolModeOverride == nil &&
+				mcpServerCanDiscoverLocalStdio(name, &config) {
+				config.ProtocolMode = MCPProtocolDiscoverLocalStdio
+			}
 			// Rust applies the runtime's read-only policy to every enabled
 			// server (McpConnectionSet::with_read_only_mcp_tools).
 			config.RequiresReadOnlyTools = runtime.RequiresReadOnlyMCPTools
@@ -890,6 +1003,7 @@ func NewMCPService(runtime *RuntimeConfig) *MCPService {
 				service.required[name] = true
 			}
 			if !registration.Config.Enabled {
+				service.disabledConfigs[name] = config
 				continue
 			}
 			if !mcpRegistrationEnvironmentAvailable(name, registration, runtime) {
@@ -902,14 +1016,15 @@ func NewMCPService(runtime *RuntimeConfig) *MCPService {
 				pluginID = cloneStringPtr(&registration.PluginID)
 			}
 			service.servers[name] = MCPServerStatus{
-				Name:          name,
-				PluginID:      pluginID,
-				Server:        info,
-				ServerInfo:    &info,
-				State:         MCPServerReady,
-				AuthStatus:    authStatus,
-				source:        SourceFromRegistration(&registration),
-				hostOwnedApps: isHostOwnedCodexAppsRegistration(name, registration),
+				Name:           name,
+				PluginID:       pluginID,
+				pluginHostRoot: strings.TrimSpace(registration.PluginHostRoot),
+				Server:         info,
+				ServerInfo:     &info,
+				State:          MCPServerReady,
+				AuthStatus:     authStatus,
+				source:         SourceFromRegistration(&registration),
+				hostOwnedApps:  isHostOwnedCodexAppsRegistration(name, registration),
 			}
 		}
 		service.permissionProfile = cloneMCPPermissionProfile(runtime.PermissionProfile)
@@ -919,6 +1034,12 @@ func NewMCPService(runtime *RuntimeConfig) *MCPService {
 			service.serverPermissionProfiles = make(map[string]*sandbox.PermissionProfile, len(runtime.ServerPermissionProfiles))
 			for name, profile := range runtime.ServerPermissionProfiles {
 				service.serverPermissionProfiles[strings.TrimSpace(name)] = cloneMCPPermissionProfile(profile)
+			}
+		}
+		if runtime.ServerPermissionSources != nil {
+			service.serverPermissionSources = make(map[string]MCPServerPermissionSource, len(runtime.ServerPermissionSources))
+			for name, source := range runtime.ServerPermissionSources {
+				service.serverPermissionSources[strings.TrimSpace(name)] = cloneMCPServerPermissionSource(source)
 			}
 		}
 	}
@@ -964,7 +1085,7 @@ func (s *MCPService) ApplyRuntimeConfig(runtime *RuntimeConfig) {
 	nextHTTPClients := map[string]*cachedMCPHTTPClient{}
 	nextStdioClients := map[string]*cachedMCPStdioClient{}
 	var oldHTTPClients []*httpClient
-	var oldStdioClients []*stdioClient
+	var oldStdioClients []*cachedMCPStdioClient
 	for name, cached := range s.httpClients {
 		config, ok := refreshed.configs[name]
 		sharedHTTPClientKey := refreshed.sharedHTTPClientKey
@@ -972,7 +1093,7 @@ func (s *MCPService) ApplyRuntimeConfig(runtime *RuntimeConfig) {
 			sharedHTTPClientKey = mcpHTTPDoerIdentity(config.HTTPClient)
 		}
 		if ok && cached != nil && cached.client != nil && !cached.client.isClosed() &&
-			cached.key == mcpHTTPConnectionCacheKey(&config, s.openAIForm, mcpServerAllowsUserVerification(refreshed.servers, name, s.openAIForm), sharedHTTPClientKey) {
+			cached.key == refreshed.mcpHTTPClientCacheKey(&config, s.openAIForm, mcpServerAllowsUserVerification(refreshed.servers, name, s.userVerification), sharedHTTPClientKey) {
 			nextHTTPClients[name] = cached
 			preserveMCPServerInventory(refreshed.servers, s.servers, name)
 			continue
@@ -984,18 +1105,19 @@ func (s *MCPService) ApplyRuntimeConfig(runtime *RuntimeConfig) {
 	for name, cached := range s.stdioClients {
 		config, ok := refreshed.configs[name]
 		if ok && cached != nil && cached.client != nil && !cached.client.isClosed() &&
-			cached.key == mcpConnectionCacheKeyWithFeatures(&config, s.openAIForm, mcpServerAllowsUserVerification(refreshed.servers, name, s.openAIForm)) {
+			cached.key == refreshed.mcpStdioClientCacheKey(&config, s.openAIForm, mcpServerAllowsUserVerification(refreshed.servers, name, s.userVerification)) {
 			nextStdioClients[name] = cached
 			preserveMCPServerInventory(refreshed.servers, s.servers, name)
 			continue
 		}
 		if cached != nil && cached.client != nil {
-			oldStdioClients = append(oldStdioClients, cached.client)
+			oldStdioClients = append(oldStdioClients, cached)
 		}
 	}
 	oldOAuthLogins := s.oauthLoginsForCancelLocked()
 	s.servers = refreshed.servers
 	s.configs = refreshed.configs
+	s.disabledConfigs = refreshed.disabledConfigs
 	s.dynamicConfig = refreshed.dynamicConfig
 	s.required = refreshed.required
 	s.starting = refreshed.starting
@@ -1007,14 +1129,20 @@ func (s *MCPService) ApplyRuntimeConfig(runtime *RuntimeConfig) {
 	s.sharedHTTPClientKey = refreshed.sharedHTTPClientKey
 	s.permissionProfile = refreshed.permissionProfile
 	s.serverPermissionProfiles = refreshed.serverPermissionProfiles
+	s.serverPermissionSources = refreshed.serverPermissionSources
 	s.selectedEnvironments = refreshed.selectedEnvironments
+	s.discoverLocalStdio = refreshed.discoverLocalStdio
+	s.lazyStdioStartup = refreshed.lazyStdioStartup
+	s.networkPolicyMetadata = refreshed.networkPolicyMetadata
+	s.chatGPTBaseURL = refreshed.chatGPTBaseURL
+	s.refreshToolListOnNotifications = refreshed.refreshToolListOnNotifications
 	s.generation++
 	if s.resourceCache == nil {
 		s.resourceCache = NewMCPResourceCache(nil)
 	}
 	s.mu.Unlock()
 	closeHTTPClients(oldHTTPClients)
-	closeStdioClients(oldStdioClients)
+	retireCachedStdioClients(oldStdioClients)
 	cancelOAuthLogins(oldOAuthLogins)
 	s.clearResourceCache()
 }
@@ -1057,7 +1185,12 @@ func (s *MCPService) Close() error {
 	if s == nil {
 		return nil
 	}
+	// Waiting outside s.mu keeps close ordered after in-flight Apps fetches
+	// without blocking their completion (Rust #60639).
+	s.WaitForAppsToolRefresh(context.Background())
 	s.mu.Lock()
+	s.closed = true
+	s.generation++
 	httpClients := s.httpClientsForCloseLocked()
 	stdioClients := s.stdioClientsForCloseLocked()
 	oauthLogins := s.oauthLoginsForCancelLocked()
@@ -1066,7 +1199,7 @@ func (s *MCPService) Close() error {
 	s.oauthLogins = map[string]*OAuthLoginServer{}
 	s.mu.Unlock()
 	closeHTTPClients(httpClients)
-	closeStdioClients(stdioClients)
+	closeCachedStdioClients(stdioClients)
 	cancelOAuthLogins(oauthLogins)
 	s.clearResourceCache()
 	return nil
@@ -1106,18 +1239,23 @@ func (s *MCPService) SetServerConfig(name string, config *ServerConfig) {
 	oldOAuthLogin := s.deleteOAuthLoginLocked(name)
 	if config == nil {
 		delete(s.configs, name)
+		delete(s.disabledConfigs, name)
 		delete(s.dynamicConfig, name)
 		delete(s.required, name)
 		delete(s.servers, name)
 		s.clearResourceCache()
 		s.mu.Unlock()
 		closeHTTPClients([]*httpClient{oldHTTPClient})
-		closeStdioClients([]*stdioClient{oldStdioClient})
+		retireCachedStdioClients([]*cachedMCPStdioClient{oldStdioClient})
 		cancelOAuthLogins([]*OAuthLoginServer{oldOAuthLogin})
 		return
 	}
 	if !config.Enabled {
 		delete(s.configs, name)
+		if s.disabledConfigs == nil {
+			s.disabledConfigs = map[string]ServerConfig{}
+		}
+		s.disabledConfigs[name] = cloneServerConfig(config)
 		delete(s.dynamicConfig, name)
 		if config.Required {
 			s.required[name] = true
@@ -1128,10 +1266,11 @@ func (s *MCPService) SetServerConfig(name string, config *ServerConfig) {
 		s.clearResourceCache()
 		s.mu.Unlock()
 		closeHTTPClients([]*httpClient{oldHTTPClient})
-		closeStdioClients([]*stdioClient{oldStdioClient})
+		retireCachedStdioClients([]*cachedMCPStdioClient{oldStdioClient})
 		cancelOAuthLogins([]*OAuthLoginServer{oldOAuthLogin})
 		return
 	}
+	delete(s.disabledConfigs, name)
 	cloned := cloneServerConfig(config)
 	if strings.TrimSpace(cloned.OAuthServerName) == "" {
 		cloned.OAuthServerName = name
@@ -1160,7 +1299,7 @@ func (s *MCPService) SetServerConfig(name string, config *ServerConfig) {
 	s.clearResourceCache()
 	s.mu.Unlock()
 	closeHTTPClients([]*httpClient{oldHTTPClient})
-	closeStdioClients([]*stdioClient{oldStdioClient})
+	retireCachedStdioClients([]*cachedMCPStdioClient{oldStdioClient})
 	cancelOAuthLogins([]*OAuthLoginServer{oldOAuthLogin})
 }
 
@@ -1245,15 +1384,34 @@ func (s *MCPService) AddOAuthLoginCompletionListener(listener MCPOAuthLoginCompl
 }
 
 func (s *MCPService) SetOpenAIFormElicitationEnabled(enabled bool) {
+	s.setElicitationCapabilities(&enabled, nil)
+}
+
+// SetUserVerificationEnabled controls the native user-verification extension
+// independently of the legacy OpenAI form capability. App-server activates it
+// only for trusted local clients (Rust #44613).
+func (s *MCPService) SetUserVerificationEnabled(enabled bool) {
+	s.setElicitationCapabilities(nil, &enabled)
+}
+
+func (s *MCPService) setElicitationCapabilities(openAIForm *bool, userVerification *bool) {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
-	if s.openAIForm == enabled {
+	changed := false
+	if openAIForm != nil && s.openAIForm != *openAIForm {
+		s.openAIForm = *openAIForm
+		changed = true
+	}
+	if userVerification != nil && s.userVerification != *userVerification {
+		s.userVerification = *userVerification
+		changed = true
+	}
+	if !changed {
 		s.mu.Unlock()
 		return
 	}
-	s.openAIForm = enabled
 	s.generation++
 	oldHTTPClients := s.httpClientsForCloseLocked()
 	oldStdioClients := s.stdioClientsForCloseLocked()
@@ -1261,7 +1419,7 @@ func (s *MCPService) SetOpenAIFormElicitationEnabled(enabled bool) {
 	s.stdioClients = map[string]*cachedMCPStdioClient{}
 	s.mu.Unlock()
 	closeHTTPClients(oldHTTPClients)
-	closeStdioClients(oldStdioClients)
+	retireCachedStdioClients(oldStdioClients)
 	s.clearResourceCache()
 }
 
@@ -1284,6 +1442,7 @@ func (s *MCPService) ConfiguredStatuses() []MCPServerStatus {
 		cloned := cloneMCPServerStatus(status)
 		if config, ok := configs[cloned.effectiveName()]; ok {
 			cloned.AuthStatus = s.authStatusForConfig(cloned.effectiveName(), &config)
+			cloned.HTTPOrigin = mcpServerHTTPOrigin(&config)
 		}
 		statuses = append(statuses, cloned)
 	}
@@ -1375,6 +1534,82 @@ func (s *MCPService) ValidateRequiredServers(threadID string) error {
 	return fmt.Errorf("required MCP servers failed to initialize: %s", strings.Join(failures, "; "))
 }
 
+// toolCatalogCacheStore returns the cache store this service publishes to. A
+// nil field keeps the process-wide default so a service built without going
+// through NewMCPService still shares what the rest of the process cached.
+func (s *MCPService) toolCatalogCacheStore() ToolCatalogCacheStore {
+	if s == nil {
+		return nil
+	}
+	if s.toolCatalogCache != nil {
+		return s.toolCatalogCache
+	}
+	return defaultToolCatalogCacheStore
+}
+
+// mcpNow supplies the timestamp for cache reads and publications.
+func (s *MCPService) mcpNow() time.Time {
+	if s != nil && s.toolCatalogClock != nil {
+		return s.toolCatalogClock()
+	}
+	return time.Now()
+}
+
+// beginToolCatalogFetch allocates the generation for one discovery attempt, or
+// 0 when this server's catalog is not cacheable.
+func (s *MCPService) beginToolCatalogFetch(name string, config *ServerConfig) uint64 {
+	identity, ok := mcpToolCatalogIdentity(name, config)
+	if !ok {
+		return 0
+	}
+	entry := s.toolCatalogCacheStore().Entry(identity)
+	if entry == nil {
+		return 0
+	}
+	return entry.BeginFetch(s.mcpNow())
+}
+
+// publishToolCatalog stores a successful catalog so a later chat can satisfy
+// startup from it, and honours the server's opt-out capability.
+func (s *MCPService) publishToolCatalog(name string, config *ServerConfig, generation uint64, tools []MCPToolInfo, serverCapabilities any) {
+	if generation == 0 {
+		return
+	}
+	identity, ok := mcpToolCatalogIdentity(name, config)
+	if !ok {
+		return
+	}
+	entry := s.toolCatalogCacheStore().Entry(identity)
+	if entry == nil {
+		return
+	}
+	if mcpServerOptsOutOfToolCatalogCache(serverCapabilities) {
+		entry.Disable()
+		return
+	}
+	entry.PublishIfNewest(generation, tools, nil, s.mcpNow())
+}
+
+// recordModernToolCatalogDiscovery marks the generation at which this identity
+// negotiated the modern protocol, so a discovery client never reuses a catalog
+// published before that handshake while a legacy client still may (Rust #60037).
+// It runs before the publish so the fresh catalog is not older than the
+// handshake it belongs to.
+func (s *MCPService) recordModernToolCatalogDiscovery(name string, config *ServerConfig, generation uint64) {
+	if generation == 0 {
+		return
+	}
+	identity, ok := mcpToolCatalogIdentity(name, config)
+	if !ok {
+		return
+	}
+	entry := s.toolCatalogCacheStore().Entry(identity)
+	if entry == nil {
+		return
+	}
+	entry.RecordModernDiscovery(generation, s.mcpNow())
+}
+
 // WaitForServerStartup refreshes only the MCP server that owns the selected
 // tool. The inventory request can block without occupying the tool execution
 // gate, so unrelated calls in the same model response remain runnable.
@@ -1397,10 +1632,9 @@ func (s *MCPService) WaitForServerStartup(ctx context.Context, name string, thre
 	if !starting && (status.State == "" || status.State == MCPServerReady) {
 		return nil
 	}
-	done := make(chan struct{}, 1)
+	done := make(chan mcpInventoryStatusResult, 1)
 	go func() {
-		_ = s.inventoryStatusForConfig(0, name, &config, status, false, strings.TrimSpace(threadID))
-		done <- struct{}{}
+		done <- s.inventoryStatusForConfig(0, name, &config, status, false, strings.TrimSpace(threadID))
 	}()
 	if ctx == nil {
 		ctx = context.Background()
@@ -1408,7 +1642,18 @@ func (s *MCPService) WaitForServerStartup(ctx context.Context, name string, thre
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-done:
+	case result := <-done:
+		// Rust #60038: a cached tool stays advertised after its server failed to
+		// start, so the call has to carry the startup failure instead of the
+		// generic "not available to the model" text. The inventory attempt above
+		// already published the failed status, so the error is the same one the
+		// model would see if it read the server list.
+		if result.Err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return &MCPServerStartupError{Server: name, Err: result.Err}
+		}
 		return nil
 	}
 }
@@ -1442,6 +1687,7 @@ func (s *MCPService) ListStatusCheckedWithObserver(params *MCPListServerStatusPa
 		cloned.catalogSource = ""
 		if config, ok := configs[cloned.effectiveName()]; ok {
 			cloned.AuthStatus = s.authStatusForConfig(cloned.effectiveName(), &config)
+			cloned.HTTPOrigin = mcpServerHTTPOrigin(&config)
 		}
 		if !detail.includesTools() {
 			cloned.Tools = nil
@@ -1609,9 +1855,9 @@ func retainedToolCatalogInventory(status MCPServerStatus) *stdioInventory {
 // revision it was listed at and whether that listing stayed stable across its
 // own pages. A listing that raced a notification is reported as not stable, so
 // it is never published as the current catalog (Rust #54656).
-func (s *MCPService) listCatalogIfStable(name string, config *ServerConfig, threadID string) (*stdioInventory, uint64, bool, error) {
+func (s *MCPService) listCatalogIfStable(name string, config *ServerConfig, threadID string, skipResourceTemplates bool) (*stdioInventory, uint64, bool, error) {
 	revision := s.cachedToolListRevision(name)
-	inventory, err := s.listInventoryForConfig(name, config, threadID)
+	inventory, err := s.listInventoryForConfig(name, config, threadID, skipResourceTemplates)
 	if err != nil {
 		return nil, revision, false, err
 	}
@@ -1627,8 +1873,9 @@ func (s *MCPService) listCatalogIfStable(name string, config *ServerConfig, thre
 // starts a short retry cooldown, so a flapping server neither drops its catalog
 // nor hammers the connection.
 func (s *MCPService) discoverToolCatalogForStatus(name string, config *ServerConfig, threadID string, retained MCPServerStatus) (*stdioInventory, error) {
+	skipResourceTemplates := retained.hostOwnedApps
 	if !s.mcpToolListRefreshApplies(name) {
-		return s.listInventoryForConfig(name, config, threadID)
+		return s.listInventoryForConfig(name, config, threadID, skipResourceTemplates)
 	}
 	state := s.toolListRefreshStateFor(name)
 	state.mu.Lock()
@@ -1644,7 +1891,7 @@ func (s *MCPService) discoverToolCatalogForStatus(name string, config *ServerCon
 	case mcpToolListNoChange:
 		// Nothing was invalidated on this connection, so the read lists the
 		// server exactly as a read without the feature does.
-		inventory, revision, stable, err := s.listCatalogIfStable(name, config, threadID)
+		inventory, revision, stable, err := s.listCatalogIfStable(name, config, threadID, skipResourceTemplates)
 		if err != nil {
 			return nil, err
 		}
@@ -1658,7 +1905,7 @@ func (s *MCPService) discoverToolCatalogForStatus(name string, config *ServerCon
 	// own pages is published.
 	var lastErr error
 	for attempt := 0; attempt < mcpToolListNotificationRefreshAttempts; attempt++ {
-		inventory, revision, stable, err := s.listCatalogIfStable(name, config, threadID)
+		inventory, revision, stable, err := s.listCatalogIfStable(name, config, threadID, skipResourceTemplates)
 		if err != nil {
 			lastErr = err
 			break
@@ -1746,10 +1993,27 @@ func (s *MCPService) populateStatusInventories(params *MCPListServerStatusParams
 		// Rust #38217's lazy-startup behavior still applies to required servers
 		// during non-blocking capture. Explicit turn/plugin requirements always
 		// wait for a live connection.
+		//
+		// Rust #60039: with `mcp_lazy_stdio_startup` a regular chat may also defer
+		// an eligible stdio server (optional, or required with catalog readiness)
+		// and connect on first use. The catalog still has to be warm, which
+		// cachedCatalogStartupTools checks below.
+		if params != nil && params.SkipDeferredStartup && len(servers[i].Tools) == 0 {
+			// Rust #60423: an aggregate resource listing reports a server that
+			// still needs a live start as deferred. A connected server already
+			// carries its tool catalog here, so only unstarted servers reach this
+			// branch and the read never launches them.
+			notStarted := MCPConnectionNotStarted
+			servers[i].RuntimeStatus = &notStarted
+			notifyMCPStartupObserver(observer, name, servers[i].State, servers[i].FailureReason, nil)
+			continue
+		}
+		lazyStdioStartup := s.lazyStdioStartup && mcpServerCanDeferStdioStartup(&config)
 		cachedStartupCandidate := !explicitlyRequired &&
 			(config.StartupReadiness.Effective() == MCPStartupReadinessCatalog ||
 				(params != nil && params.NonBlockingOptional &&
-					servers[i].State == MCPServerReady && config.Required))
+					servers[i].State == MCPServerReady && config.Required) ||
+				lazyStdioStartup)
 		if cachedStartupCandidate {
 			if tools, ok := s.cachedCatalogStartupTools(name, &config, servers[i]); ok {
 				servers[i].Tools = tools
@@ -1861,6 +2125,7 @@ func (s *MCPService) inventoryStatusForConfig(index int, name string, config *Se
 	// Rust #54656: an ordinary server whose connection reported a tool-list
 	// change is listed again before its catalog is published, and the previous
 	// catalog is retained when that refresh fails.
+	catalogGeneration := s.beginToolCatalogFetch(name, config)
 	inventory, err := s.discoverToolCatalogForStatus(name, config, threadID, status)
 	status.ServerCapabilities = nil
 	// A failed discovery reports no catalog metadata either, so the wire field
@@ -1880,8 +2145,17 @@ func (s *MCPService) inventoryStatusForConfig(index int, name string, config *Se
 		}
 		status.State = MCPServerReady
 		status.Error = nil
+		// A connection that negotiated the modern protocol records that
+		// generation before publishing, so a discovery client never reuses a
+		// catalog that predates this handshake (Rust #60037).
+		if inventory.NegotiatedModern {
+			s.recordModernToolCatalogDiscovery(name, config, catalogGeneration)
+		}
+		// Publish into the process-scoped cache so a later chat can start from
+		// this catalog instead of launching the server (Rust ToolCatalogCache).
+		s.publishToolCatalog(name, config, catalogGeneration, inventory.Tools, inventory.ServerCapabilities)
 	} else if isRunnableMCPConfig(config) {
-		message := err.Error()
+		message := mcpStartupErrorMessage(err)
 		authStatus := s.authStatusForConfig(name, config)
 		if display, ok := mcpInitAuthErrorDisplay(name, config, authStatus, err); ok {
 			message = display
@@ -1893,6 +2167,12 @@ func (s *MCPService) inventoryStatusForConfig(index int, name string, config *Se
 		status.State = MCPServerFailed
 		status.Error = &message
 		status.ToolsError = &message
+		if !errors.Is(err, context.Canceled) {
+			// Rust #42370: log exactly once per startup attempt, including
+			// attempts whose optional-startup result is dropped before any
+			// observer notification, and keep the wrapped causes visible.
+			slog.Warn("MCP server startup failed", "server_name", name, "error", message)
+		}
 		// Rust #53672: startup recovery must not remove Codex Apps functions the
 		// model already discovered. The failed state still reports the error, but
 		// the retained catalog remains available to binding capture and a later
@@ -1923,6 +2203,27 @@ func notifyMCPStartupObserver(observer MCPStartupObserver, name string, status M
 	}
 }
 
+// mcpStartupErrorMessage renders err together with its wrapped causes,
+// mirroring Rust's format!("{error:#}") for cloneable startup outcomes
+// (Rust #42370). Wrappers that already embed their cause are not repeated.
+func mcpStartupErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	message := ""
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		text := strings.TrimSpace(current.Error())
+		if text == "" || strings.HasSuffix(message, text) {
+			continue
+		}
+		if message != "" {
+			message += ": "
+		}
+		message += text
+	}
+	return message
+}
+
 // mcpInitAuthErrorDisplay returns the user-facing startup error for a server
 // whose MCP initialization was rejected for authentication. It mirrors Rust's
 // mcp_init_error_display: an OAuth credential that the server rejects is
@@ -1945,6 +2246,18 @@ func mcpInitAuthErrorDisplay(serverName string, config *ServerConfig, authStatus
 func mcpErrAuthenticationRequired(err error) bool {
 	if err == nil {
 		return false
+	}
+	// Rust #55691: an enterprise token-source failure classifies a required
+	// sign-in by credential kind and exchange stage, so a resource authorization
+	// rejection is not reported as a login failure. A raw sanitized failure keeps
+	// its own classification.
+	var tokenSourceErr *EMATokenSourceError
+	if errors.As(err, &tokenSourceErr) {
+		return tokenSourceErr.IsAuthenticationRequired()
+	}
+	var emaFailure *EMAAuthFailure
+	if errors.As(err, &emaFailure) {
+		return emaFailure.IsAuthenticationRequired()
 	}
 	var status *mcpHTTPStatusError
 	return errors.As(err, &status) && (status.StatusCode == 401 || status.StatusCode == 407)
@@ -2103,7 +2416,16 @@ func mcpToolCatalogGraceKeyWithFeatures(name string, config *ServerConfig, openA
 		return "", false
 	}
 	if strings.TrimSpace(config.Command) != "" {
-		return strings.TrimSpace(name) + "\x00" + mcpConnectionCacheKeyWithFeatures(config, openAIForm, userVerification), true
+		// Rust #57210 keys a discovering connection by the legacy catalog mode:
+		// an unmarked helper is expected to fall back, and a modern negotiation
+		// invalidates that legacy catalog instead of publishing into it.
+		catalogConfig := config
+		if catalogConfig.ProtocolMode == MCPProtocolDiscoverLocalStdio {
+			cloned := cloneServerConfig(catalogConfig)
+			cloned.ProtocolMode = MCPProtocolLegacy
+			catalogConfig = &cloned
+		}
+		return strings.TrimSpace(name) + "\x00" + mcpConnectionCacheKeyWithFeatures(catalogConfig, openAIForm, userVerification), true
 	}
 	if strings.TrimSpace(config.URL) == "" {
 		return "", false
@@ -2133,6 +2455,12 @@ func (s *MCPService) OauthLogin(params *MCPServerOauthLoginParams) (*MCPServerOa
 	if err != nil {
 		return nil, err
 	}
+	// Rust #56266: a requirements denial also blocks the standalone login HTTP
+	// client (including its headers helper), so report it instead of minting an
+	// unusable authorization URL.
+	if config, ok := s.serverConfigIncludingDisabled(name); ok && managedconfig.MCPDisabledByManagedRequirements(config.DisabledReason) {
+		return nil, invalidMCPRequest("the MCP server is disabled by managed requirements")
+	}
 	// Rust #49276: the login attempt id is minted by the app-server when the
 	// login starts, returned in this response and echoed in the completion
 	// notification, so a client can match the two.
@@ -2140,9 +2468,10 @@ func (s *MCPService) OauthLogin(params *MCPServerOauthLoginParams) (*MCPServerOa
 	url := "http://localhost/oauth/" + name
 	if config, ok := s.serverConfig(name); ok && strings.TrimSpace(config.URL) != "" {
 		if config.EffectiveAuth() == ServerAuthEMAAuth {
-			// Enterprise MCP authorization is managed by Codex account sign-in
-			// (Rust #44832); ordinary MCP OAuth login is blocked for EMA.
-			return nil, invalidMCPRequest("EMA MCP connections are not enabled in this version")
+			// Enterprise MCP authorization is managed by Codex account
+			// enterprise sign-in (Rust #55334); ordinary MCP OAuth login is
+			// blocked for EMA.
+			return nil, invalidMCPRequest("enterprise MCP authorization uses account enterprise sign-in, not MCP OAuth login")
 		}
 		if config.EffectiveAuth() == ServerAuthChatGPT && !config.IsLocalEnvironment() {
 			return nil, invalidMCPRequest("OAuth login is not supported for executor-owned ChatGPT MCP servers")
@@ -2240,7 +2569,7 @@ func (s *MCPService) startOAuthLoginServer(name string, config *ServerConfig, pa
 		ServerName:                 config.OAuthCredentialName(name),
 		ServerURL:                  config.URL,
 		ClientID:                   clientID,
-		ClientSecret:               strings.TrimSpace(config.OAuthClientSecret),
+		ClientSecret:               config.OAuthClientSecret,
 		OmitClientSecretFromRecord: strings.TrimSpace(config.OAuthClientSecret) != "",
 		Issuer:                     strings.TrimSpace(discovery.Issuer),
 		RegistrationEndpoint:       discovery.RegistrationEndpoint,
@@ -2413,6 +2742,9 @@ func (s *MCPService) ReadResource(params *MCPResourceReadParams) (*MCPResourceRe
 	if err := validateMCPResourceOrigin(params); err != nil {
 		return nil, err
 	}
+	if err := validateMCPResourceReadCallerMeta(params.Meta, server); err != nil {
+		return nil, err
+	}
 	if err := validateMCPResourceTarget(params, server); err != nil {
 		return nil, err
 	}
@@ -2429,8 +2761,13 @@ func (s *MCPService) ReadResource(params *MCPResourceReadParams) (*MCPResourceRe
 		Scope:    resourceReadScopeKey(params),
 		Target:   resourceReadTargetKey(params),
 	}
-	if cached, ok := s.readCachedResource(cacheKey); ok {
-		return cached, nil
+	// Caller metadata can change server-side routing or content, so a read that
+	// carries it always reaches the server and is not stored in the cache.
+	cacheable := len(params.Meta) == 0
+	if cacheable {
+		if cached, ok := s.readCachedResource(cacheKey); ok {
+			return cached, nil
+		}
 	}
 	request := *params
 	request.Server = server
@@ -2448,27 +2785,33 @@ func (s *MCPService) ReadResource(params *MCPResourceReadParams) (*MCPResourceRe
 			if err := ValidateServerAuth(server, &config); err != nil {
 				return nil, err
 			}
-			response, err = readMCPHTTPResourceWithClient(s.httpClientForServer(server, &config), server, roots, s.elicitationHandlerForServer(server), s.progressHandler(), &request)
+			response, err = readMCPHTTPResourceWithClient(nil, s.httpClientForServer(server, &config), server, roots, s.elicitationHandlerForServer(server), s.progressHandler(), &request)
 			if err != nil {
 				return nil, err
 			}
 			setOrigin()
-			s.writeCachedResource(cacheKey, response)
+			if cacheable {
+				s.writeCachedResource(cacheKey, response)
+			}
 			return response, nil
 		}
 		if strings.TrimSpace(config.Command) != "" {
-			response, err = readMCPStdioResourceWithClient(s.stdioClientForServer(server, &config), server, roots, s.elicitationHandlerForServer(server), s.progressHandler(), &request)
+			response, err = readMCPStdioResourceWithLease(s.stdioClientForServer(server, &config), s.stdioConnectionLease(server), server, roots, s.elicitationHandlerForServer(server), s.progressHandler(), &request)
 			if err != nil {
 				return nil, err
 			}
 			setOrigin()
-			s.writeCachedResource(cacheKey, response)
+			if cacheable {
+				s.writeCachedResource(cacheKey, response)
+			}
 			return response, nil
 		}
 	}
 	response = &MCPResourceReadResponse{Contents: []MCPResourceContent{{URI: uri, MimeType: "text/plain", Text: ""}}}
 	setOrigin()
-	s.writeCachedResource(cacheKey, response)
+	if cacheable {
+		s.writeCachedResource(cacheKey, response)
+	}
 	return response, nil
 }
 
@@ -2486,6 +2829,30 @@ func validateMCPResourceOrigin(params *MCPResourceReadParams) error {
 	}
 	if origin != "" && strings.ContainsAny(origin, " \t\r\n") {
 		return invalidMCPRequest("originCallId must be a single call id")
+	}
+	return nil
+}
+
+// validateMCPResourceReadCallerMeta rejects metadata the host owns. A normal
+// MCP server may use connector_id/link_id as caller data; codex_apps reserves
+// them, and its legacy nested resource_uri, for app and account routing.
+func validateMCPResourceReadCallerMeta(meta map[string]any, server string) error {
+	codexApps := IsCodexAppsMCPServerName(server)
+	for key, value := range meta {
+		reserved := key == "threadId" || key == MCPToolTurnMetadataMetaKey || key == ConnectionLeaseMetaKey
+		if codexApps && (key == "connector_id" || key == "link_id") {
+			reserved = true
+		}
+		if codexApps && key == "_codex_apps" {
+			if object, ok := value.(map[string]any); ok {
+				if _, present := object["resource_uri"]; present {
+					return invalidMCPRequest("reserved resource read metadata key: _codex_apps.resource_uri")
+				}
+			}
+		}
+		if reserved {
+			return invalidMCPRequest("reserved resource read metadata key: " + key)
+		}
 	}
 	return nil
 }
@@ -2559,8 +2926,11 @@ func (s *MCPService) CallTool(params *MCPToolCallParams) (*MCPToolCallResponse, 
 	// call its sandbox policy and launcher metadata.
 	var httpTarget *httpClient
 	var stdioTarget *stdioClient
+	var serverConfigValue *ServerConfig
 	serverEnvironmentID := ""
 	if config, ok := s.serverConfig(server); ok {
+		configCopy := config
+		serverConfigValue = &configCopy
 		serverEnvironmentID = config.EffectiveEnvironmentID()
 		if strings.TrimSpace(config.URL) != "" {
 			if err := ValidateServerAuth(server, &config); err != nil {
@@ -2572,16 +2942,26 @@ func (s *MCPService) CallTool(params *MCPToolCallParams) (*MCPToolCallResponse, 
 		}
 	}
 	effective, meta := s.prepareToolCallSandboxState(server, serverEnvironmentID, stdioTarget != nil, params, httpTarget.sandboxStateMetaNegotiated(), stdioTarget.sandboxStateMetaNegotiated())
+	// The read-only marker belongs to the resolved metadata, so it survives a
+	// resolver rebuild. The policy metadata itself is resolved against the
+	// session that sends each attempt, while caller-supplied policy metadata is
+	// always discarded (Rust #56278).
+	meta = mcpMetaWithReadOnlyTools(meta, serverConfigValue)
+	metaForSession := s.mcpNetworkPolicyMetaForToolCall(server, serverConfigValue, effective.ServerEnvironmentID, meta)
 	roots := s.rootsForThread(effective.ThreadID)
 	if httpTarget != nil {
 		ctx := params.Context
 		if ctx == nil {
 			ctx = context.Background()
 		}
-		return callMCPHTTPToolWithClient(ctx, httpTarget, server, effective.ThreadID, effective.TurnID, effective.ItemID, roots, s.elicitationHandlerForServer(server), s.progressHandler(), tool, effective.Arguments, meta)
+		return callMCPHTTPToolWithClient(ctx, httpTarget, server, effective.ThreadID, effective.TurnID, effective.ItemID, roots, s.elicitationHandlerForServer(server), s.progressHandler(), tool, effective.Arguments, meta, metaForSession)
 	}
 	if stdioTarget != nil {
-		return callMCPStdioToolWithClient(stdioTarget, server, effective.ThreadID, effective.TurnID, effective.ItemID, roots, s.elicitationHandlerForServer(server), s.progressHandler(), tool, effective.Arguments, meta)
+		resolvedMeta, err := metaForSession(stdioTarget.serverCapabilitiesRaw())
+		if err != nil {
+			return nil, err
+		}
+		return callMCPStdioToolWithLease(stdioTarget, s.stdioConnectionLease(server), server, effective.ThreadID, effective.TurnID, effective.ItemID, roots, s.elicitationHandlerForServer(server), s.progressHandler(), tool, effective.Arguments, resolvedMeta)
 	}
 	encoded, err := json.Marshal(params.Arguments)
 	if err != nil {
@@ -2637,14 +3017,20 @@ func (s *MCPService) sandboxStateToolCallParams(server string, environmentID str
 // permissionProfileJSONForServer serializes the authority published for the
 // server (falling back to the thread authority) as the opaque policy document
 // the sandbox CLI parses.
-func (s *MCPService) permissionProfileJSONForServer(server string) string {
+// permissionProfileForServer returns the authority published for a server,
+// falling back to the thread authority (Rust permission_profile_for_server).
+func (s *MCPService) permissionProfileForServer(server string) *sandbox.PermissionProfile {
 	if s == nil {
-		return ""
+		return nil
 	}
-	profile, ok := s.PermissionProfileForServer(server)
-	if !ok || profile == nil {
-		profile = s.PermissionProfile()
+	if profile, ok := s.PermissionProfileForServer(server); ok && profile != nil {
+		return profile
 	}
+	return s.PermissionProfile()
+}
+
+func (s *MCPService) permissionProfileJSONForServer(server string) string {
+	profile := s.permissionProfileForServer(server)
 	if profile == nil {
 		return ""
 	}
@@ -2815,6 +3201,21 @@ func withMCPToolCallIDsMeta(meta any, params *MCPToolCallParams) any {
 	return out
 }
 
+// serverConfigIncludingDisabled returns a configured server even when it is
+// disabled, so callers can report why (Rust #56266).
+func (s *MCPService) serverConfigIncludingDisabled(name string) (ServerConfig, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	name = strings.TrimSpace(name)
+	if config, ok := s.configs[name]; ok {
+		return cloneServerConfig(&config), true
+	}
+	if config, ok := s.disabledConfigs[name]; ok {
+		return cloneServerConfig(&config), true
+	}
+	return ServerConfig{}, false
+}
+
 func (s *MCPService) serverConfig(name string) (ServerConfig, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2835,7 +3236,49 @@ func (s *MCPService) ServerConfigForServer(name string) (ServerConfig, bool) {
 	return s.serverConfig(name)
 }
 
-func (s *MCPService) listInventoryForConfig(name string, config *ServerConfig, threadID string) (*stdioInventory, error) {
+// ResolvedServerForServer returns the effective registration for an enabled
+// server: its winning source, plugin attribution, and config. It mirrors the
+// resolved-catalog lookup Rust's AgentMcpMetadataRecipient performs (#58378).
+func (s *MCPService) ResolvedServerForServer(name string) (ResolvedServer, bool) {
+	if s == nil {
+		return ResolvedServer{}, false
+	}
+	name = strings.TrimSpace(name)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	config, ok := s.configs[name]
+	if !ok || !config.Enabled {
+		return ResolvedServer{}, false
+	}
+	status, ok := s.servers[name]
+	if !ok {
+		return ResolvedServer{}, false
+	}
+	resolved := ResolvedServer{
+		Source:           status.source,
+		Config:           cloneServerConfig(&config),
+		CredentialPolicy: EffectiveCredentialPolicy(config.CredentialPolicy),
+	}
+	if status.PluginID != nil {
+		if pluginID := strings.TrimSpace(*status.PluginID); pluginID != "" {
+			resolved.PluginAttribution = &PluginAttribution{PluginID: pluginID, HostRoot: status.pluginHostRoot}
+		}
+	}
+	return resolved, true
+}
+
+// serverEnvironmentID reports the environment that owns one runtime server
+// (Rust McpRuntimeContext::server_environment_id). Servers without a runtime
+// configuration report no owner.
+func (s *MCPService) serverEnvironmentID(server string) string {
+	config, ok := s.ServerConfigForServer(server)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(config.EffectiveEnvironmentID())
+}
+
+func (s *MCPService) listInventoryForConfig(name string, config *ServerConfig, threadID string, skipResourceTemplates bool) (*stdioInventory, error) {
 	// Rust #48143: an executor-discovered declaration may only reach a remote
 	// HTTP transport that needs no host environment headers, helpers or bearer
 	// tokens, and the rejection happens before any host value is read.
@@ -2847,10 +3290,10 @@ func (s *MCPService) listInventoryForConfig(name string, config *ServerConfig, t
 		if err := ValidateServerAuth(name, config); err != nil {
 			return nil, err
 		}
-		return listMCPHTTPInventoryWithOptions(s.httpClientForServer(name, config), name, threadID, roots)
+		return listMCPHTTPInventoryWithOptions(s.httpClientForServer(name, config), name, threadID, roots, skipResourceTemplates)
 	}
 	if config != nil && strings.TrimSpace(config.Command) != "" {
-		return listMCPStdioInventoryWithOptions(s.stdioClientForServer(name, config), name, threadID, roots)
+		return listMCPStdioInventoryWithOptions(s.stdioClientForServer(name, config), name, threadID, roots, skipResourceTemplates)
 	}
 	return listMCPInventory(config)
 }
@@ -2872,14 +3315,14 @@ func (s *MCPService) httpClientForServer(name string, config *ServerConfig) *htt
 		s.httpClients = map[string]*cachedMCPHTTPClient{}
 	}
 	openAIForm := s.openAIForm
-	userVerification := openAIForm && s.serverAllowsUserVerificationLocked(name)
+	userVerification := s.serverAllowsUserVerificationLocked(name)
 	sharedHTTPClient := s.sharedHTTPClient
 	sharedHTTPClientKey := s.sharedHTTPClientKey
 	if config.HTTPClient != nil {
 		sharedHTTPClient = config.HTTPClient
 		sharedHTTPClientKey = mcpHTTPDoerIdentity(config.HTTPClient)
 	}
-	key := mcpHTTPConnectionCacheKey(config, openAIForm, userVerification, sharedHTTPClientKey)
+	key := s.mcpHTTPClientCacheKey(config, openAIForm, userVerification, sharedHTTPClientKey)
 	if cached := s.httpClients[name]; cached != nil && cached.key == key && cached.client != nil && !cached.client.isClosed() &&
 		(cached.client.isInitialized() || cached.startupTimeout == config.StartupTimeout) {
 		s.mu.Unlock()
@@ -2887,7 +3330,12 @@ func (s *MCPService) httpClientForServer(name string, config *ServerConfig) *htt
 	}
 	old := s.deleteHTTPClientLocked(name)
 	cloned := cloneServerConfig(config)
-	client := newMCPHTTPClientWithFeatures(&cloned, openAIForm, userVerification, sharedHTTPClient)
+	client := newMCPHTTPClientWithCapabilities(&cloned, mcpClientFeatures{
+		OpenAIForm:       openAIForm,
+		UserVerification: userVerification,
+		EMAAuth:          cloned.EMAAuthExtension,
+		NetworkPolicy:    s.networkPolicyAdvertisedForServer(config),
+	}, sharedHTTPClient)
 	s.httpClients[name] = &cachedMCPHTTPClient{key: key, client: client, startupTimeout: config.StartupTimeout}
 	s.mu.Unlock()
 	closeHTTPClients([]*httpClient{old})
@@ -2896,6 +3344,21 @@ func (s *MCPService) httpClientForServer(name string, config *ServerConfig) *htt
 
 func mcpHTTPConnectionCacheKey(config *ServerConfig, openAIForm bool, userVerification bool, sharedHTTPClientKey string) string {
 	return mcpConnectionCacheKeyWithFeatures(config, openAIForm, userVerification) + "|httpClient=" + sharedHTTPClientKey
+}
+
+// mcpStdioClientCacheKey scopes a cached connection to the capabilities it
+// advertised, so a call can never reuse a connection that did not offer the
+// network policy capability (Rust #56278).
+func (s *MCPService) mcpStdioClientCacheKey(config *ServerConfig, openAIForm bool, userVerification bool) string {
+	key := mcpConnectionCacheKeyWithFeatures(config, openAIForm, userVerification)
+	if s.networkPolicyAdvertisedForServer(config) {
+		key += "|networkPolicy=1"
+	}
+	return key
+}
+
+func (s *MCPService) mcpHTTPClientCacheKey(config *ServerConfig, openAIForm bool, userVerification bool, sharedHTTPClientKey string) string {
+	return s.mcpStdioClientCacheKey(config, openAIForm, userVerification) + "|httpClient=" + sharedHTTPClientKey
 }
 
 func mcpHTTPDoerIdentity(client HTTPDoer) string {
@@ -2991,6 +3454,26 @@ func mcpReferencedEnvironmentVariables(config *ServerConfig) []string {
 	return references
 }
 
+// stdioConnectionLease reports this chat's server-side lease id for a pooled
+// stdio server, or an empty string when the helper did not negotiate the
+// extension (Rust #57978).
+func (s *MCPService) stdioConnectionLease(name string) *mcpChatLease {
+	if s == nil {
+		return nil
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cached := s.stdioClients[name]
+	if cached == nil {
+		return nil
+	}
+	return cached.lease
+}
+
 func (s *MCPService) stdioClientForServer(name string, config *ServerConfig) *stdioClient {
 	if config == nil {
 		return newMCPStdioClient(nil)
@@ -3011,21 +3494,90 @@ func (s *MCPService) stdioClientForServer(name string, config *ServerConfig) *st
 		s.stdioClients = map[string]*cachedMCPStdioClient{}
 	}
 	openAIForm := s.openAIForm
-	userVerification := openAIForm && s.serverAllowsUserVerificationLocked(name)
+	userVerification := s.serverAllowsUserVerificationLocked(name)
 	authChanges := s.authChangeSource
-	key := mcpConnectionCacheKeyWithFeatures(config, openAIForm, userVerification)
+	key := s.mcpStdioClientCacheKey(config, openAIForm, userVerification)
 	if cached := s.stdioClients[name]; cached != nil && cached.key == key && cached.client != nil && !cached.client.isClosed() &&
 		(cached.client.isInitialized() || cached.startupTimeout == config.StartupTimeout) {
 		s.mu.Unlock()
 		return cached.client
 	}
 	old := s.deleteStdioClientLocked(name)
-	client := newMCPStdioClientWithFeatures(config, openAIForm, userVerification)
-	client.authChanges = authChanges
-	s.stdioClients[name] = &cachedMCPStdioClient{key: key, client: client, startupTimeout: config.StartupTimeout}
+	var (
+		client  *stdioClient
+		release func()
+		lease   *mcpChatLease
+	)
+	if s.mcpStdioSharingEligible(name, config) {
+		client, lease, release = sharedMCPStdioConnections.acquire(mcpStdioPoolKey(key, config, mcpStdioAuthScopeFor(authChanges)), func() *stdioClient {
+			created := newMCPStdioClientWithCapabilities(config, mcpClientFeatures{
+				OpenAIForm:       openAIForm,
+				UserVerification: userVerification,
+				NetworkPolicy:    s.networkPolicyAdvertisedForServer(config),
+			})
+			created.authChanges = authChanges
+			return created
+		})
+	} else {
+		client = newMCPStdioClientWithCapabilities(config, mcpClientFeatures{
+			OpenAIForm:       openAIForm,
+			UserVerification: userVerification,
+			NetworkPolicy:    s.networkPolicyAdvertisedForServer(config),
+		})
+		client.authChanges = authChanges
+	}
+	var previous *stdioClient
+	if old != nil {
+		previous = old.client
+	}
+	if release == nil && mcpStdioUpgradeFromLegacy(previous, config, openAIForm, userVerification) {
+		// A forced reconnect must wait for the previously published helper to
+		// exit, but a working legacy helper stays available until the upgrade
+		// proves itself: a failed discovery for the same account falls back to
+		// it instead of failing the chat (Rust #57210).
+		client.legacyFallback = previous
+		old = nil
+	}
+	s.stdioClients[name] = &cachedMCPStdioClient{key: key, client: client, startupTimeout: config.StartupTimeout, release: release, lease: lease}
 	s.mu.Unlock()
-	closeStdioClients([]*stdioClient{old})
+	closeCachedStdioClients([]*cachedMCPStdioClient{old})
 	return client
+}
+
+// mcpStdioConnectionFamilyKey identifies the helper a config would launch while
+// ignoring the protocol handshake, so an upgrade attempt can recognize the
+// legacy connection it replaces.
+func mcpStdioConnectionFamilyKey(config *ServerConfig, openAIForm bool, userVerification bool) string {
+	if config == nil {
+		return ""
+	}
+	family := config
+	if family.ProtocolMode != MCPProtocolLegacy {
+		cloned := cloneServerConfig(family)
+		cloned.ProtocolMode = MCPProtocolLegacy
+		family = &cloned
+	}
+	return mcpConnectionCacheKeyWithFeatures(family, openAIForm, userVerification)
+}
+
+// mcpStdioUpgradeFromLegacy reports whether previous is a ready legacy
+// connection for the same helper that config now wants to connect with a
+// protocol it has not negotiated yet.
+func mcpStdioUpgradeFromLegacy(previous *stdioClient, config *ServerConfig, openAIForm bool, userVerification bool) bool {
+	if previous == nil || config == nil {
+		return false
+	}
+	if config.ProtocolMode != MCPProtocolDiscoverLocalStdio && config.ProtocolMode != MCPProtocol20260728 {
+		return false
+	}
+	if previous.legacyDelegate() != nil || previous.isClosed() || !previous.isInitialized() {
+		return false
+	}
+	if previous.protocolModeSnapshot() != MCPProtocolLegacy {
+		return false
+	}
+	return mcpStdioConnectionFamilyKey(previous.config, previous.openAIForm, previous.userVerification) ==
+		mcpStdioConnectionFamilyKey(config, openAIForm, userVerification)
 }
 
 // authChangeSourceSnapshot returns the configured auth-change source.
@@ -3036,6 +3588,31 @@ func (s *MCPService) authChangeSourceSnapshot() MCPAuthChangeSource {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.authChangeSource
+}
+
+// mcpStdioAuthScope returns the credential scope that keeps a pooled stdio
+// connection private to one credential source (Rust #57211 ConnectionKey's
+// auth_state): sharing survives a credential refresh but not an owner or login
+// change. A source that cannot describe its scope stays one opaque scope, and a
+// service without a source shares freely like Rust's absent auth_state.
+func (s *MCPService) mcpStdioAuthScope() string {
+	return mcpStdioAuthScopeFor(s.authChangeSourceSnapshot())
+}
+
+// mcpStdioAuthScopeFor derives the pool scope from an already captured source
+// so callers holding the service lock never re-enter it.
+func mcpStdioAuthScopeFor(source MCPAuthChangeSource) string {
+	if source == nil {
+		return "auth=none"
+	}
+	scoper, ok := source.(MCPConnectionAuthScoper)
+	if !ok {
+		return "auth=opaque"
+	}
+	if scope := strings.TrimSpace(scoper.MCPConnectionAuthScope()); scope != "" {
+		return scope
+	}
+	return "auth=none"
 }
 
 // SetAuthChangeSource installs the source used to notify opted-in stdio MCP
@@ -3090,11 +3667,11 @@ func (s *MCPService) serverAllowsUserVerification(serverName string) bool {
 }
 
 func (s *MCPService) serverAllowsUserVerificationLocked(serverName string) bool {
-	return mcpServerAllowsUserVerification(s.servers, serverName, s.openAIForm)
+	return mcpServerAllowsUserVerification(s.servers, serverName, s.userVerification)
 }
 
-func mcpServerAllowsUserVerification(servers map[string]MCPServerStatus, serverName string, openAIForm bool) bool {
-	if !openAIForm {
+func mcpServerAllowsUserVerification(servers map[string]MCPServerStatus, serverName string, userVerification bool) bool {
+	if !userVerification {
 		return false
 	}
 	status, ok := servers[strings.TrimSpace(serverName)]
@@ -3180,9 +3757,15 @@ func (s *MCPService) authStatusForConfig(name string, config *ServerConfig) MCPA
 		return MCPAuthUnsupported
 	}
 	if config.EffectiveAuth() == ServerAuthEMAAuth {
-		// EMA connections are not enabled until the runtime stage of the stack
-		// (Rust #44832).
-		return MCPAuthUnsupported
+		// Rust #55334: enterprise authorization is reported like OAuth once the
+		// account-scoped IdP grant exists, and as not signed in before that.
+		if !config.EMAConfigured {
+			return MCPAuthUnsupported
+		}
+		if config.EMACredentialsAvailable {
+			return MCPAuthOAuth
+		}
+		return MCPAuthNotLoggedIn
 	}
 	if strings.TrimSpace(config.BearerTokenEnvVar) != "" {
 		return MCPAuthBearerToken
@@ -3307,39 +3890,69 @@ func (s *MCPService) clearStdioClients() {
 	clients := s.stdioClientsForCloseLocked()
 	s.stdioClients = map[string]*cachedMCPStdioClient{}
 	s.mu.Unlock()
-	closeStdioClients(clients)
+	retireCachedStdioClients(clients)
 }
 
-func (s *MCPService) stdioClientsForCloseLocked() []*stdioClient {
+func (s *MCPService) stdioClientsForCloseLocked() []*cachedMCPStdioClient {
 	if s == nil || len(s.stdioClients) == 0 {
 		return nil
 	}
-	clients := make([]*stdioClient, 0, len(s.stdioClients))
+	clients := make([]*cachedMCPStdioClient, 0, len(s.stdioClients))
 	for _, cached := range s.stdioClients {
 		if cached != nil && cached.client != nil {
-			clients = append(clients, cached.client)
+			clients = append(clients, cached)
 		}
 	}
 	return clients
 }
 
-func (s *MCPService) deleteStdioClientLocked(name string) *stdioClient {
+func (s *MCPService) deleteStdioClientLocked(name string) *cachedMCPStdioClient {
 	if s == nil || s.stdioClients == nil {
 		return nil
 	}
 	cached := s.stdioClients[name]
 	delete(s.stdioClients, name)
-	if cached == nil {
-		return nil
+	return cached
+}
+
+// closeCachedStdioClients releases pooled connections and closes private ones.
+// Releasing a shared connection keeps the helper running for other chats.
+func closeCachedStdioClients(cached []*cachedMCPStdioClient) {
+	for _, entry := range cached {
+		if entry == nil {
+			continue
+		}
+		if entry.release != nil {
+			entry.release()
+			entry.release = nil
+			continue
+		}
+		closeStdioClients([]*stdioClient{entry.client})
 	}
-	return cached.client
+}
+
+// retireCachedStdioClients retires pooled connections before releasing them:
+// a forced refresh must start a fresh helper for new chats, while chats that
+// already share the old helper keep it until their own release (Rust #57211).
+func retireCachedStdioClients(cached []*cachedMCPStdioClient) {
+	for _, entry := range cached {
+		if entry == nil || entry.release == nil || entry.client == nil {
+			continue
+		}
+		sharedMCPStdioConnections.retireClient(entry.client)
+	}
+	closeCachedStdioClients(cached)
 }
 
 func closeStdioClients(clients []*stdioClient) {
 	for _, client := range clients {
-		if client != nil {
-			_ = client.Close()
+		if client == nil {
+			continue
 		}
+		if fallback := client.takeLegacyFallback(); fallback != nil {
+			_ = fallback.Close()
+		}
+		_ = client.Close()
 	}
 }
 
@@ -3379,6 +3992,7 @@ func cancelOAuthLogins(logins []*OAuthLoginServer) {
 func cloneMCPServerStatus(status MCPServerStatus) MCPServerStatus {
 	status.RuntimeStatus = cloneMCPConnectionStatus(status.RuntimeStatus)
 	status.PluginID = cloneStringPtr(status.PluginID)
+	status.HTTPOrigin = cloneStringPtr(status.HTTPOrigin)
 	status.ServerCapabilities = cloneMCPRawMessage(status.ServerCapabilities)
 	status.ToolListMeta = cloneMCPRawMessage(status.ToolListMeta)
 	status.FailureReason = cloneStringPtr(status.FailureReason)

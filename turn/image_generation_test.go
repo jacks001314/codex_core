@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"codex_core/codemode"
 	"codex_core/codexapi"
 	"codex_core/eventmap"
 	"codex_core/model"
@@ -20,7 +21,7 @@ import (
 )
 
 func TestImageGenerationUsageLimitFailureDetectionLikeRust(t *testing.T) {
-	failure := imageGenerationUsageLimitFailure([]byte(`{"error":{"message":"usage limit","limit_id":"image_gen","resets_at":1786000000}}`))
+	failure := imageGenerationUsageLimitFailure([]byte(`{"error":{"message":"usage limit","limit_id":"image_gen","resets_at":1786000000}}`), nil)
 	if failure == nil {
 		t.Fatal("failure = nil, want usageLimitExceeded")
 	}
@@ -32,11 +33,26 @@ func TestImageGenerationUsageLimitFailureDetectionLikeRust(t *testing.T) {
 		t.Fatalf("resetsAt = %#v", failure["resetsAt"])
 	}
 	// Non-image limits and malformed bodies are not treated as failures.
-	if got := imageGenerationUsageLimitFailure([]byte(`{"error":{"limit_id":"other"}}`)); got != nil {
+	if got := imageGenerationUsageLimitFailure([]byte(`{"error":{"limit_id":"other"}}`), nil); got != nil {
 		t.Fatalf("other limit failure = %#v, want nil", got)
 	}
-	if got := imageGenerationUsageLimitFailure([]byte(`not json`)); got != nil {
+	if got := imageGenerationUsageLimitFailure([]byte(`not json`), nil); got != nil {
 		t.Fatalf("malformed failure = %#v, want nil", got)
+	}
+}
+
+func TestImageGenerationDeclaresCodeModeResultWithoutChangingDirectAPILikeRust(t *testing.T) {
+	spec := NewImageGenerationHandler(nil).Spec()
+	augmented := codemode.AugmentToolSpec(spec)
+	if want := "): Promise<{ image_url: string; output_hint?: string; }>;"; !strings.Contains(augmented.Description, want) {
+		t.Fatalf("code-mode declaration = %q, want return type %q", augmented.Description, want)
+	}
+	payload, err := json.Marshal(model.ResponsesToolsFromSpecs([]tool.Spec{spec}))
+	if err != nil {
+		t.Fatalf("marshal tools: %v", err)
+	}
+	if strings.Contains(string(payload), "output_schema") {
+		t.Fatalf("direct API payload gained an output schema: %s", payload)
 	}
 }
 
@@ -330,7 +346,7 @@ func TestImageGenerationBackgroundArgumentMatchesRust(t *testing.T) {
 	}
 
 	// The advertised schema carries the new boolean property.
-	schema := imageGenerationSchema()
+	schema := imageGenerationSchema(false)
 	properties, ok := schema["properties"].(map[string]any)
 	if !ok {
 		t.Fatalf("schema properties = %#v", schema["properties"])
@@ -341,56 +357,65 @@ func TestImageGenerationBackgroundArgumentMatchesRust(t *testing.T) {
 	}
 }
 
-// TestRecentImageURLsRejectsFileBackedWindowsLikeRust mirrors Rust #45794's
-// `recent_images`: the window still counts file-backed images (so numbering
-// matches), a short window reports how many were available, and a window that
-// contains a file reference is rejected instead of silently editing an older
-// inline image.
-func TestRecentImageURLsRejectsFileBackedWindowsLikeRust(t *testing.T) {
+// TestRecentImageReferencesPassesFileBackedWindowsLikeRust mirrors Rust #47956:
+// the window still counts file-backed images (so numbering matches), a short
+// window reports how many were available, and file references pass through to
+// the edit request in selection order.
+func TestRecentImageReferencesPassesFileBackedWindowsLikeRust(t *testing.T) {
 	inline := func(url string) map[string]any {
 		return map[string]any{"type": "message", "content": []any{map[string]any{"type": "input_image", "image_url": url}}}
 	}
 	fileBacked := map[string]any{"type": "message", "content": []any{map[string]any{"type": "input_image", "file_id": "file_1"}}}
 
 	// All-inline windows come back in chronological order.
-	images, err := recentImageURLs([]any{inline("a"), inline("b")}, 2)
+	images, err := recentImageReferences([]any{inline("a"), inline("b")}, 2)
 	if err != nil {
-		t.Fatalf("recentImageURLs() error = %v", err)
+		t.Fatalf("recentImageReferences() error = %v", err)
 	}
 	if len(images) != 2 || images[0].ImageURL != "a" || images[1].ImageURL != "b" {
-		t.Fatalf("recentImageURLs() = %#v", images)
+		t.Fatalf("recentImageReferences() = %#v", images)
 	}
 
-	// A file-backed image inside the window is rejected.
-	_, err = recentImageURLs([]any{inline("a"), fileBacked}, 2)
-	if err == nil || err.Error() != "requested the last 2 conversation images, but that window includes a file-backed image that cannot be used for editing" {
-		t.Fatalf("recentImageURLs(file-backed) error = %v", err)
+	// A file-backed image inside the window is preserved after the inline image.
+	images, err = recentImageReferences([]any{inline("a"), fileBacked}, 2)
+	if err != nil {
+		t.Fatalf("recentImageReferences(file-backed) error = %v", err)
+	}
+	if len(images) != 2 || images[0].ImageURL != "a" || images[0].FileID != "" ||
+		images[1].ImageURL != "" || images[1].FileID != "file_1" {
+		t.Fatalf("recentImageReferences(file-backed) = %#v", images)
 	}
 
 	// A window shorter than requested reports the available count.
-	_, err = recentImageURLs([]any{inline("a")}, 3)
+	_, err = recentImageReferences([]any{inline("a")}, 3)
 	if err == nil || err.Error() != "requested the last 3 conversation images, but only 1 were available" {
-		t.Fatalf("recentImageURLs(short) error = %v", err)
+		t.Fatalf("recentImageReferences(short) error = %v", err)
 	}
 
 	// The camelCase spelling of the file reference is recognized too, and tool
 	// output content items count the same way.
-	_, err = recentImageURLs([]any{inline("a"), map[string]any{"type": "message", "content": []any{map[string]any{"type": "input_image", "fileId": "file_2"}}}}, 2)
-	if err == nil || !strings.Contains(err.Error(), "file-backed image") {
-		t.Fatalf("recentImageURLs(camelCase file reference) error = %v", err)
+	images, err = recentImageReferences([]any{inline("a"), map[string]any{"type": "message", "content": []any{map[string]any{"type": "input_image", "fileId": "file_2"}}}}, 2)
+	if err != nil {
+		t.Fatalf("recentImageReferences(camelCase file reference) error = %v", err)
 	}
-	_, err = recentImageURLs([]any{
+	if len(images) != 2 || images[1].FileID != "file_2" {
+		t.Fatalf("recentImageReferences(camelCase file reference) = %#v", images)
+	}
+	images, err = recentImageReferences([]any{
 		inline("a"),
 		map[string]any{"type": "function_call_output", "output": []any{map[string]any{"type": "input_image", "file_id": "file_3"}}},
 	}, 2)
-	if err == nil || !strings.Contains(err.Error(), "file-backed image") {
-		t.Fatalf("recentImageURLs(file tool output) error = %v", err)
+	if err != nil {
+		t.Fatalf("recentImageReferences(file tool output) error = %v", err)
+	}
+	if len(images) != 2 || images[1].FileID != "file_3" {
+		t.Fatalf("recentImageReferences(file tool output) = %#v", images)
 	}
 }
 
-// TestImageGenerationEditRejectsFileBackedRecentWindow drives the same rule
-// through the tool arguments.
-func TestImageGenerationEditRejectsFileBackedRecentWindow(t *testing.T) {
+// TestImageGenerationEditPassesFileBackedRecentWindow drives the same rule
+// through the tool arguments (Rust #47956).
+func TestImageGenerationEditPassesFileBackedRecentWindow(t *testing.T) {
 	handler := NewImageGenerationHandler(&ImageGenerationOptions{
 		InputItems: []any{
 			map[string]any{"type": "message", "content": []any{map[string]any{"type": "input_image", "image_url": "data:image/png;base64,AAA"}}},
@@ -398,12 +423,22 @@ func TestImageGenerationEditRejectsFileBackedRecentWindow(t *testing.T) {
 		},
 	})
 	count := 2
-	_, _, err := handler.requestForArgs(context.Background(), &imageGenerationArgs{
+	request, _, err := handler.requestForArgs(context.Background(), &imageGenerationArgs{
 		Prompt:                 "add a frame",
 		NumLastImagesToInclude: &count,
 	})
-	if err == nil || !strings.Contains(err.Error(), "file-backed image that cannot be used for editing") {
+	if err != nil {
 		t.Fatalf("requestForArgs() error = %v", err)
+	}
+	if request.kind != imageGenerationRequestEdit {
+		t.Fatalf("request kind = %q, want edit", request.kind)
+	}
+	if len(request.edit.Images) != 2 ||
+		request.edit.Images[0].ImageURL != "data:image/png;base64,AAA" ||
+		request.edit.Images[0].FileID != "" ||
+		request.edit.Images[1].ImageURL != "" ||
+		request.edit.Images[1].FileID != "file_recent" {
+		t.Fatalf("edit images = %#v", request.edit.Images)
 	}
 }
 
@@ -511,5 +546,45 @@ func TestImageGenerationRecordsInputImageIdentityLikeRust(t *testing.T) {
 	}
 	if len(none) != 0 {
 		t.Fatalf("generation input images = %#v, want none", none)
+	}
+}
+
+// Rust #57275: the premium imagegen limit is recognized, and an exhausted
+// window's reset time fills in when the body carries none.
+func TestImageGenerationPremiumUsageLimitFailureLikeRust(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("x-codex-active-limit", "imagegen_premium")
+	headers.Set("x-imagegen-premium-primary-used-percent", "100.0")
+	headers.Set("x-imagegen-premium-primary-window-minutes", "1440")
+	headers.Set("x-imagegen-premium-primary-reset-at", "1786154400")
+	failure := imageGenerationUsageLimitFailure([]byte(`{"error":{"type":"usage_limit_reached","message":"image limit reached"}}`), headers)
+	if failure == nil {
+		t.Fatal("premium failure = nil, want usageLimitExceeded")
+	}
+	if failure["type"] != "usageLimitExceeded" || failure["limitId"] != "imagegen_premium" {
+		t.Fatalf("premium failure = %#v", failure)
+	}
+	resetsAt, ok := failure["resetsAt"].(*int64)
+	if !ok || *resetsAt != 1786154400 {
+		t.Fatalf("resetsAt = %#v, want the exhausted window reset", failure["resetsAt"])
+	}
+	// A body reset time wins over the header fallback.
+	withBody := imageGenerationUsageLimitFailure([]byte(`{"error":{"limit_id":"image_gen","resets_at":1786150800}}`), headers)
+	if withBody == nil {
+		t.Fatal("body reset failure = nil")
+	}
+	if got, ok := withBody["resetsAt"].(*int64); !ok || *got != 1786150800 {
+		t.Fatalf("body resetsAt = %#v, want the body value", withBody["resetsAt"])
+	}
+	// Neither a header limit id nor an exhausted window is a failure.
+	unrelated := http.Header{}
+	unrelated.Set("x-codex-active-limit", "premium")
+	if got := imageGenerationUsageLimitFailure([]byte(`{"error":{}}`), unrelated); got != nil {
+		t.Fatalf("unrelated limit = %#v, want nil", got)
+	}
+	noReset := http.Header{}
+	noReset.Set("x-codex-active-limit", "imagegen_premium")
+	if got := imageGenerationUsageLimitFailure([]byte(`{"error":{}}`), noReset); got == nil || got["resetsAt"] != (*int64)(nil) {
+		t.Fatalf("missing reset = %#v, want the limit with no reset time", got)
 	}
 }

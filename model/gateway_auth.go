@@ -9,6 +9,7 @@ package model
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -32,12 +33,14 @@ func gatewayAuthConfigFromInfo(config *GatewayOAuthConfig) auth.GatewayAuthConfi
 		resource = strings.TrimSpace(*config.Resource)
 	}
 	return auth.GatewayAuthConfig{
-		AuthorizationURL: strings.TrimSpace(config.AuthorizationURL),
-		TokenURL:         strings.TrimSpace(config.TokenURL),
-		ClientID:         strings.TrimSpace(config.ClientID),
-		Resource:         resource,
-		Scopes:           append([]string(nil), config.Scopes...),
-		RedirectPort:     config.RedirectPort,
+		AuthorizationURL:       strings.TrimSpace(config.AuthorizationURL),
+		DeviceAuthorizationURL: strings.TrimSpace(config.DeviceAuthorizationURL),
+		TokenURL:               strings.TrimSpace(config.TokenURL),
+		ClientID:               strings.TrimSpace(config.ClientID),
+		Resource:               resource,
+		Scopes:                 append([]string(nil), config.Scopes...),
+		RedirectPort:           config.RedirectPort,
+		CredentialsStore:       strings.TrimSpace(config.CredentialsStore),
 	}
 }
 
@@ -90,9 +93,11 @@ func sharedGatewayAuthManager(config *GatewayOAuthConfig, codexHome string) (*au
 
 func gatewayAuthConfigEqual(left auth.GatewayAuthConfig, right auth.GatewayAuthConfig) bool {
 	if left.AuthorizationURL != right.AuthorizationURL ||
+		left.DeviceAuthorizationURL != right.DeviceAuthorizationURL ||
 		left.TokenURL != right.TokenURL ||
 		left.ClientID != right.ClientID ||
-		left.Resource != right.Resource {
+		left.Resource != right.Resource ||
+		left.CredentialsStore != right.CredentialsStore {
 		return false
 	}
 	if len(left.Scopes) != len(right.Scopes) {
@@ -126,6 +131,12 @@ func composeGatewayAuth(ctx context.Context, config *GatewayOAuthConfig, provide
 	}
 	token, err := provider.ResolveAccessToken(ctx)
 	if err != nil {
+		// Rust compose_auth preserves the two interactive-sign-in outcomes: a
+		// required sign-in means the credential was rejected, while a sign-in
+		// already in flight is only an invalid request.
+		if errors.Is(err, auth.ErrGatewayLoginRequired) || errors.Is(err, auth.ErrGatewayLoginInProgress) {
+			return AuthHeaders{}, err
+		}
 		return AuthHeaders{}, errors.New("Gateway OAuth authentication failed; check the gateway configuration and credential store.")
 	}
 	name, value, err := gatewayAuthHeader(config, token)
@@ -133,7 +144,7 @@ func composeGatewayAuth(ctx context.Context, config *GatewayOAuthConfig, provide
 		return AuthHeaders{}, err
 	}
 	if headerExists(primary.Headers, name) {
-		return AuthHeaders{}, errors.New("gateway OAuth conflicts with primary auth headers")
+		return AuthHeaders{}, fmt.Errorf("The model provider already sets the %s header. Choose a different header or cookie in gateway_oauth.delivery for the gateway token.", name)
 	}
 	headers := http.Header{}
 	for key, values := range primary.Headers {
@@ -150,13 +161,14 @@ func gatewayAuthHeader(config *GatewayOAuthConfig, token string) (string, string
 	if token == "" {
 		return "", "", errors.New("gateway OAuth returned an empty token")
 	}
-	switch config.Delivery.Kind {
+	delivery := config.Delivery.Effective()
+	switch delivery.Kind {
 	case "header":
-		name := strings.TrimSpace(config.Delivery.Name)
+		name := strings.TrimSpace(delivery.Name)
 		if !httpguts.ValidHeaderFieldName(name) {
 			return "", "", errors.New("invalid gateway header")
 		}
-		value := config.Delivery.HeaderScheme() + " " + token
+		value := delivery.HeaderScheme() + " " + token
 		if !httpguts.ValidHeaderFieldValue(value) {
 			return "", "", errors.New("invalid gateway OAuth token header")
 		}
@@ -166,7 +178,7 @@ func gatewayAuthHeader(config *GatewayOAuthConfig, token string) (string, string
 		if !validCookieOAuthToken(token) {
 			return "", "", errors.New("gateway OAuth token is not a valid cookie value")
 		}
-		value := strings.TrimSpace(config.Delivery.Name) + "=" + token
+		value := strings.TrimSpace(delivery.Name) + "=" + token
 		if !httpguts.ValidHeaderFieldValue(value) {
 			return "", "", errors.New("invalid gateway OAuth token header")
 		}

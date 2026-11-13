@@ -64,6 +64,8 @@ Set `Persist: true` in `ConfigOptions` or inject a `session.Store` through `core
 - `examples/session_resume`
 - `examples/session_lifecycle`
 - `examples/event_sink` (offline; shows event delivery without a model endpoint)
+- `examples/guardian_context` (offline; composes scoped Guardian context sections)
+- `examples/memory_citations` (offline; parses memory citations and validates thread ids)
 
 ## Validation
 

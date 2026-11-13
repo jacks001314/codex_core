@@ -3,8 +3,10 @@ package codemode
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
+	"time"
 )
 
 const (
@@ -131,6 +133,53 @@ func (r *ExecuteRequest) Validate() error {
 type WaitRequest struct {
 	CellID      CellID `json:"cell_id"`
 	YieldTimeMS uint64 `json:"yield_time_ms"`
+	// MaxOutputTokens limits this observation when the session uses server
+	// output truncation; client mode ignores it (Rust #57272). The stdio wire
+	// carries the budget on the enclosing host request, not this payload.
+	MaxOutputTokens *int `json:"-"`
+}
+
+// TerminateRequest stops a cell and optionally bounds its final observation
+// (Rust #57272).
+type TerminateRequest struct {
+	CellID          CellID
+	MaxOutputTokens *int
+}
+
+// TerminateRequestForCell builds the default terminate request for a cell.
+func TerminateRequestForCell(cellID CellID) TerminateRequest {
+	return TerminateRequest{CellID: cellID}
+}
+
+// OutputTruncation names who applies the output budget for exec and wait
+// observations (Rust CodeModeOutputTruncation).
+type OutputTruncation string
+
+const (
+	// OutputTruncationClient returns raw output and lets the caller truncate it.
+	OutputTruncationClient OutputTruncation = "client"
+	// OutputTruncationServer asks the host to apply each observation's budget
+	// before transmission. Requires the bounded-output-v1 host capability.
+	OutputTruncationServer OutputTruncation = "server"
+)
+
+// SessionOptions are the settings shared by every cell in one code-mode
+// session (Rust CodeModeSessionOptions).
+type SessionOptions struct {
+	CellExecutionLimits *CellExecutionLimits
+	OutputTruncation    OutputTruncation
+}
+
+// ValidateSessionOptions rejects malformed truncation settings. Whether a
+// provider can honor server truncation depends on the host's bounded-output-v1
+// capability and is negotiated when the session opens (Rust #58125).
+func ValidateSessionOptions(options SessionOptions) error {
+	switch options.OutputTruncation {
+	case "", OutputTruncationClient, OutputTruncationServer:
+		return nil
+	default:
+		return fmt.Errorf("unknown code-mode output truncation %q", options.OutputTruncation)
+	}
 }
 
 // CellExecutionLimits carries the optional per-cell resource limits shared by
@@ -144,18 +193,31 @@ func (l *CellExecutionLimits) IsZero() bool {
 	return l == nil || (l.MaxYieldTimeMS == nil && l.MaxHeapSizeBytes == nil)
 }
 
-// ClampYieldTimeMS applies the session's max_yield_time_ms to an execute or
-// wait yield time without terminating the running cell. A zero yield time
-// keeps its zero-timeout (fire-and-forget) semantics and is never raised by
-// the limit, mirroring Rust resolve_yield_timeout.
-func (l *CellExecutionLimits) ClampYieldTimeMS(yieldMS uint64) uint64 {
-	if l == nil || l.MaxYieldTimeMS == nil || yieldMS == 0 {
-		return yieldMS
+// maxYieldTimeMS bounds a yield time so the converted Duration cannot
+// overflow.
+const maxYieldTimeMS = uint64(math.MaxInt64 / int64(time.Millisecond))
+
+// YieldTimeout mirrors Rust's InProcessCodeModeSession::resolve_yield_timeout
+// (code-mode-runtime/src/service.rs): a yield time at or above
+// MIN_YIELD_TIME_FOR_GRACE gets a one-second grace so output published just
+// after the deadline still lands in this observation, and the session's
+// max_yield_time_ms then caps the result. A zero yield stays immediate and is
+// never raised by the limit.
+func (l *CellExecutionLimits) YieldTimeout(yieldMS uint64) time.Duration {
+	if yieldMS > maxYieldTimeMS {
+		yieldMS = maxYieldTimeMS
 	}
-	if yieldMS > *l.MaxYieldTimeMS {
-		return *l.MaxYieldTimeMS
+	timeout := time.Duration(yieldMS) * time.Millisecond
+	if yieldMS >= ProtocolMinYieldTimeForGrace {
+		timeout += time.Duration(ProtocolYieldGracePeriodMS) * time.Millisecond
 	}
-	return yieldMS
+	if l == nil || l.MaxYieldTimeMS == nil {
+		return timeout
+	}
+	if limit := time.Duration(*l.MaxYieldTimeMS) * time.Millisecond; timeout > limit {
+		return limit
+	}
+	return timeout
 }
 
 type WaitToPendingRequest struct {
@@ -167,6 +229,10 @@ type RuntimeResponse struct {
 	CellID       CellID        `json:"cell_id"`
 	ContentItems []ContentItem `json:"content_items"`
 	ErrorText    *string       `json:"error_text,omitempty"`
+	// ResultBufferedForNS measures how long a completed Result waited for
+	// retrieval (Rust #55653's `result_buffered_for`). Immediate delivery
+	// reports zero, and non-Result responses never carry a measurement.
+	ResultBufferedForNS uint64 `json:"result_buffered_for_ns,omitempty"`
 	// CodeModeHostDurationNS is the host's own measurement of the request
 	// (Rust #46288's `code_mode_host_duration_ns`): elapsed monotonic time from
 	// receipt of the Execute/Wait/Terminate request until its outcome is ready,
@@ -199,6 +265,9 @@ func (r RuntimeResponse) MarshalJSON() ([]byte, error) {
 	}
 	if variant == "Result" {
 		body["error_text"] = r.ErrorText
+		// Rust's wire payload always serializes the buffering measurement for a
+		// Result and defaults it to zero when an older host omits it (#55653).
+		body["result_buffered_for_ns"] = r.ResultBufferedForNS
 	}
 	return json.Marshal(map[string]any{variant: body})
 }
@@ -216,6 +285,9 @@ func (r *RuntimeResponse) UnmarshalJSON(data []byte) error {
 			CellID       CellID        `json:"cell_id"`
 			ContentItems []ContentItem `json:"content_items"`
 			ErrorText    *string       `json:"error_text"`
+			// Optional for compatibility with older hosts; absent decodes as zero
+			// (Rust's `#[serde(default)]`).
+			ResultBufferedForNS *uint64 `json:"result_buffered_for_ns"`
 			// Rust's host payload requires the measurement; zero is valid but
 			// absent is not (MissingCodeModeHostDuration).
 			CodeModeHostDurationNS *uint64 `json:"code_mode_host_duration_ns"`
@@ -232,6 +304,10 @@ func (r *RuntimeResponse) UnmarshalJSON(data []byte) error {
 			r.CellID = decoded.CellID
 			r.ContentItems = decoded.ContentItems
 			r.ErrorText = decoded.ErrorText
+			r.ResultBufferedForNS = 0
+			if decoded.ResultBufferedForNS != nil {
+				r.ResultBufferedForNS = *decoded.ResultBufferedForNS
+			}
 			r.CodeModeHostDurationNS = *decoded.CodeModeHostDurationNS
 			return nil
 		default:
@@ -259,6 +335,16 @@ func (o *WaitOutcome) RuntimeResponse() RuntimeResponse {
 		return RuntimeResponse{}
 	}
 	return o.Response
+}
+
+// ResultBufferedFor reports how long a completed result waited for retrieval
+// (Rust #55653's `WaitOutcome::result_buffered_for`). ok is false when this wait
+// did not retrieve a completed result.
+func (o *WaitOutcome) ResultBufferedFor() (time.Duration, bool) {
+	if o == nil || o.Variant != "LiveCell" || o.Response.Variant != "Result" {
+		return 0, false
+	}
+	return time.Duration(o.Response.ResultBufferedForNS), true
 }
 
 func (o WaitOutcome) MarshalJSON() ([]byte, error) {

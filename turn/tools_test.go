@@ -896,60 +896,48 @@ func TestBuildToolRegistryAppliesIndirectDescriptionPrefixesLikeRust(t *testing.
 	if err := json.Unmarshal([]byte(output.Body), &result); err != nil {
 		t.Fatalf("decode tool search: %v", err)
 	}
-	if len(result.Tools) != 1 || result.Tools[0].Description != "Drive guidance.\n\nDrive tools.\n\nFind Drive." {
+	if len(result.Tools) != 1 || result.Tools[0].Description != "Drive guidance.\n\nFind Drive.\n\nDrive tools." {
 		t.Fatalf("tool search results = %#v", result.Tools)
 	}
 }
 
 func TestBuildToolRegistryOrdersCodeModeToolDescriptionsLikeRust(t *testing.T) {
-	for _, test := range []struct {
-		name                 string
-		toolDescriptionFirst bool
-		want                 string
-	}{
-		{name: "namespace first", want: "Drive tools.\n\nFind Drive."},
-		{name: "tool first", toolDescriptionFirst: true, want: "Find Drive.\n\nDrive tools."},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			options := &ToolRegistryOptions{
-				EnableToolSearch:             true,
-				CodeModeToolDescriptionFirst: test.toolDescriptionFirst,
-				ExtraTools: []tool.Executor{
-					indirectPrefixMCPServerExecutor{
-						serverName: "drive",
-						spec: tool.Spec{
-							Name:                 tool.NamespacedName("mcp__drive", "find"),
-							Description:          "Find Drive.",
-							NamespaceDescription: "Drive tools.",
-							Exposure:             tool.ExposureDiscoverable,
-							Search:               &tool.SearchInfo{Text: "Find Drive."},
-						},
-					},
+	options := &ToolRegistryOptions{
+		EnableToolSearch: true,
+		ExtraTools: []tool.Executor{
+			indirectPrefixMCPServerExecutor{
+				serverName: "drive",
+				spec: tool.Spec{
+					Name:                 tool.NamespacedName("mcp__drive", "find"),
+					Description:          "Find Drive.",
+					NamespaceDescription: "Drive tools.",
+					Exposure:             tool.ExposureDiscoverable,
+					Search:               &tool.SearchInfo{Text: "Find Drive."},
 				},
-			}
-			registry, err := BuildToolRegistry(options)
-			if err != nil {
-				t.Fatalf("BuildToolRegistry() error = %v", err)
-			}
-			executor, ok := registry.Lookup(tool.PlainName(tool.ToolSearchName))
-			if !ok {
-				t.Fatal("tool_search executor is missing")
-			}
-			output, err := executor.Execute(context.Background(), &tool.Invocation{Payload: tool.Payload{
-				Kind:   tool.PayloadToolSearch,
-				Search: map[string]any{"query": "drive"},
-			}})
-			if err != nil || output == nil {
-				t.Fatalf("tool search = %#v, %v", output, err)
-			}
-			var result tool.ToolSearchResult
-			if err := json.Unmarshal([]byte(output.Body), &result); err != nil {
-				t.Fatalf("decode tool search: %v", err)
-			}
-			if len(result.Tools) != 1 || result.Tools[0].Description != test.want {
-				t.Fatalf("tool search results = %#v, want description %q", result.Tools, test.want)
-			}
-		})
+			},
+		},
+	}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatalf("BuildToolRegistry() error = %v", err)
+	}
+	executor, ok := registry.Lookup(tool.PlainName(tool.ToolSearchName))
+	if !ok {
+		t.Fatal("tool_search executor is missing")
+	}
+	output, err := executor.Execute(context.Background(), &tool.Invocation{Payload: tool.Payload{
+		Kind:   tool.PayloadToolSearch,
+		Search: map[string]any{"query": "drive"},
+	}})
+	if err != nil || output == nil {
+		t.Fatalf("tool search = %#v, %v", output, err)
+	}
+	var result tool.ToolSearchResult
+	if err := json.Unmarshal([]byte(output.Body), &result); err != nil {
+		t.Fatalf("decode tool search: %v", err)
+	}
+	if len(result.Tools) != 1 || result.Tools[0].Description != "Find Drive.\n\nDrive tools." {
+		t.Fatalf("tool search results = %#v", result.Tools)
 	}
 }
 
@@ -1242,7 +1230,9 @@ func TestBuildToolRegistryUnifiedExecFeatureGatesWriteStdinLikeRust(t *testing.T
 		t.Fatalf("shell_command required = %#v", shellSpec.InputSchema["required"])
 	}
 	codeModeSpec, ok := registry.Spec(tool.PlainName(tool.CodeModeExecToolName))
-	if !ok || !strings.Contains(codeModeSpec.Description, "tools.shell_command") {
+	// Rust describes nested tools generically; shell_command is exposed as its
+	// own tool rather than a Go-only section inside the exec description.
+	if !ok || !strings.Contains(codeModeSpec.Description, "All nested tools are available on the global `tools` object") || strings.Contains(codeModeSpec.Description, "Enabled nested command tool") {
 		t.Fatalf("code-mode spec = %#v", codeModeSpec)
 	}
 
@@ -1773,6 +1763,7 @@ func TestBuildToolRegistryBoundsMCPNamespaceDescriptionAndForwardsReadiness(t *t
 	options.MCPTools = []mcp.RuntimeToolInfo{{
 		ServerName:           "drive",
 		NamespaceDescription: full,
+		AgentPlugin:          true,
 		Tool:                 mcp.RuntimeTool{Name: "create_doc", Description: "Create a document"},
 	}}
 	registry, err := BuildToolRegistry(options)
@@ -1787,8 +1778,35 @@ func TestBuildToolRegistryBoundsMCPNamespaceDescriptionAndForwardsReadiness(t *t
 	if full == spec.NamespaceDescription {
 		t.Fatal("model-facing namespace description was not bounded")
 	}
+	if options.MCPTools[0].NamespaceDescription != full {
+		t.Fatal("handler metadata lost the complete namespace description")
+	}
 	if !tool.NewRouter(registry).HasReadinessWait(name) {
 		t.Fatal("MCP readiness hook was not forwarded through the spec override")
+	}
+}
+
+// Rust #51755 bounds only Agent Plugins v1 descriptions at 1,000 bytes; other
+// MCP namespaces keep the larger tool-spec budget.
+func TestBuildToolRegistryKeepsLongOrdinaryMCPNamespaceDescriptionLikeRust(t *testing.T) {
+	full := strings.Repeat("é", 1000)
+	options := DefaultToolRegistryOptions(t.TempDir())
+	options.EnableCore = false
+	options.EnableShell = false
+	options.EnableApplyPatch = false
+	options.EnableAgents = false
+	options.MCPTools = []mcp.RuntimeToolInfo{{
+		ServerName:           "drive",
+		NamespaceDescription: full,
+		Tool:                 mcp.RuntimeTool{Name: "create_doc", Description: "Create a document"},
+	}}
+	registry, err := BuildToolRegistry(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, ok := registry.Spec(tool.NamespacedName("mcp__drive", "create_doc"))
+	if !ok || spec.NamespaceDescription != full {
+		t.Fatalf("MCP spec namespace description bytes=%d, want the complete %d", len(spec.NamespaceDescription), len(full))
 	}
 }
 
@@ -2302,11 +2320,11 @@ func (s *originCodeModeSession) Execute(ctx context.Context, _ tool.CodeModeRemo
 	}, nil
 }
 
-func (s *originCodeModeSession) Wait(context.Context, string, uint64, *tool.YieldSignal) (tool.CodeModeRemoteResponse, error) {
+func (s *originCodeModeSession) Wait(context.Context, string, uint64, *int, *tool.YieldSignal) (tool.CodeModeRemoteResponse, error) {
 	return tool.CodeModeRemoteResponse{CellID: "turn-origin-cell", State: "completed"}, nil
 }
 
-func (s *originCodeModeSession) Terminate(context.Context, string) (tool.CodeModeRemoteResponse, error) {
+func (s *originCodeModeSession) Terminate(context.Context, string, *int) (tool.CodeModeRemoteResponse, error) {
 	return tool.CodeModeRemoteResponse{}, nil
 }
 
@@ -2478,5 +2496,25 @@ func TestBuildToolRegistrySourcesMCPResourceCatalogEntriesLikeRust(t *testing.T)
 	required, _ := readSpec.InputSchema["required"].([]string)
 	if len(required) != 2 || required[0] != "server" || required[1] != "uri" {
 		t.Fatalf("invalid parameter override did not fall back: %#v", readSpec.InputSchema)
+	}
+}
+
+// TestShellSnapshotTelemetryModeLikeRust mirrors Rust #57235's four feature
+// combinations; v2 wins when both snapshot features are enabled.
+func TestShellSnapshotTelemetryModeLikeRust(t *testing.T) {
+	tests := []struct {
+		v1, v2 bool
+		want   string
+	}{
+		{false, false, "disabled"},
+		{true, false, "v1"},
+		{true, true, "v2"},
+		{false, true, "v2"},
+	}
+	for _, tc := range tests {
+		settings := map[string]bool{"shell_snapshot": tc.v1, "shell_snapshot_v2": tc.v2}
+		if got := ShellSnapshotTelemetryMode(settings); got != tc.want {
+			t.Fatalf("v1=%v v2=%v mode = %q, want %q", tc.v1, tc.v2, got, tc.want)
+		}
 	}
 }

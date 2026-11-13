@@ -84,7 +84,7 @@ func TestToolExecutorHonorsCodexAppsPolicyLikeRust(t *testing.T) {
 					AppPolicy:      testCase.appPolicy,
 				},
 			})
-			denied, err := executor.approveToolCallIfNeeded(context.Background(), "call-1", nil)
+			denied, err := executor.approveToolCallIfNeeded(context.Background(), "call-1", nil, "")
 			if err != nil {
 				t.Fatalf("approveToolCallIfNeeded() error = %v", err)
 			}
@@ -167,6 +167,11 @@ func TestRequiresMCPToolApprovalForModeLikeRust(t *testing.T) {
 		DestructiveHint: boolPtrMCPApproval(false),
 		OpenWorldHint:   boolPtrMCPApproval(false),
 	}
+	readOnlyDestructiveOpenWorld := &RuntimeToolAnnotations{
+		ReadOnlyHint:    boolPtrMCPApproval(true),
+		DestructiveHint: boolPtrMCPApproval(true),
+		OpenWorldHint:   boolPtrMCPApproval(true),
+	}
 	tests := []struct {
 		name        string
 		annotations *RuntimeToolAnnotations
@@ -175,6 +180,7 @@ func TestRequiresMCPToolApprovalForModeLikeRust(t *testing.T) {
 	}{
 		{name: "auto destructive", annotations: destructive, mode: apps.AppToolApprovalAuto, want: true},
 		{name: "auto read-only", annotations: readOnly, mode: apps.AppToolApprovalAuto, want: false},
+		{name: "auto read-only wins conflicting hints", annotations: readOnlyDestructiveOpenWorld, mode: apps.AppToolApprovalAuto, want: false},
 		{name: "auto unannotated", annotations: nil, mode: apps.AppToolApprovalAuto, want: true},
 		{name: "auto open-world", annotations: openWorldOnly, mode: apps.AppToolApprovalAuto, want: true},
 		{name: "auto safe", annotations: safe, mode: apps.AppToolApprovalAuto, want: false},
@@ -422,7 +428,7 @@ func TestToolExecutorUsesTheRejectionMessageLikeRust(t *testing.T) {
 			ApprovalPolicy: sandbox.ApprovalOnRequest,
 		},
 	})
-	denied, err := executor.approveToolCallIfNeeded(context.Background(), "call-1", nil)
+	denied, err := executor.approveToolCallIfNeeded(context.Background(), "call-1", nil, "")
 	if err != nil {
 		t.Fatalf("approveToolCallIfNeeded() error = %v", err)
 	}
@@ -445,16 +451,16 @@ func TestToolExecutorSurfacesHandlerMessagesLikeRust(t *testing.T) {
 		TurnID:     "turn-1",
 		ToolApproval: &ToolApprovalOptions{
 			Handler: MCPToolApprovalHandlerFunc(func(context.Context, *MCPToolApprovalRequest) (MCPToolApprovalOutcome, error) {
-				return MCPToolApprovalOutcome{Decision: MCPToolApprovalDeny, Message: MCPElicitationHandoffMessage}, nil
+				return MCPToolApprovalOutcome{Decision: MCPToolApprovalDeny, Message: MCPToolApprovalUserInputRootThreadMessage}, nil
 			}),
 			ApprovalPolicy: sandbox.ApprovalOnRequest,
 		},
 	})
-	denied, err := executor.approveToolCallIfNeeded(context.Background(), "call-1", nil)
+	denied, err := executor.approveToolCallIfNeeded(context.Background(), "call-1", nil, "")
 	if err != nil {
 		t.Fatalf("approveToolCallIfNeeded() error = %v", err)
 	}
-	if denied == nil || denied.Success || denied.Body != MCPElicitationHandoffMessage {
+	if denied == nil || denied.Success || denied.Body != MCPToolApprovalUserInputRootThreadMessage {
 		t.Fatalf("handoff output = %#v", denied)
 	}
 }
@@ -484,15 +490,15 @@ func TestNormalizeMCPToolApprovalDecisionLikeRust(t *testing.T) {
 // TestMCPSessionToolApprovalKeyLikeRust mirrors Rust
 // session_mcp_tool_approval_key: only Auto mode offers a remembered approval.
 func TestMCPSessionToolApprovalKeyLikeRust(t *testing.T) {
-	if _, ok := MCPSessionToolApprovalKey(apps.AppToolApprovalAuto, "docs", "search"); !ok {
+	if _, ok := MCPSessionToolApprovalKey(apps.AppToolApprovalAuto, "docs", "search", "", ""); !ok {
 		t.Fatal("auto mode must offer a session key")
 	}
 	for _, mode := range []apps.AppToolApproval{apps.AppToolApprovalPrompt, apps.AppToolApprovalWrites, apps.AppToolApprovalApprove} {
-		if _, ok := MCPSessionToolApprovalKey(mode, "docs", "search"); ok {
+		if _, ok := MCPSessionToolApprovalKey(mode, "docs", "search", "", ""); ok {
 			t.Fatalf("mode %q must not offer a session key", mode)
 		}
 	}
-	if _, ok := MCPSessionToolApprovalKey(apps.AppToolApprovalAuto, "", "search"); ok {
+	if _, ok := MCPSessionToolApprovalKey(apps.AppToolApprovalAuto, "", "search", "", ""); ok {
 		t.Fatal("empty server must not offer a session key")
 	}
 }
@@ -598,7 +604,7 @@ func TestToolExecutorGatesCustomMCPToolCallsLikeRust(t *testing.T) {
 					},
 				},
 			})
-			denied, err := executor.approveToolCallIfNeeded(context.Background(), "call-1", map[string]any{"q": "x"})
+			denied, err := executor.approveToolCallIfNeeded(context.Background(), "call-1", map[string]any{"q": "x"}, "")
 			if err != nil {
 				t.Fatalf("approveToolCallIfNeeded() error = %v", err)
 			}

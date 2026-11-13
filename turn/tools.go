@@ -26,6 +26,9 @@ type ToolRegistryOptions struct {
 	ContextStatus                  func() compact.TokenStatus
 	UserInputResponder             tool.UserInputResponder
 	RequestUserInputAvailableModes []string
+	// UserInputCallIDResponder takes precedence over UserInputResponder and
+	// receives the calling tool's ID (Rust #57207).
+	UserInputCallIDResponder tool.UserInputCallIDResponder
 	// VerifiedAnswerRecorder receives the accepted request_user_input answers
 	// (Rust request_user_input.rs's retained verified-answer capture).
 	VerifiedAnswerRecorder       tool.VerifiedAnswerRecorder
@@ -57,9 +60,26 @@ type ToolRegistryOptions struct {
 	// reports in `_meta` (Rust build_mcp_tool_call_request_meta). Nil omits the
 	// entry; the callback runs per call so live turn state is current.
 	MCPTurnMetadata func() map[string]any
+	// MCPAppsProductSKU is the turn's configured `apps_mcp_product_sku`; only
+	// REPL-backed MCP calls report it (Rust #60697).
+	MCPAppsProductSKU string
 	// MCPTurnRootTurnID supplies the issuing turn's root turn id for host-owned
 	// Apps calls (Rust #51421). Nil omits the field.
 	MCPTurnRootTurnID func() string
+	// MCPAgentMetadataRecipient is the host-selected plugin registration that
+	// receives private agent attribution in MCP `_meta` (Rust #58378). Nil omits
+	// both keys.
+	MCPAgentMetadataRecipient *mcp.AgentMCPMetadataRecipient
+	// MCPToolRequestMetaHook is the host-scoped private metadata hook for one
+	// server/tool registration. Nil disables the hook.
+	MCPToolRequestMetaHook *mcp.MCPToolRequestMetaHook
+	// MCPToolAdmission rejects a prepared MCP call before approval or dispatch.
+	// Search uses it to keep one provider responsible for a thread's browsing
+	// references when a background call outlives its sampling step.
+	MCPToolAdmissionHook func(info *mcp.RuntimeToolInfo, callID string) error
+	// MCPCyberAccessProgram supplies the issuing turn's explicit Cyber program
+	// for a matching agent registration (Rust turn_context.cyber_access_program).
+	MCPCyberAccessProgram func() string
 	// MCPToolApproval enables Rust's custom-MCP-server tool approval policy
 	// (mcp_tool_call.rs maybe_request_mcp_tool_approval). Nil leaves the gate
 	// off, which mirrors a runtime without a client to ask.
@@ -89,8 +109,19 @@ type ToolRegistryOptions struct {
 	MCPSourceObserver         func(source mcp.McpCallSource)
 	OrchestratorSkillsEnabled *bool
 	SkillProviders            *skillprovider.Registry
-	OpenAIFileRewriter        *mcp.OpenAIFileRewriter
-	Model                     string
+	// CloudSkillProvider replaces MCP resource discovery for the cloud
+	// (orchestrator) catalog when the host supplies a frozen snapshot
+	// (Rust #55631). Nil keeps the MCP-backed path.
+	CloudSkillProvider skillprovider.Provider
+	// DiscoveryV2Skills exposes skills.installations. It is set only when the
+	// step's executor capability inventory came from discovery V2 (Rust #55330).
+	DiscoveryV2Skills bool
+	// SkillMetrics receives the bounded skill tool outcome counters
+	// (Rust #59295 codex.skills.read.result / codex.skills.installations.result).
+	// Nil disables the counters.
+	SkillMetrics       SkillToolMetrics
+	OpenAIFileRewriter *mcp.OpenAIFileRewriter
+	Model              string
 	// ModelConfirmationPolicies carries the issuing model's Browser Use /
 	// Computer Use confirmation-policy Markdown (#41072), forwarded to actor MCP
 	// calls. Nil results in an empty openai/confirmation_policies object for
@@ -120,8 +151,14 @@ type ToolRegistryOptions struct {
 	// AgentToolOverrides carries the model catalog's per-tool Multi-Agent V2
 	// overrides (Rust ModelMessages::multi_agent_tool_*, #46505).
 	AgentToolOverrides map[string]agent.MultiAgentToolOverride
-	AgentRoles         map[string]agent.RoleConfig
-	AgentDefaults      agent.SpawnDefaults
+	// AgentToolOverrideStore carries the same overrides through a store the
+	// turn can replace when a mid-turn model change selects a different catalog.
+	AgentToolOverrideStore *agent.MultiAgentToolOverrideStore
+	AgentRoles             map[string]agent.RoleConfig
+	AgentDefaults          agent.SpawnDefaults
+	// AgentGuardianNativeMultiAgentReview opts state-changing MAv2 calls into
+	// synchronous Guardian review (Rust #57451).
+	AgentGuardianNativeMultiAgentReview bool
 
 	PluginInstallCandidates            []plugin.DiscoverableInfo
 	PluginInstallRecommendationContext bool
@@ -157,10 +194,6 @@ type ToolRegistryOptions struct {
 	// CodeModeShowCellOverhead mirrors features.code_mode.experimental_show_cell_overhead
 	// (#46288): code-mode cell responses report the host duration and overhead.
 	CodeModeShowCellOverhead bool
-	// CodeModeToolDescriptionFirst mirrors
-	// features.code_mode_tool_description_first (#51690/#51704): nested tool
-	// definitions put the tool description before the namespace description.
-	CodeModeToolDescriptionFirst bool
 	// DirectOnlyToolNamespaces mirrors Rust
 	// features.code_mode.direct_only_tool_namespaces: exact namespaces exposed
 	// only as direct model tools, bypassing deferral and the nested Code Mode
@@ -222,10 +255,13 @@ type ToolRegistryOptions struct {
 	RequestUserInputAsyncParameters  *string
 	// MCPResourceMessages carries the model catalog's `mcp_resources` entries
 	// for the built-in resource helpers (Rust #47677).
-	MCPResourceMessages  *model.McpResourceToolMessages
-	DisableWaitAgent     bool
-	DisableDirectMessage bool
-	// MessageBoard, when set, registers the shared discussion board's nine
+	MCPResourceMessages *model.McpResourceToolMessages
+	// ContextManagementMessages carries the model catalog entries for
+	// new_context and get_context_remaining (Rust #56313).
+	ContextManagementMessages *model.ContextManagementToolMessages
+	DisableWaitAgent          bool
+	DisableDirectMessage      bool
+	// MessageBoard, when set, registers the shared discussion board's ten
 	// collaboration tools for this turn's caller (Rust
 	// `install_agent_message_board`). The host owns board selection, the tool
 	// namespace and its description.
@@ -280,10 +316,12 @@ type MessageBoardOptions struct {
 	// the merged namespace.
 	Namespace            string
 	NamespaceDescription string
-	// ToolOverrides carries the active model catalog's per-tool overrides keyed
-	// by tool name (Rust `MultiAgentToolMessages::by_name`, which the board
-	// tools look up by their own names).
-	ToolOverrides map[string]agentboard.MessageBoardToolOverride
+	// ToolOverrides carries the active model catalog's live per-tool
+	// descriptions keyed by tool name (Rust `MultiAgentToolMessages::by_name`,
+	// which the board tools look up by their own names). A mid-turn model
+	// change replaces the store contents so the next step follows the new
+	// model.
+	ToolOverrides *agentboard.MessageBoardToolOverrides
 }
 
 // registerMessageBoardTools mirrors Rust's
@@ -293,7 +331,7 @@ func registerMessageBoardTools(registry *tool.Registry, options *MessageBoardOpt
 	if options == nil || options.Board == nil {
 		return nil
 	}
-	for _, executor := range agentboard.NewMessageBoardToolsWithOverrides(
+	for _, executor := range agentboard.NewMessageBoardToolsWithOverrideStore(
 		options.Board,
 		options.Caller,
 		options.CallerPath,
@@ -306,6 +344,19 @@ func registerMessageBoardTools(registry *tool.Registry, options *MessageBoardOpt
 		}
 	}
 	return nil
+}
+
+// ShellSnapshotTelemetryMode reports the configured shell snapshot mode for the
+// exec_command telemetry tag (Rust #57235): v2 takes precedence over v1, and
+// neither feature enabled means "disabled".
+func ShellSnapshotTelemetryMode(settings map[string]bool) string {
+	if featureflags.Enabled(settings, "shell_snapshot_v2") {
+		return "v2"
+	}
+	if featureflags.Enabled(settings, "shell_snapshot") {
+		return "v1"
+	}
+	return "disabled"
 }
 
 func DefaultToolRegistryOptions(cwd string) *ToolRegistryOptions {
@@ -326,6 +377,7 @@ func DefaultToolRegistryOptions(cwd string) *ToolRegistryOptions {
 				LoginShellPackagePath: featureflags.Enabled(nil, "login_shell_package_path"),
 				CWD:                   cwd,
 			},
+			ShellSnapshotMode: ShellSnapshotTelemetryMode(nil),
 		},
 		ApplyPatch:                   &tool.ApplyPatchExecutorOptions{CWD: cwd},
 		UnifiedExec:                  tool.NewUnifiedExecManager(),
@@ -495,6 +547,16 @@ func execCommandLoginParameter(options *ToolRegistryOptions) bool {
 	return allow
 }
 
+// contextManagementCatalogOverride converts one context-management catalog
+// entry into the tool package override shape (Rust #56313).
+func contextManagementCatalogOverride(messages *model.ContextManagementToolMessages, toolName string) *tool.CatalogToolOverride {
+	message := messages.Tool(toolName)
+	if message == nil {
+		return nil
+	}
+	return &tool.CatalogToolOverride{Description: message.Description, Parameters: message.Parameters}
+}
+
 func BuildToolRegistry(options *ToolRegistryOptions) (*tool.Registry, error) {
 	if options == nil {
 		options = DefaultToolRegistryOptions("")
@@ -511,6 +573,7 @@ func BuildToolRegistry(options *ToolRegistryOptions) (*tool.Registry, error) {
 			ContextStatus:                  options.ContextStatus,
 			UserInputResponder:             options.UserInputResponder,
 			RequestUserInputAvailableModes: options.RequestUserInputAvailableModes,
+			UserInputCallIDResponder:       options.UserInputCallIDResponder,
 			DisableRequestUserInput:        options.DisableRequestUserInput,
 			VerifiedAnswerRecorder:         options.VerifiedAnswerRecorder,
 			ClockProvider:                  options.ClockProvider,
@@ -521,6 +584,8 @@ func BuildToolRegistry(options *ToolRegistryOptions) (*tool.Registry, error) {
 			DisableGetContextRemaining:     options.DisableGetContextRemaining,
 			NonfatalClockReadErrors:        options.NonfatalClockReadErrors,
 			NewContextWindow:               options.NewContextWindow,
+			NewContextCatalog:              contextManagementCatalogOverride(options.ContextManagementMessages, "new_context"),
+			GetContextRemainingCatalog:     contextManagementCatalogOverride(options.ContextManagementMessages, "get_context_remaining"),
 		}); err != nil {
 			return nil, err
 		}
@@ -645,22 +710,24 @@ func BuildToolRegistry(options *ToolRegistryOptions) (*tool.Registry, error) {
 	}
 	if options.EnableAgents {
 		if err := agent.RegisterMultiAgentHandlersWithOptions(registry, &agent.MultiAgentHandlerOptions{
-			Controller:                options.AgentController,
-			Exposure:                  options.AgentExposure,
-			Version:                   options.AgentVersion,
-			Namespace:                 options.AgentNamespace,
-			UsageHintText:             options.AgentUsageHintText,
-			WaitDefault:               options.AgentWaitDefault,
-			WaitMin:                   options.AgentWaitMin,
-			WaitMax:                   options.AgentWaitMax,
-			WaitConfigured:            options.AgentWaitConfigured,
-			HideSpawnMetadata:         options.AgentHideSpawnMetadata,
-			ExposeSpawnModelOverrides: options.AgentExposeSpawnModelOverrides,
-			Roles:                     options.AgentRoles,
-			Defaults:                  options.AgentDefaults,
-			DisableWaitAgent:          options.DisableWaitAgent,
-			DisableDirectMessage:      options.DisableDirectMessage,
-			ToolOverrides:             options.AgentToolOverrides,
+			Controller:                     options.AgentController,
+			Exposure:                       options.AgentExposure,
+			Version:                        options.AgentVersion,
+			Namespace:                      options.AgentNamespace,
+			UsageHintText:                  options.AgentUsageHintText,
+			WaitDefault:                    options.AgentWaitDefault,
+			WaitMin:                        options.AgentWaitMin,
+			WaitMax:                        options.AgentWaitMax,
+			WaitConfigured:                 options.AgentWaitConfigured,
+			HideSpawnMetadata:              options.AgentHideSpawnMetadata,
+			ExposeSpawnModelOverrides:      options.AgentExposeSpawnModelOverrides,
+			Roles:                          options.AgentRoles,
+			Defaults:                       options.AgentDefaults,
+			DisableWaitAgent:               options.DisableWaitAgent,
+			DisableDirectMessage:           options.DisableDirectMessage,
+			ToolOverrides:                  options.AgentToolOverrides,
+			ToolOverrideStore:              options.AgentToolOverrideStore,
+			GuardianNativeMultiAgentReview: options.AgentGuardianNativeMultiAgentReview,
 		}); err != nil {
 			return nil, err
 		}
@@ -771,7 +838,7 @@ func BuildToolRegistry(options *ToolRegistryOptions) (*tool.Registry, error) {
 		if registryHasSearchableDeferredTool(registry) {
 			registry.Remove(tool.PlainName(tool.ToolSearchName))
 			specs := registry.DiscoverableSpecs()
-			specs = tool.OrderCodeModeToolDescriptions(specs, options.CodeModeToolDescriptionFirst)
+			specs = tool.OrderCodeModeToolDescriptions(specs)
 			if indirectPrefixes != nil {
 				specs = indirectPrefixes.ApplyToSpecs(specs)
 			}
@@ -788,7 +855,6 @@ func BuildToolRegistry(options *ToolRegistryOptions) (*tool.Registry, error) {
 			options.CodeModeRuntime.SetDefaultExecYieldTime(options.CodeModeDefaultExecYieldTime)
 			options.CodeModeRuntime.SetCodeModeMessages(options.CodeModeMessages)
 			options.CodeModeRuntime.SetShowCellOverhead(options.CodeModeShowCellOverhead)
-			options.CodeModeRuntime.SetToolDescriptionFirst(options.CodeModeToolDescriptionFirst)
 			options.CodeModeRuntime.SetExcludedToolNamespaces(options.ExcludedToolNamespaces)
 			options.CodeModeRuntime.SetIndirectDescriptionPrefixes(indirectPrefixes)
 			// Rust #45409: a Code Mode cell retains the window it started in, so
@@ -800,7 +866,6 @@ func BuildToolRegistry(options *ToolRegistryOptions) (*tool.Registry, error) {
 			runtime.SetDefaultExecYieldTime(options.CodeModeDefaultExecYieldTime)
 			runtime.SetCodeModeMessages(options.CodeModeMessages)
 			runtime.SetShowCellOverhead(options.CodeModeShowCellOverhead)
-			runtime.SetToolDescriptionFirst(options.CodeModeToolDescriptionFirst)
 			runtime.SetExcludedToolNamespaces(options.ExcludedToolNamespaces)
 			runtime.SetIndirectDescriptionPrefixes(indirectPrefixes)
 			execExecutor, waitExecutor = runtime.Executors(registry, codeModeCommandTool)
@@ -1084,6 +1149,19 @@ func registerMCPToolSet(registry *tool.Registry, options *ToolRegistryOptions, t
 		// Rust #46010: the raw result metadata is captured only when analytics is
 		// enabled and the call belongs to the host-owned apps server.
 		captureResultMetadata := mcpResultMetadataCaptureAllowed(options, info.ServerName)
+		var resolvedServer *mcp.ResolvedServer
+		if options.MCPService != nil {
+			if registration, ok := options.MCPService.ResolvedServerForServer(info.ServerName); ok {
+				resolvedServer = &registration
+			}
+		}
+		var admission func(serverName string, toolName string, callID string) error
+		if options.MCPToolAdmissionHook != nil {
+			infoForHook := info
+			admission = func(serverName string, toolName string, callID string) error {
+				return options.MCPToolAdmissionHook(&infoForHook, callID)
+			}
+		}
 		executor := mcp.NewToolExecutor(&mcp.ToolExecutorOptions{
 			Service:    options.MCPService,
 			ServerName: info.ServerName,
@@ -1110,7 +1188,13 @@ func registerMCPToolSet(registry *tool.Registry, options *ToolRegistryOptions, t
 			PluginID:                          info.PluginID,
 			Model:                             options.Model,
 			TurnMetadata:                      options.MCPTurnMetadata,
+			AppsMCPProductSKU:                 options.MCPAppsProductSKU,
 			TurnRootTurnID:                    options.MCPTurnRootTurnID,
+			AgentMetadataRecipient:            options.MCPAgentMetadataRecipient,
+			ToolRequestMetaHook:               options.MCPToolRequestMetaHook,
+			ToolAdmission:                     admission,
+			ResolvedServer:                    resolvedServer,
+			TurnCyberAccessProgram:            options.MCPCyberAccessProgram,
 			HostOwnedApps:                     info.HostOwnedApps,
 			AuthElicitation:                   options.MCPAuthElicitation,
 			ToolApproval:                      options.MCPToolApproval,
@@ -1124,7 +1208,7 @@ func registerMCPToolSet(registry *tool.Registry, options *ToolRegistryOptions, t
 		})
 		spec := executor.Spec()
 		spec.ThirdParty = true
-		spec.NamespaceDescription = mcp.BoundedMCPNamespaceDescription(info.NamespaceDescription)
+		spec.NamespaceDescription = mcp.EffectiveMCPNamespaceDescription(info.NamespaceDescription, info.AgentPlugin)
 		if spec.Search != nil && spec.Search.Source != nil {
 			spec.Search.Source.Description = spec.NamespaceDescription
 		}
@@ -1145,6 +1229,9 @@ func mcpRuntimeToolRequestMeta(info *mcp.RuntimeToolInfo) map[string]any {
 	apps := map[string]any{}
 	if connectorID := strings.TrimSpace(info.ConnectorID); connectorID != "" {
 		apps["connector_id"] = connectorID
+	}
+	if invocationContext, ok := mcp.ModelSearchInvocationContext(info); ok {
+		apps["invocation_context"] = invocationContext
 	}
 	return map[string]any{"_codex_apps": apps}
 }

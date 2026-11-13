@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"codex_core/sandbox"
 	"codex_core/utils"
 )
 
@@ -93,8 +94,12 @@ type Spec struct {
 	InputSchema map[string]any `json:"inputSchema,omitempty"`
 	// InputSchemaMaxBytes is the internal Code Mode type-rendering budget for
 	// this tool (Rust #47936). Zero uses the registry default.
-	InputSchemaMaxBytes  int            `json:"-"`
-	OutputSchema         map[string]any `json:"outputSchema,omitempty"`
+	InputSchemaMaxBytes int            `json:"-"`
+	OutputSchema        map[string]any `json:"outputSchema,omitempty"`
+	// CodeModeOutputSchema declares a code-mode return type without changing
+	// the direct Responses API tool payload (Rust #57836 keeps the namespace
+	// function's output_schema out of serialization).
+	CodeModeOutputSchema map[string]any `json:"-"`
 	Freeform             *FreeformSpec  `json:"freeform,omitempty"`
 	Search               *SearchInfo    `json:"search,omitempty"`
 	Exposure             Exposure       `json:"exposure,omitempty"`
@@ -142,18 +147,34 @@ type Payload struct {
 }
 
 type Invocation struct {
-	CallID    string
-	ToolName  ToolName
-	Payload   Payload
-	Source    string
-	StartedAt time.Time
-	Context   map[string]any
-	Cancel    context.CancelCauseFunc
+	CallID   string
+	ToolName ToolName
+	Payload  Payload
+	Source   string
+	// NativeCall is the original function-call item retained through dispatch
+	// for tools whose registry policy requires native review (Rust #58040). It
+	// is Guardian evidence only: it is never logged or serialized.
+	NativeCall json.RawMessage
+	StartedAt  time.Time
+	Context    map[string]any
+	Cancel     context.CancelCauseFunc
 	// Truncation is the effective model's output-truncation policy for this
 	// call (Rust `ToolCall::truncation_policy`). It bounds a direct call's
 	// response-content budget through ResponseByteBudget; Code Mode calls
 	// ignore it because they receive typed results.
 	Truncation *utils.TruncationPolicy
+	// StepAttribution carries the settings captured for the sampling step that
+	// issued this call (Rust #45248 `StepContext::settings`), so pre/post tool
+	// hooks report the step's model and permission mode rather than the turn's
+	// initial ones. It is set per invocation and never serialized.
+	StepAttribution *StepAttribution
+}
+
+// StepAttribution is the captured execution metadata of one sampling step.
+type StepAttribution struct {
+	Model           string
+	ReasoningEffort string
+	PermissionMode  string
 }
 
 type CodeModeNotifyFunc func(callID string, text string)
@@ -198,6 +219,18 @@ type Output struct {
 	Error       string         `json:"error,omitempty"`
 	LogPreview  string         `json:"logPreview,omitempty"`
 	CompletedAt time.Time      `json:"completedAt"`
+	// DeliveredAssistantMessage is the bounded text a successful host-owned
+	// User Messaging call confirmed after its input hooks. It is retained as
+	// untrusted assistant context for Guardian reviews and never serialized to
+	// the model (Rust `CodexHarnessMetadata::delivered_assistant_message`).
+	DeliveredAssistantMessage string `json:"-"`
+	// SandboxType is the observed process backend for a command execution
+	// (Rust #47568). It is analytics-only and never serialized or model-visible.
+	SandboxType *sandbox.SandboxType `json:"-"`
+	// SandboxDenied reports that the command was blocked by the sandbox. It is
+	// never serialized: the model sees the command output, while hosts use it to
+	// tell a policy denial apart from a command that simply failed.
+	SandboxDenied bool `json:"-"`
 	// ToolResultMetadata is the raw tool-result `_meta` a tool exposes for the
 	// internal executed-tool-call record (Rust `ToolOutput::tool_result_metadata`,
 	// #46010). It is never serialized: the model-visible data carries the
@@ -217,6 +250,27 @@ type Executor interface {
 	Execute(ctx context.Context, invocation *Invocation) (*Output, error)
 }
 
+// GuardianReviewOptIn opts one invocation into synchronous approval review
+// before its handler runs (Rust CoreToolRuntime::requires_guardian_review,
+// #57433). A denied review stops dispatch and reaches the model as the tool
+// call's error, so the handler never executes.
+type GuardianReviewOptIn interface {
+	RequiresGuardianReview(invocation *Invocation) bool
+}
+
+// NativeReviewPolicyProvider declares at registration time whether an
+// executor requires synchronous native-call review (Rust #58040's
+// NativeReview::Required captured with the tool plan). The registry remembers
+// the answer so dispatch can retain the original call without probing the
+// executor with an invocation it does not own yet.
+type NativeReviewPolicyProvider interface {
+	NativeReviewRequired() bool
+}
+
+// GuardianReviewFunc reviews one opted-in invocation after its pre-tool hooks
+// produced the final arguments. A non-nil error is the model-facing rejection.
+type GuardianReviewFunc func(ctx context.Context, invocation *Invocation) error
+
 type TelemetryTagProvider interface {
 	TelemetryTags(invocation *Invocation) map[string]string
 }
@@ -231,6 +285,15 @@ const RequestErrorCodeTelemetryTag = "request_error_code"
 // it onto the execution's telemetry tags.
 type RequestErrorCoder interface {
 	RequestErrorCode() string
+}
+
+// ModelVisibleError marks a readiness failure that belongs in the tool result
+// the model sees rather than in a turn-level failure (Rust's
+// FunctionCallError::RespondToModel). Cancellation and infrastructure errors
+// must not implement it: those still fail the turn.
+type ModelVisibleError interface {
+	error
+	ModelVisibleToolError()
 }
 
 // ReadinessWaiter lets an exact tool runtime wait for external readiness before
@@ -263,6 +326,7 @@ type Registry struct {
 	mu                         sync.RWMutex
 	executors                  map[string]Executor
 	specs                      map[string]Spec
+	nativeReview               map[string]bool
 	order                      []string
 	defaultInputSchemaMaxBytes int
 }
@@ -275,6 +339,7 @@ func NewRegistry() *Registry {
 	return &Registry{
 		executors:                  map[string]Executor{},
 		specs:                      map[string]Spec{},
+		nativeReview:               map[string]bool{},
 		order:                      []string{},
 		defaultInputSchemaMaxBytes: DefaultCodeModeInputSchemaMaxBytes,
 	}
@@ -436,6 +501,7 @@ func (r *Registry) register(executor Executor, skipDuplicate bool, prepend bool)
 	}
 	r.executors[key] = executor
 	r.specs[key] = spec
+	r.nativeReview[key] = registryRequiresNativeReview(executor)
 	if prepend {
 		r.order = append([]string{key}, r.order...)
 	} else {
@@ -457,6 +523,7 @@ func (r *Registry) Remove(name ToolName) (Executor, bool) {
 	}
 	delete(r.executors, key)
 	delete(r.specs, key)
+	delete(r.nativeReview, key)
 	for index, orderedKey := range r.order {
 		if orderedKey == key {
 			r.order = append(r.order[:index], r.order[index+1:]...)
@@ -514,7 +581,51 @@ func (r *Registry) Spec(name ToolName) (Spec, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	spec, ok := r.specs[name.Key()]
-	return spec, ok
+	if !ok {
+		return spec, false
+	}
+	return liveDescriptionSpec(r.executors[name.Key()], spec), true
+}
+
+// LiveDescriptionProvider lets a turn-scoped executor publish a model-facing
+// description that follows the sampling step's model. The registry keeps the
+// registered schema and overlays the live text on every read, so a mid-turn
+// model change reaches the next step without re-registering the tool
+// (Rust step settings: model-owned tool messages).
+type LiveDescriptionProvider interface {
+	LiveDescription() (string, bool)
+}
+
+func liveDescriptionSpec(executor Executor, spec Spec) Spec {
+	if executor == nil {
+		return spec
+	}
+	provider, ok := executor.(LiveDescriptionProvider)
+	if !ok {
+		return spec
+	}
+	description, ok := provider.LiveDescription()
+	if !ok {
+		return spec
+	}
+	spec.Description = description
+	return spec
+}
+
+// NativeReviewRequired reports the native-review policy captured for the
+// registered tool (Rust #58040 RegisteredTool::native_review).
+func (r *Registry) NativeReviewRequired(name ToolName) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.nativeReview[name.Key()]
+}
+
+func registryRequiresNativeReview(executor Executor) bool {
+	provider, ok := executor.(NativeReviewPolicyProvider)
+	return ok && provider.NativeReviewRequired()
 }
 
 // SetExposure replaces one registered tool's exposure. It backs Rust's
@@ -535,6 +646,29 @@ func (r *Registry) SetExposure(name ToolName, exposure Exposure) bool {
 	return true
 }
 
+// ReplaceSpec updates a registered tool's model-visible spec while keeping its
+// executor and registration order. Dynamic-tool replacement uses it so a
+// pending call for the previous catalog still dispatches (Rust #57553).
+func (r *Registry) ReplaceSpec(spec Spec) bool {
+	if r == nil {
+		return false
+	}
+	key := spec.Name.Key()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.executors[key]; !ok {
+		return false
+	}
+	if _, ok := r.specs[key]; !ok {
+		return false
+	}
+	if spec.InputSchemaMaxBytes < r.defaultInputSchemaMaxBytes {
+		spec.InputSchemaMaxBytes = r.defaultInputSchemaMaxBytes
+	}
+	r.specs[key] = spec
+	return true
+}
+
 func (r *Registry) ModelVisibleSpecs() []Spec {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -542,7 +676,7 @@ func (r *Registry) ModelVisibleSpecs() []Spec {
 	for _, key := range r.order {
 		spec := r.specs[key]
 		if IsModelVisible(spec.Exposure) {
-			out = append(out, spec)
+			out = append(out, liveDescriptionSpec(r.executors[key], spec))
 		}
 	}
 	return out
@@ -555,7 +689,7 @@ func (r *Registry) DiscoverableSpecs() []Spec {
 	for _, key := range r.order {
 		spec := r.specs[key]
 		if IsDeferred(spec.Exposure) {
-			out = append(out, spec)
+			out = append(out, liveDescriptionSpec(r.executors[key], spec))
 		}
 	}
 	return out
@@ -671,6 +805,7 @@ type Router struct {
 	plannedCodeModeNames map[string]CodeModeToolNameMetadata
 	toolNamespacesInfo   ToolNamespacesInfo
 	canManageChildren    bool
+	guardianReview       GuardianReviewFunc
 }
 
 func NewRouter(registry *Registry) *Router {
@@ -678,6 +813,65 @@ func NewRouter(registry *Registry) *Router {
 		registry = NewRegistry()
 	}
 	return &Router{registry: registry, now: time.Now}
+}
+
+// nestedGuardianReviewSetter receives the host review for the nested router a
+// Code Mode cell builds (Rust's nested calls share the registry's dispatch).
+type nestedGuardianReviewSetter interface {
+	SetNestedGuardianReview(review GuardianReviewFunc)
+}
+
+// SetGuardianReview installs the host review an opted-in tool invocation runs
+// before its handler (Rust #57433). Without one, an opted-in invocation is not
+// reviewed here; the tool layer never silently approves on the host's behalf.
+// Code Mode cells get the same review, because Rust dispatches nested calls
+// through the same registry and must not let the wrapper bypass it.
+func (r *Router) SetGuardianReview(review GuardianReviewFunc) {
+	if r == nil {
+		return
+	}
+	r.guardianReview = review
+	if r.registry == nil {
+		return
+	}
+	if executor, ok := r.registry.Lookup(PlainName(CodeModeExecToolName)); ok {
+		if setter, ok := executor.(nestedGuardianReviewSetter); ok {
+			setter.SetNestedGuardianReview(review)
+		}
+	}
+}
+
+// RequiresGuardianReview reports whether the invocation's executor opts into a
+// synchronous review before dispatch.
+func (r *Router) RequiresGuardianReview(invocation *Invocation) bool {
+	if r == nil || r.registry == nil || invocation == nil {
+		return false
+	}
+	executor, ok := r.registry.Lookup(invocation.ToolName)
+	if !ok {
+		return false
+	}
+	optIn, ok := executor.(GuardianReviewOptIn)
+	// The plan captured at registration already settles native-review tools
+	// (Rust #58040); the executor opt-in remains for runtimes whose eligibility
+	// depends on the invocation itself.
+	if r.registry.NativeReviewRequired(invocation.ToolName) {
+		return true
+	}
+	return ok && optIn.RequiresGuardianReview(invocation)
+}
+
+// reviewBeforeDispatch runs the host review for an opted-in invocation. A nil
+// review function leaves the call unreviewed, matching the default-off trait
+// method in Rust.
+func (r *Router) reviewBeforeDispatch(ctx context.Context, invocation *Invocation) error {
+	if r == nil || r.guardianReview == nil || !r.RequiresGuardianReview(invocation) {
+		return nil
+	}
+	_, err := runCancellableStep(ctx, func() (struct{}, error) {
+		return struct{}{}, r.guardianReview(ctx, invocation)
+	})
+	return err
 }
 
 func (r *Router) SetClock(clock func() time.Time) {
@@ -737,6 +931,12 @@ func (r *Router) HasTerminalControls() bool {
 
 func (r *Router) CanManageChildren() bool {
 	return r != nil && r.canManageChildren
+}
+
+// ExposesTool reports whether the router advertises the named plain tool
+// (Rust StepContext::tool_router.exposes_tool, #59633).
+func (r *Router) ExposesTool(name string) bool {
+	return r.registryHasBaseName(name)
 }
 
 func (r *Router) registryHasBaseName(name string) bool {
@@ -1000,6 +1200,14 @@ func (r *Router) BuildToolCall(item ResponseItem) (*Invocation, bool, error) {
 		source = "direct_plaintext_message"
 	}
 	invocation := &Invocation{CallID: item.CallID, ToolName: name, Payload: payload, Source: source, StartedAt: r.now().UTC()}
+	if item.Type == "function_call" && r != nil && r.registry != nil && r.registry.NativeReviewRequired(name) {
+		// Rust #58040 retains the original call for native-review tools so the
+		// evidence survives even when live history no longer holds it.
+		invocation.NativeCall = cloneResponseItemRaw(item.Raw)
+		if len(invocation.NativeCall) == 0 {
+			invocation.NativeCall = synthesizeNativeCallJSON(item)
+		}
+	}
 	if origin := strings.TrimSpace(item.ID); origin != "" {
 		// Rust ToolInvocation::originating_call: a non-code-mode call reports the
 		// item that requested it, which is the dispatched call item itself.
@@ -1023,6 +1231,38 @@ func directPlaintextCollaborationCall(name ToolName, encryptedFunctionArgs *[]st
 	default:
 		return false
 	}
+}
+
+func cloneResponseItemRaw(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return nil
+	}
+	return append(json.RawMessage(nil), raw...)
+}
+
+// synthesizeNativeCallJSON rebuilds the function-call item from the dispatch
+// view when the dispatcher could not supply the original wire item.
+func synthesizeNativeCallJSON(item ResponseItem) json.RawMessage {
+	call := map[string]any{
+		"type":      "function_call",
+		"name":      item.Name,
+		"arguments": item.Arguments,
+		"call_id":   item.CallID,
+	}
+	if strings.TrimSpace(item.ID) != "" {
+		call["id"] = item.ID
+	}
+	if namespace := strings.TrimSpace(item.Namespace); namespace != "" {
+		call["namespace"] = namespace
+	}
+	if item.EncryptedFunctionArgs != nil {
+		call["encrypted_function_args"] = append([]string{}, (*item.EncryptedFunctionArgs)...)
+	}
+	raw, err := json.Marshal(call)
+	if err != nil {
+		return nil
+	}
+	return raw
 }
 
 func applySpecInvocationContext(invocation *Invocation, spec Spec) {
@@ -1110,6 +1350,9 @@ func (r *Router) Dispatch(ctx context.Context, invocation *Invocation) (*Output,
 		return nil, ErrToolCancelled
 	default:
 	}
+	if err := r.reviewBeforeDispatch(ctx, invocation); err != nil {
+		return nil, err
+	}
 	output, err := executeToolSafely(ctx, executor, invocation)
 	if err != nil {
 		return nil, err
@@ -1121,6 +1364,9 @@ func (r *Router) Dispatch(ctx context.Context, invocation *Invocation) (*Output,
 	output.ToolName = invocation.ToolName
 	if output.CompletedAt.IsZero() {
 		output.CompletedAt = r.now().UTC()
+	}
+	if payload, ok := postToolUsePayload(executor, invocation, output); ok {
+		captureDeliveredAssistantMessage(output, payload)
 	}
 	return output, nil
 }
@@ -1181,7 +1427,10 @@ func (r *Router) WaitUntilReady(ctx context.Context, invocation *Invocation) err
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return waiter.WaitUntilReady(ctx, invocation)
+	_, err := runCancellableStep(ctx, func() (struct{}, error) {
+		return struct{}{}, waiter.WaitUntilReady(ctx, invocation)
+	})
+	return err
 }
 
 func (r *Router) DispatchParallel(ctx context.Context, invocations []Invocation) ([]Output, error) {
@@ -1231,6 +1480,9 @@ type ResponseItem struct {
 	Input                 string
 	Execution             string
 	Search                map[string]any
+	// Raw is the original wire item when the dispatcher has it, so a tool that
+	// requires native review can retain the exact evidence (Rust #58040).
+	Raw json.RawMessage
 }
 
 type LifecycleEvent struct {

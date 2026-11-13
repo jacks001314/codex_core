@@ -48,11 +48,12 @@ var knownRequirementsTopLevelFields = func() map[string]bool {
 		"feature_requirements", "featureRequirements", "features",
 		"hooks",
 		"enforce_residency", "enforceResidency",
-		"experimental_network",
+		"network_proxy", "experimental_network",
 		"application",
 		"models",
 		"mcp_servers", "mcpServers",
 		"plugins",
+		"marketplaces",
 	}
 	out := make(map[string]bool, len(keys))
 	for _, key := range keys {
@@ -178,6 +179,8 @@ func obsoleteConfigFieldPaths(values map[string]any) [][]string {
 	}
 	out := [][]string{}
 	for _, path := range [][]string{
+		{"auto_review", "extra_policy"},
+		{"auto_review", "experimental_policy_template"},
 		{"windows", "sandbox_private_desktop"},
 		{"permissions", "windows_sandbox_private_desktop"},
 	} {
@@ -239,13 +242,17 @@ func sortedAnyKeys(values map[string]any) []string {
 func ignoredSettingHint(key string) string {
 	switch key {
 	case "network_proxy":
-		return " Use [permissions.<name>.network] for network settings, or [experimental_network] in requirements.toml for enforced network policy."
+		return " Use [permissions.<name>.network] for network settings, or [network_proxy] in requirements.toml for enforced network policy."
 	case "allowed_permissions":
 		return " Use [allowed_permission_profiles] and default_permissions; the old allowlist is ignored even when both forms are present."
 	case "include_view_image_tool", "features.include_view_image_tool":
 		return " Use [features].view_image to configure the image tool."
 	case "windows.sandbox_private_desktop", "permissions.windows_sandbox_private_desktop":
 		return " Remove windows.sandbox_private_desktop; legacy Windows sandboxes always use a private desktop."
+	case "auto_review.experimental_policy_template":
+		return " Remove auto_review.experimental_policy_template from config.toml."
+	case "auto_review.extra_policy":
+		return " To enforce additional Guardian rules, set guardian_extra_policy in managed requirements.toml."
 	}
 	segments := strings.Split(key, ".")
 	if len(segments) >= 2 && segments[0] == "profiles" && segments[len(segments)-1] == "include_view_image_tool" {
@@ -276,10 +283,16 @@ func boundedConfigLabel(value string) string {
 func configLayerSourceLabel(source LayerSource) string {
 	switch source.Type {
 	case LayerSourcePackagedDefaults:
+		if file := strings.TrimSpace(source.File); file != "" {
+			return "packaged defaults (" + file + ")"
+		}
 		return "packaged defaults"
 	case LayerSourceMDM:
 		return "managed configuration (MDM)"
 	case LayerSourceSystem:
+		if file := strings.TrimSpace(source.File); file != "" {
+			return "system (" + file + ")"
+		}
 		return "system"
 	case LayerSourceEnterpriseManaged:
 		if name := strings.TrimSpace(source.Name); name != "" {
@@ -287,8 +300,17 @@ func configLayerSourceLabel(source LayerSource) string {
 		}
 		return "enterprise managed"
 	case LayerSourceUser:
+		if file := strings.TrimSpace(source.File); file != "" {
+			return "user (" + file + ")"
+		}
 		return "user"
 	case LayerSourceProject:
+		if folder := strings.TrimSpace(source.DotCodexFolder); folder != "" {
+			return "project (" + folder + "/config.toml)"
+		}
+		if file := strings.TrimSpace(source.File); file != "" {
+			return "project (" + file + ")"
+		}
 		return "project"
 	case LayerSourceSessionFlags:
 		return "session flags"
@@ -386,7 +408,7 @@ func (s *ConfigService) configLayersForWarning(cwd string) ([]Layer, error) {
 		return nil, err
 	}
 	if strings.TrimSpace(profile) != "" {
-		if err := applyProfileLayer(s.codexHome, userValues, profile); err != nil {
+		if _, _, err := applyProfileLayer(s.codexHome, userValues, profile); err != nil {
 			return nil, err
 		}
 	}

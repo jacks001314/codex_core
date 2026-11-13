@@ -61,7 +61,15 @@ func (r *LocalShellRunner) Run(ctx context.Context, req *ShellRequest) (*ShellRe
 	if req.PermissionProfile != nil {
 		return r.runWithPermissionProfile(ctx, req, env, started)
 	}
-	return r.runDirect(ctx, req.Command, req.CWD, env, started)
+	result, err := r.runDirect(ctx, req.Command, req.CWD, env, started)
+	if err == nil && result != nil {
+		// The direct runner is the explicit unsandboxed path (Rust #47568).
+		result.SandboxType = cloneSandboxTypePtr(req.ProcessSandboxType)
+		if result.SandboxType == nil {
+			result.SandboxType = cloneSandboxType(sandbox.SandboxTypeNone)
+		}
+	}
+	return result, err
 }
 
 func (r *LocalShellRunner) runWithPermissionProfile(ctx context.Context, req *ShellRequest, env map[string]string, started time.Time) (*ShellResult, error) {
@@ -70,6 +78,7 @@ func (r *LocalShellRunner) runWithPermissionProfile(ctx context.Context, req *Sh
 		ResolvedPermissionProfileID:   req.PermissionProfileID,
 		ResolvedPermissionProfileJSON: req.PermissionProfileJSON,
 		CWD:                           req.CWD,
+		WorkspaceRoots:                req.WorkspaceRoots,
 		AllowedSymlinkedCodexHome:     req.AllowedSymlinkedCodexHome,
 		Command:                       append([]string(nil), req.Command...),
 	}
@@ -90,12 +99,15 @@ func (r *LocalShellRunner) runWithPermissionProfile(ctx context.Context, req *Sh
 		result, err = r.runDirect(ctx, plan.Command, plan.CWD, env, started)
 	}
 	if err == nil && result != nil {
-		sandbox.RecordFileSystemSandboxViolation(plan.SandboxType, sandbox.SandboxExecOutput{
+		result.SandboxType = cloneSandboxType(plan.SandboxType)
+		output := sandbox.SandboxExecOutput{
 			ExitCode:         result.ExitCode,
 			Stdout:           result.Stdout,
 			Stderr:           result.Stderr,
 			AggregatedOutput: shellOutputText(result),
-		})
+		}
+		result.SandboxDenied = sandbox.IsLikelySandboxDenied(plan.SandboxType, output)
+		sandbox.RecordFileSystemSandboxViolation(plan.SandboxType, output)
 	}
 	return result, err
 }
@@ -129,13 +141,12 @@ func (r *LocalShellRunner) runWindowsSandbox(ctx context.Context, req *ShellRequ
 	capture := &windowssandbox.CaptureRequest{
 		PermissionProfileID:    plan.PermissionProfileID,
 		PermissionProfile:      plan.PermissionProfile,
-		WorkspaceRoots:         []string{commandCWD},
+		WorkspaceRoots:         windowsCaptureWorkspaceRoots(req.WorkspaceRoots, commandCWD),
 		CodexHome:              codexHome,
 		Command:                append([]string(nil), plan.Command...),
 		CWD:                    commandCWD,
 		Env:                    env,
 		TimeoutMS:              timeout,
-		UsePrivateDesktop:      req.WindowsSandboxPrivateDesktop,
 		TTY:                    req.TTY,
 		ProxyEnforced:          req.EnforceManagedNetwork,
 		ProxySettingsMode:      windowsSandboxProxySettingsMode(req.WindowsSandboxProxySettingsMode),
@@ -157,12 +168,20 @@ func (r *LocalShellRunner) runWindowsSandbox(ctx context.Context, req *ShellRequ
 		return nil, errors.New("windows sandbox returned nil result")
 	}
 	return &ShellResult{
-		ExitCode: result.ExitCode,
-		Stdout:   string(result.Stdout),
-		Stderr:   string(result.Stderr),
-		Duration: time.Since(started),
-		TimedOut: result.TimedOut || errors.Is(ctx.Err(), context.DeadlineExceeded),
+		ExitCode:    result.ExitCode,
+		SandboxType: cloneSandboxType(plan.SandboxType),
+		Stdout:      string(result.Stdout),
+		Stderr:      string(result.Stderr),
+		Duration:    time.Since(started),
+		TimedOut:    result.TimedOut || errors.Is(ctx.Err(), context.DeadlineExceeded),
 	}, nil
+}
+
+func windowsCaptureWorkspaceRoots(roots []string, fallbackCWD string) []string {
+	if roots == nil {
+		return []string{fallbackCWD}
+	}
+	return append([]string{}, roots...)
 }
 
 func windowsShellSandboxUsesElevated(_ *sandbox.PermissionProfile, configured sandbox.WindowsSandboxLevel) bool {

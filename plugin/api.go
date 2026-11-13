@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -466,7 +467,6 @@ type PluginSummary struct {
 	InstallSuggestion                bool                       `json:"installSuggestion,omitempty"`
 	PluginDisplayNameTag             string                     `json:"pluginDisplayNameTag,omitempty"`
 	Keywords                         []string                   `json:"keywords"`
-	Extensions                       *PluginExtensions          `json:"extensions"`
 }
 
 func (s PluginSummary) MarshalJSON() ([]byte, error) {
@@ -494,7 +494,6 @@ func (s PluginSummary) MarshalJSON() ([]byte, error) {
 		InstalledAt                      *int64                     `json:"installedAt"`
 		Enabled                          bool                       `json:"enabled"`
 		Keywords                         []string                   `json:"keywords"`
-		Extensions                       *PluginExtensions          `json:"extensions"`
 	}{
 		ID:                               s.ID,
 		Name:                             s.Name,
@@ -515,7 +514,6 @@ func (s PluginSummary) MarshalJSON() ([]byte, error) {
 		InstalledAt:                      cloneInt64Ptr(s.InstalledAt),
 		Enabled:                          s.Enabled,
 		Keywords:                         keywords,
-		Extensions:                       clonePluginExtensions(s.Extensions),
 	})
 }
 
@@ -1399,6 +1397,7 @@ type PluginService struct {
 	marketplacePluginMaterializer MarketplacePluginMaterializer
 	marketplaceRevision           MarketplaceRevisionResolver
 	marketplaceConfigPath         string
+	marketplaceStartupUpgradeBusy bool
 	suggestedProvider             SuggestedPluginProvider
 	suggestedProviderKey          string
 	suggestedCache                *SuggestedPluginList
@@ -1406,13 +1405,19 @@ type PluginService struct {
 	suggestedFetch                *suggestedPluginFetch
 	cloudCapabilities             []CapabilitySummary
 	cloudCatalogKey               string
-	shareBackend                  PluginShareBackend
-	codexHome                     string
-	authMode                      string
-	modelProviderID               string
-	targetCuratedMarketplace      TargetCuratedMarketplace
-	curatedSyncInFlight           bool
-	curatedSyncMetricsObserver    CuratedSyncMetricsObserver
+	// cloudCatalogComplete records that the published cloud catalog came from a
+	// complete listing; a later partial refresh must not replace it (#55301).
+	cloudCatalogComplete       bool
+	cloudCatalog               *PluginCatalog
+	shareBackend               PluginShareBackend
+	codexHome                  string
+	authMode                   string
+	modelProviderID            string
+	targetCuratedMarketplace   TargetCuratedMarketplace
+	marketplacePolicy          *MarketplacePolicy
+	marketplacePolicyConfig    map[string]any
+	curatedSyncInFlight        bool
+	curatedSyncMetricsObserver CuratedSyncMetricsObserver
 	// manifests reuses parsed manifest revisions across the service's
 	// marketplace materialization (Rust #49099). Go's discovery path carries no
 	// plugin store, so the service owns the cache; it is the same
@@ -1423,6 +1428,30 @@ type PluginService struct {
 	// #49100 PluginsConfigInput::remote_http_clients). A shallow copy of the
 	// service shares the pool; independently created services do not.
 	remoteHTTPPool *RemotePluginHTTPPool
+	// runtimeAuthProvider resolves runtime request credentials for remote
+	// plugin traffic when runtime agent instances are enabled (Rust #59564).
+	runtimeAuthProvider RuntimeAuthProvider
+}
+
+// SetRuntimeAuthProvider installs the per-request runtime credential provider
+// for remote plugin traffic built by this service.
+func (s *PluginService) SetRuntimeAuthProvider(provider RuntimeAuthProvider) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.runtimeAuthProvider = provider
+	s.mu.Unlock()
+}
+
+// RuntimeAuthProvider returns the installed remote plugin runtime provider.
+func (s *PluginService) RuntimeAuthProvider() RuntimeAuthProvider {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.runtimeAuthProvider
 }
 
 func (s *PluginService) SetShareBackend(backend PluginShareBackend) {
@@ -1431,6 +1460,24 @@ func (s *PluginService) SetShareBackend(backend PluginShareBackend) {
 	}
 	s.mu.Lock()
 	s.shareBackend = backend
+	s.mu.Unlock()
+}
+
+// SetMarketplacePolicy installs the managed marketplace source policy and the
+// effective config projection it evaluates. Both are copied so later config
+// edits cannot mutate the policy in place.
+func (s *PluginService) SetMarketplacePolicy(requirements *MarketplaceRequirements, configValues map[string]any) {
+	if s == nil {
+		return
+	}
+	policy := NewMarketplacePolicy(requirements)
+	var config map[string]any
+	if cloned, ok := cloneMarketplacePolicyValue(configValues).(map[string]any); ok {
+		config = cloned
+	}
+	s.mu.Lock()
+	s.marketplacePolicy = policy
+	s.marketplacePolicyConfig = config
 	s.mu.Unlock()
 }
 
@@ -1466,18 +1513,28 @@ func (s *PluginService) RemotePluginHTTPPool() *RemotePluginHTTPPool {
 }
 
 // NewRemotePluginProvider builds a remote plugin service configuration that
-// shares this service's connection pool while keeping the current endpoint,
-// product SKU and authentication (Rust #49100
-// PluginsConfigInput::remote_plugin_service_config). It is the constructor the
-// app-server uses for turn-scoped suggested-plugin providers.
+// shares this service's connection pool while using the bundled product SKU
+// (Rust #49100 PluginsConfigInput::remote_plugin_service_config).
 func (s *PluginService) NewRemotePluginProvider(baseURL string, accessToken string, accountID string, client HTTPDoer) *HTTPSuggestedPluginProvider {
+	return s.NewRemotePluginProviderWithProductSKU(baseURL, accessToken, accountID, "", client)
+}
+
+// NewRemotePluginProviderWithProductSKU keeps the current endpoint, configured
+// product SKU and authentication while sharing this service's connection pool
+// (Rust #47116). An empty SKU falls back to CODEXProductSKU.
+func (s *PluginService) NewRemotePluginProviderWithProductSKU(baseURL string, accessToken string, accountID string, productSKU string, client HTTPDoer) *HTTPSuggestedPluginProvider {
 	var pool *RemotePluginHTTPPool
 	if s != nil {
 		pool = s.RemotePluginHTTPPool()
 		// get_or_init: the first service configuration creates the shared pool.
 		pool.Client()
 	}
-	return NewHTTPSuggestedPluginProviderWithPool(baseURL, accessToken, accountID, client, pool)
+	provider := NewHTTPSuggestedPluginProviderWithPool(baseURL, accessToken, accountID, client, pool)
+	provider.ProductSKU = strings.TrimSpace(productSKU)
+	if s != nil {
+		provider.RuntimeAuth = s.RuntimeAuthProvider()
+	}
+	return provider
 }
 
 func (s *PluginService) SetClock(clock func() time.Time) {
@@ -1546,8 +1603,16 @@ func (s *PluginService) AddMarketplace(params *MarketplaceAddParams) (*Marketpla
 	if name == "" {
 		return nil, fmt.Errorf("%w: marketplace name and source are required", ErrInvalidPluginRequest)
 	}
-	if IsReservedMarketplaceName(name) {
-		return nil, fmt.Errorf("marketplace `%s` is reserved and cannot be added from this source", name)
+	s.mu.Lock()
+	codexHome := s.codexHome
+	marketplacePolicy := s.marketplacePolicy
+	s.mu.Unlock()
+	expectedManagedName, err := marketplacePolicy.ValidateMarketplaceSourceForAdd(codexHome, parsedSource)
+	if err != nil {
+		return nil, err
+	}
+	if err := ValidateMarketplaceNameForAdd(expectedManagedName, name); err != nil {
+		return nil, err
 	}
 	safeName, err := safeMarketplaceDirName(name)
 	if err != nil {
@@ -1617,6 +1682,7 @@ func (s *PluginService) AddMarketplace(params *MarketplaceAddParams) (*Marketpla
 		return nil, err
 	}
 	s.marketplaces[name] = marketplace
+	s.recordPolicyMarketplaceLocked(marketplace)
 	return &MarketplaceAddResponse{
 		MarketplaceName: name,
 		InstalledRoot:   marketplace.RootPath,
@@ -1670,7 +1736,8 @@ func (s *PluginService) RemoveMarketplace(params *MarketplaceRemoveParams) (*Mar
 		}
 	}
 	s.mu.Unlock()
-	if err := removeMarketplaceConfig(configPath, name); err != nil {
+	removedConfig, err := removeMarketplaceConfig(configPath, name)
+	if err != nil {
 		return nil, err
 	}
 	if err := removeInstalledPluginConfigsForMarketplace(configPath, name); err != nil {
@@ -1678,6 +1745,28 @@ func (s *PluginService) RemoveMarketplace(params *MarketplaceRemoveParams) (*Mar
 	}
 	if err := removeMaterializedMarketplacePlugins(installRoot, name); err != nil {
 		return nil, err
+	}
+	// Rust deletes `marketplace_install_root/<name>` for cloned marketplaces
+	// and reports it as the removed root; a local marketplace root points at
+	// the user's own directory and is never touched.
+	removedClone := false
+	if installRoot != "" && marketplace.SourceType == string(MarketplaceSourceGit) {
+		if safeName, err := safeMarketplaceDirName(name); err == nil {
+			destination := filepath.Join(installRoot, safeName)
+			if info, statErr := os.Stat(destination); statErr == nil {
+				if info.IsDir() {
+					if err := os.RemoveAll(destination); err != nil {
+						return nil, err
+					}
+				}
+				removedClone = true
+			} else if !os.IsNotExist(statErr) {
+				return nil, statErr
+			}
+		}
+	}
+	if !existed && !removedConfig && !removedClone {
+		return nil, fmt.Errorf("%w: marketplace `%s` is not configured or installed", ErrInvalidPluginRequest, name)
 	}
 	var installedRoot *string
 	if existed {
@@ -1697,6 +1786,7 @@ func (s *PluginService) UpgradeMarketplace(params *MarketplaceUpgradeParams) (*M
 	}
 	materializer := s.marketplaceMaterializer
 	resolver := s.marketplaceRevision
+	marketplacePolicy := s.marketplacePolicy
 	s.mu.Unlock()
 
 	selected := make([]string, 0, len(marketplaces))
@@ -1720,6 +1810,14 @@ func (s *PluginService) UpgradeMarketplace(params *MarketplaceUpgradeParams) (*M
 			Kind:    MarketplaceSourceGit,
 			URL:     marketplaceConfigSource(&marketplace),
 			RefName: cloneStringPtr(marketplace.RefName),
+		}
+		normalizedSource, err := marketplacePolicy.ValidateGitSource(source.URL, source.RefName)
+		if err != nil {
+			upgradeErrors = append(upgradeErrors, MarketplaceUpgradeErrorInfo{MarketplaceName: name, Message: err.Error()})
+			continue
+		}
+		if normalizedSource != nil {
+			source = normalizedSource
 		}
 		revision := ""
 		if resolver != nil {
@@ -1989,12 +2087,20 @@ func (s *PluginService) addPluginLocked(detail PluginDetail) PluginDetail {
 // (Rust #46309). A display-only refresh must not invalidate loaded plugins, so
 // callers clear their caches only when this returns true.
 func (s *PluginService) ReplaceInstalledRemotePlugins(marketplaceName string, details []PluginDetail) bool {
+	changed, _ := s.ReplaceInstalledRemotePluginsWithChanges(marketplaceName, details)
+	return changed
+}
+
+// ReplaceInstalledRemotePluginsWithChanges is ReplaceInstalledRemotePlugins
+// plus the change id that attributes this invalidation (Rust #60505): callers
+// pass the id to the MCP refresh they trigger so both diagnostics correlate.
+// The id is empty when only display metadata changed.
+func (s *PluginService) ReplaceInstalledRemotePluginsWithChanges(marketplaceName string, details []PluginDetail) (bool, string) {
 	if s == nil {
-		return false
+		return false, ""
 	}
 	marketplaceName = strings.TrimSpace(marketplaceName)
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	previous := make([]PluginDetail, 0, len(details))
 	for id, detail := range s.plugins {
 		if detail.Summary.MarketplaceName == marketplaceName && strings.TrimSpace(detail.Summary.RemotePluginID) != "" {
@@ -2018,7 +2124,20 @@ func (s *PluginService) ReplaceInstalledRemotePlugins(marketplaceName string, de
 	if len(installed) > 0 {
 		sortInstalledPluginDetailsForCompare(installed)
 	}
-	return !InstalledPluginMetadataEqual(previous, installed)
+	changes := InstalledPluginMetadataChanges(previous, installed)
+	s.mu.Unlock()
+	if len(changes) == 0 {
+		return false, ""
+	}
+	changeID := NewInstalledPluginMetadataChangeID()
+	// Rust logs field names only, never plugin values.
+	slog.Info("installed plugin runtime metadata invalidated",
+		"change_id", changeID,
+		"marketplace", marketplaceName,
+		"changes", changes,
+		"initial_snapshot", len(previous) == 0,
+	)
+	return true, changeID
 }
 
 // sortInstalledPluginDetailsForCompare gives the comparison a stable order by
@@ -2042,9 +2161,10 @@ func (s *PluginService) List(params *PluginListParams) *PluginListResponse {
 	marketplaces := s.marketplaceListLocked()
 	target := s.targetCuratedMarketplace
 	policy := s.activationPolicy
+	marketplacePolicy := s.marketplacePolicy
 	s.mu.Unlock()
 	loadedDetails, loadErrors := loadMarketplacePlugins(marketplaces, s.manifests)
-	details := routePluginDetails(mergePluginDetails(storedDetails, loadedDetails, policy), target)
+	details := routePluginDetails(filterPluginDetailsByMarketplacePolicy(mergePluginDetails(storedDetails, loadedDetails, policy), marketplaces, marketplacePolicy), target)
 	plugins := make([]PluginSummary, 0, len(details))
 	for _, detail := range details {
 		if !params.IncludeInstalled && detail.Summary.Installed {
@@ -2069,8 +2189,14 @@ func (s *PluginService) Installed(params *PluginInstalledParams) *PluginInstalle
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	plugins := make([]PluginSummary, 0)
+	marketplaces := s.marketplaceListLocked()
+	details := make([]PluginDetail, 0, len(s.plugins))
 	for _, detail := range s.plugins {
+		details = append(details, cloneDetail(detail))
+	}
+	details = s.filterPluginDetailsForPolicyLocked(details, marketplaces)
+	plugins := make([]PluginSummary, 0, len(details))
+	for _, detail := range details {
 		if detail.Summary.Installed && pluginEligibleForCuratedTarget(detail.Summary.ID, detail.Summary.MarketplaceName, s.targetCuratedMarketplace) {
 			plugins = append(plugins, cloneSummary(detail.Summary))
 		}
@@ -2093,7 +2219,7 @@ func (s *PluginService) Installed(params *PluginInstalledParams) *PluginInstalle
 		return plugins[i].ID < plugins[j].ID
 	})
 	return &PluginInstalledResponse{
-		Marketplaces:          marketplaceEntries(s.marketplaceListLocked(), plugins),
+		Marketplaces:          marketplaceEntries(marketplaces, plugins),
 		MarketplaceLoadErrors: []MarketplaceLoadErrorInfo{},
 		Plugins:               plugins,
 	}
@@ -2108,12 +2234,14 @@ func (s *PluginService) InstalledDetails() []PluginDetail {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	marketplaces := s.marketplaceListLocked()
 	details := make([]PluginDetail, 0, len(s.plugins))
 	for _, detail := range s.plugins {
 		if detail.Summary.Installed && strings.TrimSpace(detail.Summary.ID) != "" {
 			details = append(details, cloneDetail(detail))
 		}
 	}
+	details = s.filterPluginDetailsForPolicyLocked(details, marketplaces)
 	sort.SliceStable(details, func(i, j int) bool { return details[i].Summary.ID < details[j].Summary.ID })
 	return details
 }
@@ -2204,11 +2332,31 @@ func (s *PluginService) SetCloudPluginCatalog(catalog *PluginCatalog, cacheKey s
 	if s == nil {
 		return
 	}
+	cacheKey = strings.TrimSpace(cacheKey)
 	capabilities := cloudCapabilitiesFromCatalog(catalog)
 	s.mu.Lock()
-	s.cloudCatalogKey = strings.TrimSpace(cacheKey)
+	if catalog != nil && catalog.IsPartial && s.cloudCatalogComplete && cacheKey != "" && cacheKey == s.cloudCatalogKey {
+		s.mu.Unlock()
+		return
+	}
+	s.cloudCatalogKey = cacheKey
 	s.cloudCapabilities = capabilities
+	s.cloudCatalogComplete = catalog != nil && !catalog.IsPartial
+	s.cloudCatalog = nil
+	if catalog != nil {
+		s.cloudCatalog = catalog.Clone()
+	}
 	s.mu.Unlock()
+}
+
+// CloudPluginCatalog returns a copy of the last published cloud catalog.
+func (s *PluginService) CloudPluginCatalog() *PluginCatalog {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cloudCatalog.Clone()
 }
 
 func (s *PluginService) CloudPluginCatalogKey() string {
@@ -2529,9 +2677,11 @@ func (s *PluginService) Read(params *PluginReadParams) (*PluginReadResponse, err
 	marketplaces := s.marketplaceListLocked()
 	target := s.targetCuratedMarketplace
 	policy := s.activationPolicy
+	marketplacePolicy := s.marketplacePolicy
 	s.mu.Unlock()
 	loadedDetails, _ := loadMarketplacePlugins(marketplaces, s.manifests)
-	for _, detail := range routePluginDetails(mergePluginDetails(storedDetails, loadedDetails, policy), target) {
+	details := filterPluginDetailsByMarketplacePolicy(mergePluginDetails(storedDetails, loadedDetails, policy), marketplaces, marketplacePolicy)
+	for _, detail := range routePluginDetails(details, target) {
 		if response := readPluginDetailResponse(detail, params); response != nil {
 			materialized, err := s.materializeMarketplacePluginDetail(&response.Plugin)
 			if err != nil {
@@ -2576,9 +2726,11 @@ func (s *PluginService) readInstalledPluginSkill(params *PluginSkillReadParams) 
 	marketplaces := s.marketplaceListLocked()
 	target := s.targetCuratedMarketplace
 	policy := s.activationPolicy
+	marketplacePolicy := s.marketplacePolicy
 	s.mu.Unlock()
 	loadedDetails, _ := loadMarketplacePlugins(marketplaces, s.manifests)
-	for _, detail := range routePluginDetails(mergePluginDetails(storedDetails, loadedDetails, policy), target) {
+	details := filterPluginDetailsByMarketplacePolicy(mergePluginDetails(storedDetails, loadedDetails, policy), marketplaces, marketplacePolicy)
+	for _, detail := range routePluginDetails(details, target) {
 		if !pluginDetailMatchesSkillRead(&detail, params) {
 			continue
 		}
@@ -2862,6 +3014,10 @@ func (s *PluginService) Install(params *PluginInstallParams) (*PluginInstallResp
 			s.mu.Unlock()
 			return nil, fmt.Errorf("%w: plugin %q is not available for the active authentication mode", ErrInvalidPluginRequest, id)
 		}
+		if err := s.validatePluginInstallPolicyLocked(detail); err != nil {
+			s.mu.Unlock()
+			return nil, fmt.Errorf("%w: %v", ErrInvalidPluginRequest, err)
+		}
 		configPath := s.marketplaceConfigPath
 		s.mu.Unlock()
 		if detail.Summary.InstallPolicy == InstallBlocked {
@@ -2953,6 +3109,10 @@ func (s *PluginService) HydrateRecommendedPluginMetadata(remotePluginID string) 
 		}
 	}
 	if found != nil {
+		if err := s.validatePluginInstallPolicyLocked(*found); err != nil {
+			s.mu.Unlock()
+			return nil, false, nil
+		}
 		s.mu.Unlock()
 		materialized, err := s.materializeMarketplacePluginDetail(found)
 		if err != nil {
@@ -3387,7 +3547,11 @@ func (s *PluginService) marketplaceListLocked() []Marketplace {
 	}
 	curated := s.implicitCuratedMarketplaceLocked()
 	marketplaces = appendImplicitCuratedMarketplace(marketplaces, curated)
-	marketplaces = filterReservedMarketplaceSpoofs(marketplaces, curated)
+	if s.marketplacePolicy != nil && s.marketplacePolicy.IsRestricted() {
+		marketplaces = s.filterMarketplacesByPolicyLocked(marketplaces)
+	} else {
+		marketplaces = filterReservedMarketplaceSpoofs(marketplaces, curated)
+	}
 	marketplaces = routeMarketplaces(marketplaces, s.targetCuratedMarketplace)
 	sort.SliceStable(marketplaces, func(i int, j int) bool {
 		return marketplaces[i].Name < marketplaces[j].Name
@@ -3721,7 +3885,6 @@ func cloneDetail(detail PluginDetail) PluginDetail {
 }
 
 func cloneSummary(summary PluginSummary) PluginSummary {
-	summary.Extensions = clonePluginExtensions(summary.Extensions)
 	summary.MCPServers = append([]string(nil), summary.MCPServers...)
 	summary.AppConnectors = append([]string(nil), summary.AppConnectors...)
 	summary.Source = clonePluginSource(summary.Source)

@@ -3,7 +3,9 @@ package telemetry
 import (
 	"context"
 	"strconv"
+	"strings"
 
+	"codex_core/metrics"
 	"codex_core/model"
 )
 
@@ -44,7 +46,8 @@ func (t *SessionTelemetry) RecordWebsocketConnect(ctx context.Context, record mo
 		"endpoint":                                    record.Endpoint,
 		"auth.header_attached":                        strconv.FormatBool(record.AuthHeaderAttached),
 		"auth.retry_after_unauthorized":               strconv.FormatBool(record.RetryAfterUnauthorized),
-		"auth.connection_reused":                      strconv.FormatBool(record.ConnectionReused),
+		"auth.connection_reused":                      "false",
+		"auth.reauth":                                 strconv.FormatBool(record.Reauth),
 		"auth.env_openai_api_key_present":             strconv.FormatBool(authEnv.OpenAIAPIKeyEnvPresent),
 		"auth.env_codex_api_key_present":              strconv.FormatBool(authEnv.CodexAPIKeyEnvPresent),
 		"auth.env_codex_api_key_enabled":              strconv.FormatBool(authEnv.CodexAPIKeyEnvEnabled),
@@ -85,7 +88,13 @@ func (t *SessionTelemetry) RecordWebsocketConnect(ctx context.Context, record mo
 // token counts and timing of a completed model response, on both the log record
 // and the span event.
 func (t *SessionTelemetry) RecordSSEEventCompleted(ctx context.Context, record model.SSECompletedRecord) {
-	if t == nil || t.Logs == nil {
+	if t == nil {
+		return
+	}
+	// The reasoning-replay metrics report every completed response, including
+	// one without a usage block (Rust #61017 record_responses).
+	t.recordReasoningReplayMetrics(record.ReasoningRemovals)
+	if t.Logs == nil || !record.UsageReported {
 		return
 	}
 	usage := record.Usage
@@ -119,6 +128,43 @@ func (t *SessionTelemetry) RecordSSEEventCompleted(ctx context.Context, record m
 		fields["model_reasoning_effort"] = record.ReasoningEffort
 	}
 	t.LogAndTraceEvent(ctx, "codex.sse_event", fields, nil, nil)
+}
+
+// recordReasoningReplayMetrics mirrors Rust #61017's record_responses arm: one
+// counter classifies how the response reported replayed reasoning removals, and
+// one histogram sample per bounded reason (including zeros) covers a report the
+// response actually carried.
+func (t *SessionTelemetry) recordReasoningReplayMetrics(removals *model.ReasoningRemovals) {
+	report := "unavailable"
+	switch {
+	case removals == nil:
+	case len(removals.Counts) == 0:
+		report = "no_removals_reported"
+	case removals.HasPrefixMismatch():
+		report = "prefix_mismatch_reported"
+	default:
+		report = "removals_reported"
+	}
+	tags := map[string]string{"report": report}
+	if productSKU := strings.TrimSpace(t.Metadata.ProductSKU); productSKU != "" {
+		tags["product_sku"] = productSKU
+	}
+	metrics.Counter(ReasoningReplayCountMetric, 1, tags)
+	if removals == nil {
+		return
+	}
+	for _, reason := range model.AllReasoningRemovalReasons {
+		reasonTags := map[string]string{"reason": string(reason)}
+		if productSKU := strings.TrimSpace(t.Metadata.ProductSKU); productSKU != "" {
+			reasonTags["product_sku"] = productSKU
+		}
+		metrics.HistogramWithBounds(
+			ReasoningItemsRemovedMetric,
+			int(removals.Counts[reason]),
+			ReasoningItemsRemovedBoundaries,
+			reasonTags,
+		)
+	}
 }
 
 // RecordWebsocketRequest emits the diagnostic records for one websocket request
@@ -208,4 +254,24 @@ func (t *SessionTelemetry) RecordAPIRequest(ctx context.Context, record model.AP
 		fields["auth.env_provider_key_present"] = strconv.FormatBool(*authEnv.ProviderEnvKeyPresent)
 	}
 	t.LogAndTraceEvent(ctx, "codex.api_request", fields, nil, nil)
+}
+
+// RecordSSEDelta mirrors SessionTelemetry's successful per-delta record: the
+// event kind and payload size are logged, and #58034's log_sse_deltas switch
+// drops the successful delta records while leaving errors and metrics intact.
+func (t *SessionTelemetry) RecordSSEDelta(ctx context.Context, eventKind string, payloadBytes int) {
+	if t == nil || t.Logs == nil || !t.LogSSEDeltas {
+		return
+	}
+	kind := strings.TrimSpace(eventKind)
+	if !strings.HasSuffix(kind, ".delta") {
+		// Only successful delta records are gated; completed and error records
+		// always report.
+		return
+	}
+	fields := map[string]string{
+		"event.kind":    kind,
+		"payload_bytes": strconv.Itoa(payloadBytes),
+	}
+	t.LogAndTraceEvent(ctx, "codex.sse_event", fields, nil, nil)
 }

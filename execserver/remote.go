@@ -48,10 +48,16 @@ type RemoteEnvironmentConfig struct {
 	// Managed credentials (workload identity) are refreshed asynchronously
 	// before the request is sent. When nil, the static AuthHeaders are used.
 	ResolveAuthHeaders func(ctx context.Context) (http.Header, error)
-	HTTPClient         *http.Client
-	Dial               func(context.Context, string, *websocket.DialOptions) (*websocket.Conn, *http.Response, error)
-	Backoff            time.Duration
-	MaxBackoff         time.Duration
+	// RefreshAfterUnauthorized mirrors Rust AuthProvider::refresh_after_unauthorized
+	// (#55987): after a registry request is rejected with HTTP 401 it may supply
+	// replacement credentials. A true result authorizes exactly one replay of the
+	// same request with freshly resolved auth. It receives the headers of the
+	// rejected attempt so concurrent failures can reuse an earlier refresh.
+	RefreshAfterUnauthorized func(ctx context.Context, rejected http.Header) bool
+	HTTPClient               *http.Client
+	Dial                     func(context.Context, string, *websocket.DialOptions) (*websocket.Conn, *http.Response, error)
+	Backoff                  time.Duration
+	MaxBackoff               time.Duration
 	// PreferMXC mirrors Rust ExecServerRuntimeOptions::prefer_mxc: only the
 	// sandbox preference from startup `features.prefer_mxc` flags.
 	PreferMXC *bool
@@ -65,6 +71,11 @@ type RemoteEnvironmentConfig struct {
 	// AllowedSymlinkedCodexHome is the execution host's macOS Seatbelt opt-out
 	// (Rust #42716), applied to this remote executor's sandbox preparation.
 	AllowedSymlinkedCodexHome string
+	// ForwardURL is Rust's exec-server forwarding destination
+	// (`exec-server forward --connect`): when set, the registered environment
+	// bridges every accepted Noise relay stream to that exec-server WebSocket
+	// instead of executing locally.
+	ForwardURL string
 	// DirectHTTPClient is Rust's `http_direct` registry pool: the client a
 	// scoped executor credential must use when the registry is plain-HTTP
 	// loopback, so a system proxy can never receive the credential in plaintext
@@ -76,6 +87,22 @@ type RemoteEnvironmentConfig struct {
 	// to select scoped auth is WithExecutorCredentialAuth, which enforces the
 	// URL restrictions of Rust #54346.
 	authMode registryAuthMode
+	// Transport mirrors Rust ExecServerRemoteTransport (#42781): the Noise
+	// rendezvous transport by default, or the direct JSON-RPC WebSocket
+	// transport that authenticates the registry and handshake with SigV4.
+	Transport RemoteEnvironmentTransport
+	// DirectSigner signs Direct registrations and WebSocket handshakes. It is
+	// only consulted when Transport is RemoteTransportDirect.
+	DirectSigner DirectHandshakeSigner
+}
+
+// WithRegistryBearerRedaction treats the configured ChatGPT bearer as
+// sensitive in registry diagnostics while retaining its account header. The
+// caller must validate that the registry is HTTPS; this mirrors Rust's
+// `RemoteEnvironmentConfig::with_registry_bearer_redaction` (#59569).
+func (cfg RemoteEnvironmentConfig) WithRegistryBearerRedaction() RemoteEnvironmentConfig {
+	cfg.authMode = registryAuthModeChatGPTToken
+	return cfg
 }
 
 // WithExecutorCredentialAuth selects Rust's scoped executor-credential mode
@@ -90,6 +117,11 @@ type RemoteEnvironmentConfig struct {
 func (cfg RemoteEnvironmentConfig) WithExecutorCredentialAuth() (RemoteEnvironmentConfig, error) {
 	if err := requireSecureOrLoopback(cfg.BaseURL, "https"); err != nil {
 		return cfg, err
+	}
+	// Rust #42781: the direct transport authenticates with its own auth
+	// provider, so scoped executor credentials cannot be combined with it.
+	if cfg.Transport == RemoteTransportDirect {
+		return cfg, errors.New("environment registry config error: scoped executor credentials are not supported by the direct exec-server transport")
 	}
 	cfg.authMode = registryAuthModeExecutorCredential
 	return cfg, nil
@@ -234,23 +266,36 @@ func RunRemoteEnvironment(ctx context.Context, cfg RemoteEnvironmentConfig) erro
 		cfg.MaxBackoff = defaultRemoteMaxBackoff
 	}
 
-	identity, err := generateRemoteNoiseIdentity()
-	if err != nil {
-		return fmt.Errorf("failed to generate Noise relay identity: %w", err)
-	}
-	defer identity.Destroy()
-
 	server := NewServerWithHTTPClient(cfg.HTTPClient)
 	server.SetPreferMXC(cfg.PreferMXC)
 	server.SetProxyPrivateIPsViaUpstream(cfg.ProxyPrivateIPsViaUpstream)
 	server.SetEnvironmentConfigReader(cfg.EnvironmentConfigReader)
 	server.SetAllowedSymlinkedCodexHome(cfg.AllowedSymlinkedCodexHome)
 	defer server.shutdownSessions()
+	if forwardURL := strings.TrimSpace(cfg.ForwardURL); forwardURL != "" {
+		if cfg.Transport == RemoteTransportDirect {
+			// Rust's run_remote_environment_forward_until_shutdown rejects the
+			// Direct transport because its bridge is Noise-specific.
+			return errors.New("direct exec-server transport does not support forwarding")
+		}
+		server.SetForwardDestination(forwardURL)
+	}
+	if cfg.Transport == RemoteTransportDirect {
+		return runDirectEnvironment(ctx, cfg, server)
+	}
+
+	identity, err := generateRemoteNoiseIdentity()
+	if err != nil {
+		return fmt.Errorf("failed to generate Noise relay identity: %w", err)
+	}
+	defer identity.Destroy()
+
 	backoff := newRemoteReconnectBackoff(cfg.Backoff, cfg.MaxBackoff)
 	registration, err := registerRemoteEnvironmentWithRetry(ctx, cfg, identity.PublicKey())
 	if err != nil {
 		return err
 	}
+	server.SetExecutorRegistrationIdentity(registration.EnvironmentID, registration.ExecutorRegistrationID)
 	// Each connection attempt is correlated by its own request id and reported
 	// with credential-free, typed diagnostics (Rust #51483).
 	connectionAttempt := uint64(0)
@@ -326,28 +371,18 @@ func registerRemoteEnvironment(ctx context.Context, cfg RemoteEnvironmentConfig,
 	if err != nil {
 		return nil, err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, remoteEndpointURL(cfg.BaseURL, "/cloud/environment/"+cfg.EnvironmentID+"/register"), bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("environment registry request failed: %w", err)
-	}
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Accept", "application/json")
-	headers, executorCredential, err := resolveRemoteEnvironmentAuth(ctx, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("environment registry auth resolution failed: %w", err)
-	}
-	for key, values := range headers {
-		for _, value := range values {
-			request.Header.Add(key, value)
+	build := func() (*http.Request, error) {
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, remoteEndpointURL(cfg.BaseURL, "/cloud/environment/"+cfg.EnvironmentID+"/register"), bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("environment registry request failed: %w", err)
 		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Accept", "application/json")
+		return request, nil
 	}
-	client, err := remoteRegistryHTTPClientForAuth(cfg)
+	response, executorCredential, err := sendRegistryAuthenticated(ctx, cfg, build, true)
 	if err != nil {
 		return nil, err
-	}
-	response, err := client.Do(request)
-	if err != nil {
-		return nil, fmt.Errorf("environment registry request failed: %w", err)
 	}
 	defer response.Body.Close()
 	var decoded remoteRegistrationResponse
@@ -392,6 +427,22 @@ func registerRemoteEnvironmentWithRetry(ctx context.Context, cfg RemoteEnvironme
 		registration, err := registerRemoteEnvironment(ctx, cfg, key)
 		if err == nil {
 			return registration, nil
+		}
+		// Credential resolution failed before any registration was sent. Keep
+		// the executor alive without replaying an ambiguous write (Rust #58251).
+		if errors.Is(err, ErrRegistryCredentialsTransient) {
+			attempt++
+			delay := registrationConflictRetryDelay(retryKey, attempt-1)
+			slog.Warn("Noise executor retrying unavailable credential resolution",
+				"noise_event", "registration",
+				"noise_outcome", "retry",
+				"retry_attempt", attempt,
+				"retry_delay_ms", delay.Milliseconds(),
+			)
+			if sleepErr := sleepContext(ctx, delay); sleepErr != nil {
+				return nil, sleepErr
+			}
+			continue
 		}
 		var httpErr *remoteRegistryHTTPError
 		if !errors.As(err, &httpErr) || !retryableRegistryRegistrationError(httpErr) {

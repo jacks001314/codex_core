@@ -1,11 +1,13 @@
 package compact
 
 import (
+	"codex_core/protocol"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -189,6 +191,11 @@ type Item struct {
 	Data      map[string]any
 	Raw       json.RawMessage
 	Created   time.Time
+	// HistorySequence is the thread-local append identity restored from harness
+	// metadata. SampledThroughSequence is the input prefix acknowledged by a
+	// completed regular inference request (Rust #59404).
+	HistorySequence        uint64
+	SampledThroughSequence uint64
 }
 
 // CompactionPrefix identifies the history snapshot a speculative compaction
@@ -305,7 +312,12 @@ func BuildCompactedHistory(prefix []Item, userMessages []Item, summary string) [
 	history := make([]Item, 0, len(prefix)+len(userMessages)+1)
 	history = append(history, cloneItems(prefix)...)
 	history = append(history, cloneItems(userMessages)...)
-	history = append(history, Item{
+	history = append(history, compactionSummaryItem(summary))
+	return history
+}
+
+func compactionSummaryItem(summary string) Item {
+	return Item{
 		ID:   "compaction-summary",
 		Type: "message",
 		Role: "user",
@@ -316,8 +328,77 @@ func BuildCompactedHistory(prefix []Item, userMessages []Item, summary string) [
 				"content_item_kinds": []any{contextfrag.CompactionSummaryKind},
 			},
 		},
+	}
+}
+
+// pendingMailSequence returns the first agent-message identity newer than the
+// highest completed regular-inference checkpoint. Compactor output is not a
+// delivery proof (Rust compact_pending_input.rs).
+func pendingMailSequence(items []Item) (uint64, bool) {
+	sampledThrough := uint64(0)
+	for i := range items {
+		sampledThrough = max(sampledThrough, items[i].SampledThroughSequence)
+	}
+	for i := range items {
+		if items[i].Type == "agent_message" && items[i].HistorySequence > sampledThrough {
+			return items[i].HistorySequence, true
+		}
+	}
+	return 0, false
+}
+
+func isRetainedPendingMail(item Item, first uint64) bool {
+	return item.Type == "agent_message" && item.HistorySequence >= first &&
+		EstimateItemTokens(&item) <= MaxRetainedAgentMessageTokens
+}
+
+func pendingAgentMessagesForCompaction(items []Item, first uint64, budget int) []Item {
+	if budget <= 0 {
+		return nil
+	}
+	remaining := budget
+	selected := []Item{}
+	for i := len(items) - 1; i >= 0 && remaining > 0; i-- {
+		if !isRetainedPendingMail(items[i], first) {
+			continue
+		}
+		cost := max(1, EstimateItemTokens(&items[i]))
+		if cost > remaining {
+			continue
+		}
+		selected = append(selected, items[i])
+		remaining -= cost
+	}
+	for left, right := 0, len(selected)-1; left < right; left, right = left+1, right-1 {
+		selected[left], selected[right] = selected[right], selected[left]
+	}
+	return selected
+}
+
+func sortByHistorySequence(items []Item) {
+	sort.SliceStable(items, func(i, j int) bool {
+		return items[i].HistorySequence < items[j].HistorySequence
 	})
-	return history
+}
+
+func insertBeforePending(items []Item, inserted []Item, first uint64, hasPending bool) []Item {
+	if len(inserted) == 0 {
+		return items
+	}
+	position := len(items)
+	if hasPending {
+		for i := range items {
+			if items[i].HistorySequence >= first {
+				position = i
+				break
+			}
+		}
+	}
+	out := make([]Item, 0, len(items)+len(inserted))
+	out = append(out, items[:position]...)
+	out = append(out, cloneItems(inserted)...)
+	out = append(out, items[position:]...)
+	return out
 }
 
 func SummarizeLocally(history []Item, maxChars int) string {
@@ -359,7 +440,28 @@ func CompactLocally(request *Request, maxSummaryChars int, initialContext []Item
 	}
 	history := requestHistoryForCompaction(request)
 	summary := SummarizeLocally(history, maxSummaryChars)
-	compacted := BuildCompactedHistory(nil, retainedUserMessagesForLocalCompaction(history, CompactionUserMessageBudget), summary)
+	pendingFirst, hasPending := pendingMailSequence(history)
+	pending := []Item(nil)
+	budget := CompactionUserMessageBudget
+	if hasPending {
+		pending = pendingAgentMessagesForCompaction(history, pendingFirst, budget)
+		for i := range pending {
+			budget -= max(1, EstimateItemTokens(&pending[i]))
+		}
+		if budget < 0 {
+			budget = 0
+		}
+	}
+	users := retainedUserMessagesForLocalCompaction(history, budget)
+	retained := append(cloneItems(users), cloneItems(pending)...)
+	if hasPending {
+		sortByHistorySequence(retained)
+	}
+	compacted := append(retained, compactionSummaryItem(summary))
+	if hasPending {
+		summaryItem := compacted[len(compacted)-1]
+		compacted = insertBeforePending(compacted[:len(compacted)-1], []Item{summaryItem}, pendingFirst, true)
+	}
 	if injectBeforeLastUser {
 		compacted = InsertInitialContextBeforeLastUserOrSummary(compacted, initialContext)
 	}
@@ -393,6 +495,10 @@ type RemoteOptions struct {
 	// The compaction pipeline reads `retain_client_tool_outputs` and
 	// `retain_client_developer_messages` from it.
 	FeatureSettings map[string]bool
+	// FileAudioDurations carries measured uploaded-audio durations for the
+	// retained-message budget (Rust #59268). A missing entry reserves the full
+	// Responses maximum.
+	FileAudioDurations FileAudioDurations
 }
 
 func CompactRemotely(ctx context.Context, request *Request, options *RemoteOptions) (*Result, error) {
@@ -415,7 +521,7 @@ func CompactRemotely(ctx context.Context, request *Request, options *RemoteOptio
 			if len(result.NewHistory) == 0 && strings.TrimSpace(result.Summary) != "" {
 				result.NewHistory = BuildCompactedHistory(nil, lastUserMessages(requestHistoryForCompaction(request), 1), result.Summary)
 			}
-			result.NewHistory = processRemoteHistoryWithRetained(
+			result.NewHistory = processRemoteHistoryWithRetainedWithAudio(
 				result.NewHistory,
 				requestHistoryForCompaction(request),
 				options.InitialContext,
@@ -425,6 +531,7 @@ func CompactRemotely(ctx context.Context, request *Request, options *RemoteOptio
 					options.RetainClientDeveloperMessages,
 					options.RetainClientToolOutputs,
 				),
+				options.FileAudioDurations,
 			)
 			if result.CompletedAt.IsZero() {
 				result.CompletedAt = time.Now().UTC()
@@ -563,21 +670,80 @@ func historyContainsRealUserOrAgentMessage(items []Item) bool {
 	return false
 }
 
-// TrimHistoryToContextWindow applies an explicit context window rather than
-// reading configuration at request time, so speculative requests keep the
-// window captured by their model step.
-func TrimHistoryToContextWindow(items []Item, contextWindow int, baseInstructions string) []Item {
+// ContextWindowTruncatedOutputMessage is the placeholder Rust writes into a
+// tool output that is rewritten to fit the streaming compaction window.
+const ContextWindowTruncatedOutputMessage = "Output exceeded the available model context and was truncated"
+
+// TrimFunctionCallHistoryToFitContextWindow mirrors Rust's
+// `trim_function_call_history_to_fit_context_window` (#44255). The streamed
+// remote compaction boundary never drops conversation items: while the history
+// plus the session base instructions exceed the captured window it rewrites the
+// newest tool outputs in place, and it stops at the first item that cannot be
+// rewritten so older history stays intact. It returns the history and the number
+// of rewritten outputs.
+func TrimFunctionCallHistoryToFitContextWindow(items []Item, contextWindow int, baseInstructions string, retainClientToolOutputs bool) ([]Item, int) {
+	trimmed := cloneItems(items)
 	if contextWindow <= 0 {
-		return cloneItems(items)
+		return trimmed, 0
 	}
-	used := EstimateTextTokens(baseInstructions)
-	for i := range items {
-		used += max(1, EstimateItemTokens(&items[i]))
+	estimated := EstimateTextTokens(baseInstructions)
+	for i := range trimmed {
+		estimated += EstimateItemTokens(&trimmed[i])
 	}
-	if used <= contextWindow {
-		return cloneItems(items)
+	if estimated <= contextWindow {
+		return trimmed, 0
 	}
-	return TrimHistoryToTokenBudget(items, max(0, contextWindow-EstimateTextTokens(baseInstructions)))
+	rewritten := 0
+	for i := len(trimmed) - 1; i >= 0 && estimated > contextWindow; i-- {
+		// Rust turns feature-enabled retained client outputs into the same
+		// boundary as user/developer messages: they are never rewritten.
+		if retainClientToolOutputs && IsRetainedToolOutput(trimmed[i]) {
+			break
+		}
+		replacement, ok := rewrittenOutputForContextWindow(&trimmed[i])
+		if !ok {
+			break
+		}
+		estimated -= EstimateItemTokens(&trimmed[i])
+		estimated += EstimateItemTokens(&replacement)
+		trimmed[i] = replacement
+		rewritten++
+	}
+	return trimmed, rewritten
+}
+
+// rewrittenOutputForContextWindow rewrites tool outputs only: function and
+// custom tool outputs become the truncation placeholder, and a tool-search
+// output keeps its identity but reports an empty discovered-tools array.
+func rewrittenOutputForContextWindow(item *Item) (Item, bool) {
+	switch strings.ToLower(strings.TrimSpace(item.Type)) {
+	case "function_call_output", "custom_tool_call_output":
+		replacement := *item
+		replacement.Content = nil
+		replacement.Raw = nil
+		replacement.Text = ContextWindowTruncatedOutputMessage
+		data := cloneItemData(item.Data)
+		if data == nil {
+			data = map[string]any{}
+		}
+		delete(data, "content_items")
+		data["output"] = ContextWindowTruncatedOutputMessage
+		replacement.Data = data
+		return replacement, true
+	case "tool_search_output":
+		replacement := *item
+		replacement.Content = nil
+		replacement.Raw = nil
+		replacement.Text = ""
+		data := cloneItemData(item.Data)
+		if data == nil {
+			data = map[string]any{}
+		}
+		data["tools"] = []any{}
+		replacement.Data = data
+		return replacement, true
+	}
+	return Item{}, false
 }
 
 // HistoryVersion returns a stable fingerprint used to deduplicate speculative
@@ -604,15 +770,29 @@ func ProcessRemoteHistory(remote []Item, initialContext []Item, injectBeforeLast
 }
 
 func processRemoteHistoryWithRetained(remote []Item, original []Item, initialContext []Item, injectBeforeLastUser bool, policy retentionPolicy) []Item {
-	retained := retainedMessagesForRemoteCompaction(original, RemoteRetainedMessageTokenBudget, policy)
+	return processRemoteHistoryWithRetainedWithAudio(remote, original, initialContext, injectBeforeLastUser, policy, nil)
+}
+
+func processRemoteHistoryWithRetainedWithAudio(remote []Item, original []Item, initialContext []Item, injectBeforeLastUser bool, policy retentionPolicy, durations FileAudioDurations) []Item {
+	retained := retainedMessagesForRemoteCompactionWithAudio(original, RemoteRetainedMessageTokenBudget, policy, durations)
 	filtered := FilterCompactedHistory(remote, policy.clientDeveloperMessages, policy.clientToolOutputs)
 	history := append([]Item(nil), retained...)
+	checkpoints := []Item{}
 	for _, item := range filtered {
 		if compactHistoryContainsItem(history, item) {
 			continue
 		}
+		if item.Type == "compaction" || item.Type == "context_compaction" {
+			checkpoints = append(checkpoints, item)
+			continue
+		}
 		history = append(history, item)
 	}
+	pendingFirst, hasPending := pendingMailSequence(original)
+	if hasPending {
+		sortByHistorySequence(history)
+	}
+	history = insertBeforePending(history, checkpoints, pendingFirst, hasPending)
 	if injectBeforeLastUser {
 		return InsertInitialContextBeforeLastUserOrSummary(history, initialContext)
 	}
@@ -620,11 +800,20 @@ func processRemoteHistoryWithRetained(remote []Item, original []Item, initialCon
 }
 
 func retainedMessagesForRemoteCompaction(items []Item, maxTokens int, policy retentionPolicy) []Item {
+	return retainedMessagesForRemoteCompactionWithAudio(items, maxTokens, policy, nil)
+}
+
+// retainedMessagesForRemoteCompactionWithAudio mirrors Rust
+// truncate_retained_messages (#59237, #59268): measured uploaded-audio
+// durations replace the conservative maximum when the store knows them.
+func retainedMessagesForRemoteCompactionWithAudio(items []Item, maxTokens int, policy retentionPolicy, durations FileAudioDurations) []Item {
 	if maxTokens <= 0 {
 		return nil
 	}
 	candidates := make([]Item, 0, len(items))
+	pendingFirst, hasPending := pendingMailSequence(items)
 	for _, item := range items {
+		pending := hasPending && isRetainedPendingMail(item, pendingFirst)
 		keep := (item.Type == "message" || item.Type == "user_message") && item.Role == "user" && ShouldKeepCompactedHistoryItem(item)
 		if policy.clientDeveloperMessages && IsClientAuthoredDeveloperMessage(item) {
 			keep = true
@@ -636,7 +825,9 @@ func retainedMessagesForRemoteCompaction(items []Item, maxTokens int, policy ret
 		}
 		if isStructuredAgentMessage(&item) {
 			cost := EstimateItemTokens(&item)
-			keep = !isAgentCompletionMessage(&item) && cost <= MaxRetainedAgentMessageTokens
+			keep = pending || (!isAgentCompletionMessage(&item) && cost <= MaxRetainedAgentMessageTokens)
+		} else {
+			keep = keep || pending
 		}
 		if keep {
 			candidates = append(candidates, item)
@@ -649,15 +840,14 @@ func retainedMessagesForRemoteCompaction(items []Item, maxTokens int, policy ret
 		item := candidates[i]
 		clientDeveloper := IsClientAuthoredDeveloperMessage(item)
 		chargeImages := policy.imageBudget && !clientDeveloper
-		textCost := EstimateTextTokens(ItemText(&item))
-		contentCost := EstimateItemTokens(&item)
-		cost := max(1, contentCost)
+		cost := max(1, EstimateItemTokensWithAudio(&item, durations))
 		itemType := strings.ToLower(strings.TrimSpace(item.Type))
 		isMessage := itemType == "message" || itemType == "user_message" || itemType == "assistant_message"
-		if isMessage && !clientDeveloper && !chargeImages {
-			// Without the image budget, retained messages charge their text only
-			// (Rust #40280); outputs and other items keep the serialized estimate.
-			cost = max(1, textCost)
+		if isMessage && !clientDeveloper {
+			// Retained messages charge their content parts: text, images only
+			// with the image budget (Rust #40280), and uploaded file audio
+			// always at its measured or maximum budget (Rust #59237).
+			cost = max(1, retainedMessageTokens(item, chargeImages, durations))
 		}
 		if cost <= remaining {
 			retainedReversed = append(retainedReversed, item)
@@ -674,13 +864,13 @@ func retainedMessagesForRemoteCompaction(items []Item, maxTokens int, policy ret
 		if isStructuredAgentMessage(&item) {
 			continue
 		}
-		if chargeImages && retainedMessageImageCount(item) > 0 {
-			// Rust #40280: an image at the truncation boundary is kept or dropped
-			// whole with its adjacent labels. Once it does not fit, stop
+		if requiresMediaBoundaryTruncation(item, chargeImages) {
+			// Rust #40280/#59237: media at the truncation boundary is kept or
+			// dropped whole with its adjacent labels. Once it does not fit, stop
 			// backfilling the remaining budget with older messages.
 			budget := remaining
 			remaining = 0
-			if truncated, ok := truncateRetainedMessageWithImages(item, budget); ok {
+			if truncated, ok := truncateRetainedMessageWithMedia(item, budget, chargeImages, durations); ok {
 				retainedReversed = append(retainedReversed, truncated)
 			}
 			continue
@@ -711,11 +901,55 @@ func retainedMessageImageCount(item Item) int {
 	return count
 }
 
-// truncateRetainedMessageWithImages keeps later content within a token budget,
-// treating each image (and its immediate `<image>` / `</image>` labels) as an
-// atomic group. Text follows the normal token truncation policy; audio and
-// other media stay uncharged, mirroring Rust #40280.
-func truncateRetainedMessageWithImages(item Item, maxTokens int) (Item, bool) {
+// requiresMediaBoundaryTruncation mirrors Rust #59237: a charged image or any
+// uploaded file audio makes the message boundary media-aware.
+func requiresMediaBoundaryTruncation(item Item, chargeImages bool) bool {
+	return (chargeImages && retainedMessageImageCount(item) > 0) || retainedMessageFileAudioCount(item) > 0
+}
+
+// retainedMessageFileAudioCount counts uploaded-file audio references, which
+// always consume budget regardless of the image budget.
+func retainedMessageFileAudioCount(item Item) int {
+	count := 0
+	for _, part := range item.Content {
+		if isRetainedFileAudioPart(part) {
+			count++
+		}
+	}
+	return count
+}
+
+// isRetainedFileAudioPart reports the uploaded-file arm of an audio part
+// (Rust AudioReference::File). Inline audio keeps its payload in the request.
+func isRetainedFileAudioPart(part ContentPart) bool {
+	kind := retainedContentPartKind(part)
+	if kind != "input_audio" && kind != "audio" {
+		return false
+	}
+	return strings.TrimSpace(part.AudioURL) == "" && strings.TrimSpace(part.FileID) != ""
+}
+
+// retainedMessageTokens mirrors Rust retained_message_token_count.
+func retainedMessageTokens(item Item, chargeImages bool, durations FileAudioDurations) int {
+	itemType := strings.ToLower(strings.TrimSpace(item.Type))
+	if itemType != "message" && itemType != "user_message" && itemType != "assistant_message" {
+		return EstimateItemTokensWithAudio(&item, durations)
+	}
+	if len(item.Content) == 0 {
+		return EstimateTextTokens(ItemText(&item))
+	}
+	total := 0
+	for _, part := range item.Content {
+		total += retainedContentPartTokens(part, chargeImages, durations)
+	}
+	return total
+}
+
+// truncateRetainedMessageWithMedia keeps later content within a token budget,
+// treating each image or audio part (and its immediate <image>/<audio> labels)
+// as an atomic group. Text follows the normal token truncation policy. File
+// audio is charged at its measured or maximum budget (Rust #59237, #59268).
+func truncateRetainedMessageWithMedia(item Item, maxTokens int, chargeImages bool, durations FileAudioDurations) (Item, bool) {
 	if maxTokens <= 0 || len(item.Content) == 0 {
 		return Item{}, false
 	}
@@ -724,32 +958,28 @@ func truncateRetainedMessageWithImages(item Item, maxTokens int) (Item, bool) {
 	keptReversed := make([]ContentPart, 0, len(parts))
 	for len(parts) > 0 && remaining > 0 {
 		last := len(parts) - 1
-		imageIndex := -1
+		mediaIndex := -1
 		switch {
-		case isRetainedImagePart(parts[last]):
-			imageIndex = last
-		case isRetainedImageCloseLabel(parts[last]) && last > 0 && isRetainedImagePart(parts[last-1]):
-			imageIndex = last - 1
+		case isRetainedMediaPart(parts[last]):
+			mediaIndex = last
+		case last > 0 && isRetainedMediaCloseLabel(parts[last], parts[last-1]):
+			mediaIndex = last - 1
 		}
-		if imageIndex >= 0 {
-			start := imageIndex
-			if start > 0 && isRetainedImageOpenLabel(parts[start-1]) {
+		if mediaIndex >= 0 {
+			start := mediaIndex
+			if start > 0 && isRetainedMediaOpenLabel(parts[start-1], parts[start]) {
 				start--
 			}
 			groupTokens := 0
 			for _, part := range parts[start:] {
-				groupTokens += retainedContentPartTokens(part)
+				groupTokens += retainedContentPartTokens(part, chargeImages, durations)
 			}
-			fits := groupTokens <= remaining
-			if fits {
-				remaining -= groupTokens
-			} else {
-				remaining = 0
+			if groupTokens > remaining {
+				break
 			}
-			if fits {
-				for index := len(parts) - 1; index >= start; index-- {
-					keptReversed = append(keptReversed, parts[index])
-				}
+			remaining -= groupTokens
+			for index := len(parts) - 1; index >= start; index-- {
+				keptReversed = append(keptReversed, parts[index])
 			}
 			parts = parts[:start]
 			continue
@@ -757,7 +987,7 @@ func truncateRetainedMessageWithImages(item Item, maxTokens int) (Item, bool) {
 		part := parts[last]
 		parts = parts[:last]
 		switch retainedContentPartKind(part) {
-		case "input_text":
+		case "input_text", "output_text", "text":
 			if remaining == 0 {
 				continue
 			}
@@ -771,8 +1001,6 @@ func truncateRetainedMessageWithImages(item Item, maxTokens int) (Item, bool) {
 			if part.Text != "" {
 				keptReversed = append(keptReversed, part)
 			}
-		case "input_audio":
-			keptReversed = append(keptReversed, part)
 		default:
 			keptReversed = append(keptReversed, part)
 		}
@@ -799,32 +1027,61 @@ func retainedContentPartKind(part ContentPart) string {
 	return strings.ToLower(strings.TrimSpace(part.Type))
 }
 
-func retainedContentPartTokens(part ContentPart) int {
+// retainedContentPartTokens mirrors Rust compact_remote_v2_media
+// content_item_token_count: inline audio is free, file audio always charges its
+// budget, and images charge only when the image budget is enabled.
+func retainedContentPartTokens(part ContentPart, chargeImages bool, durations FileAudioDurations) int {
 	switch retainedContentPartKind(part) {
-	case "input_text", "output_text":
+	case "input_text", "output_text", "text":
 		return EstimateTextTokens(part.Text)
-	case "input_image":
+	case "input_image", "image":
+		if !chargeImages {
+			return 0
+		}
 		return compactTokensFromBytes(compactImageReferenceBytes(part))
+	case "input_audio", "audio":
+		if isRetainedFileAudioPart(part) {
+			return durations.FileTokens(part.FileID)
+		}
+		return 0
 	default:
-		// Audio and other media remain uncharged, matching Rust.
 		return 0
 	}
 }
 
 func isRetainedImagePart(part ContentPart) bool {
-	return retainedContentPartKind(part) == "input_image"
+	kind := retainedContentPartKind(part)
+	return kind == "input_image" || kind == "image"
 }
 
-func isRetainedImageOpenLabel(part ContentPart) bool {
+// isRetainedMediaPart reports a content part that must move together with its
+// adjacent harness labels.
+func isRetainedMediaPart(part ContentPart) bool {
+	kind := retainedContentPartKind(part)
+	return kind == "input_image" || kind == "image" || kind == "input_audio" || kind == "audio"
+}
+
+// isRetainedMediaOpenLabel mirrors Rust is_opening_media_label.
+func isRetainedMediaOpenLabel(part ContentPart, media ContentPart) bool {
 	if retainedContentPartKind(part) != "input_text" {
 		return false
 	}
 	text := part.Text
-	return text == "<image>" || (strings.HasPrefix(text, "<image name=") && strings.HasSuffix(text, ">"))
+	if isRetainedImagePart(media) {
+		return text == "<image>" || (strings.HasPrefix(text, "<image name=") && strings.HasSuffix(text, ">"))
+	}
+	return text == "<audio>" || (strings.HasPrefix(text, "<audio name=") && strings.HasSuffix(text, ">"))
 }
 
-func isRetainedImageCloseLabel(part ContentPart) bool {
-	return retainedContentPartKind(part) == "input_text" && part.Text == "</image>"
+// isRetainedMediaCloseLabel mirrors Rust is_closing_media_label.
+func isRetainedMediaCloseLabel(part ContentPart, previous ContentPart) bool {
+	if retainedContentPartKind(part) != "input_text" {
+		return false
+	}
+	if isRetainedImagePart(previous) {
+		return part.Text == "</image>"
+	}
+	return part.Text == "</audio>"
 }
 
 func retainedMessageText(parts []ContentPart) string {
@@ -961,6 +1218,13 @@ func resolveRetentionPolicy(settings map[string]bool, retainClientDeveloperMessa
 }
 
 func EstimateItemTokens(item *Item) int {
+	return EstimateItemTokensWithAudio(item, nil)
+}
+
+// EstimateItemTokensWithAudio mirrors Rust estimate_item_token_count_with_audio
+// (#59268): uploaded file audio is charged from its measured duration when the
+// session cache has one.
+func EstimateItemTokensWithAudio(item *Item, durations FileAudioDurations) int {
 	if item == nil {
 		return 0
 	}
@@ -973,6 +1237,26 @@ func EstimateItemTokens(item *Item) int {
 		return compactTokensFromBytes(functionCallModelVisibleBytes(item))
 	case "function_call_output", "custom_tool_call_output", "tool_output":
 		return compactTokensFromBytes(functionCallOutputModelVisibleBytes(item))
+	case "tool_search_call":
+		// Rust #44255 charges the JSON arguments, not the transport envelope.
+		if arguments, ok := item.Data["arguments"]; ok && arguments != nil {
+			if encoded, err := json.Marshal(arguments); err == nil {
+				return compactTokensFromBytes(len(encoded))
+			}
+		}
+		return compactTokensFromBytes(len(strings.TrimSpace(ItemText(item))))
+	case "tool_search_output":
+		if tokens, ok := estimateToolSearchOutputTokens(item); ok {
+			return tokens
+		}
+	case "reasoning":
+		// Rust charges an encrypted reasoning item through the length of its
+		// opaque payload. The summary text is not model-visible history, so
+		// without this branch long reasoning items look almost free and cannot
+		// be trimmed when a compaction request is bounded.
+		if tokens, ok := estimateEncryptedReasoningTokens(item); ok {
+			return tokens
+		}
 	}
 	if isStructuredAgentMessage(item) {
 		return (agentMessageModelVisibleBytes(item) + 3) / 4
@@ -981,9 +1265,32 @@ func EstimateItemTokens(item *Item) int {
 		// Rust estimate_response_item_model_visible_bytes counts a message's
 		// content blocks, so an image (inline or file-backed) is charged instead
 		// of contributing zero (#46072).
-		return compactTokensFromBytes(compactItemContentBytes(item))
+		return compactTokensFromBytes(compactItemContentBytes(item, durations))
 	}
-	return EstimateTextTokens(ItemText(item))
+	if tokens := EstimateTextTokens(ItemText(item)); tokens > 0 {
+		return tokens
+	}
+	// Legacy or provider-shaped items may keep their only payload in Raw.
+	// Charging the serialized payload is a conservative upper bound that keeps
+	// those items from bypassing the compaction history budget.
+	if len(item.Raw) > 0 {
+		return compactTokensFromBytes(len(item.Raw))
+	}
+	return 0
+}
+
+// estimateToolSearchOutputTokens mirrors Rust's `json_content_bytes(tools)`:
+// a discovered tool catalog is itself JSON, so its syntax is charged.
+func estimateToolSearchOutputTokens(item *Item) (int, bool) {
+	tools, ok := item.Data["tools"]
+	if !ok {
+		return 0, false
+	}
+	encoded, err := json.Marshal(tools)
+	if err != nil {
+		return 0, false
+	}
+	return compactTokensFromBytes(len(encoded)), true
 }
 
 // EstimateCompactionContentLength mirrors Rust #53691's replay-cache-aware
@@ -1044,19 +1351,49 @@ const compactResizedImageBytes = 7373
 // detail reference is charged the maximum patch count (#46072).
 const compactOriginalImageMaxPatches = 10_000
 
+// FileAudioTokensEstimate mirrors Rust FILE_AUDIO_TOKENS_ESTIMATE (#58430):
+// an uploaded audio file with no measured duration reserves the Responses
+// 20-minute maximum at the existing 10 audio tokens per second.
+const FileAudioTokensEstimate = audioutil.MaxFileAudioTokens
+
+// FileAudioDurations maps uploaded file IDs to measured durations in seconds
+// (Rust SessionState::file_audio_durations, #59268). A missing entry reserves
+// the full budget because admission belongs to Responses.
+type FileAudioDurations map[string]float64
+
+// FileTokens returns the budget charged for one uploaded recording.
+func (d FileAudioDurations) FileTokens(fileID string) int {
+	var duration *float64
+	if seconds, ok := d[strings.TrimSpace(fileID)]; ok {
+		duration = &seconds
+	}
+	return audioutil.EstimateFileAudioTokens(duration)
+}
+
 // compactImageReferenceBytes mirrors Rust estimate_image_reference_bytes
-// (#46072): an inline image keeps the resized-image estimate, while a file
-// reference is charged the fixed resized cost or the maximum patch count when
-// the request asks for `original` detail.
+// (#46072, #54776): an inline image keeps the resized-image estimate unless the
+// request asks for `original` detail, which is measured from the payload's
+// dimensions; a file reference cannot expose dimensions and is charged the fixed
+// resized cost or the maximum patch count for `original` detail. The shared
+// estimate lives in context so history accounting and compaction charge the same
+// bytes for the same reference.
 func compactImageReferenceBytes(part ContentPart) int {
-	if strings.TrimSpace(part.FileID) == "" {
-		return compactResizedImageBytes
+	detail := ""
+	if part.Detail != nil {
+		detail = *part.Detail
 	}
-	if part.Detail != nil && strings.EqualFold(strings.TrimSpace(*part.Detail), "original") {
-		// Rust approx_bytes_for_tokens(ORIGINAL_IMAGE_MAX_PATCHES): 4 bytes/token.
-		return compactOriginalImageMaxPatches * 4
+	return int(contextfrag.EstimateImageReferenceBytes(part.ImageURL, part.FileID, detail))
+}
+
+// compactAudioReferenceBytes mirrors Rust estimate_audio_reference_bytes
+// (#58430): inline audio is charged from the decoded duration, while a
+// file-backed reference has no local duration and uses the conservative
+// maximum-duration budget.
+func compactAudioReferenceBytes(part ContentPart, durations FileAudioDurations) int {
+	if strings.TrimSpace(part.AudioURL) == "" && strings.TrimSpace(part.FileID) != "" {
+		return durations.FileTokens(part.FileID) * 4
 	}
-	return compactResizedImageBytes
+	return audioutil.EstimateAudioTokenCount(part.AudioURL) * 4
 }
 
 // compactTokensFromBytes mirrors Rust approx_tokens_from_byte_count_i64.
@@ -1072,11 +1409,11 @@ func functionCallModelVisibleBytes(item *Item) int {
 	if namespace == "" {
 		namespace = functionNamespaceDefault
 	}
-	return len(item.Name) + len(namespace) + compactItemContentBytes(item)
+	return len(item.Name) + len(namespace) + compactItemContentBytes(item, nil)
 }
 
 func functionCallOutputModelVisibleBytes(item *Item) int {
-	return compactItemContentBytes(item) +
+	return compactItemContentBytes(item, nil) +
 		len(item.CallID) +
 		len(item.Name) +
 		len(strings.TrimSpace(item.Namespace))
@@ -1085,7 +1422,7 @@ func functionCallOutputModelVisibleBytes(item *Item) int {
 // compactItemContentBytes estimates the model-visible payload bytes: the joined
 // text, or per-block content when structured blocks are present (Rust
 // estimate_function_output_bytes for the shapes Go models).
-func compactItemContentBytes(item *Item) int {
+func compactItemContentBytes(item *Item, durations FileAudioDurations) int {
 	if item == nil {
 		return 0
 	}
@@ -1100,9 +1437,7 @@ func compactItemContentBytes(item *Item) int {
 		case "input_image", "image":
 			bytes += compactImageReferenceBytes(part)
 		case "input_audio", "audio":
-			// Rust estimate_audio_bytes: approx_bytes_for_tokens over the
-			// duration-derived token count.
-			bytes += audioutil.EstimateAudioTokenCount(part.AudioURL) * 4
+			bytes += compactAudioReferenceBytes(part, durations)
 		}
 	}
 	if bytes == 0 {
@@ -1147,6 +1482,42 @@ func encryptedFunctionOutputByteEstimate(encodedLen int) int {
 	return (encodedLen*9 + 15) / 16
 }
 
+// estimateEncryptedReasoningTokens mirrors Rust's estimate_reasoning_length:
+// the encoded payload expands to roughly three quarters of its length once
+// decrypted, with a fixed 650-byte framing allowance.
+func estimateEncryptedReasoningTokens(item *Item) (int, bool) {
+	encrypted := encryptedReasoningContent(item)
+	if encrypted == "" {
+		return 0, false
+	}
+	bytes := len(encrypted)*3/4 - 650
+	if bytes < 0 {
+		bytes = 0
+	}
+	return compactTokensFromBytes(bytes), true
+}
+
+func encryptedReasoningContent(item *Item) string {
+	if item == nil {
+		return ""
+	}
+	if encrypted, ok := item.Data["encrypted_content"].(string); ok && strings.TrimSpace(encrypted) != "" {
+		return encrypted
+	}
+	if len(item.Raw) == 0 {
+		return ""
+	}
+	var raw map[string]any
+	if json.Unmarshal(item.Raw, &raw) != nil {
+		return ""
+	}
+	encrypted, _ := raw["encrypted_content"].(string)
+	if strings.TrimSpace(encrypted) == "" {
+		return ""
+	}
+	return encrypted
+}
+
 func isStructuredAgentMessage(item *Item) bool {
 	if item == nil || item.Type != "agent_message" || len(item.Raw) == 0 {
 		return false
@@ -1166,16 +1537,18 @@ func isAgentCompletionMessage(item *Item) bool {
 }
 
 // isDescendantProgressMessage reports whether an agent message is a
-// descendant-authored progress update ("Message Type: MESSAGE") that remote
-// compaction v2 should not retain (Rust #39176). Descendant-authored tasks
-// (encrypted NEW_TASK payloads) are still retained.
+// descendant-authored progress update ("Message Type: MESSAGE" or
+// "Message Type: CHANNEL_POST") that remote compaction v2 should not retain
+// (Rust #39176, #47249). Descendant-authored tasks (encrypted NEW_TASK
+// payloads) are still retained.
 func isDescendantProgressMessage(item *Item) bool {
 	author, recipient := agentMessageAuthorRecipient(item)
 	if author == "" || recipient == "" || !strings.HasPrefix(author, recipient+"/") {
 		return false
 	}
 	text, ok := firstAgentMessageInputText(item)
-	return ok && strings.HasPrefix(text, "Message Type: MESSAGE\n")
+	return ok && (strings.HasPrefix(text, "Message Type: MESSAGE\n") ||
+		strings.HasPrefix(text, "Message Type: CHANNEL_POST\n"))
 }
 
 func agentMessageAuthorRecipient(item *Item) (string, string) {
@@ -1310,14 +1683,109 @@ func ItemsAfterLastModelGeneratedItem(items []Item) []Item {
 	return append([]Item(nil), items[last+1:]...)
 }
 
-// EstimateActiveContextTokens mirrors Rust Session::get_total_token_usage:
-// the last server-reported total plus an estimate of any local items recorded
-// after the most recent model-generated item.
+// EstimateActiveContextTokens mirrors Rust Session::get_total_token_usage with
+// the session's default reasoning-inclusion state: the last server-reported
+// total plus local trailing items plus encrypted reasoning the server did not
+// already account for.
 func EstimateActiveContextTokens(items []Item, lastTotalTokens int) int {
+	return EstimateActiveContextTokensWithServerReasoning(items, lastTotalTokens, false)
+}
+
+// EstimateActiveContextTokensWithServerReasoning mirrors Rust
+// Session::get_total_token_usage. When the last sampling request reported that
+// the server already accounted for reasoning, its total includes every retained
+// reasoning item and re-estimating them would double count (Rust #55991).
+func EstimateActiveContextTokensWithServerReasoning(items []Item, lastTotalTokens int, serverReasoningIncluded bool) int {
+	return EstimateActiveContextTokensWithUsageBoundary(items, lastTotalTokens, serverReasoningIncluded, -1)
+}
+
+// ItemsSinceLastUsage mirrors Rust history::items_since_last_usage: history at
+// or after the boundary covered by the last usable usage report. A negative
+// boundary means persisted history carried no boundary, so the restored-history
+// approximation (Rust reset_last_usage_boundary) is used instead: everything
+// after the latest model-generated item, or nothing when the model never
+// produced an item.
+func ItemsSinceLastUsage(items []Item, boundary int) []Item {
+	if boundary < 0 {
+		return ItemsAfterLastModelGeneratedItem(items)
+	}
+	if boundary >= len(items) {
+		return nil
+	}
+	return append([]Item(nil), items[boundary:]...)
+}
+
+// EstimateActiveContextTokensWithUsageBoundary mirrors Rust
+// Session::get_total_token_usage after #58404: only items recorded after the
+// last usable usage report are estimated, and reasoning before that boundary
+// was already covered. Failed or usage-less responses keep their retained
+// output in the estimate until a later usable report covers it. Pass a
+// negative boundary for persisted history that did not save one.
+func EstimateActiveContextTokensWithUsageBoundary(items []Item, lastTotalTokens int, serverReasoningIncluded bool, boundary int) int {
 	if lastTotalTokens < 0 {
 		lastTotalTokens = 0
 	}
-	return lastTotalTokens + EstimateTokens(ItemsAfterLastModelGeneratedItem(items))
+	total := lastTotalTokens + EstimateTokens(ItemsSinceLastUsage(items, boundary))
+	if !serverReasoningIncluded {
+		total += EstimateNonLastReasoningTokensSinceUsage(items, boundary)
+	}
+	return total
+}
+
+// EstimateNonLastReasoningTokens mirrors Rust
+// History::get_non_last_reasoning_items_tokens: encrypted reasoning items before
+// the most recent user-turn boundary are not reflected in the last
+// server-reported total unless the server says it includes reasoning.
+func EstimateNonLastReasoningTokens(items []Item) int {
+	return EstimateNonLastReasoningTokensSinceUsage(items, -1)
+}
+
+// EstimateNonLastReasoningTokensSinceUsage mirrors Rust
+// History::get_non_last_reasoning_items_tokens after #58404: reasoning at or
+// after the usage boundary is charged by the trailing-item estimate, so it is
+// excluded here to avoid double counting. A negative boundary falls back to the
+// whole pre-turn range (restored-history approximation).
+func EstimateNonLastReasoningTokensSinceUsage(items []Item, boundary int) int {
+	lastBoundary := -1
+	for i := range items {
+		if compactItemIsUserTurnBoundary(&items[i]) {
+			lastBoundary = i
+		}
+	}
+	if lastBoundary <= 0 {
+		return 0
+	}
+	if boundary >= 0 && boundary < lastBoundary {
+		lastBoundary = boundary
+	}
+	total := 0
+	for i := 0; i < lastBoundary; i++ {
+		item := &items[i]
+		if !strings.EqualFold(strings.TrimSpace(item.Type), "reasoning") {
+			continue
+		}
+		if encryptedReasoningContent(item) == "" {
+			continue
+		}
+		total += EstimateItemTokens(item)
+	}
+	return total
+}
+
+// compactItemIsUserTurnBoundary mirrors Rust is_user_turn_boundary for the
+// compact package's item view: an agent message or a non-contextual user
+// message closes the previous turn.
+func compactItemIsUserTurnBoundary(item *Item) bool {
+	if item == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(item.Type), "agent_message") {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(item.Type), "message") && strings.TrimSpace(item.Role) == "user" {
+		return strings.TrimSpace(item.Text) != ""
+	}
+	return false
 }
 
 func EstimateTextTokens(text string) int {
@@ -1475,15 +1943,17 @@ type Window struct {
 }
 
 func NewWindow(threadID string) *Window {
-	id := defaultWindowID(threadID, 0)
+	// Rust #59354: context window identity uses the shared UUIDv7 allocator.
+	// threadID remains an argument for source compatibility with callers that
+	// used to derive display-only ids from it.
+	_ = threadID
+	id := protocol.NewContextWindowID().String()
 	return &Window{
 		ids: WindowIDs{
 			FirstWindowID: id,
 			WindowID:      id,
 		},
-		nextID: func() string {
-			return defaultWindowID(threadID, time.Now().UTC().UnixNano())
-		},
+		nextID: func() string { return protocol.NewContextWindowID().String() },
 	}
 }
 
@@ -1491,7 +1961,7 @@ func NewWindowWithIDs(ids WindowIDs) *Window {
 	if ids.FirstWindowID == "" {
 		ids.FirstWindowID = ids.WindowID
 	}
-	return &Window{ids: ids, nextID: func() string { return defaultWindowID("window", time.Now().UTC().UnixNano()) }}
+	return &Window{ids: ids, nextID: func() string { return protocol.NewContextWindowID().String() }}
 }
 
 func (w *Window) SetIDGenerator(next func() string) {
@@ -1964,13 +2434,6 @@ func truncateTextToTokens(text string, maxTokens int) string {
 		}
 	}
 	return strings.TrimSpace(string(runes[:low]))
-}
-
-func defaultWindowID(threadID string, suffix any) string {
-	if threadID == "" {
-		threadID = "thread"
-	}
-	return fmt.Sprintf("%s:%v", threadID, suffix)
 }
 
 func cloneIntPtr(value *int) *int {

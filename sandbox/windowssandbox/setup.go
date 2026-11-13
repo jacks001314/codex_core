@@ -71,7 +71,10 @@ func (m *SetupMarker) RequestMismatchReason(networkIdentity SandboxNetworkIdenti
 	if m == nil || !networkIdentity.UsesOfflineIdentity() {
 		return ""
 	}
-	if equalUint16s(m.ProxyPorts, desired.ProxyPorts) && m.AllowLocalBinding == desired.AllowLocalBinding {
+	// Rust #43930: local-binding mode has no port-specific loopback rules, so
+	// changing proxy listeners does not require a firewall update while that
+	// mode stays enabled.
+	if m.AllowLocalBinding == desired.AllowLocalBinding && (m.AllowLocalBinding || equalUint16s(m.ProxyPorts, desired.ProxyPorts)) {
 		return ""
 	}
 	return "offline firewall settings changed (stored_ports=" + fmtUint16s(m.ProxyPorts) +
@@ -198,6 +201,12 @@ var proxyEnvKeys = []string{
 	"wss_proxy",
 }
 
+// ProxyEnvKeys lists the proxy variables consulted for offline firewall
+// settings, in setup's precedence order (Rust setup::PROXY_ENV_KEYS).
+func ProxyEnvKeys() []string {
+	return append([]string(nil), proxyEnvKeys...)
+}
+
 const allowLocalBindingEnvKey = "CODEX_NETWORK_ALLOW_LOCAL_BINDING"
 
 var UserProfileRootExclusions = []string{
@@ -278,13 +287,20 @@ func LoopbackProxyPortFromURL(value string) (uint16, bool) {
 }
 
 func GatherReadRoots(commandCWD string, permissions *ResolvedWindowsSandboxPermissions, envMap map[string]string, codexHome string) []string {
+	return GatherReadRootsForRuntime(commandCWD, permissions, envMap, codexHome, CurrentSetupRuntime())
+}
+
+// GatherReadRootsForRuntime gathers the readable set for the selected setup
+// runtime. A registered runtime never adds or creates the legacy helper bin
+// directory (Rust `gather_read_roots`).
+func GatherReadRootsForRuntime(commandCWD string, permissions *ResolvedWindowsSandboxPermissions, envMap map[string]string, codexHome string, runtime SetupRuntime) []string {
 	if permissions == nil {
 		return nil
 	}
 	if permissions.HasFullDiskReadAccess() {
-		return GatherFullReadRootsForPermissions(commandCWD, permissions, envMap, codexHome)
+		return GatherFullReadRootsForRuntime(commandCWD, permissions, envMap, codexHome, runtime)
 	}
-	roots := GatherHelperReadRoots(codexHome)
+	roots := GatherHelperReadRootsForRuntime(codexHome, runtime)
 	if permissions.IncludePlatformDefaults() {
 		roots = append(roots, WindowsPlatformDefaultReadRoots...)
 	}
@@ -293,7 +309,11 @@ func GatherReadRoots(commandCWD string, permissions *ResolvedWindowsSandboxPermi
 }
 
 func GatherFullReadRootsForPermissions(commandCWD string, permissions *ResolvedWindowsSandboxPermissions, envMap map[string]string, codexHome string) []string {
-	roots := GatherHelperReadRoots(codexHome)
+	return GatherFullReadRootsForRuntime(commandCWD, permissions, envMap, codexHome, CurrentSetupRuntime())
+}
+
+func GatherFullReadRootsForRuntime(commandCWD string, permissions *ResolvedWindowsSandboxPermissions, envMap map[string]string, codexHome string, runtime SetupRuntime) []string {
+	roots := GatherHelperReadRootsForRuntime(codexHome, runtime)
 	roots = append(roots, WindowsPlatformDefaultReadRoots...)
 	if userProfile := strings.TrimSpace(os.Getenv("USERPROFILE")); userProfile != "" {
 		roots = append(roots, ProfileReadRoots(userProfile)...)
@@ -306,6 +326,15 @@ func GatherFullReadRootsForPermissions(commandCWD string, permissions *ResolvedW
 }
 
 func GatherHelperReadRoots(codexHome string) []string {
+	return GatherHelperReadRootsForRuntime(codexHome, CurrentSetupRuntime())
+}
+
+// GatherHelperReadRootsForRuntime only creates the helper bin directory for a
+// legacy runtime (Rust `gather_helper_read_roots`).
+func GatherHelperReadRootsForRuntime(codexHome string, runtime SetupRuntime) []string {
+	if !runtime.IsLegacy() {
+		return nil
+	}
 	helperDir := HelperBinDir(codexHome)
 	_ = os.MkdirAll(helperDir, 0o700)
 	return []string{helperDir}
@@ -337,20 +366,26 @@ func EffectiveWriteRootsForSetup(permissions *ResolvedWindowsSandboxPermissions,
 }
 
 func BuildPayloadRoots(request *SandboxSetupRequest, overrides SetupRootOverrides) ([]string, []string) {
+	return BuildPayloadRootsForRuntime(request, overrides, CurrentSetupRuntime())
+}
+
+// BuildPayloadRootsForRuntime is the explicit-runtime form used by callers that
+// carry the setup runtime in a payload and by tests.
+func BuildPayloadRootsForRuntime(request *SandboxSetupRequest, overrides SetupRootOverrides, runtime SetupRuntime) ([]string, []string) {
 	if request == nil {
 		return nil, nil
 	}
 	writeRoots := EffectiveWriteRootsForSetup(request.Permissions, request.CommandCWD, request.Env, request.CodexHome, overrides.WriteRoots, overrides.WriteRootsSet)
 	var readRoots []string
 	if overrides.ReadRootsSet {
-		readRoots = GatherHelperReadRoots(request.CodexHome)
+		readRoots = GatherHelperReadRootsForRuntime(request.CodexHome, runtime)
 		if overrides.ReadRootsIncludePlatformDefaults {
 			readRoots = append(readRoots, WindowsPlatformDefaultReadRoots...)
 		}
 		readRoots = append(readRoots, overrides.ReadRoots...)
 		readRoots = canonicalExisting(readRoots)
 	} else {
-		readRoots = GatherReadRoots(request.CommandCWD, request.Permissions, request.Env, request.CodexHome)
+		readRoots = GatherReadRootsForRuntime(request.CommandCWD, request.Permissions, request.Env, request.CodexHome, runtime)
 	}
 	readRoots = ExpandUserProfileRoot(readRoots)
 	readRoots = FilterUserProfileRoot(readRoots)

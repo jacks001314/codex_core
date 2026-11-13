@@ -106,6 +106,19 @@ func (r *Recorder) appendPaginatedItem(item Item, now time.Time) error {
 	for i := range item.Content {
 		sessionItem.Content = append(sessionItem.Content, session.ContentPart{Type: item.Content[i].Type, Text: item.Content[i].Text, ImageURL: item.Content[i].ImageURL, Detail: cloneStringPtr(item.Content[i].Detail)})
 	}
+	// Additional-context tool outputs keep their ResponseItem shape and
+	// provenance instead of being rewritten as DynamicToolCall items.
+	if payload, metadata, ok := additionalContextToolOutputRolloutItem(&sessionItem); ok {
+		line := Line{
+			Type:         "response_item",
+			Timestamp:    now.UTC().Format(time.RFC3339Nano),
+			Item:         payload,
+			ItemMetadata: metadata,
+			ItemID:       item.ID,
+			TurnID:       sessionItemExactTurnID(&sessionItem),
+		}
+		return r.AppendLine(line)
+	}
 	// Harness-authored configuration updates have no core TurnItem variant; they
 	// persist as trusted response_item rollout lines (Rust #43110).
 	if payload, metadata, ok := configurationUpdateRolloutItem(&sessionItem); ok {
@@ -514,6 +527,9 @@ func populateCoreImageGeneration(core map[string]any, item *session.Item, values
 	core["result"] = firstNonEmptyString(anyString(values, "result"), item.Text)
 	copyOptional(core, "transparent_background", firstAny(values, "transparentBackground", "transparent_background"))
 	copyOptional(core, "saved_path", firstAny(values, "savedPath", "saved_path"))
+	// Rust #57552: the backend-provided image generation id is persisted with
+	// the item and restored on resume.
+	copyOptional(core, "generation_id", firstAny(values, "generationId", "generation_id"))
 	// Rust #54398 `GeneratedImageRef::File`: a completed generation keeps its
 	// durable attachment reference instead of the inline result, and #54420
 	// keeps the observed local `input_images` (`Vec<ImageGenerationInputImage>`).
@@ -539,6 +555,7 @@ func populatePublicImageGeneration(out, core map[string]any) {
 		out["result"] = anyString(core, "result")
 	}
 	out["transparentBackground"] = nullableAny(core, "transparent_background", "transparentBackground")
+	out["generationId"] = nullableAny(core, "generation_id", "generationId")
 	copyOptional(out, "savedPath", firstAny(core, "saved_path", "savedPath"))
 	// Rust skips an empty `input_images` on both the extension item and the
 	// public surface (`#[serde(skip_serializing_if = "Vec::is_empty")]`, #54420).

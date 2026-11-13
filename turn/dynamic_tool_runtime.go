@@ -13,6 +13,7 @@ import (
 
 const dynamicToolServerRequestMethod = "item/tool/call"
 const remoteImageURLError = "remote image URLs are not supported; use an inline data URL instead"
+const dynamicToolSearchSourceName = "Dynamic tools"
 
 // dynamicToolCancelledMessage is the terminal error a dynamic tool reports when
 // its invocation is cancelled before a response arrives (Rust #51556:
@@ -31,6 +32,42 @@ type DynamicToolRegistryOptions struct {
 	Tools     []DynamicToolSpec
 	Now       func() time.Time
 	EnableAll bool
+}
+
+type dynamicToolEntry struct {
+	namespace *DynamicToolNamespaceSpec
+	function  *DynamicToolFunctionSpec
+}
+
+// dynamicToolEntries flattens a catalog into registrable tools, treating a
+// namespace's members as individual tools (Rust #57553 registers the same
+// entries for replacement as for thread start).
+func dynamicToolEntries(tools []DynamicToolSpec) []dynamicToolEntry {
+	var entries []dynamicToolEntry
+	for i := range tools {
+		spec := &tools[i]
+		if spec.Namespace != nil || strings.EqualFold(spec.Type, "namespace") {
+			namespace := spec.Namespace
+			if namespace == nil {
+				namespace = &DynamicToolNamespaceSpec{Name: spec.Name, Description: spec.Description, Tools: spec.Tools}
+			}
+			for j := range namespace.Tools {
+				entries = append(entries, dynamicToolEntry{namespace: namespace, function: &namespace.Tools[j]})
+			}
+			continue
+		}
+		function := spec.Function
+		if function == nil {
+			function = &DynamicToolFunctionSpec{
+				Name:         spec.Name,
+				Description:  spec.Description,
+				InputSchema:  spec.InputSchema,
+				DeferLoading: spec.DeferLoading,
+			}
+		}
+		entries = append(entries, dynamicToolEntry{function: function})
+	}
+	return entries
 }
 
 type DynamicToolCallParams struct {
@@ -95,8 +132,23 @@ func RegisterDynamicToolHandlers(registry *tool.Registry, options *DynamicToolRe
 }
 
 func registerDynamicToolHandler(registry *tool.Registry, options *DynamicToolRegistryOptions, namespace *DynamicToolNamespaceSpec, function *DynamicToolFunctionSpec) error {
+	executor, _, err := newDynamicToolExecutor(options, namespace, function)
+	if err != nil || executor == nil {
+		return err
+	}
+	_, err = registry.RegisterExternal(executor)
+	return err
+}
+
+// newDynamicToolExecutor builds the executor and model-visible spec for one
+// dynamic tool. Replacement uses it to publish a new catalog without rebuilding
+// the turn's router (Rust #57553).
+func newDynamicToolExecutor(options *DynamicToolRegistryOptions, namespace *DynamicToolNamespaceSpec, function *DynamicToolFunctionSpec) (*dynamicToolExecutor, tool.Spec, error) {
+	if options == nil {
+		options = &DynamicToolRegistryOptions{}
+	}
 	if function == nil {
-		return nil
+		return nil, tool.Spec{}, nil
 	}
 	name := tool.PlainName(function.Name)
 	if namespace != nil {
@@ -104,7 +156,7 @@ func registerDynamicToolHandler(registry *tool.Registry, options *DynamicToolReg
 	}
 	inputSchema, ok := dynamicToolInputSchema(function.InputSchema)
 	if !ok {
-		return fmt.Errorf("%w: dynamic tool input schema is not an object: %s", ErrInvalidTurnRequest, function.Name)
+		return nil, tool.Spec{}, fmt.Errorf("%w: dynamic tool input schema is not an object: %s", ErrInvalidTurnRequest, function.Name)
 	}
 	exposure := tool.ExposureModelVisible
 	if function.DeferLoading {
@@ -128,12 +180,12 @@ func registerDynamicToolHandler(registry *tool.Registry, options *DynamicToolReg
 		NamespaceDescription:   dynamicToolNamespaceDescription(namespace),
 		Search: &tool.SearchInfo{
 			Source: &tool.SearchSourceInfo{
-				Name:        "Dynamic tools",
+				Name:        dynamicToolSearchSourceName,
 				Description: "Tools provided by the current Codex thread.",
 			},
 		},
 	}
-	_, err := registry.RegisterExternal(&dynamicToolExecutor{
+	return &dynamicToolExecutor{
 		spec:      spec,
 		caller:    options.Caller,
 		threadID:  strings.TrimSpace(options.ThreadID),
@@ -141,8 +193,7 @@ func registerDynamicToolHandler(registry *tool.Registry, options *DynamicToolReg
 		namespace: dynamicToolNamespaceName(namespace),
 		tool:      function.Name,
 		now:       options.Now,
-	})
-	return err
+	}, spec, nil
 }
 
 type dynamicToolExecutor struct {
@@ -187,8 +238,8 @@ func (e *dynamicToolExecutor) Execute(ctx context.Context, invocation *tool.Invo
 		Tool:      e.tool,
 		Arguments: arguments,
 	}
-	var response DynamicToolCallResponse
-	if err := e.caller.Request(ctx, dynamicToolServerRequestMethod, params, &response); err != nil {
+	response, err := requestDynamicToolResponse(ctx, e.caller, params)
+	if err != nil {
 		// Rust #51556: a request aborted by cancellation is reported with the
 		// cancellation message so it is distinguishable from a generic failure.
 		message := "dynamic tool request failed"
@@ -196,6 +247,11 @@ func (e *dynamicToolExecutor) Execute(ctx context.Context, invocation *tool.Invo
 			message = dynamicToolCancelledMessage
 		}
 		return e.fallbackOutput(invocation, arguments, started, message), nil
+	}
+	// Rust #51556: once the turn is cancelled, a response that arrives late must
+	// not be fed back into the model context.
+	if ctx != nil && ctx.Err() != nil {
+		return e.fallbackOutput(invocation, arguments, started, dynamicToolCancelledMessage), nil
 	}
 	var valid bool
 	response.ContentItems, valid = normalizeDynamicToolContentItems(response.ContentItems)
@@ -215,6 +271,44 @@ func (e *dynamicToolExecutor) Execute(ctx context.Context, invocation *tool.Invo
 		Data:        e.outputData(arguments, response.ContentItems, response.Success, started),
 		CompletedAt: e.timeNow(),
 	}, nil
+}
+
+// dynamicToolResponseResult carries the outcome of a dynamic tool request so the
+// waiter can abandon it as soon as the turn is cancelled.
+type dynamicToolResponseResult struct {
+	response DynamicToolCallResponse
+	err      error
+}
+
+// requestDynamicToolResponse waits for a dynamic tool response while honouring
+// cancellation. Rust #51556 requires cancellation to win the race: a caller that
+// writes a successful response after the context is done must not be observed.
+func requestDynamicToolResponse(
+	ctx context.Context,
+	caller DynamicToolCaller,
+	params *DynamicToolCallParams,
+) (DynamicToolCallResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return DynamicToolCallResponse{}, context.Canceled
+	}
+	done := make(chan dynamicToolResponseResult, 1)
+	go func() {
+		var response DynamicToolCallResponse
+		err := caller.Request(ctx, dynamicToolServerRequestMethod, params, &response)
+		done <- dynamicToolResponseResult{response: response, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return DynamicToolCallResponse{}, context.Canceled
+	case result := <-done:
+		if ctx.Err() != nil {
+			return DynamicToolCallResponse{}, context.Canceled
+		}
+		return result.response, result.err
+	}
 }
 
 func (e *dynamicToolExecutor) fallbackOutput(invocation *tool.Invocation, arguments any, started time.Time, message string) *tool.Output {

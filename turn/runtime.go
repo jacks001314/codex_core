@@ -5,14 +5,22 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"time"
 
+	"codex_core/agent"
 	"codex_core/codemode"
 	"codex_core/codexapi"
 	"codex_core/model"
+	"codex_core/retainedctx"
 	"codex_core/tool"
 	"codex_core/utils"
 )
+
+// ErrSearchReservationUnavailable tells the sampling loop that a prepared
+// native fallback lost its provider race. The step continues without native
+// search declarations instead of failing the turn or allowing provider mixing.
+var ErrSearchReservationUnavailable = errors.New("native search reservation is unavailable")
 
 type RuntimeOptions struct {
 	Agent  model.AgentRunner
@@ -33,6 +41,15 @@ type RuntimeOptions struct {
 	// CodeModeMessagesForModel resolves the catalog overrides for a model so a
 	// mid-turn model change can refresh exec/wait descriptions (Rust #47118).
 	CodeModeMessagesForModel func(model string) *model.CodeModeToolMessages
+	// UnifiedImageBudget mirrors unified_image_budget_enabled: the Code Mode
+	// description hides image detail and request image preparation uses the
+	// original-detail budget. Stored here as the code-mode helper selector
+	// the way Rust's ImageDetailVisibility does: the unified image budget hides
+	// detail values for lite models and models that can request `original`.
+	UnifiedImageBudget bool
+	// UnifiedImageBudgetForModel refreshes the mode above when a
+	// step switches models.
+	UnifiedImageBudgetForModel func(model string) bool
 	// CodeModeDefaultExecYieldTime substitutes
 	// {{ default_exec_yield_time_ms }} in catalog exec text.
 	CodeModeDefaultExecYieldTime time.Duration
@@ -65,9 +82,59 @@ type RuntimeOptions struct {
 	// calls even though inter-agent mail is queued at a commentary or
 	// partial-answer boundary (#49262, #51249).
 	DeferMailboxPreemption bool
+	// InterruptOnCancel mirrors the `features.interrupt_on_cancel` gate
+	// (#57864): a cancelled Responses Lite sampling request interrupts the
+	// upstream response and drains its terminal event, keeping the socket
+	// reusable and the completed usage.
+	InterruptOnCancel bool
 	// IndirectDescriptionPrefixes carries the active model's indirect namespace
 	// guidance for Code Mode rendering (Rust #47642).
 	IndirectDescriptionPrefixes *tool.IndirectNamespacePrefixes
+	// DynamicToolCaller, DynamicToolThreadID, and DynamicToolTurnID let a later
+	// ReplaceDynamicTools register executors for a new catalog (Rust #57553).
+	DynamicToolCaller   DynamicToolCaller
+	DynamicToolThreadID string
+	DynamicToolTurnID   string
+	// DynamicTools is the catalog registered in Router when the runtime was
+	// built, used to recognize tools owned by this thread.
+	DynamicTools []DynamicToolSpec
+	// DynamicToolStepRefresh rebuilds the model-visible tool list before every
+	// sampling step, so a mid-turn replacement applies to the following step
+	// (Rust #57553).
+	DynamicToolStepRefresh bool
+	// MultiAgentOverridesForModel, when set, refreshes the turn's Multi-Agent V2
+	// catalog overrides for the sampling step's model, so a mid-turn model
+	// change selects that model's tool schemas (Rust #46505).
+	MultiAgentOverridesForModel func(model string)
+	// StepToolSurface, when set, refreshes the model-dependent part of the
+	// turn's tool registry for the sampling step's model before that step's
+	// tool list is built. Rust plans every step's tools from the captured
+	// model settings (#44242), so a model the turn did not start on can add a
+	// tool or change a tool's schema for the following step.
+	StepToolSurface func(model string)
+	// StepToolPlan, when set, rebuilds a later sampling step's complete tool
+	// plan from that step's captured model (Rust `built_tools`). The returned
+	// router replaces the turn's for that step and for dispatch until the next
+	// rebuild; a nil plan keeps the turn-start tool plan.
+	StepToolPlan func(model string) (*StepToolPlan, error)
+	// InvocationRegistry opts this turn into live V2 tool-call lookup and unique
+	// active call IDs (Rust #57586 HostToolInvocationLookup). A nil registry
+	// leaves dispatch unchanged.
+	InvocationRegistry *agent.InvocationRegistry
+	// SearchReservation holds a fallback provider claim across the sampling
+	// request and the tool calls it emits. The returned release is a no-op when
+	// native search actually ran, making that provider ownership durable.
+	SearchReservation func() (func(), error)
+}
+
+// StepToolPlan is one sampling step's rebuilt tool plan (Rust's per-step
+// `ToolRouter`). Router and HostedTools replace the turn's plans from that step
+// on; ReplaceHostedTools distinguishes "no hosted declarations" from "keep the
+// turn's".
+type StepToolPlan struct {
+	Router             *tool.Router
+	HostedTools        []any
+	ReplaceHostedTools bool
 }
 
 type Runtime struct {
@@ -85,11 +152,36 @@ type Runtime struct {
 	onToolOutputExternalContext  func(ctx context.Context, threadID string, invocation *tool.Invocation)
 	instantInterrupt             bool
 	deferMailboxPreemption       bool
+	interruptOnCancel            bool
 	indirectDescriptionPrefixes  *tool.IndirectNamespacePrefixes
 	codeModeMessages             *model.CodeModeToolMessages
 	allowedTools                 *[]string
 	codeModeMessagesForModel     func(model string) *model.CodeModeToolMessages
 	codeModeDefaultExecYieldTime time.Duration
+	unifiedImageBudget           bool
+	unifiedImageBudgetFor        func(model string) bool
+	dynamicToolMu                sync.Mutex
+	dynamicToolCaller            DynamicToolCaller
+	dynamicToolThreadID          string
+	dynamicToolTurnID            string
+	dynamicToolNames             map[string]tool.ToolName
+	dynamicToolStepRefresh       bool
+	multiAgentOverridesForModel  func(model string)
+	stepToolSurface              func(model string)
+	stepToolPlan                 func(model string) (*StepToolPlan, error)
+	stepToolPlanModel            string
+	dynamicToolCatalog           []DynamicToolSpec
+	invocationRegistry           *agent.InvocationRegistry
+	searchReservation            func() (func(), error)
+}
+
+// ExposesTool reports whether this turn's tool router advertises the named
+// plain tool (Rust StepContext::tool_router.exposes_tool, #59633).
+func (r *Runtime) ExposesTool(name string) bool {
+	if r == nil || r.router == nil {
+		return false
+	}
+	return r.router.ExposesTool(name)
 }
 
 func NewRuntime(options *RuntimeOptions) *Runtime {
@@ -105,6 +197,17 @@ func NewRuntime(options *RuntimeOptions) *Runtime {
 		executedToolCalls = NewExecutedToolCallRecorder()
 	}
 	executedToolCalls.SetToolMetadataMetrics(options.ToolMetadataMetrics)
+	dynamicTools := make(map[string]tool.ToolName)
+	for _, entry := range dynamicToolEntries(options.DynamicTools) {
+		if entry.function == nil {
+			continue
+		}
+		_, spec, err := newDynamicToolExecutor(nil, entry.namespace, entry.function)
+		if err != nil {
+			continue
+		}
+		dynamicTools[spec.Name.Key()] = spec.Name
+	}
 	return &Runtime{
 		agent:                        options.Agent,
 		router:                       options.Router,
@@ -120,11 +223,25 @@ func NewRuntime(options *RuntimeOptions) *Runtime {
 		onToolOutputExternalContext:  options.OnToolOutputExternalContext,
 		instantInterrupt:             options.InstantInterrupt,
 		deferMailboxPreemption:       options.DeferMailboxPreemption,
+		interruptOnCancel:            options.InterruptOnCancel,
 		indirectDescriptionPrefixes:  options.IndirectDescriptionPrefixes,
 		codeModeMessages:             options.CodeModeMessages,
 		allowedTools:                 options.AllowedTools,
 		codeModeMessagesForModel:     options.CodeModeMessagesForModel,
 		codeModeDefaultExecYieldTime: options.CodeModeDefaultExecYieldTime,
+		unifiedImageBudget:           options.UnifiedImageBudget,
+		unifiedImageBudgetFor:        options.UnifiedImageBudgetForModel,
+		dynamicToolCaller:            options.DynamicToolCaller,
+		dynamicToolThreadID:          strings.TrimSpace(options.DynamicToolThreadID),
+		dynamicToolTurnID:            strings.TrimSpace(options.DynamicToolTurnID),
+		dynamicToolNames:             dynamicTools,
+		dynamicToolStepRefresh:       options.DynamicToolStepRefresh,
+		multiAgentOverridesForModel:  options.MultiAgentOverridesForModel,
+		stepToolSurface:              options.StepToolSurface,
+		stepToolPlan:                 options.StepToolPlan,
+		dynamicToolCatalog:           append([]DynamicToolSpec(nil), options.DynamicTools...),
+		invocationRegistry:           options.InvocationRegistry,
+		searchReservation:            options.SearchReservation,
 	}
 }
 
@@ -133,6 +250,112 @@ func (r *Runtime) DeferredToolNamespaces() map[string]string {
 		return nil
 	}
 	return r.router.DeferredToolNamespaces()
+}
+
+// ReplaceDynamicTools publishes a new dynamic-tool catalog on this turn's
+// router (Rust #57553). Tools removed from the catalog are hidden from later
+// model steps but keep their executors so calls already emitted by the previous
+// step still dispatch; a new or updated tool becomes visible on the next step.
+// An empty catalog clears the catalog.
+func (r *Runtime) ReplaceDynamicTools(tools []DynamicToolSpec) error {
+	if r == nil || r.router == nil {
+		return errors.New("turn runtime has no tool registry")
+	}
+	registry := r.router.Registry()
+	if registry == nil {
+		return errors.New("turn runtime has no tool registry")
+	}
+	if err := ValidateDynamicTools(tools); err != nil {
+		return err
+	}
+	r.dynamicToolMu.Lock()
+	defer r.dynamicToolMu.Unlock()
+	next := make(map[string]tool.ToolName, len(tools))
+	options := &DynamicToolRegistryOptions{
+		Caller:   r.dynamicToolCaller,
+		ThreadID: r.dynamicToolThreadID,
+		TurnID:   r.dynamicToolTurnID,
+	}
+	for _, entry := range dynamicToolEntries(tools) {
+		executor, spec, err := newDynamicToolExecutor(options, entry.namespace, entry.function)
+		if err != nil {
+			return err
+		}
+		if executor == nil {
+			continue
+		}
+		key := spec.Name.Key()
+		if current, ok := registry.Spec(spec.Name); ok && isDynamicToolSpec(current) {
+			// Keep the executor that served the previous step so a pending call
+			// for this name still runs with its original schema.
+			registry.ReplaceSpec(spec)
+			next[key] = spec.Name
+			continue
+		}
+		if _, exists := registry.Lookup(spec.Name); exists {
+			// A built-in tool owns this name; RegisterExternal would skip it.
+			continue
+		}
+		if _, err := registry.RegisterExternal(executor); err != nil {
+			return err
+		}
+		next[key] = spec.Name
+	}
+	for key, name := range r.dynamicToolNames {
+		if _, ok := next[key]; ok {
+			continue
+		}
+		current, ok := registry.Spec(name)
+		if !ok || !isDynamicToolSpec(current) {
+			continue
+		}
+		registry.SetExposure(name, tool.ExposureHidden)
+	}
+	r.dynamicToolNames = next
+	r.dynamicToolCatalog = append(r.dynamicToolCatalog[:0], tools...)
+	return nil
+}
+
+// reapplyDynamicToolCatalog re-registers the turn's current dynamic tools on a
+// router rebuilt for a later sampling step (Rust #44242 rebuilds the plan, and
+// #57553 keeps the replaced catalog dispatchable). Calls already emitted by the
+// previous step keep their original executors.
+func (r *Runtime) reapplyDynamicToolCatalog() {
+	if r == nil || len(r.dynamicToolCatalog) == 0 {
+		return
+	}
+	_ = r.ReplaceDynamicTools(append([]DynamicToolSpec(nil), r.dynamicToolCatalog...))
+}
+
+// applyStepToolPlan swaps in the tool plan rebuilt for a later sampling step's
+// model (Rust `built_tools` planning each step from its captured settings).
+// A failed rebuild keeps the previous plan so the step still samples instead of
+// losing its tools.
+func (r *Runtime) applyStepToolPlan(modelID string, dispatcher *ToolDispatcher) {
+	if r == nil || r.stepToolPlan == nil {
+		return
+	}
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" || modelID == r.stepToolPlanModel {
+		return
+	}
+	plan, err := r.stepToolPlan(modelID)
+	if err != nil || plan == nil || plan.Router == nil {
+		return
+	}
+	r.stepToolPlanModel = modelID
+	r.router = plan.Router
+	if dispatcher != nil {
+		dispatcher.SetRouter(plan.Router)
+	}
+	if plan.ReplaceHostedTools {
+		r.hostedTools = append([]any(nil), plan.HostedTools...)
+	}
+	r.reapplyDynamicToolCatalog()
+}
+
+func isDynamicToolSpec(spec tool.Spec) bool {
+	return spec.Search != nil && spec.Search.Source != nil && spec.Search.Source.Name == dynamicToolSearchSourceName
 }
 
 func (r *Runtime) StandaloneWebSearchRegistered() bool {
@@ -229,16 +452,32 @@ func (r *Runtime) Run(ctx context.Context, request *AgentLoopRequest) (*AgentLoo
 		if request.InstructionsProvider != nil {
 			instructions = request.InstructionsProvider()
 		}
-		recordToolRegistrationMetrics(r.toolRegistrationMetrics, tool.RegistrationCounts{}, request.ToolMode)
+		recordToolRegistrationMetrics(r.toolRegistrationMetrics, tool.RegistrationCounts{}, request.ToolMode, request.IncrementalTools)
+		var releaseSearch func()
+		if r.searchReservation != nil {
+			release, reserveErr := r.searchReservation()
+			if errors.Is(reserveErr, ErrSearchReservationUnavailable) {
+				tools = withoutModelWebSearchTools(tools)
+			} else if reserveErr != nil {
+				return nil, reserveErr
+			} else {
+				releaseSearch = release
+			}
+		}
+		if releaseSearch != nil {
+			defer releaseSearch()
+		}
 		response, err := r.agent.Run(ctx, &model.AgentRequest{
 			Prompt:                       request.Prompt,
 			Instructions:                 instructions,
 			InputItems:                   inputItems,
 			Tools:                        tools,
+			IncrementalTools:             request.IncrementalTools,
 			Model:                        request.Model,
 			ProviderID:                   request.ProviderID,
 			TaskKind:                     request.TaskKind,
 			ThreadID:                     request.ThreadID,
+			SessionID:                    request.SessionID,
 			TurnID:                       request.TurnID,
 			Ephemeral:                    request.Ephemeral,
 			Originator:                   request.Originator,
@@ -247,6 +486,7 @@ func (r *Runtime) Run(ctx context.Context, request *AgentLoopRequest) (*AgentLoo
 			ParallelToolCalls:            request.ParallelToolCalls,
 			ReasoningEffort:              request.ReasoningEffort,
 			ReasoningSummary:             request.ReasoningSummary,
+			UnifiedImageBudget:           r.unifiedImageBudget,
 			DropReasoningEffortUpdates:   request.DropReasoningEffortUpdates,
 			ConcurrentReasoningSummaries: request.ConcurrentReasoningSummaries,
 			ModelVerbosity:               request.ModelVerbosity,
@@ -255,8 +495,10 @@ func (r *Runtime) Run(ctx context.Context, request *AgentLoopRequest) (*AgentLoo
 			ItemIDsEnabled:               request.ItemIDsEnabled,
 			ServiceTier:                  request.ServiceTier,
 			PromptCacheKey:               request.PromptCacheKey,
+			PromptCacheTTL:               request.PromptCacheTTL,
 			CyberAccessProgram:           request.CyberAccessProgram,
 			ClientMetadata:               cloneStringMap(clientMetadata),
+			MCPAttribution:               r.mcpAttributionSnapshot(),
 			Trace:                        request.Trace,
 			AttestationProvider:          request.AttestationProvider,
 			OutputSchema:                 request.OutputSchema,
@@ -295,6 +537,9 @@ func (r *Runtime) Run(ctx context.Context, request *AgentLoopRequest) (*AgentLoo
 		return &AgentLoopResult{Response: response, Responses: []*model.AgentResponse{response}, InputItems: resultInputItems, InitialInputCount: len(request.InputItems), Usage: response.Usage, Iterations: 1, TimingProfile: &profile}, nil
 	}
 	loopRequest := *request
+	if loopRequest.CriticalPathTiming && loopRequest.Timing == nil {
+		loopRequest.Timing = NewTimingState()
+	}
 	if loopRequest.SteerMailbox == nil {
 		loopRequest.SteerMailbox = r.steerMailbox
 	}
@@ -313,9 +558,25 @@ func (r *Runtime) Run(ctx context.Context, request *AgentLoopRequest) (*AgentLoo
 		visibleSpecs = r.modelVisibleSpecsForRequest(effectiveToolMode)
 		loopRequest.Tools = model.ResponsesToolsFromSpecs(visibleSpecs)
 	}
-	if r.codeModeMessagesForModel != nil {
+	var dispatcher *ToolDispatcher
+	// The turn's own model starts on the turn-start plan, so a later step only
+	// asks the host to plan when the model actually changed (Rust `built_tools`
+	// runs per step, but rebuilding an identical plan is pure overhead here).
+	r.stepToolPlanModel = strings.TrimSpace(loopRequest.Model)
+	if r.codeModeMessagesForModel != nil || r.unifiedImageBudgetFor != nil || r.dynamicToolStepRefresh || r.multiAgentOverridesForModel != nil || r.stepToolSurface != nil || r.stepToolPlan != nil {
+		loopRequest.UnifiedImageBudget = r.unifiedImageBudget
+		loopRequest.UnifiedImageBudgetForModel = r.unifiedImageBudgetFor
 		loopRequest.ToolsForStep = func(modelID string) []any {
-			r.applyCodeModeMessagesForModel(modelID)
+			if r.codeModeMessagesForModel != nil || r.unifiedImageBudgetFor != nil {
+				r.applyCodeModeMessagesForModel(modelID)
+			}
+			if r.multiAgentOverridesForModel != nil {
+				r.multiAgentOverridesForModel(strings.TrimSpace(modelID))
+			}
+			if r.stepToolSurface != nil {
+				r.stepToolSurface(strings.TrimSpace(modelID))
+			}
+			r.applyStepToolPlan(modelID, dispatcher)
 			return buildTools()
 		}
 	}
@@ -327,35 +588,117 @@ func (r *Runtime) Run(ctx context.Context, request *AgentLoopRequest) (*AgentLoo
 	}
 	loopRequest.Tools = MergeHostedTools(MergeHostedTools(loopRequest.Tools, r.hostedTools), request.HostedTools)
 	loopRequest.Tools = filterAllowedHostedTools(loopRequest.Tools, r.allowedTools)
+	loopRequest.InterruptOnCancel = r.interruptOnCancel
+	loopRequest.ReserveSearch = r.searchReservation
+	dispatcher = NewToolDispatcher(&ToolDispatcherOptions{
+		Router:                      r.router,
+		Hooks:                       r.hooks,
+		Now:                         r.now,
+		PostToolInputItems:          request.PostToolInputItems,
+		OnToolStarted:               request.OnToolStarted,
+		OnToolCompleted:             request.OnToolCompleted,
+		EmitCodeModeNestedLifecycle: request.EmitCodeModeNestedLifecycle,
+		OnCodeModeNotify:            request.OnCodeModeNotify,
+		InjectResponseItems:         r.codeModeResponseItemInjector(request.ThreadID, request.TurnID),
+		ThreadID:                    request.ThreadID,
+		TurnID:                      request.TurnID,
+		ExecutedToolCalls:           executedToolCalls,
+		ToolMode:                    firstNonEmpty(r.router.ToolMode(), loopRequest.ToolMode),
+		InstantInterrupt:            r.instantInterrupt,
+		Truncation:                  r.truncationPolicy(loopRequest.Model),
+		TruncationForModel:          r.truncationPolicy,
+		OnToolOutputExternalContext: r.toolOutputExternalContextHandler(loopRequest.ThreadID),
+		Tracer:                      loopRequest.Tracer,
+		CriticalPathTiming:          loopRequest.CriticalPathTiming,
+		TimingState:                 loopRequest.Timing,
+		InvocationRegistry:          r.invocationRegistry,
+	})
 	return NewAgentLoop(&AgentLoopOptions{
 		Agent:                   r.agent,
 		SteerMailbox:            r.steerMailbox,
 		ExecutedToolCalls:       executedToolCalls,
+		MCPAttribution:          r.executedToolCalls,
 		ToolRegistrationMetrics: r.toolRegistrationMetrics,
 		ToolRegistrationCounts:  r.toolRegistrationCounts,
-		Dispatcher: NewToolDispatcher(&ToolDispatcherOptions{
-			Router:                      r.router,
-			Hooks:                       r.hooks,
-			Now:                         r.now,
-			PostToolInputItems:          request.PostToolInputItems,
-			OnToolStarted:               request.OnToolStarted,
-			OnToolCompleted:             request.OnToolCompleted,
-			EmitCodeModeNestedLifecycle: request.EmitCodeModeNestedLifecycle,
-			OnCodeModeNotify:            request.OnCodeModeNotify,
-			ThreadID:                    request.ThreadID,
-			TurnID:                      request.TurnID,
-			ExecutedToolCalls:           executedToolCalls,
-			ToolMode:                    firstNonEmpty(r.router.ToolMode(), loopRequest.ToolMode),
-			InstantInterrupt:            r.instantInterrupt,
-			Truncation:                  r.truncationPolicy(loopRequest.Model),
-			TruncationForModel:          r.truncationPolicy,
-			OnToolOutputExternalContext: r.toolOutputExternalContextHandler(loopRequest.ThreadID),
-			Tracer:                      loopRequest.Tracer,
-		}),
-		MaxTurns:               r.maxTurns,
-		Now:                    r.now,
-		DeferMailboxPreemption: r.deferMailboxPreemption,
+		Dispatcher:              dispatcher,
+		MaxTurns:                r.maxTurns,
+		Now:                     r.now,
+		DeferMailboxPreemption:  r.deferMailboxPreemption,
 	}).Run(ctx, &loopRequest)
+}
+
+func withoutModelWebSearchTools(tools []any) []any {
+	out := make([]any, 0, len(tools))
+	for _, value := range tools {
+		toolMap, ok := value.(map[string]any)
+		if !ok {
+			out = append(out, value)
+			continue
+		}
+		toolType := strings.ToLower(strings.TrimSpace(hostedToolString(toolMap["type"])))
+		if toolType == HostedWebSearchToolType {
+			continue
+		}
+		if toolType == "namespace" && strings.EqualFold(strings.TrimSpace(hostedToolString(toolMap["name"])), WebSearchNamespace) {
+			continue
+		}
+		if toolType == "additional_tools" {
+			if definitions, ok := toolMap["tools"].([]any); ok {
+				copy := cloneHostedToolMap(toolMap)
+				copy["tools"] = withoutModelWebSearchTools(definitions)
+				out = append(out, copy)
+				continue
+			}
+		}
+		out = append(out, value)
+	}
+	return out
+}
+
+// ToolNamespacesInfo returns the finalized tool inventory of the router that
+// issued the current step (Rust `StepContext::tool_router`). Remote compaction
+// reports it separately so its metadata matches the issuing request (#45248).
+// mcpAttributionSnapshot reports the thread's cumulative MCP attribution for a
+// sampling request (Rust `ExecutedToolCalls::mcp_attribution_snapshot`). Unlike
+// executed-tool-call capture the recorder is never feature-gated; only the
+// provider's internal-metadata grant decides whether the document is sent.
+func (r *Runtime) mcpAttributionSnapshot() *retainedctx.McpAttribution {
+	if r == nil || r.executedToolCalls == nil {
+		return nil
+	}
+	snapshot := r.executedToolCalls.McpAttributionSnapshot()
+	return &snapshot
+}
+
+func (r *Runtime) ToolNamespacesInfo() tool.ToolNamespacesInfo {
+	if r == nil || r.router == nil {
+		return nil
+	}
+	return r.router.ToolNamespacesInfo()
+}
+
+// codeModeResponseItemInjector queues a response item as pending input for the
+// running turn (Rust `Session::inject_if_running`). A Code Mode cell outlives
+// the exec call that started it, so a notification emitted later must reach the
+// active turn's next sampling request instead of a per-call buffer that was
+// already drained. A finishing or closed turn rejects the item, mirroring the
+// inject_if_running gate.
+func (r *Runtime) codeModeResponseItemInjector(threadID string, turnID string) func(items []any) bool {
+	if r == nil || r.steerMailbox == nil {
+		return nil
+	}
+	threadID = strings.TrimSpace(threadID)
+	turnID = strings.TrimSpace(turnID)
+	if threadID == "" || turnID == "" {
+		return nil
+	}
+	return func(items []any) bool {
+		if len(items) == 0 {
+			return false
+		}
+		stored, err := r.steerMailbox.EnqueueIfAcceptingDelivery(&SteerEnqueueParams{ThreadID: threadID, TurnID: turnID, InputItems: items})
+		return err == nil && stored
+	}
 }
 
 func filterAllowedHostedTools(tools []any, allowed *[]string) []any {
@@ -401,7 +744,7 @@ func (r *Runtime) modelVisibleSpecsForRequest(effectiveToolMode string) []tool.S
 		visibleSpecs = directModeVisibleSpecs(visibleSpecs, r.router.CodeModeToolSpecs())
 	} else if effectiveToolMode == model.ToolModeCodeModeOnly && codemode.HasExecTool(visibleSpecs) {
 		visibleSpecs = codeModeOnlyVisibleSpecs(visibleSpecs)
-		visibleSpecs = codeModeOnlyExecPromptSpecsWithOptions(visibleSpecs, r.router.CodeModeToolSpecs(), r.indirectDescriptionPrefixes, r.codeModeMessages, r.codeModeDefaultExecYieldTime)
+		visibleSpecs = codeModeOnlyExecPromptSpecsWithOptions(visibleSpecs, r.router.CodeModeToolSpecs(), r.indirectDescriptionPrefixes, r.codeModeMessages, r.codeModeDefaultExecYieldTime, r.unifiedImageBudget)
 	}
 	if codemode.HasExecTool(visibleSpecs) {
 		visibleSpecs = augmentCodeModeWinnerSpecs(visibleSpecs, r.router.CodeModeToolSpecs())
@@ -410,13 +753,18 @@ func (r *Runtime) modelVisibleSpecsForRequest(effectiveToolMode string) []tool.S
 }
 
 func (r *Runtime) applyCodeModeMessagesForModel(modelID string) {
-	if r == nil || r.codeModeMessagesForModel == nil {
+	if r == nil {
 		return
 	}
-	messages := r.codeModeMessagesForModel(modelID)
-	r.codeModeMessages = messages
-	if r.router != nil {
-		r.router.SetCodeModeMessages(messages)
+	if r.unifiedImageBudgetFor != nil {
+		r.unifiedImageBudget = r.unifiedImageBudgetFor(modelID)
+	}
+	if r.codeModeMessagesForModel != nil {
+		messages := r.codeModeMessagesForModel(modelID)
+		r.codeModeMessages = messages
+		if r.router != nil {
+			r.router.SetCodeModeMessages(messages)
+		}
 	}
 }
 
@@ -447,6 +795,24 @@ func (r *Runtime) ModelVisibleToolDefinitions(toolMode string, disableCodeModeFa
 		return nil
 	}
 	return model.ResponsesToolsFromSpecs(r.modelVisibleSpecsForRequest(r.effectiveToolModeForRequest(toolMode, disableCodeModeFallback)))
+}
+
+// ModelVisibleToolDefinitionsWithoutThirdParty mirrors a turn whose MCP
+// projection is empty (Rust `McpServersDisabled`): MCP, app, and other
+// third-party specs are omitted while built-in tools stay declared.
+func (r *Runtime) ModelVisibleToolDefinitionsWithoutThirdParty(toolMode string, disableCodeModeFallback bool) []any {
+	if r == nil {
+		return nil
+	}
+	specs := r.modelVisibleSpecsForRequest(r.effectiveToolModeForRequest(toolMode, disableCodeModeFallback))
+	kept := make([]tool.Spec, 0, len(specs))
+	for _, spec := range specs {
+		if spec.ThirdParty {
+			continue
+		}
+		kept = append(kept, spec)
+	}
+	return model.ResponsesToolsFromSpecs(kept)
 }
 
 // truncationPolicy resolves the effective model's output-truncation policy for
@@ -524,10 +890,10 @@ func codeModeOnlyVisibleSpecs(specs []tool.Spec) []tool.Spec {
 }
 
 func codeModeOnlyExecPromptSpecs(visibleSpecs []tool.Spec, nestedSpecs []tool.Spec, indirectPrefixes *tool.IndirectNamespacePrefixes) []tool.Spec {
-	return codeModeOnlyExecPromptSpecsWithOptions(visibleSpecs, nestedSpecs, indirectPrefixes, nil, 0)
+	return codeModeOnlyExecPromptSpecsWithOptions(visibleSpecs, nestedSpecs, indirectPrefixes, nil, 0, false)
 }
 
-func codeModeOnlyExecPromptSpecsWithOptions(visibleSpecs []tool.Spec, nestedSpecs []tool.Spec, indirectPrefixes *tool.IndirectNamespacePrefixes, messages *model.CodeModeToolMessages, defaultYieldTime time.Duration) []tool.Spec {
+func codeModeOnlyExecPromptSpecsWithOptions(visibleSpecs []tool.Spec, nestedSpecs []tool.Spec, indirectPrefixes *tool.IndirectNamespacePrefixes, messages *model.CodeModeToolMessages, defaultYieldTime time.Duration, imageDetailHidden bool) []tool.Spec {
 	enabledSpecs := make([]tool.Spec, 0, len(nestedSpecs))
 	deferredSpecs := make([]tool.Spec, 0)
 	namespaces := map[string]codemode.NamespaceDescription{}
@@ -556,7 +922,7 @@ func codeModeOnlyExecPromptSpecsWithOptions(visibleSpecs []tool.Spec, nestedSpec
 	if defaultYieldMS <= 0 {
 		defaultYieldMS = 10000
 	}
-	description := codemode.BuildExecToolDescriptionWithOptions(
+	description := codemode.BuildExecToolDescriptionWithVisibility(
 		codemode.CollectPromptDefinitions(enabledSpecs),
 		codemode.CollectPromptDefinitions(deferredSpecs),
 		namespaces,
@@ -564,7 +930,7 @@ func codeModeOnlyExecPromptSpecsWithOptions(visibleSpecs []tool.Spec, nestedSpec
 		len(deferredSpecs) > 0,
 		messages,
 		defaultYieldMS,
-		"image(value), audio(value), generatedImage(value): Append supported media results.",
+		imageDetailHidden,
 	)
 	out := append([]tool.Spec(nil), visibleSpecs...)
 	for index := range out {

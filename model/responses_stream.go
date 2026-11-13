@@ -22,6 +22,7 @@ import (
 
 	"codex_core/codexapi"
 	contextfrag "codex_core/context"
+	"codex_core/network"
 )
 
 // Rust 5a0d0929e2: connection failures during sampling are retried with
@@ -33,15 +34,20 @@ const maxConnectionRetryDelay = 60 * time.Second
 type ResponsesStreamEventKind string
 
 const (
-	ResponsesStreamEventHeaders                   ResponsesStreamEventKind = "response.headers"
-	ResponsesStreamEventServerModel               ResponsesStreamEventKind = "response.server_model"
-	ResponsesStreamEventRateLimits                ResponsesStreamEventKind = "response.rate_limits"
-	ResponsesStreamEventModelsETag                ResponsesStreamEventKind = "response.models_etag"
-	ResponsesStreamEventReasoning                 ResponsesStreamEventKind = "response.server_reasoning_included"
-	ResponsesStreamEventTimingMetrics             ResponsesStreamEventKind = "responsesapi.websocket_timing"
-	ResponsesStreamEventModelReroute              ResponsesStreamEventKind = "response.model_reroute"
-	ResponsesStreamEventModelVerify               ResponsesStreamEventKind = "response.model_verification"
-	ResponsesStreamEventModeration                ResponsesStreamEventKind = "response.turn_moderation_metadata"
+	ResponsesStreamEventHeaders       ResponsesStreamEventKind = "response.headers"
+	ResponsesStreamEventServerModel   ResponsesStreamEventKind = "response.server_model"
+	ResponsesStreamEventRateLimits    ResponsesStreamEventKind = "response.rate_limits"
+	ResponsesStreamEventModelsETag    ResponsesStreamEventKind = "response.models_etag"
+	ResponsesStreamEventReasoning     ResponsesStreamEventKind = "response.server_reasoning_included"
+	ResponsesStreamEventTimingMetrics ResponsesStreamEventKind = "responsesapi.websocket_timing"
+	ResponsesStreamEventModelReroute  ResponsesStreamEventKind = "response.model_reroute"
+	ResponsesStreamEventModelVerify   ResponsesStreamEventKind = "response.model_verification"
+	ResponsesStreamEventModeration    ResponsesStreamEventKind = "response.turn_moderation_metadata"
+	// ResponsesStreamEventGuardianAssessment carries action-bound Guardian
+	// evidence from a `response.metadata` event (Rust #57757). It is
+	// request-scoped evidence: it never enters conversation history and does not
+	// authorize a tool by itself.
+	ResponsesStreamEventGuardianAssessment        ResponsesStreamEventKind = "response.guardian_assessment"
 	ResponsesStreamEventSafetyBuffer              ResponsesStreamEventKind = "response.safety_buffering"
 	ResponsesStreamEventCreated                   ResponsesStreamEventKind = "response.created"
 	ResponsesStreamEventOutputAdded               ResponsesStreamEventKind = "response.output_item.added"
@@ -57,18 +63,22 @@ const (
 )
 
 type ResponsesStreamEvent struct {
-	Kind               ResponsesStreamEventKind
-	RetryAttempt       uint64
-	RetryMax           uint64
-	RetryError         string
-	RetryDelay         time.Duration
-	RetryHTTPStatus    *uint16
-	RetryStatus        string
-	ResponseID         string
-	RequestID          string
-	Model              string
-	TurnState          string
-	ModelsETag         string
+	Kind            ResponsesStreamEventKind
+	RetryAttempt    uint64
+	RetryMax        uint64
+	RetryError      string
+	RetryDelay      time.Duration
+	RetryHTTPStatus *uint16
+	RetryStatus     string
+	ResponseID      string
+	RequestID       string
+	Model           string
+	TurnState       string
+	ModelsETag      string
+	// RoutingAffinity is the handshake pin of the connection that produced
+	// this event. It never leaves the transport: RuntimeRouter keeps it beside
+	// the parent response id for Guardian routing only (Rust #57710).
+	RoutingAffinity    *network.RoutingAffinity
 	Headers            map[string]string
 	RateLimit          *ResponsesRateLimitSnapshot
 	TimingMetrics      map[string]any
@@ -76,6 +86,7 @@ type ResponsesStreamEvent struct {
 	Reroute            *ResponsesModelReroute
 	Verification       *ResponsesModelVerification
 	ModerationMetadata any
+	GuardianAssessment *ResponsesGuardianAssessment
 	SafetyBuffering    *ResponsesSafetyBuffering
 	Item               *AgentItem
 	RawItem            json.RawMessage
@@ -87,15 +98,19 @@ type ResponsesStreamEvent struct {
 	ReasoningPart      *ResponsesReasoningPart
 	Usage              *AgentUsage
 	UsageMetadata      *ResponseUsageMetadata
-	EndTurn            *bool
-	RawType            string
+	// ReasoningRemovals reports the replayed reasoning items the API dropped.
+	// Nil means the response did not report input transformations at all.
+	ReasoningRemovals *ReasoningRemovals
+	EndTurn           *bool
+	RawType           string
 }
 
-// flexUnavailableStreamError recognizes Rust's `parse_flex_unavailable`
-// (codex-api/src/error.rs, #47967): an error object whose `code` is
-// `flex_unavailable`, either as the SSE event's top-level `error` field or as
-// the `response.error` payload of a `response.failed` event.
-func flexUnavailableStreamError(data []byte) (string, bool) {
+// terminalProviderStreamError recognizes Rust's `parse_terminal_provider_error`
+// (codex-api/src/error.rs, #47967/#56445/#58434) for streamed errors: an error
+// object whose `code` is `flex_unavailable`, `model_not_found` or one of the
+// audio validation codes, either as the SSE event's top-level `error` field or
+// as the `response.error` payload of a `response.failed` event.
+func terminalProviderStreamError(data []byte) (*codexapi.APIError, bool) {
 	var payload struct {
 		Error    *responsesAgentAPIErrorBody `json:"error"`
 		Response struct {
@@ -103,17 +118,121 @@ func flexUnavailableStreamError(data []byte) (string, bool) {
 		} `json:"response"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
-		return "", false
+		return nil, false
 	}
 	for _, body := range []*responsesAgentAPIErrorBody{payload.Error, payload.Response.Error} {
-		if body == nil {
-			continue
-		}
-		if responseErrorCode(body) == "flex_unavailable" {
-			return strings.TrimSpace(body.Message), true
+		if apiErr := terminalProviderError(body, 0); apiErr != nil {
+			return apiErr, true
 		}
 	}
-	return "", false
+	return nil, false
+}
+
+// terminalProviderError maps provider error codes that end a turn without
+// retries, preserving the provider message and any eligible HTTP status.
+// Status 0 means the error arrived streamed, without a status.
+func terminalProviderError(body *responsesAgentAPIErrorBody, status int) *codexapi.APIError {
+	if body == nil {
+		return nil
+	}
+	code := responseErrorCode(body)
+	if audioValidationErrorCodes[code] {
+		// Rust #58434: audio validation failures are terminal on a statusless
+		// error or an HTTP 400, keep the provider message, and fall back to a
+		// fixed copy when it is absent or blank.
+		if status != 0 && status != http.StatusBadRequest {
+			return nil
+		}
+		message := strings.TrimSpace(body.Message)
+		if message == "" {
+			message = AudioInputFallbackMessage
+		}
+		return &codexapi.APIError{Kind: codexapi.ErrorInvalidAudioInput, Status: status, Message: message, AudioValidationCode: code}
+	}
+	switch code {
+	case "budget_reached":
+		// Rust #59228: a provider budget stop is terminal for a statusless
+		// streamed error or an HTTP 400; retry advice and later completion
+		// events are ignored.
+		if status != 0 && status != http.StatusBadRequest {
+			return nil
+		}
+		return &codexapi.APIError{Kind: codexapi.ErrorSessionBudgetExceeded, Status: status}
+	case "flex_unavailable":
+		if status != 0 && status != http.StatusTooManyRequests {
+			return nil
+		}
+		if status == 0 {
+			status = http.StatusTooManyRequests
+		}
+		return &codexapi.APIError{Kind: codexapi.ErrorFlexUnavailable, Status: status, Message: strings.TrimSpace(body.Message)}
+	case "model_not_found":
+		switch status {
+		case 0, http.StatusBadRequest, http.StatusForbidden, http.StatusNotFound:
+		default:
+			return nil
+		}
+		message := strings.TrimSpace(body.Message)
+		if message == "" {
+			message = "model_not_found"
+		}
+		return &codexapi.APIError{Kind: codexapi.ErrorModelNotFound, Status: status, Message: message}
+	case "inference_hook_denied":
+		// Rust #60511: a workspace inference-hook denial is terminal on a
+		// statusless streamed error or an HTTP 403 and keeps the provider
+		// message.
+		if status != 0 && status != http.StatusForbidden {
+			return nil
+		}
+		message := strings.TrimSpace(body.Message)
+		if message == "" {
+			message = InferenceHookDeniedFallbackMessage
+		}
+		return &codexapi.APIError{Kind: codexapi.ErrorInferenceHookDenied, Status: status, Message: message}
+	case "context_length_exceeded":
+		// Rust #60482: a context-length failure is typed on the same 400 the
+		// HTTP path classifies, and also on a statusless streamed error, so both
+		// transports compact instead of retrying. A 503 keeps the generic
+		// retryable path.
+		if status != 0 && status != http.StatusBadRequest {
+			return nil
+		}
+		return &codexapi.APIError{Kind: codexapi.ErrorContextWindowExceeded, Status: status, Message: strings.TrimSpace(body.Message)}
+	case "invalid_access_program", "unsupported_access_program":
+		// Rust #60481: a statusless streamed rejection names the access
+		// program the model cannot use, and is terminal.
+		if status != 0 {
+			return nil
+		}
+		message := strings.TrimSpace(body.Message)
+		if message == "" {
+			message = AccessProgramUnsupportedFallbackMessage
+		}
+		return &codexapi.APIError{Kind: codexapi.ErrorInvalidRequest, Status: status, Message: message}
+	case "content_policy_violation":
+		// Rust #60479: content-policy refusals are terminal on a statusless
+		// streamed error or an HTTP 400 and keep their provider message.
+		if status != 0 && status != http.StatusBadRequest {
+			return nil
+		}
+		message := strings.TrimSpace(body.Message)
+		if message == "" {
+			message = ContentPolicyFallbackMessage
+		}
+		return &codexapi.APIError{Kind: codexapi.ErrorContentPolicyViolation, Status: status, Message: message}
+	case "access_program_not_enabled":
+		// Rust #60476: an HTTP 403 keeps its response details in the API
+		// bridge; the statusless streamed form is terminal here.
+		if status != 0 {
+			return nil
+		}
+		message := strings.TrimSpace(body.Message)
+		if message == "" {
+			message = AccessProgramNotEnabledFallbackMessage
+		}
+		return &codexapi.APIError{Kind: codexapi.ErrorAccessProgramNotEnabled, Status: status, Message: message}
+	}
+	return nil
 }
 
 // ResponseUsageMetadata mirrors Rust protocol::ResponseUsageMetadata (#41087):
@@ -201,6 +320,7 @@ type responsesStreamAccumulator struct {
 	functionCallArgDeltas map[string]string
 	customToolInputDeltas map[string]string
 	declaredCustomTools   map[string]struct{}
+	routingAffinity       *network.RoutingAffinity
 	// safetyBufferingTreatment carries the response-side safety-buffering
 	// headers: the HTTP response headers for a streamed response, or the JSON
 	// `headers` of each WebSocket event (Rust's `safety_buffering_for_event`).
@@ -526,21 +646,28 @@ func isRetryableResponsesStreamError(err error) bool {
 		switch details.Kind {
 		case codexapi.ErrorRetryable:
 			return true
-		case codexapi.ErrorServerOverloaded:
-			// Rust #49441: `CodexErr::retry_delay` now answers
-			// `server_retry_delay()` for `ServerOverloaded`, so an overload
-			// retries only while the server supplied retry advice. A headerless
-			// overload is terminal at this layer; the request layer still spends
-			// its own budget on the 5xx.
+		case codexapi.ErrorServerOverloaded, codexapi.ErrorPolicyCapacityUnavailable:
+			// Rust #49441/#57452: `CodexErr::retry_delay` answers
+			// `server_retry_delay()` for both overload kinds, so they retry only
+			// while the server supplied retry advice. A headerless failure is
+			// terminal at this layer; the request layer still spends its own budget
+			// on the 5xx.
 			return retryAdvicePresent(err)
 		case codexapi.ErrorRateLimitExceeded:
 			// Rust #45602: `slow_down` (and `rate_limit_exceeded`) are retryable
 			// rate limits, so the stream retries them even without a 5xx status.
 			return true
 		case codexapi.ErrorContextWindowExceeded, codexapi.ErrorQuotaExceeded,
-			codexapi.ErrorUsageNotIncluded, codexapi.ErrorInvalidRequest,
+			codexapi.ErrorUsageNotIncluded, codexapi.ErrorSessionBudgetExceeded,
+			codexapi.ErrorInvalidRequest,
+			codexapi.ErrorInvalidPrompt, codexapi.ErrorInvalidAudioInput,
 			codexapi.ErrorCyberPolicy, codexapi.ErrorBioPolicy,
-			codexapi.ErrorFlexUnavailable:
+			codexapi.ErrorFlexUnavailable, codexapi.ErrorModelNotFound,
+			// Rust #60475/#60476/#60479/#60480: workspace access denials,
+			// access-program rejections and content-policy refusals are
+			// terminal, so the stream spends no retry on them.
+			codexapi.ErrorWorkspaceAccessDenied, codexapi.ErrorAccessProgramNotEnabled,
+			codexapi.ErrorContentPolicyViolation, codexapi.ErrorInferenceHookDenied:
 			return false
 		default:
 			return details.Status >= http.StatusInternalServerError
@@ -678,14 +805,18 @@ func parseResponsesStreamWithTreatment(ctx context.Context, reader io.Reader, re
 			elapsed := time.Since(streamStartedAt).Milliseconds()
 			ttftMillis = &elapsed
 		}
-		if streamedEvent != nil && streamedEvent.Kind == ResponsesStreamEventCompleted &&
-			streamedEvent.Usage != nil && telemetrySink != nil {
-			telemetrySink.RecordSSEEventCompleted(ctx, SSECompletedRecord{
-				Usage:           *streamedEvent.Usage,
-				TTFTMillis:      ttftMillis,
-				ServiceTier:     requestServiceTier(request),
-				ReasoningEffort: requestReasoningEffort(request),
-			})
+		if streamedEvent != nil && streamedEvent.Kind == ResponsesStreamEventCompleted && telemetrySink != nil {
+			completedRecord := SSECompletedRecord{
+				TTFTMillis:        ttftMillis,
+				ServiceTier:       requestServiceTier(request),
+				ReasoningEffort:   requestReasoningEffort(request),
+				ReasoningRemovals: streamedEvent.ReasoningRemovals,
+			}
+			if streamedEvent.Usage != nil {
+				completedRecord.Usage = *streamedEvent.Usage
+				completedRecord.UsageReported = true
+			}
+			telemetrySink.RecordSSEEventCompleted(ctx, completedRecord)
 		}
 		receivingSpan.End()
 		handleResponsesSpan.End()
@@ -1014,63 +1145,149 @@ func responseHeaderBool(headers http.Header, name string) (bool, bool) {
 	}
 }
 
+// maxSSEEventBytes bounds a single SSE event. Providers send the whole item in
+// response.output_item.done, so a large tool result arrives as one data line;
+// this is a safety net against unbounded buffering, not a protocol rule.
+const maxSSEEventBytes = 128 << 20
+
+var errSSEEventTooLarge = errors.New("responses: SSE event exceeds size limit")
+
 func newResponsesSSEParser(reader io.Reader) *responsesSSEParser {
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 0, 64*1024), 16<<20)
-	return &responsesSSEParser{scanner: scanner}
+	return &responsesSSEParser{
+		reader:        bufio.NewReaderSize(reader, 64*1024),
+		maxEventBytes: maxSSEEventBytes,
+	}
 }
 
+// responsesSSEParser decodes the text/event-stream framing. It reads lines
+// through a bufio.Reader instead of bufio.Scanner so a single large event does
+// not hit the scanner token limit: a 32 MiB item in one "data:" line is a
+// normal provider response, not an error.
 type responsesSSEParser struct {
-	scanner *bufio.Scanner
-	event   string
-	data    bytes.Buffer
+	reader        *bufio.Reader
+	line          []byte
+	event         string
+	data          bytes.Buffer
+	maxEventBytes int
 }
 
 func (p *responsesSSEParser) Next() (*responsesSSEEvent, error) {
-	for p.scanner.Scan() {
-		line := strings.TrimRight(p.scanner.Text(), "\r")
-		if line == "" {
+	for {
+		blank, err := p.nextLine()
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				return nil, err
+			}
 			if event := p.flush(); event != nil {
 				return event, nil
 			}
-			continue
+			return nil, io.EOF
 		}
-		if strings.HasPrefix(line, ":") {
-			continue
-		}
-		field, value, hasValue := strings.Cut(line, ":")
-		if hasValue {
-			value = strings.TrimPrefix(value, " ")
-		}
-		switch field {
-		case "event":
-			p.event = value
-		case "data":
-			if p.data.Len() > 0 {
-				p.data.WriteByte('\n')
+		if blank {
+			if event := p.flush(); event != nil {
+				return event, nil
 			}
-			p.data.WriteString(value)
 		}
 	}
-	if err := p.scanner.Err(); err != nil {
-		return nil, err
+}
+
+// nextLine reads one SSE line. "data" values are appended straight into the
+// event buffer instead of being reassembled as a line first: a provider can
+// send the whole output item in one multi-megabyte data line, and buffering it
+// twice would double both the allocation and the resident heap for that frame.
+// The return value reports a blank line, which terminates the pending event.
+func (p *responsesSSEParser) nextLine() (bool, error) {
+	p.line = p.line[:0]
+	first := true
+	inData := false
+	inEvent := false
+	for {
+		fragment, err := p.reader.ReadSlice('\n')
+		last := !errors.Is(err, bufio.ErrBufferFull)
+		body := fragment
+		if last {
+			body = bytes.TrimSuffix(body, []byte{'\n'})
+			body = bytes.TrimSuffix(body, []byte{'\r'})
+		}
+		switch {
+		case first && last && len(body) == 0:
+			return true, err
+		case first:
+			first = false
+			field, value := splitSSEField(body)
+			switch string(field) {
+			case "data":
+				inData = true
+				if p.data.Len() > 0 {
+					p.data.WriteByte('\n')
+				}
+				_, _ = p.data.Write(value)
+				if limitErr := p.dataLimitError(); limitErr != nil {
+					return false, limitErr
+				}
+			case "event":
+				inEvent = true
+				p.line = append(p.line, value...)
+			default:
+				// Comments and unsupported fields are ignored; their value is
+				// not needed, so a long line is never buffered.
+			}
+		case inData:
+			_, _ = p.data.Write(body)
+			if limitErr := p.dataLimitError(); limitErr != nil {
+				return false, limitErr
+			}
+		case inEvent:
+			p.line = append(p.line, body...)
+		}
+		if last {
+			if inEvent {
+				p.event = string(p.line)
+			}
+			if cap(p.line) > 1<<20 {
+				// A pathological event name must not stay resident.
+				p.line = nil
+			}
+			return false, err
+		}
 	}
-	if event := p.flush(); event != nil {
-		return event, nil
+}
+
+// splitSSEField splits "field: value" into its parts. A line with no colon is
+// a field with an empty value, which is how SSE treats it.
+func splitSSEField(line []byte) ([]byte, []byte) {
+	index := bytes.IndexByte(line, ':')
+	if index < 0 {
+		return line, nil
 	}
-	return nil, io.EOF
+	field := line[:index]
+	value := line[index+1:]
+	if len(value) > 0 && value[0] == ' ' {
+		value = value[1:]
+	}
+	return field, value
+}
+
+func (p *responsesSSEParser) dataLimitError() error {
+	limit := p.maxEventBytes
+	if limit > 0 && p.data.Len() > limit {
+		return fmt.Errorf("%w: %d bytes > %d", errSSEEventTooLarge, p.data.Len(), limit)
+	}
+	return nil
 }
 
 func (p *responsesSSEParser) flush() *responsesSSEEvent {
 	if p.event == "" && p.data.Len() == 0 {
 		return nil
 	}
+	// Hand the buffer to the event rather than copying it: the next frame
+	// writes into a fresh buffer, so the payload is copied once, not twice.
 	event := &responsesSSEEvent{
 		Event: p.event,
-		Data:  append([]byte(nil), p.data.Bytes()...),
+		Data:  p.data.Bytes(),
 	}
 	p.event = ""
-	p.data.Reset()
+	p.data = bytes.Buffer{}
 	return event
 }
 
@@ -1080,14 +1297,18 @@ func (a *responsesStreamAccumulator) apply(sse *responsesSSEEvent, handler Respo
 	}
 	rawType := strings.TrimSpace(sse.Event)
 	if rawType == "" && len(bytes.TrimSpace(sse.Data)) > 0 {
-		rawType = jsonStringField(sse.Data, "type")
+		rawType = streamEventType(sse.Data)
 	}
 	if rawType == "" || rawType == "[DONE]" {
 		return false, nil
 	}
 	if len(bytes.TrimSpace(sse.Data)) == 0 {
 		if rawType == string(ResponsesStreamEventCreated) {
-			emitResponsesStreamEvent(handler, &ResponsesStreamEvent{Kind: ResponsesStreamEventCreated, RawType: rawType})
+			emitResponsesStreamEvent(handler, &ResponsesStreamEvent{
+				Kind:            ResponsesStreamEventCreated,
+				RoutingAffinity: a.routingAffinity,
+				RawType:         rawType,
+			})
 		}
 		return false, nil
 	}
@@ -1120,12 +1341,8 @@ func (a *responsesStreamAccumulator) apply(sse *responsesSSEEvent, handler Respo
 		// `flex_unavailable` is a terminal Flex-capacity failure; it ends the
 		// turn without retries instead of being buffered as a generic stream
 		// error.
-		if message, ok := flexUnavailableStreamError(sse.Data); ok {
-			return false, &codexapi.APIError{
-				Kind:    codexapi.ErrorFlexUnavailable,
-				Status:  http.StatusTooManyRequests,
-				Message: message,
-			}
+		if apiErr, ok := terminalProviderStreamError(sse.Data); ok {
+			return false, apiErr
 		}
 	case string(ResponsesStreamEventTimingMetrics):
 		metrics := responsesTimingMetricsFromEventData(sse.Data)
@@ -1141,12 +1358,13 @@ func (a *responsesStreamAccumulator) apply(sse *responsesSSEEvent, handler Respo
 		responseID := responseIDFromEventData(sse.Data)
 		a.responseID = firstNonEmptyResponseValue(a.responseID, responseID)
 		emitResponsesStreamEvent(handler, &ResponsesStreamEvent{
-			Kind:       ResponsesStreamEventCreated,
-			ResponseID: a.responseID,
-			RawType:    rawType,
+			Kind:            ResponsesStreamEventCreated,
+			ResponseID:      a.responseID,
+			RoutingAffinity: a.routingAffinity,
+			RawType:         rawType,
 		})
 	case "response.output_item.added":
-		item, err := agentItemFromStreamEventData(sse.Data, len(a.items), true)
+		item, rawItem, err := agentItemAndRawFromStreamEventData(sse.Data, len(a.items), true)
 		if err != nil {
 			return false, err
 		}
@@ -1158,17 +1376,18 @@ func (a *responsesStreamAccumulator) apply(sse *responsesSSEEvent, handler Respo
 			Kind:       ResponsesStreamEventOutputAdded,
 			ResponseID: a.responseID,
 			Item:       item,
-			RawItem:    rawResponseItemFromStreamEventData(sse.Data),
+			RawItem:    rawItem,
 			ItemID:     agentItemID(item),
 			CallID:     agentItemCallID(item),
 			RawType:    rawType,
 		})
 	case "response.output_item.done":
-		item, err := agentItemFromStreamEventData(sse.Data, len(a.items), false)
+		item, rawItem, err := agentItemAndRawFromStreamEventData(sse.Data, len(a.items), false)
 		if err != nil {
 			return false, err
 		}
 		a.applyToolInputDeltas(item)
+		a.releaseToolInputDeltas(item)
 		if item != nil {
 			a.recordAgentItem(item)
 		}
@@ -1176,18 +1395,18 @@ func (a *responsesStreamAccumulator) apply(sse *responsesSSEEvent, handler Respo
 			Kind:       ResponsesStreamEventOutputDone,
 			ResponseID: a.responseID,
 			Item:       item,
-			RawItem:    rawResponseItemFromStreamEventData(sse.Data),
+			RawItem:    rawItem,
 			ItemID:     agentItemID(item),
 			CallID:     agentItemCallID(item),
 			RawType:    rawType,
 		})
 	case "response.output_text.delta":
-		delta := jsonStringField(sse.Data, "delta")
+		delta, itemID := outputTextDeltaFields(sse.Data)
 		emitResponsesStreamEvent(handler, &ResponsesStreamEvent{
 			Kind:       ResponsesStreamEventOutputText,
 			ResponseID: a.responseID,
 			Delta:      delta,
-			ItemID:     jsonStringField(sse.Data, "item_id"),
+			ItemID:     itemID,
 			RawType:    rawType,
 		})
 	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
@@ -1265,10 +1484,12 @@ func (a *responsesStreamAccumulator) apply(sse *responsesSSEEvent, handler Respo
 		}
 		for i := range items {
 			a.applyToolInputDeltas(&items[i])
+			a.releaseToolInputDeltas(&items[i])
 			a.recordAgentItem(&items[i])
 		}
 		usage, hasUsage := usageFromStreamEventData(sse.Data)
 		usageMetadata, hasUsageMetadata := usageMetadataFromStreamEventData(sse.Data)
+		reasoningRemovals := reasoningRemovalsFromStreamEventData(sse.Data)
 		a.responseID = firstNonEmptyResponseValue(a.responseID, responseIDFromEventData(sse.Data))
 		if hasUsage {
 			a.usage = usage
@@ -1279,10 +1500,11 @@ func (a *responsesStreamAccumulator) apply(sse *responsesSSEEvent, handler Respo
 			endTurn = responsesBoolPointer(false)
 		}
 		event := &ResponsesStreamEvent{
-			Kind:       ResponsesStreamEventCompleted,
-			ResponseID: a.responseID,
-			RawType:    rawType,
-			EndTurn:    endTurn,
+			Kind:              ResponsesStreamEventCompleted,
+			ResponseID:        a.responseID,
+			RawType:           rawType,
+			EndTurn:           endTurn,
+			ReasoningRemovals: reasoningRemovals,
 		}
 		if hasUsage {
 			usageCopy := usage
@@ -1767,6 +1989,21 @@ func (a *responsesStreamAccumulator) applyToolInputDeltas(item *AgentItem) {
 	}
 }
 
+// releaseToolInputDeltas drops the accumulated argument buffers once the item
+// they belong to is complete. The completed item already carries the applied
+// payload; keeping the delta copies would hold every tool argument alive until
+// the response finishes (Rust #57563 releases completed-item payloads as soon
+// as they are delivered).
+func (a *responsesStreamAccumulator) releaseToolInputDeltas(item *AgentItem) {
+	if a == nil || item == nil {
+		return
+	}
+	for _, key := range uniqueNonEmptyResponseValues(item.ID, item.CallID) {
+		delete(a.functionCallArgDeltas, key)
+		delete(a.customToolInputDeltas, key)
+	}
+}
+
 func (a *responsesStreamAccumulator) restoreDeclaredCustomToolCall(item *AgentItem) {
 	if item == nil || item.Type != "function_call" || !a.isDeclaredCustomTool(item) {
 		return
@@ -1900,6 +2137,13 @@ func (a *responsesStreamAccumulator) emitMetadataEvents(data []byte, handler Res
 			RawType:            string(ResponsesStreamEventModeration),
 		})
 	}
+	if assessment := guardianAssessmentFromStreamMetadata(data); assessment != nil {
+		emitResponsesStreamEvent(handler, &ResponsesStreamEvent{
+			Kind:               ResponsesStreamEventGuardianAssessment,
+			GuardianAssessment: assessment,
+			RawType:            string(ResponsesStreamEventGuardianAssessment),
+		})
+	}
 }
 
 func (a *responsesStreamAccumulator) emitServerModelMetadata(data []byte, handler ResponsesStreamHandler) {
@@ -1947,8 +2191,55 @@ func modelVerificationFromStreamMetadata(data []byte) *ResponsesModelVerificatio
 	return &ResponsesModelVerification{Verifications: verifications}
 }
 
+// ResponsesGuardianAssessment is the serving-side assessment a response may
+// carry outside model-visible items (Rust #57757). Consumers must validate the
+// response, the completed action and the current authorization before using a
+// low-risk result; it does not grant permission to execute.
+type ResponsesGuardianAssessment struct {
+	ResponseID     string
+	ItemID         string
+	RequiresReview bool
+}
+
+// guardianAssessmentFromStreamMetadata decodes Rust's
+// `parse_guardian_assessment`: the event carries `response_id`, and its
+// metadata object holds `guardian: {item_id, requires_review}`. A missing,
+// malformed or empty assessment stays unavailable.
+func guardianAssessmentFromStreamMetadata(data []byte) *ResponsesGuardianAssessment {
+	if !bytes.Contains(data, []byte("guardian")) {
+		return nil
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil
+	}
+	responseID, ok := payload["response_id"].(string)
+	if !ok || responseID == "" {
+		return nil
+	}
+	metadata, ok := payload["metadata"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	guardian, ok := metadata["guardian"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	itemID, ok := guardian["item_id"].(string)
+	if !ok || itemID == "" {
+		return nil
+	}
+	requiresReview, ok := guardian["requires_review"].(bool)
+	if !ok {
+		return nil
+	}
+	return &ResponsesGuardianAssessment{ResponseID: responseID, ItemID: itemID, RequiresReview: requiresReview}
+}
+
 func turnModerationMetadataFromStreamMetadata(data []byte) (any, bool) {
-	value := streamMetadataValue(data, "turn_moderation_metadata", "turnModerationMetadata", "moderation_metadata", "moderationMetadata")
+	// Rust codex-api responses.rs turn_moderation_metadata(): the key is
+	// `openai_chatgpt_moderation_metadata` on a `response.metadata` event.
+	value := streamMetadataValue(data, "openai_chatgpt_moderation_metadata")
 	if value == nil {
 		return nil, false
 	}
@@ -1956,6 +2247,12 @@ func turnModerationMetadataFromStreamMetadata(data []byte) (any, bool) {
 }
 
 func safetyBufferingFromStreamMetadata(data []byte, treatment safetyBufferingTreatment) *ResponsesSafetyBuffering {
+	// Rust calls this for every event, but only a handful actually carry the
+	// field. Scanning for the key keeps a multi-megabyte item event from being
+	// decoded into a map (and a second copy of its text) for nothing.
+	if !bytes.Contains(data, []byte("safety_buffering")) && !bytes.Contains(data, []byte(`"metadata"`)) {
+		return nil
+	}
 	var payload map[string]any
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return nil
@@ -2083,13 +2380,14 @@ func (a *responsesStreamAccumulator) agentResponse(request *AgentRequest, provid
 		usage = AgentUsage{OutputTokens: outputTokens, TotalTokens: outputTokens}
 	}
 	return &AgentResponse{
-		ResponseID:    a.responseID,
-		Message:       message,
-		Items:         append([]AgentItem(nil), a.items...),
-		Usage:         usage,
-		Model:         requestModel(request),
-		ProviderID:    firstNonEmptyResponseValue(providerID, requestProviderID(request)),
-		TimingMetrics: cloneMapAny(a.timingMetrics),
+		ResponseID:      a.responseID,
+		Message:         message,
+		Items:           append([]AgentItem(nil), a.items...),
+		Usage:           usage,
+		Model:           requestModel(request),
+		ProviderID:      firstNonEmptyResponseValue(providerID, requestProviderID(request)),
+		TimingMetrics:   cloneMapAny(a.timingMetrics),
+		RoutingAffinity: a.routingAffinity,
 	}, nil
 }
 
@@ -2106,18 +2404,30 @@ func responsesTimingMetricsFromEventData(data []byte) map[string]any {
 	return cloneMapAny(metrics)
 }
 
-func agentItemFromStreamEventData(data []byte, index int, allowEmptyMessage bool) (*AgentItem, error) {
+// agentItemAndRawFromStreamEventData decodes one streamed output item together
+// with the raw JSON it came from. Stream handlers need both, and decoding the
+// same multi-megabyte payload twice is pure overhead, so the raw item is
+// returned from the only decode instead of being re-extracted by the caller.
+func agentItemAndRawFromStreamEventData(data []byte, index int, allowEmptyMessage bool) (*AgentItem, json.RawMessage, error) {
 	var payload struct {
-		Item *responsesAgentOutputItem `json:"item"`
+		Item json.RawMessage `json:"item"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
-		return nil, fmt.Errorf("failed to decode responses stream output item: %w", err)
+		return nil, nil, fmt.Errorf("failed to decode responses stream output item: %w", err)
 	}
-	if payload.Item == nil {
-		return nil, nil
+	rawItem := payload.Item
+	if len(rawItem) == 0 || bytes.Equal(bytes.TrimSpace(rawItem), []byte("null")) {
+		return nil, nil, nil
 	}
-	rawItem := rawResponseItemFromStreamEventData(data)
-	return agentItemFromResponseOutput(payload.Item, rawItem, index, allowEmptyMessage)
+	var output responsesAgentOutputItem
+	if err := json.Unmarshal(rawItem, &output); err != nil {
+		return nil, nil, fmt.Errorf("failed to decode responses stream output item: %w", err)
+	}
+	item, err := agentItemFromResponseOutput(&output, rawItem, index, allowEmptyMessage)
+	if err != nil {
+		return nil, nil, err
+	}
+	return item, rawItem, nil
 }
 
 func completedAgentItemsFromStreamEventData(data []byte, index int) ([]AgentItem, error) {
@@ -2193,28 +2503,58 @@ func agentItemFromResponseOutput(output *responsesAgentOutputItem, rawItem json.
 	if len(output.Content) > 0 {
 		data["outputContent"] = append([]responsesAgentContentBlock(nil), output.Content...)
 	}
-	return &AgentItem{ID: id, Type: "agent_message", Text: text, Data: data}, nil
+	return &AgentItem{
+		ID: id, Type: "agent_message", Text: text, Data: data,
+		ContentTokenCount: contentTokenCountFromInternalMetadata(output.InternalMetadata),
+	}, nil
 }
 
-func rawResponseItemFromStreamEventData(data []byte) json.RawMessage {
-	var payload struct {
-		Item json.RawMessage `json:"item"`
-	}
-	if err := json.Unmarshal(data, &payload); err != nil || len(payload.Item) == 0 {
+// contentTokenCountFromInternalMetadata reads the producer-supplied native
+// content-token count leniently: malformed metadata is unavailable, not fatal
+// (Rust #59041 deserializes it with DefaultOnError).
+func contentTokenCountFromInternalMetadata(raw json.RawMessage) *uint64 {
+	if len(raw) == 0 {
 		return nil
 	}
-	return append(json.RawMessage(nil), payload.Item...)
+	var envelope struct {
+		ContentTokenCount json.RawMessage `json:"content_token_count"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil || len(envelope.ContentTokenCount) == 0 {
+		return nil
+	}
+	literal := strings.TrimSpace(string(envelope.ContentTokenCount))
+	if literal == "" || literal[0] < '0' || literal[0] > '9' {
+		// encoding/json also accepts a quoted numeric string for json.Number;
+		// serde's u64 does not, so reject anything that is not a bare number.
+		return nil
+	}
+	var number json.Number
+	if err := json.Unmarshal(envelope.ContentTokenCount, &number); err != nil {
+		return nil
+	}
+	value, err := number.Int64()
+	if err != nil || value < 0 {
+		return nil
+	}
+	count := uint64(value)
+	return &count
 }
 
 func reasoningAgentItemFromRaw(raw json.RawMessage, index int) (*AgentItem, bool) {
 	if len(raw) == 0 {
 		return nil, false
 	}
-	var item map[string]any
-	if err := json.Unmarshal(raw, &item); err != nil {
+	// Probe the discriminator before decoding the whole item: a large
+	// assistant message must not be turned into a map just to learn it is not
+	// a reasoning item.
+	var probe struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil || probe.Type != "reasoning" {
 		return nil, false
 	}
-	if stringFromAnyMap(item, "type") != "reasoning" {
+	var item map[string]any
+	if err := json.Unmarshal(raw, &item); err != nil {
 		return nil, false
 	}
 	id := stringFromAnyMap(item, "id")
@@ -2357,6 +2697,100 @@ func usageMetadataFromStreamEventData(data []byte) (*ResponseUsageMetadata, bool
 	return metadata, true
 }
 
+// ReasoningRemovalReason is one bounded category of replayed reasoning removal
+// the API reports (Rust #61017).
+type ReasoningRemovalReason string
+
+const (
+	ReasoningRemovalOrganizationMismatch ReasoningRemovalReason = "organization_mismatch"
+	ReasoningRemovalEndUserMismatch      ReasoningRemovalReason = "end_user_mismatch"
+	ReasoningRemovalModelMismatch        ReasoningRemovalReason = "model_mismatch"
+	ReasoningRemovalPrefixMismatch       ReasoningRemovalReason = "prefix_mismatch"
+	ReasoningRemovalTurnBoundary         ReasoningRemovalReason = "turn_boundary"
+	ReasoningRemovalOther                ReasoningRemovalReason = "other"
+)
+
+// AllReasoningRemovalReasons lists every metric category, including the bucket
+// that groups unrecognized API reasons.
+var AllReasoningRemovalReasons = []ReasoningRemovalReason{
+	ReasoningRemovalOrganizationMismatch,
+	ReasoningRemovalEndUserMismatch,
+	ReasoningRemovalModelMismatch,
+	ReasoningRemovalPrefixMismatch,
+	ReasoningRemovalTurnBoundary,
+	ReasoningRemovalOther,
+}
+
+// ReasoningRemovals carries the reasoning items the API removed from the
+// replayed input, counted by bounded reason. An empty report means the response
+// described its input transformations without removals; a nil report means the
+// response did not describe them at all.
+type ReasoningRemovals struct {
+	Counts map[ReasoningRemovalReason]int64
+}
+
+// HasPrefixMismatch reports whether the API removed reasoning because the
+// replayed prefix no longer matched.
+func (r *ReasoningRemovals) HasPrefixMismatch() bool {
+	if r == nil {
+		return false
+	}
+	return r.Counts[ReasoningRemovalPrefixMismatch] > 0
+}
+
+// reasoningRemovalsFromStreamEventData parses the diagnostic
+// `input_transformations` report of a completed response. Missing, null, or
+// malformed reports stay unavailable so they never fail a valid response.
+func reasoningRemovalsFromStreamEventData(data []byte) *ReasoningRemovals {
+	var payload struct {
+		Response struct {
+			InputTransformations json.RawMessage `json:"input_transformations"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil
+	}
+	raw := bytes.TrimSpace(payload.Response.InputTransformations)
+	if len(raw) == 0 || raw[0] != '[' {
+		return nil
+	}
+	var transformations []struct {
+		Type   string `json:"type"`
+		Action string `json:"action"`
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(raw, &transformations); err != nil {
+		return nil
+	}
+	counts := map[ReasoningRemovalReason]int64{}
+	for _, transformation := range transformations {
+		if transformation.Type != "reasoning" || transformation.Action != "removed" {
+			continue
+		}
+		counts[reasoningRemovalReasonFromAPI(transformation.Reason)]++
+	}
+	return &ReasoningRemovals{Counts: counts}
+}
+
+// reasoningRemovalReasonFromAPI maps the provider's reason string onto a
+// bounded metric category.
+func reasoningRemovalReasonFromAPI(reason string) ReasoningRemovalReason {
+	switch ReasoningRemovalReason(reason) {
+	case ReasoningRemovalOrganizationMismatch:
+		return ReasoningRemovalOrganizationMismatch
+	case ReasoningRemovalEndUserMismatch:
+		return ReasoningRemovalEndUserMismatch
+	case ReasoningRemovalModelMismatch:
+		return ReasoningRemovalModelMismatch
+	case ReasoningRemovalPrefixMismatch:
+		return ReasoningRemovalPrefixMismatch
+	case ReasoningRemovalTurnBoundary:
+		return ReasoningRemovalTurnBoundary
+	default:
+		return ReasoningRemovalOther
+	}
+}
+
 func responseIDFromEventData(data []byte) string {
 	var payload struct {
 		Response struct {
@@ -2379,6 +2813,18 @@ func endTurnFromStreamEventData(data []byte) *bool {
 		return nil
 	}
 	return payload.Response.EndTurn
+}
+
+// streamEventType reads the event discriminator without decoding the rest of
+// the payload, which may be a whole multi-megabyte output item.
+func streamEventType(data []byte) string {
+	var payload struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return ""
+	}
+	return payload.Type
 }
 
 func streamMetadataValue(data []byte, keys ...string) any {
@@ -2580,12 +3026,22 @@ func responseFailedError(data []byte) error {
 	// Rust checks the Flex shape with `Value::get("code")` before decoding the
 	// strict error body, so a Flex-capacity failure ends the turn even when
 	// another field is malformed (Rust #47967, #48229).
+	if code, message, ok := audioInputErrorBody(rawError); ok {
+		// Rust #58434: audio validation failures are terminal and keep the
+		// provider message (falling back when it is absent or blank).
+		return &codexapi.APIError{Kind: codexapi.ErrorInvalidAudioInput, Message: message, AudioValidationCode: code}
+	}
 	if _, message, ok := flexUnavailableErrorBody(rawError); ok {
 		return &codexapi.APIError{
 			Kind:    codexapi.ErrorFlexUnavailable,
 			Status:  http.StatusTooManyRequests,
 			Message: message,
 		}
+	}
+	// Rust #56445: a statusless `model_not_found` failure ends the turn without
+	// retries and preserves the provider message.
+	if _, message, ok := modelNotFoundErrorBody(rawError); ok {
+		return &codexapi.APIError{Kind: codexapi.ErrorModelNotFound, Message: message}
 	}
 	var errBody responsesFailedErrorBody
 	if err := json.Unmarshal(rawError, &errBody); err != nil {
@@ -2636,9 +3092,17 @@ func responseFailedError(data []byte) error {
 		return &codexapi.APIError{Kind: codexapi.ErrorMisalignmentPolicyViolation, Status: http.StatusBadRequest, Message: message, Misalignment: parseMisalignmentDetails(errBody.Misalignment)}
 	case "invalid_prompt":
 		if errBody.Message == nil {
-			message = "Invalid request."
+			return &codexapi.APIError{Kind: codexapi.ErrorInvalidPrompt, Message: InvalidPromptFallbackMessage}
 		}
-		return &codexapi.APIError{Kind: codexapi.ErrorInvalidRequest, Message: message}
+		// Rust's SSE classifier only substitutes a message when the field is
+		// missing; an explicitly empty or blank message is preserved verbatim.
+		return &codexapi.APIError{Kind: codexapi.ErrorInvalidPrompt, Message: *errBody.Message}
+	case "policy_capacity_unavailable":
+		policyCapacity := &codexapi.APIError{Kind: codexapi.ErrorPolicyCapacityUnavailable, Message: message}
+		if hasRetryAfter {
+			return policyCapacity.WithRetryAfter(retryAfter)
+		}
+		return policyCapacity
 	case "server_is_overloaded":
 		overloaded := &codexapi.APIError{Kind: codexapi.ErrorServerOverloaded, Message: message}
 		if hasRetryAfter {
@@ -2755,6 +3219,52 @@ func flexUnavailableErrorBody(rawError []byte) (string, string, bool) {
 	return *body.Code, strings.TrimSpace(*body.Message), true
 }
 
+// modelNotFoundErrorBody recognizes Rust's statusless `model_not_found`
+// provider error without requiring the rest of the error object to decode.
+func modelNotFoundErrorBody(rawError []byte) (string, string, bool) {
+	var body struct {
+		Code    *string `json:"code"`
+		Message *string `json:"message"`
+	}
+	if err := json.Unmarshal(rawError, &body); err != nil || body.Code == nil || *body.Code != "model_not_found" {
+		return "", "", false
+	}
+	message := "model_not_found"
+	if body.Message != nil && strings.TrimSpace(*body.Message) != "" {
+		message = strings.TrimSpace(*body.Message)
+	}
+	return *body.Code, message, true
+}
+
+// audioValidationErrorCodes are the provider codes Rust classifies as terminal
+// invalid audio input (codex-api/src/error.rs, #58434).
+var audioValidationErrorCodes = map[string]bool{
+	"audio_too_large":           true,
+	"audio_too_short":           true,
+	"invalid_audio":             true,
+	"invalid_audio_data":        true,
+	"invalid_audio_format":      true,
+	"missing_audio_sample_rate": true,
+}
+
+// audioInputErrorBody recognizes Rust's audio validation codes without
+// requiring the rest of the error object to decode, and applies the fixed
+// fallback copy when the provider message is absent or blank (Rust #58434).
+func audioInputErrorBody(rawError []byte) (string, string, bool) {
+	var body struct {
+		Code    *string `json:"code"`
+		Message *string `json:"message"`
+	}
+	if err := json.Unmarshal(rawError, &body); err != nil || body.Code == nil || !audioValidationErrorCodes[*body.Code] {
+		return "", "", false
+	}
+	message := AudioInputFallbackMessage
+	if body.Message != nil && strings.TrimSpace(*body.Message) != "" {
+		message = strings.TrimSpace(*body.Message)
+	}
+	return *body.Code, message, true
+}
+
 func parseMisalignmentDetails(raw json.RawMessage) *codexapi.MisalignmentDetails {
 	if len(raw) == 0 || strings.TrimSpace(string(raw)) == "" || string(raw) == "null" {
 		return nil
@@ -2831,6 +3341,19 @@ func responseErrorCode(errBody *responsesAgentAPIErrorBody) string {
 	default:
 		return strings.TrimSpace(fmt.Sprint(code))
 	}
+}
+
+// outputTextDeltaFields decodes the two fields an output_text delta carries in
+// one pass. Decoding the event twice would allocate the delta string twice.
+func outputTextDeltaFields(data []byte) (string, string) {
+	var payload struct {
+		Delta  string `json:"delta"`
+		ItemID string `json:"item_id"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return "", ""
+	}
+	return payload.Delta, payload.ItemID
 }
 
 func jsonStringField(data []byte, key string) string {

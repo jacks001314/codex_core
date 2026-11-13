@@ -3,7 +3,9 @@ package model
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -29,6 +32,7 @@ import (
 	"codex_core/eventmap"
 	"codex_core/network"
 	"codex_core/protocol"
+	"codex_core/retainedctx"
 
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
@@ -120,6 +124,8 @@ type ResponsesAgentOptions struct {
 	ProviderID                 string
 	ProviderCapabilities       *ProviderCapabilities
 	ProviderRequiresOpenAIAuth bool
+	// RuntimeAuthActive mirrors Rust's `runtime_auth.is_some()` for this request.
+	RuntimeAuthActive          bool
 	ProviderUsesOwnCredentials bool
 	Stream                     bool
 	StreamHandler              ResponsesStreamHandler
@@ -134,10 +140,15 @@ type ResponsesAgentOptions struct {
 	// WorkloadIdentityRefresh refreshes process-scoped workload identity
 	// after a downstream 401 (Rust WorkloadIdentityExternalAuth::refresh,
 	// #38188). When nil, the runner lazily builds one from StoreOptions.
-	WorkloadIdentityRefresh  WorkloadIdentityRefreshFunc
-	AgentIdentity            *AgentIdentityOptions
-	ModelsManager            ModelsManager
-	EnableRequestCompression bool
+	WorkloadIdentityRefresh WorkloadIdentityRefreshFunc
+	// ProviderUnauthorizedRecovery mirrors Rust ModelProvider::recover_from_unauthorized
+	// (#59816): it lets the provider refresh its own credentials (a gateway
+	// credential export, for example) before the shared auth plan runs. It
+	// reports whether a retry should use the refreshed credentials.
+	ProviderUnauthorizedRecovery ProviderUnauthorizedRecoveryFunc
+	AgentIdentity                *AgentIdentityOptions
+	ModelsManager                ModelsManager
+	EnableRequestCompression     bool
 	// ContentItemKindsEnabled mirrors Rust's content_item_kinds feature gate:
 	// when disabled, content_item_kinds is cleared from every response item
 	// carried to the provider (Rust client.rs prepare_response_items_for_request).
@@ -178,36 +189,43 @@ type ResponsesAgentOptions struct {
 }
 
 type ResponsesAgentRunner struct {
-	Provider                   *APIProvider
-	Auth                       *AuthHeaders
-	HTTPClient                 HTTPDoer
-	ProviderID                 string
-	ProviderCapabilities       ProviderCapabilities
+	Provider             *APIProvider
+	Auth                 *AuthHeaders
+	HTTPClient           HTTPDoer
+	ProviderID           string
+	ProviderCapabilities ProviderCapabilities
+	// RuntimeAuthActive records that this request presented runtime credentials,
+	// so a terminal runtime denial must not spend the credential-recovery plan
+	// (Rust #60096).
+	RuntimeAuthActive          bool
 	ProviderRequiresOpenAIAuth bool
 	ProviderUsesOwnCredentials bool
 	Stream                     bool
 	StreamHandler              ResponsesStreamHandler
 	// AuthRecoveryHandler receives the turn-scoped progress of a
 	// provider-owned authentication recovery (Rust #41239).
-	AuthRecoveryHandler        ProviderAuthRecoveryHandler
-	CodexHome                  string
-	AuthSnapshot               *auth.AuthDotJSON
-	AuthIssuer                 string
-	StoreOptions               *auth.StoreOptions
-	ExternalAuthRefresh        ExternalAuthRefreshFunc
-	WorkloadIdentityRefresh    WorkloadIdentityRefreshFunc
-	AgentIdentity              *AgentIdentityOptions
-	AgentIdentityTelemetry     *codexapi.AgentIdentityTelemetry
-	ModelsManager              ModelsManager
-	EnableRequestCompression   bool
-	ContentItemKindsEnabled    *bool
-	IncludeAttestation         bool
-	AttestationProvider        codexapi.AttestationProvider
-	SupportsWebsockets         bool
-	WebsocketConnectTimeout    time.Duration
-	RejectRedirects            bool
-	UnboundedConnectionRetries *bool
-	OutputTokenReplayEnabled   bool
+	AuthRecoveryHandler     ProviderAuthRecoveryHandler
+	CodexHome               string
+	AuthSnapshot            *auth.AuthDotJSON
+	AuthIssuer              string
+	StoreOptions            *auth.StoreOptions
+	ExternalAuthRefresh     ExternalAuthRefreshFunc
+	WorkloadIdentityRefresh WorkloadIdentityRefreshFunc
+	// ProviderUnauthorizedRecovery refreshes provider-owned credentials on a 401
+	// (Rust #59816 provider.recover_from_unauthorized).
+	ProviderUnauthorizedRecovery ProviderUnauthorizedRecoveryFunc
+	AgentIdentity                *AgentIdentityOptions
+	AgentIdentityTelemetry       *codexapi.AgentIdentityTelemetry
+	ModelsManager                ModelsManager
+	EnableRequestCompression     bool
+	ContentItemKindsEnabled      *bool
+	IncludeAttestation           bool
+	AttestationProvider          codexapi.AttestationProvider
+	SupportsWebsockets           bool
+	WebsocketConnectTimeout      time.Duration
+	RejectRedirects              bool
+	UnboundedConnectionRetries   *bool
+	OutputTokenReplayEnabled     bool
 	// AWS carries the Amazon Bedrock SDK credential configuration (Rust
 	// #39410) so expired SDK credentials can be refreshed on 401 failures.
 	AWS *ProviderAWSAuthInfo
@@ -272,6 +290,85 @@ type responsesWebsocketSessionCache struct {
 type responsesWebsocketSession struct {
 	mu   sync.Mutex
 	conn *websocket.Conn
+	// requestSent records that a response.create was written on conn. Rust's
+	// WebsocketSession::is_prewarmed only treats a socket as warm once it has a
+	// last request to reuse; a dialed socket that never sent one still needs a
+	// warmup (Rust #47745).
+	requestSent bool
+	// connectedAuthRevision remembers the credential used by the last successful
+	// handshake. authRevisionKnown distinguishes "no handshake yet" from a
+	// provider whose auth snapshot has no managed token (Rust #59018).
+	connectedAuthRevision *uint64
+	authRevisionKnown     bool
+	// connClosed records that the reader observed the connection ending. A
+	// completed warmup returns its client to the cache, and the next resume
+	// re-checks the socket because it may have closed since then (Rust #47709).
+	connClosed atomic.Bool
+	// routingAffinity is the parent routing pin the cached connection was
+	// opened for, and capturedAffinity is the pin its handshake returned
+	// (Rust #57710). A Guardian review reconnects when its parent affinity
+	// differs from the one the socket was opened for.
+	routingAffinity  *network.RoutingAffinity
+	capturedAffinity *network.RoutingAffinity
+	// messages is owned by the session's single reader goroutine. The request
+	// loop consumes it instead of calling conn.Read directly so that mailbox
+	// preemption can be observed while a frame is outstanding without closing
+	// the connection (Rust #55969).
+	messages   chan responsesWebsocketReadResult
+	readerDone chan struct{}
+	// maxMessageBytes is the peer's advertised request size limit from the
+	// handshake (Rust #60841); zero means the server advertised none.
+	maxMessageBytes int
+}
+
+func websocketAuthRevision(snapshot *auth.AuthDotJSON) (uint64, bool) {
+	if snapshot == nil {
+		return 0, false
+	}
+	token := stringFromAny(snapshot.Tokens, "access_token")
+	if strings.TrimSpace(token) == "" {
+		token = snapshot.OpenAIAPIKey
+	}
+	if strings.TrimSpace(token) == "" {
+		return 0, false
+	}
+	sum := sha256.Sum256([]byte(token))
+	return binary.BigEndian.Uint64(sum[:8]), true
+}
+
+// websocketReauth reports whether this handshake replaces the credential used
+// by the previous successful socket (Rust #59018).
+func (s *responsesWebsocketSession) websocketReauth(snapshot *auth.AuthDotJSON) bool {
+	if s == nil || !s.authRevisionKnown {
+		return false
+	}
+	revision, hasRevision := websocketAuthRevision(snapshot)
+	if !hasRevision {
+		return s.connectedAuthRevision != nil
+	}
+	if s.connectedAuthRevision == nil {
+		return true
+	}
+	return *s.connectedAuthRevision != revision
+}
+
+func (s *responsesWebsocketSession) markConnectedAuth(snapshot *auth.AuthDotJSON) {
+	if s == nil {
+		return
+	}
+	revision, hasRevision := websocketAuthRevision(snapshot)
+	s.authRevisionKnown = true
+	if !hasRevision {
+		s.connectedAuthRevision = nil
+		return
+	}
+	value := revision
+	s.connectedAuthRevision = &value
+}
+
+type responsesWebsocketReadResult struct {
+	data []byte
+	err  error
 }
 
 type AgentIdentityOptions struct {
@@ -308,6 +405,10 @@ type ExternalAuthRefreshFunc func(ctx context.Context, request *ExternalAuthRefr
 
 // WorkloadIdentityRefreshFunc re-exchanges workload identity tokens preserving
 // the previously authenticated account.
+// ProviderUnauthorizedRecoveryFunc refreshes provider-owned credentials after
+// a 401 and reports whether the request should be retried (Rust #59816).
+type ProviderUnauthorizedRecoveryFunc func(context.Context) (bool, error)
+
 type WorkloadIdentityRefreshFunc func(ctx context.Context, previousAccountID string) (*auth.AuthDotJSON, error)
 
 // MaxResponseMessageBytes mirrors Rust's client_tool_metadata
@@ -357,25 +458,40 @@ type responsesAgentRequest struct {
 	// Rust #49675: keep the routing fields first. encoding/json serializes
 	// struct fields in declaration order, and gateways may inspect a request
 	// body incrementally before buffering a potentially multi-megabyte input.
-	Model                string                  `json:"model"`
-	Stream               bool                    `json:"stream"`
-	ServiceTier          string                  `json:"service_tier,omitempty"`
-	Instructions         string                  `json:"instructions,omitempty"`
-	Input                []any                   `json:"input"`
-	Tools                []any                   `json:"tools,omitempty"`
-	ToolChoice           string                  `json:"tool_choice,omitempty"`
-	ParallelToolCalls    bool                    `json:"parallel_tool_calls"`
-	Reasoning            *responsesReasoning     `json:"reasoning,omitempty"`
-	Store                bool                    `json:"store"`
-	StreamOptions        *responsesStreamOptions `json:"stream_options,omitempty"`
-	Include              []string                `json:"include,omitempty"`
-	PromptCacheKey       string                  `json:"prompt_cache_key,omitempty"`
-	Text                 *responsesTextParam     `json:"text,omitempty"`
-	ClientMetadata       map[string]string       `json:"client_metadata,omitempty"`
-	AccessPrograms       *AccessPrograms         `json:"access_programs,omitempty"`
-	UseResponsesLite     bool                    `json:"-"`
-	IncludeTimingMetrics bool                    `json:"-"`
-	BetaFeaturesHeader   string                  `json:"-"`
+	Model                string                       `json:"model"`
+	Stream               bool                         `json:"stream"`
+	ServiceTier          string                       `json:"service_tier,omitempty"`
+	Instructions         string                       `json:"instructions,omitempty"`
+	Input                []any                        `json:"input"`
+	Tools                []any                        `json:"tools,omitempty"`
+	ToolChoice           string                       `json:"tool_choice,omitempty"`
+	ParallelToolCalls    bool                         `json:"parallel_tool_calls"`
+	Reasoning            *responsesReasoning          `json:"reasoning,omitempty"`
+	Store                bool                         `json:"store"`
+	StreamOptions        *responsesStreamOptions      `json:"stream_options,omitempty"`
+	Include              []string                     `json:"include,omitempty"`
+	PromptCacheKey       string                       `json:"prompt_cache_key,omitempty"`
+	PromptCacheOptions   *responsesPromptCacheOptions `json:"prompt_cache_options,omitempty"`
+	Text                 *responsesTextParam          `json:"text,omitempty"`
+	ClientMetadata       map[string]string            `json:"client_metadata,omitempty"`
+	AccessPrograms       *AccessPrograms              `json:"access_programs,omitempty"`
+	UseResponsesLite     bool                         `json:"-"`
+	IncludeTimingMetrics bool                         `json:"-"`
+	BetaFeaturesHeader   string                       `json:"-"`
+}
+
+// responsesPromptCacheOptions mirrors Rust's PromptCacheOptions (#59480).
+type responsesPromptCacheOptions struct {
+	TTL string `json:"ttl"`
+}
+
+func promptCacheOptionsForTTL(ttl string) *responsesPromptCacheOptions {
+	switch strings.TrimSpace(ttl) {
+	case "30m", "12h":
+		return &responsesPromptCacheOptions{TTL: strings.TrimSpace(ttl)}
+	default:
+		return nil
+	}
 }
 
 type responsesReasoning struct {
@@ -483,6 +599,9 @@ type responsesAgentOutputItem struct {
 	Execution             string                       `json:"execution"`
 	Search                map[string]any               `json:"search"`
 	Action                map[string]any               `json:"action"`
+	// InternalMetadata carries the producer's internal message metadata. Only
+	// the completion-token count is read from it (Rust #59041).
+	InternalMetadata json.RawMessage `json:"internal_chat_message_metadata_passthrough"`
 }
 
 type responsesAgentContentBlock struct {
@@ -679,43 +798,45 @@ func NewResponsesAgentRunner(options *ResponsesAgentOptions) *ResponsesAgentRunn
 		providerRequiresOpenAIAuth = true
 	}
 	return &ResponsesAgentRunner{
-		Provider:                   provider,
-		Auth:                       cloneAuthHeaders(options.Auth),
-		HTTPClient:                 client,
-		ProviderID:                 strings.TrimSpace(options.ProviderID),
-		ProviderCapabilities:       providerCapabilities,
-		ProviderRequiresOpenAIAuth: providerRequiresOpenAIAuth,
-		ProviderUsesOwnCredentials: options.ProviderUsesOwnCredentials || provider.Auth != nil,
-		Stream:                     options.Stream,
-		StreamHandler:              options.StreamHandler,
-		AuthRecoveryHandler:        options.AuthRecoveryHandler,
-		CodexHome:                  strings.TrimSpace(options.CodexHome),
-		AuthSnapshot:               cloneAuthSnapshot(options.AuthSnapshot),
-		AuthIssuer:                 strings.TrimSpace(options.AuthIssuer),
-		StoreOptions:               cloneStoreOptions(options.StoreOptions),
-		ExternalAuthRefresh:        options.ExternalAuthRefresh,
-		WorkloadIdentityRefresh:    options.WorkloadIdentityRefresh,
-		AgentIdentity:              cloneAgentIdentityOptions(options.AgentIdentity),
-		AgentIdentityTelemetry:     agentIdentityTelemetryFromAuthHeaders(options.Auth),
-		ModelsManager:              options.ModelsManager,
-		EnableRequestCompression:   options.EnableRequestCompression,
-		ContentItemKindsEnabled:    cloneBoolPtrModel(options.ContentItemKindsEnabled),
-		IncludeAttestation:         options.IncludeAttestation,
-		AttestationProvider:        options.AttestationProvider,
-		SupportsWebsockets:         options.SupportsWebsockets,
-		WebsocketConnectTimeout:    options.WebsocketConnectTimeout,
-		RejectRedirects:            options.RejectRedirects,
-		OutputTokenReplayEnabled:   options.OutputTokenReplayEnabled,
-		UnboundedConnectionRetries: cloneBoolPtrModel(options.UnboundedConnectionRetries),
-		AWS:                        cloneProviderAWSAuthInfo(options.AWS),
-		Metrics:                    options.Metrics,
-		ApiKeyCyberAccessPrograms:  options.ApiKeyCyberAccessPrograms,
-		ImageStore:                 attachmentstore.StoreOrDefault(options.ImageStore),
-		AWSRefreshMu:               &sync.Mutex{},
-		providerAuthFetchedAt:      providerAuthFetchedAt,
-		turnState:                  &responsesTurnStateCache{},
-		websocketSessions:          &responsesWebsocketSessionCache{sessions: map[string]*responsesWebsocketSession{}},
-		inferenceTools:             &responsesInferenceToolCache{},
+		Provider:                     provider,
+		Auth:                         cloneAuthHeaders(options.Auth),
+		HTTPClient:                   client,
+		ProviderID:                   strings.TrimSpace(options.ProviderID),
+		ProviderCapabilities:         providerCapabilities,
+		ProviderRequiresOpenAIAuth:   providerRequiresOpenAIAuth,
+		ProviderUsesOwnCredentials:   options.ProviderUsesOwnCredentials || provider.Auth != nil,
+		RuntimeAuthActive:            options.RuntimeAuthActive,
+		Stream:                       options.Stream,
+		StreamHandler:                options.StreamHandler,
+		AuthRecoveryHandler:          options.AuthRecoveryHandler,
+		CodexHome:                    strings.TrimSpace(options.CodexHome),
+		AuthSnapshot:                 cloneAuthSnapshot(options.AuthSnapshot),
+		AuthIssuer:                   strings.TrimSpace(options.AuthIssuer),
+		StoreOptions:                 cloneStoreOptions(options.StoreOptions),
+		ExternalAuthRefresh:          options.ExternalAuthRefresh,
+		WorkloadIdentityRefresh:      options.WorkloadIdentityRefresh,
+		ProviderUnauthorizedRecovery: options.ProviderUnauthorizedRecovery,
+		AgentIdentity:                cloneAgentIdentityOptions(options.AgentIdentity),
+		AgentIdentityTelemetry:       agentIdentityTelemetryFromAuthHeaders(options.Auth),
+		ModelsManager:                options.ModelsManager,
+		EnableRequestCompression:     options.EnableRequestCompression,
+		ContentItemKindsEnabled:      cloneBoolPtrModel(options.ContentItemKindsEnabled),
+		IncludeAttestation:           options.IncludeAttestation,
+		AttestationProvider:          options.AttestationProvider,
+		SupportsWebsockets:           options.SupportsWebsockets,
+		WebsocketConnectTimeout:      options.WebsocketConnectTimeout,
+		RejectRedirects:              options.RejectRedirects,
+		OutputTokenReplayEnabled:     options.OutputTokenReplayEnabled,
+		UnboundedConnectionRetries:   cloneBoolPtrModel(options.UnboundedConnectionRetries),
+		AWS:                          cloneProviderAWSAuthInfo(options.AWS),
+		Metrics:                      options.Metrics,
+		ApiKeyCyberAccessPrograms:    options.ApiKeyCyberAccessPrograms,
+		ImageStore:                   attachmentstore.StoreOrDefault(options.ImageStore),
+		AWSRefreshMu:                 &sync.Mutex{},
+		providerAuthFetchedAt:        providerAuthFetchedAt,
+		turnState:                    &responsesTurnStateCache{},
+		websocketSessions:            &responsesWebsocketSessionCache{sessions: map[string]*responsesWebsocketSession{}},
+		inferenceTools:               &responsesInferenceToolCache{},
 	}
 }
 
@@ -734,6 +855,27 @@ func (r *ResponsesAgentRunner) websocketSession(request *AgentRequest) *response
 	if session == nil {
 		session = &responsesWebsocketSession{}
 		r.websocketSessions.sessions[key] = session
+	}
+	// Rust #60055: a runtime-authenticated request revalidates access on a fresh
+	// handshake, so a cached socket never carries it. connection_pool.rs opens a
+	// fresh connection whenever `runtime_id.is_some()`, and ConnectionLease::reuse
+	// keeps only non-runtime connections. Closing here keeps exactly one reuse
+	// point and leaves `connectionReused` false for every runtime request.
+	if r != nil && r.RuntimeAuthActive && session.conn != nil {
+		session.mu.Lock()
+		closeResponsesWebsocketSession(session, "runtime auth requires a fresh handshake")
+		session.mu.Unlock()
+	}
+	// Rust #60436: credentials can change while a request is prepared (an
+	// account switch or a refreshed managed token), so a socket opened with the
+	// previous owner must not send the next request. Comparing the handshake
+	// revision against the credential the runner would use now drops the
+	// connection, and the caller dials again with the current owner instead of
+	// reusing stale credentials.
+	if session.conn != nil && session.websocketReauth(r.AuthSnapshot) {
+		session.mu.Lock()
+		closeResponsesWebsocketSession(session, "auth ownership changed")
+		session.mu.Unlock()
 	}
 	return session
 }
@@ -854,11 +996,77 @@ func responsesWebsocketSessionKey(request *AgentRequest) string {
 }
 
 func closeResponsesWebsocketSession(session *responsesWebsocketSession, reason string) {
-	if session == nil || session.conn == nil {
+	if session == nil {
+		return
+	}
+	stopResponsesWebsocketReader(session)
+	session.connClosed.Store(true)
+	session.requestSent = false
+	if session.conn == nil {
 		return
 	}
 	_ = session.conn.Close(websocket.StatusNormalClosure, reason)
 	session.conn = nil
+}
+
+// startResponsesWebsocketReader starts the session's single reader goroutine.
+// gorilla/websocket permits one concurrent reader and one concurrent writer,
+// so the request loop keeps writing (response.create, response.interrupt) while
+// the reader delivers frames. Reading through a channel is what lets the loop
+// select on mailbox preemption while a frame is outstanding (Rust #55969).
+func startResponsesWebsocketReader(session *responsesWebsocketSession) chan responsesWebsocketReadResult {
+	if session == nil {
+		return nil
+	}
+	if session.messages != nil {
+		return session.messages
+	}
+	conn := session.conn
+	if conn == nil {
+		return nil
+	}
+	messages := make(chan responsesWebsocketReadResult, 64)
+	done := make(chan struct{})
+	session.messages = messages
+	session.readerDone = done
+	go func() {
+		defer close(messages)
+		for {
+			_, data, err := conn.Read(context.Background())
+			if err != nil {
+				session.connClosed.Store(true)
+			}
+			select {
+			case messages <- responsesWebsocketReadResult{data: data, err: err}:
+			case <-done:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return messages
+}
+
+// websocketSessionPrewarmed mirrors Rust's WebsocketSession::is_prewarmed: a
+// warmup may skip preparation only when the cached connection already carries a
+// request and is not known to be closed. The caller must hold session.mu.
+func websocketSessionPrewarmed(session *responsesWebsocketSession) bool {
+	return session != nil && session.conn != nil && session.requestSent && !session.connClosed.Load()
+}
+
+// stopResponsesWebsocketReader stops the reader goroutine without closing the
+// connection. The caller must hold session.mu.
+func stopResponsesWebsocketReader(session *responsesWebsocketSession) {
+	if session == nil {
+		return
+	}
+	if session.readerDone != nil {
+		close(session.readerDone)
+		session.readerDone = nil
+	}
+	session.messages = nil
 }
 
 func (r *ResponsesAgentRunner) Prewarm(ctx context.Context, request *AgentRequest) (*AgentResponse, error) {
@@ -874,21 +1082,36 @@ func (r *ResponsesAgentRunner) Prewarm(ctx context.Context, request *AgentReques
 	session := r.websocketSession(request)
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	if session.conn != nil {
+	// Rust #47709/#47745: a resume warmup re-checks the cached socket instead of
+	// trusting the previous warmup's outcome. Only a socket that already carries
+	// a request and is not known closed may skip preparation.
+	websocketReady := websocketSessionPrewarmed(session)
+	if r.Metrics != nil {
+		outcome := "needs_prewarm"
+		if websocketReady {
+			outcome = "ready"
+		}
+		r.Metrics.Counter(startupPrewarmWebsocketCheckMetric, 1, map[string]string{
+			"outcome": outcome,
+			"input":   prewarmInputMode(request),
+		})
+	}
+	if websocketReady {
 		return nil, nil
 	}
-	modelID := strings.TrimSpace(request.Model)
-	if modelID == "" {
-		modelID = "gpt-5.5"
+	if session.conn != nil {
+		// The cached connection ended or never carried a request; drop it so the
+		// warmup redials with this resume's prepared payload.
+		closeResponsesWebsocketSession(session, "startup prewarm reconnect")
 	}
-	apiRequest := &responsesAgentRequest{
-		Model: modelID, Instructions: "", Input: r.gateContentItemKinds(responsesInputItemsForProviderWithStore(request, r.providerName(), r.imageStore())), Tools: normalizeResponseToolParameters(cloneAnySlice(request.Tools)), ToolChoice: "auto",
-		Stream: true, Store: request.Store, ParallelToolCalls: request.ParallelToolCalls, ClientMetadata: cloneStringMap(request.ClientMetadata),
+	// Rust #47635: the warmup request is built exactly like a turn request so
+	// the preconnect carries the effective service tier, routing hint, hosted
+	// tools and Responses Lite tool metadata the caller captured. The handshake
+	// itself runs before any of the turn's tool discovery can block it.
+	apiRequest, err := r.buildResponsesAgentRequest(request, true)
+	if err != nil {
+		return nil, err
 	}
-	apiRequest.Input, _ = prependResponsesBaseInstructions(apiRequest.Input, responsesInstructions(request), request.ThreadID)
-	apiRequest.Reasoning = responsesReasoningParam(request, &ModelInfo{Slug: modelID, SupportsReasoningSummaries: true})
-	apiRequest.StreamOptions = responsesStreamOptionsForRequest(request, apiRequest.Reasoning, r.providerName())
-	apiRequest.Input = boundedInputForResponseMessage(apiRequest, request, r.Metrics)
 	httpRequest, err := r.newResponsesHTTPRequest(ctx, request, apiRequest, "")
 	if err != nil {
 		return nil, err
@@ -903,30 +1126,67 @@ func (r *ResponsesAgentRunner) Prewarm(ctx context.Context, request *AgentReques
 	}
 	connectCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	dialStartedAt := time.Now()
-	// Rust #46506: a secure WebSocket handshake reuses the HTTP factory's
-	// ChatGPT cookie store, while an explicit Cookie header still wins.
-	headers := httpRequest.Header
-	if headers.Get("Cookie") == "" {
-		if cookie := network.ChatGPTCookieHeader(endpoint); cookie != "" {
-			cloned := headers.Clone()
-			cloned.Set("Cookie", cookie)
-			headers = cloned
+	// Rust #47635: preconnect recovers authentication failures exactly like a
+	// turn's websocket connect. The recovery plan cursor bounds the retries.
+	recovery := &authRecoveryState{}
+	recoveryMode, recoveryPhase := "", ""
+	// Rust #47635: tool capture runs concurrently with the handshake so a slow MCP
+	// startup cannot delay the connection; the discovered tools join the
+	// generate=false warmup once the socket is up.
+	var pendingPrewarmTools <-chan []any
+	if request.PrewarmTools != nil {
+		tools := make(chan []any, 1)
+		pendingPrewarmTools = tools
+		go func() {
+			tools <- request.PrewarmTools(ctx)
+		}()
+	}
+	var conn *websocket.Conn
+	for {
+		dialStartedAt := time.Now()
+		reauth := session.websocketReauth(r.AuthSnapshot)
+		// Rust #46506: a secure WebSocket handshake reuses the HTTP factory's
+		// ChatGPT cookie store, while an explicit Cookie header still wins.
+		headers := network.WebsocketHandshakeCookies(endpoint, httpRequest.Header)
+		var response *http.Response
+		conn, response, err = websocket.Dial(connectCtx, endpoint, &websocket.DialOptions{HTTPHeader: headers})
+		if response != nil {
+			// A rejected upgrade can refresh infrastructure cookies exactly like
+			// an HTTP response.
+			network.StoreChatGPTResponseCookies(endpoint, response.Header)
 		}
-	}
-	conn, response, err := websocket.Dial(connectCtx, endpoint, &websocket.DialOptions{HTTPHeader: headers})
-	if response != nil {
-		// A rejected upgrade can refresh infrastructure cookies exactly like an
-		// HTTP response.
-		network.StoreChatGPTResponseCookies(endpoint, response.Header)
-	}
-	// The prewarm handshake reports the same attempt telemetry, with a fresh
-	// connection and no retry.
-	r.recordWebsocketConnectRecord(ctx, request, apiRequest, httpRequest, response, err, time.Since(dialStartedAt), "", "")
-	if err != nil {
+		// The prewarm handshake reports the same attempt telemetry, with a fresh
+		// connection and no transport retry.
+		r.recordWebsocketConnectRecord(ctx, request, apiRequest, httpRequest, response, err, time.Since(dialStartedAt), recoveryMode, recoveryPhase, reauth)
+		if err == nil {
+			session.markConnectedAuth(r.AuthSnapshot)
+			break
+		}
 		if response != nil && response.StatusCode == http.StatusUpgradeRequired {
 			r.disableWebsockets()
 			return nil, nil
+		}
+		if response != nil && response.StatusCode == http.StatusUnauthorized {
+			debug := authRecoveryDebug{
+				RequestID:     responseHeaderValue(response.Header, responsesRequestIDHeader, responsesOAIRequestIDHeader),
+				CFRay:         responseHeaderValue(response.Header, "cf-ray"),
+				AuthError:     responseHeaderValue(response.Header, "x-openai-authorization-error"),
+				AuthErrorCode: responseAuthorizationErrorCode(response.Header),
+				StatusCode:    response.StatusCode,
+			}
+			mode, phase, refreshErr := r.recoverUnauthorizedAuth(ctx, recovery, debug)
+			if refreshErr == nil {
+				recoveryMode, recoveryPhase = string(mode), string(phase)
+				httpRequest, err = r.newResponsesHTTPRequest(ctx, request, apiRequest, "")
+				if err != nil {
+					return nil, err
+				}
+				endpoint, err = websocketURLFromHTTP(httpRequest.URL)
+				if err != nil {
+					return nil, err
+				}
+				continue
+			}
 		}
 		if response != nil {
 			return nil, fmt.Errorf("responses websocket handshake failed: HTTP %d: %w", response.StatusCode, err)
@@ -934,6 +1194,26 @@ func (r *ResponsesAgentRunner) Prewarm(ctx context.Context, request *AgentReques
 		return nil, err
 	}
 	session.conn = conn
+	session.connClosed.Store(false)
+	session.requestSent = false
+	// Rust #47635: attach the captured step tools to the warmup payload.
+	if pendingPrewarmTools != nil {
+		var tools []any
+		select {
+		case tools = <-pendingPrewarmTools:
+		case <-ctx.Done():
+			closeResponsesWebsocketSession(session, "prewarm tool capture canceled")
+			return nil, ctx.Err()
+		}
+		if len(tools) > 0 {
+			finalized := *request
+			finalized.Tools = tools
+			if apiRequest, err = r.buildResponsesAgentRequest(&finalized, true); err != nil {
+				closeResponsesWebsocketSession(session, "prewarm tool capture failed")
+				return nil, err
+			}
+		}
+	}
 	payload := map[string]any{
 		"type": "response.create", "model": apiRequest.Model, "input": apiRequest.Input, "tool_choice": apiRequest.ToolChoice,
 		"parallel_tool_calls": apiRequest.ParallelToolCalls, "store": apiRequest.Store, "stream": true, "include": []string{}, "generate": false,
@@ -965,21 +1245,40 @@ func (r *ResponsesAgentRunner) Prewarm(ctx context.Context, request *AgentReques
 	if apiRequest.PromptCacheKey != "" {
 		payload["prompt_cache_key"] = apiRequest.PromptCacheKey
 	}
+	if apiRequest.PromptCacheOptions != nil {
+		payload["prompt_cache_options"] = apiRequest.PromptCacheOptions
+	}
 	if apiRequest.AccessPrograms != nil {
 		payload["access_programs"] = apiRequest.AccessPrograms
 	}
 	requestStartedAt := time.Now()
-	r.recordWebsocketContinuation("full", "prewarm", "warmup")
-	writeErr := conn.Write(connectCtx, websocket.MessageText, marshalResponsesMessage(payload))
+	r.recordWebsocketContinuation("full", "prewarm", "warmup", false)
+	writeErr := writeResponsesWebsocketMessage(connectCtx, conn, websocket.MessageText, marshalResponsesMessage(payload))
 	r.recordWebsocketRequest(writeErr, time.Since(requestStartedAt))
-	// The prewarm dials a fresh connection (it returns early when one exists).
+	// A warmup that redialed reports a fresh transport like any other handshake.
 	r.recordWebsocketRequestRecord(ctx, writeErr, time.Since(requestStartedAt), false)
 	if writeErr != nil {
 		closeResponsesWebsocketSession(session, "prewarm write failed")
 		return nil, writeErr
 	}
+	session.requestSent = true
+	// Keep the session's single reader running after the warmup so a later
+	// resume can observe the peer closing this socket and repair it instead of
+	// trusting a stale warmup (Rust #47709).
+	messages := startResponsesWebsocketReader(session)
 	for {
-		_, data, err := conn.Read(ctx)
+		var read responsesWebsocketReadResult
+		var readOK bool
+		select {
+		case <-ctx.Done():
+			closeResponsesWebsocketSession(session, "prewarm canceled")
+			return nil, ctx.Err()
+		case read, readOK = <-messages:
+			if !readOK {
+				read.err = errors.New("responses websocket connection closed")
+			}
+		}
+		data, err := read.data, read.err
 		if err != nil {
 			closeResponsesWebsocketSession(session, "prewarm read failed")
 			return nil, fmt.Errorf("responses websocket closed before response.completed: %w", err)
@@ -1005,6 +1304,15 @@ func (r *ResponsesAgentRunner) Prewarm(ctx context.Context, request *AgentReques
 			return nil, fmt.Errorf("responses websocket prewarm failed: %s", strings.TrimSpace(responseToolString(event["error"])))
 		}
 	}
+}
+
+// prewarmInputMode labels a warmup by the input it prepares, mirroring Rust
+// #48812's PrewarmInput::Base / PrewarmInput::History.
+func prewarmInputMode(request *AgentRequest) string {
+	if request != nil && strings.EqualFold(strings.TrimSpace(request.PrewarmInputMode), "history") {
+		return "history"
+	}
+	return "base"
 }
 
 // toolResultMetadataDestinationAllowed reports whether raw tool-result metadata
@@ -1083,12 +1391,19 @@ func clearToolResultMetadataInPromptItem(value any) any {
 }
 
 func (r *ResponsesAgentRunner) RunWebSocket(ctx context.Context, request *AgentRequest) (*AgentResponse, error) {
+	ctx, err := r.prepareResponsesRun(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	if !r.responsesWebSocketEnabled() {
+		return r.runHTTP(ctx, request)
+	}
 	return r.runWebSocket(ctx, request, "", "", false, &authRecoveryState{})
 }
 
 func (r *ResponsesAgentRunner) runWebSocket(ctx context.Context, request *AgentRequest, recoveryMode, recoveryPhase string, transportRetried bool, recovery *authRecoveryState) (*AgentResponse, error) {
-	if r == nil || !r.SupportsWebsockets || r.websocketsDisabled() {
-		return r.Run(ctx, request)
+	if !r.responsesWebSocketEnabled() {
+		return r.runHTTP(ctx, request)
 	}
 	if request == nil {
 		return nil, ErrInvalidAgentRequest
@@ -1104,52 +1419,10 @@ func (r *ResponsesAgentRunner) runWebSocket(ctx context.Context, request *AgentR
 			session.mu.Unlock()
 		}
 	}()
-	modelID := strings.TrimSpace(request.Model)
-	if modelID == "" {
-		modelID = "gpt-5.5"
-	}
-	modelInfo := r.modelInfoForRequest(modelID)
-	inputItems := responsesInputItemsForProviderWithStore(request, r.providerName(), r.imageStore())
-	instructions := responsesInstructions(request)
-	tools := normalizeResponseToolParameters(cloneAnySlice(request.Tools))
-	if modelInfo.UseResponsesLite {
-		// Rust #51480: a responses-lite window that already recorded its tool
-		// declarations replays the recorded items and omits the rebuilt
-		// `instructions` / `tools` fields, exactly like the HTTP runner, so the
-		// websocket transport never re-declares (or moves) the window's catalog.
-		if WindowHasToolDeclarations(inputItems) {
-			inputItems = responsesLiteDeclaredInputItems(inputItems)
-			instructions = ""
-			tools = nil
-		}
-	} else {
-		// Rust #44249: downgrade `original` image detail for models that do not
-		// support it before sending the request over the websocket transport.
-		inputItems = normalizeResponseInputImageDetailsForModel(inputItems, modelInfo.SupportsImageDetailOriginal)
-		// Rust #51156: standard Responses requests carry base instructions as a
-		// stable developer input message instead of the top-level field.
-		inputItems, instructions = prependResponsesBaseInstructions(inputItems, instructions, request.ThreadID)
-	}
-	if !strings.EqualFold(strings.TrimSpace(r.providerName()), OpenAIProviderName) {
-		inputItems = clearInternalChatMessageMetadata(inputItems)
-	}
-	accessPrograms, err := AccessProgramsForAuth(request.CyberAccessProgram, r.AuthSnapshot, r.ApiKeyCyberAccessPrograms)
+	apiRequest, err := r.buildResponsesAgentRequest(request, true)
 	if err != nil {
 		return nil, err
 	}
-	apiRequest := &responsesAgentRequest{
-		Model: modelID, Instructions: instructions, Input: r.filterToolResultMetadataForDestination(r.gateContentItemKinds(inputItems)), Tools: tools, ToolChoice: "auto",
-		Stream: true, Store: request.Store, ParallelToolCalls: request.ParallelToolCalls && !modelInfo.UseResponsesLite,
-		ServiceTier: r.serviceTierForRequest(&modelInfo, request.ServiceTier), PromptCacheKey: strings.TrimSpace(request.PromptCacheKey),
-		AccessPrograms: accessPrograms,
-		ClientMetadata: cloneStringMap(request.ClientMetadata), Text: responsesTextParamForRequest(request.OutputSchema, request.ModelVerbosity, &modelInfo),
-	}
-	apiRequest.Reasoning = responsesReasoningParam(request, &modelInfo)
-	apiRequest.StreamOptions = responsesStreamOptionsForRequest(request, apiRequest.Reasoning, r.providerName())
-	if apiRequest.Reasoning != nil || r.outputTokenReplayForProvider() {
-		apiRequest.Include = r.responsesInclude()
-	}
-	apiRequest.Input = boundedInputForResponseMessage(apiRequest, request, r.Metrics)
 	httpRequest, err := r.newResponsesHTTPRequest(ctx, request, apiRequest, "")
 	if err != nil {
 		return nil, err
@@ -1163,6 +1436,16 @@ func (r *ResponsesAgentRunner) runWebSocket(ctx context.Context, request *AgentR
 		timeout = 15 * time.Second
 	}
 	conn := session.conn
+	// Rust #57710: only a Guardian reviewer request carries the parent pin, and
+	// a cached socket opened for a different parent affinity is replaced.
+	var desiredAffinity *network.RoutingAffinity
+	if request.RoutingAffinity != nil && isGuardianReviewRequest(request) {
+		desiredAffinity = request.RoutingAffinity
+	}
+	if session.conn != nil && session.routingAffinity != desiredAffinity {
+		closeResponsesWebsocketSession(session, "parent routing affinity changed")
+		conn = session.conn
+	}
 	// A dial only happens when the session had no connection, so an existing
 	// connection means this request reused it (Rust's connection_reused).
 	connectionReused := conn != nil
@@ -1171,14 +1454,41 @@ func (r *ResponsesAgentRunner) runWebSocket(ctx context.Context, request *AgentR
 		defer cancel()
 		var response *http.Response
 		dialStartedAt := time.Now()
-		conn, response, err = websocket.Dial(connectCtx, endpoint, &websocket.DialOptions{HTTPHeader: httpRequest.Header})
+		// Rust websocket-client connect_with_route (#46506): the handshake
+		// reuses the shared ChatGPT cookies unless the request set its own, and
+		// both successful and rejected upgrades may refresh them.
+		dialHeader := httpRequest.Header
+		if desiredAffinity != nil {
+			// Rust #57710 replaces the routing cookies with the scoped pin while
+			// keeping unrelated cookies, falling back to the shared jar's header.
+			existing := dialHeader.Get("Cookie")
+			if existing == "" {
+				existing = network.ChatGPTCookieHeader(endpoint)
+			}
+			if merged, ok := desiredAffinity.MergeCookieHeader(endpoint, existing); ok {
+				dialHeader = dialHeader.Clone()
+				dialHeader.Set("Cookie", merged)
+			}
+		}
+		reauth := session.websocketReauth(r.AuthSnapshot)
+		dialOptions := &websocket.DialOptions{HTTPHeader: network.WebsocketHandshakeCookies(endpoint, dialHeader)}
+		if client := r.websocketHTTPClient(); client != nil {
+			dialOptions.HTTPClient = client
+		}
+		conn, response, err = websocket.Dial(connectCtx, endpoint, dialOptions)
+		if response != nil {
+			network.StoreChatGPTResponseCookies(endpoint, response.Header)
+		}
 		// Rust reports every handshake attempt with connection_reused false,
 		// because a dial always establishes a new connection.
-		r.recordWebsocketConnectRecord(ctx, request, apiRequest, httpRequest, response, err, time.Since(dialStartedAt), recoveryMode, recoveryPhase)
+		r.recordWebsocketConnectRecord(ctx, request, apiRequest, httpRequest, response, err, time.Since(dialStartedAt), recoveryMode, recoveryPhase, reauth)
+		if err == nil {
+			session.markConnectedAuth(r.AuthSnapshot)
+		}
 		if err != nil {
 			if response != nil && response.StatusCode == http.StatusUpgradeRequired {
 				r.disableWebsockets()
-				return r.Run(ctx, request)
+				return r.runHTTP(ctx, request)
 			}
 			// Rust's websocket loop recovers from each recoverable auth error and
 			// `continue`s: the plan cursor bounds the retries, so a no-change
@@ -1189,6 +1499,7 @@ func (r *ResponsesAgentRunner) runWebSocket(ctx context.Context, request *AgentR
 					CFRay:         responseHeaderValue(response.Header, "cf-ray"),
 					AuthError:     responseHeaderValue(response.Header, "x-openai-authorization-error"),
 					AuthErrorCode: responseAuthorizationErrorCode(response.Header),
+					StatusCode:    response.StatusCode,
 				}
 				if mode, phase, refreshErr := r.recoverUnauthorizedAuth(ctx, recovery, debug); refreshErr == nil {
 					session.mu.Unlock()
@@ -1202,20 +1513,43 @@ func (r *ResponsesAgentRunner) runWebSocket(ctx context.Context, request *AgentR
 			return nil, err
 		}
 		session.conn = conn
+		session.connClosed.Store(false)
+		session.requestSent = false
+		session.routingAffinity = desiredAffinity
+		if response != nil {
+			session.capturedAffinity = network.RoutingAffinityFromResponse(endpoint, response.Header)
+		}
 		// Rust's websocket connect records the handshake response's turn state once
 		// per request (`connect_websocket`'s `turn_state.set`), so the next request
 		// in the turn carries it.
 		if response != nil {
 			r.rememberTurnStateFromHeaders(request, response.Header)
+			session.maxMessageBytes = responsesWebsocketMaxMessageBytes(response.Header)
 		}
 	}
 	payload := websocketResponseCreatePayload(apiRequest, request.PreviousResponseID, nil, request.Trace)
 	requestStartedAt := time.Now()
 	continuationMode, continuationReason := websocketContinuationTags(request.PreviousResponseID, connectionReused)
-	r.recordWebsocketContinuation(continuationMode, continuationReason, "generation")
-	writeErr := conn.Write(ctx, websocket.MessageText, marshalResponsesMessage(payload))
+	// Rust #48812 tags the generation that consumes a prepared warmup response
+	// and clears the flag on that same attempt.
+	afterPrewarm := request.PreviousResponseFromPrewarm
+	r.recordWebsocketContinuation(continuationMode, continuationReason, "generation", afterPrewarm)
+	message := marshalResponsesMessage(payload)
+	// Rust #60841: never publish a request the peer already told us it cannot
+	// accept. Falling straight back to HTTP keeps the turn alive (#60840).
+	if session.maxMessageBytes > 0 && len(message) > session.maxMessageBytes {
+		recordWebsocketEvent(r.Metrics, "message_too_large", false, 0)
+		r.disableWebsockets()
+		session.mu.Unlock()
+		locked = false
+		return r.runHTTP(ctx, request)
+	}
+	writeErr := writeResponsesWebsocketMessage(ctx, conn, websocket.MessageText, message)
 	r.recordWebsocketRequest(writeErr, time.Since(requestStartedAt))
 	r.recordWebsocketRequestRecord(ctx, writeErr, time.Since(requestStartedAt), connectionReused)
+	if writeErr == nil {
+		session.requestSent = true
+	}
 	if writeErr != nil {
 		closeResponsesWebsocketSession(session, "response write failed")
 		if !transportRetried {
@@ -1224,17 +1558,94 @@ func (r *ResponsesAgentRunner) runWebSocket(ctx context.Context, request *AgentR
 			return r.runWebSocket(ctx, request, recoveryMode, recoveryPhase, true, recovery)
 		}
 		r.disableWebsockets()
-		return r.Run(ctx, request)
+		return r.runHTTP(ctx, request)
 	}
 	handler := combinedResponsesStreamHandler(r.StreamHandler, request.StreamHandler)
+	activeHandler := handler
 	accumulator := newResponsesStreamAccumulator(request)
+	accumulator.routingAffinity = session.capturedAffinity
 	var outputText strings.Builder
 	receivedEvent := false
+	// Rust #55969: a mailbox preemption interrupts a Responses Lite stream
+	// instead of abandoning it, then drains until the terminal event so the
+	// completed items and the response ID survive for the follow-up request.
+	preempt := request.Preempt
+	preemptPending := false
+	draining := false
+	// Rust #57864: a cancelled Responses Lite turn interrupts the upstream
+	// response instead of abandoning it. canceled marks that drain, ctxDone is
+	// disabled once the cancellation is handled, and cancelDeadline bounds how
+	// long the terminal event may take.
+	ctxDone := ctx.Done()
+	canceled := false
+	var cancelDeadline <-chan time.Time
+	messages := startResponsesWebsocketReader(session)
 	for {
 		messageStartedAt := time.Now()
-		_, data, err := conn.Read(ctx)
+		var read responsesWebsocketReadResult
+		var readOK bool
+		select {
+		case <-ctxDone:
+			ctxDone = nil
+			if request.InterruptOnCancel && apiRequest.UseResponsesLite && strings.TrimSpace(accumulator.responseID) != "" {
+				interruptCtx, interruptCancel := context.WithTimeout(context.Background(), time.Second)
+				interruptErr := writeResponsesWebsocketInterrupt(interruptCtx, conn, accumulator.responseID)
+				interruptCancel()
+				if interruptErr == nil {
+					canceled = true
+					cancelDeadline = time.After(time.Second)
+					draining = true
+					activeHandler = newResponsesDrainStreamHandler(handler)
+					continue
+				}
+			}
+			closeResponsesWebsocketSession(session, "response read canceled")
+			return nil, ctx.Err()
+		case <-cancelDeadline:
+			closeResponsesWebsocketSession(session, "canceled response drain timed out")
+			return nil, ctx.Err()
+		case <-preempt:
+			preempt = nil
+			if !apiRequest.UseResponsesLite {
+				closeResponsesWebsocketSession(session, "preempted")
+				return preemptedAgentResponse(request), nil
+			}
+			if strings.TrimSpace(accumulator.responseID) == "" {
+				// Rust sends response.interrupt only after response.created
+				// supplied the id it names.
+				preemptPending = true
+				continue
+			}
+			if err := writeResponsesWebsocketInterrupt(ctx, conn, accumulator.responseID); err != nil {
+				closeResponsesWebsocketSession(session, "response interrupt failed")
+				return drainedAgentResponse(accumulator, request, r.ProviderID), nil
+			}
+			draining = true
+			activeHandler = newResponsesDrainStreamHandler(handler)
+			continue
+		case read, readOK = <-messages:
+			if !readOK {
+				read.err = errors.New("responses websocket connection closed")
+			}
+		}
+		data, err := read.data, read.err
 		if err != nil {
 			closeResponsesWebsocketSession(session, "response read failed")
+			if draining {
+				if canceled {
+					// The cancellation drain ended without a terminal event.
+					return nil, ctx.Err()
+				}
+				// Mail already requires a follow-up even when the producer
+				// exited before receiving the interrupt.
+				return drainedAgentResponse(accumulator, request, r.ProviderID), nil
+			}
+			if !receivedEvent && websocketOversizedClose(err) {
+				// Rust #60840: close code 1009 before any text means the peer
+				// refused the request size; retrying the socket cannot help.
+				r.disableWebsockets()
+				return r.runHTTP(ctx, request)
+			}
 			if !receivedEvent && !transportRetried {
 				session.mu.Unlock()
 				locked = false
@@ -1242,7 +1653,7 @@ func (r *ResponsesAgentRunner) runWebSocket(ctx context.Context, request *AgentR
 			}
 			if !receivedEvent {
 				r.disableWebsockets()
-				return r.Run(ctx, request)
+				return r.runHTTP(ctx, request)
 			}
 			return nil, fmt.Errorf("responses websocket closed before response.completed: %w", err)
 		}
@@ -1268,7 +1679,20 @@ func (r *ResponsesAgentRunner) runWebSocket(ctx context.Context, request *AgentR
 				outputText.WriteString(responseToolString(event["text"]))
 			}
 		case "error":
+			if draining {
+				// Rust keeps draining a preempted response instead of turning a
+				// server error frame into the turn's terminal error while mail
+				// still needs a follow-up request.
+				closeResponsesWebsocketSession(session, "response failed while draining")
+				if canceled {
+					return nil, ctx.Err()
+				}
+				return drainedAgentResponse(accumulator, request, r.ProviderID), nil
+			}
 			closeResponsesWebsocketSession(session, "response failed")
+			if apiErr := websocketTerminalProviderError(event); apiErr != nil {
+				return nil, apiErr
+			}
 			if usageLimit, ok := websocketUsageLimitError(event); ok {
 				// Rust's wrapped-WebSocket mapping builds `Transport(Http{headers})`
 				// and `map_api_error` then reads the rate-limit headers off it, so a
@@ -1302,18 +1726,191 @@ func (r *ResponsesAgentRunner) runWebSocket(ctx context.Context, request *AgentR
 				r.rememberTurnStateFromHeaders(request, jsonHeadersToHTTPHeaders(headers))
 			}
 		}
-		completed, err := accumulator.apply(&responsesSSEEvent{Event: rawType, Data: data}, handler)
+		completed, err := accumulator.apply(&responsesSSEEvent{Event: rawType, Data: data}, activeHandler)
 		if err != nil {
+			if draining {
+				closeResponsesWebsocketSession(session, "response failed while draining")
+				return drainedAgentResponse(accumulator, request, r.ProviderID), nil
+			}
 			return nil, err
+		}
+		if preemptPending && !draining && strings.TrimSpace(accumulator.responseID) != "" {
+			preemptPending = false
+			if err := writeResponsesWebsocketInterrupt(ctx, conn, accumulator.responseID); err != nil {
+				closeResponsesWebsocketSession(session, "response interrupt failed")
+				return drainedAgentResponse(accumulator, request, r.ProviderID), nil
+			}
+			draining = true
+			activeHandler = newResponsesDrainStreamHandler(handler)
 		}
 		if !completed {
 			continue
 		}
-		if len(accumulator.items) == 0 && strings.TrimSpace(outputText.String()) != "" {
+		if !draining && len(accumulator.items) == 0 && strings.TrimSpace(outputText.String()) != "" {
 			accumulator.recordAgentItem(&AgentItem{Type: "agent_message", Text: outputText.String()})
+		}
+		if draining {
+			if canceled {
+				// Rust #57864: the interrupted response keeps whatever it
+				// completed, including usage, and leaves the socket reusable.
+				response, err := accumulator.agentResponse(request, r.ProviderID)
+				if err != nil || response == nil {
+					return nil, ctx.Err()
+				}
+				response.Canceled = true
+				return response, nil
+			}
+			return drainedAgentResponse(accumulator, request, r.ProviderID), nil
 		}
 		return accumulator.agentResponse(request, r.ProviderID)
 	}
+}
+
+// responsesWebsocketFragmentSize bounds each frame of a large Responses
+// request (Rust #60522 keeps the same 1 MiB fragment size).
+const responsesWebsocketFragmentSize = 1024 * 1024
+
+// writeResponsesWebsocketMessage sends one WebSocket message, splitting text
+// payloads larger than 1 MiB into bounded frames with continuation opcodes and
+// a final frame (Rust #60522 send_message). Bytes are never re-encoded, so a
+// multibyte UTF-8 character may cross a frame boundary unchanged.
+// responsesWebsocketMaxMessageBytes reads the handshake's advertised request
+// size limit (Rust #60841).
+func responsesWebsocketMaxMessageBytes(header http.Header) int {
+	if header == nil {
+		return 0
+	}
+	raw := strings.TrimSpace(header.Get("x-codex-websocket-max-message-bytes"))
+	if raw == "" {
+		return 0
+	}
+	limit, err := strconv.Atoi(raw)
+	if err != nil || limit <= 0 {
+		return 0
+	}
+	return limit
+}
+
+// websocketOversizedClose reports the peer's 1009 close, which Rust maps to
+// ApiError::WebsocketMessageTooLarge (#60840).
+func websocketOversizedClose(err error) bool {
+	var closeErr websocket.CloseError
+	if errors.As(err, &closeErr) {
+		return closeErr.Code == websocket.StatusMessageTooBig
+	}
+	return false
+}
+
+func writeResponsesWebsocketMessage(ctx context.Context, conn *websocket.Conn, typ websocket.MessageType, payload []byte) error {
+	if conn == nil {
+		return errors.New("responses websocket connection is nil")
+	}
+	if typ != websocket.MessageText || len(payload) <= responsesWebsocketFragmentSize {
+		return conn.Write(ctx, typ, payload)
+	}
+	writer, err := conn.Writer(ctx, typ)
+	if err != nil {
+		return err
+	}
+	remaining := payload
+	for len(remaining) > 0 {
+		size := responsesWebsocketFragmentSize
+		if len(remaining) < size {
+			size = len(remaining)
+		}
+		if _, err := writer.Write(remaining[:size]); err != nil {
+			_ = writer.Close()
+			return err
+		}
+		remaining = remaining[size:]
+	}
+	return writer.Close()
+}
+
+// writeResponsesWebsocketInterrupt asks the server to stop generating the
+// current response while preserving what it already completed (Rust #55969's
+// `ResponseInterrupt::Drain`).
+func writeResponsesWebsocketInterrupt(ctx context.Context, conn *websocket.Conn, responseID string) error {
+	if conn == nil || strings.TrimSpace(responseID) == "" {
+		return errors.New("responses websocket interrupt requires a response id")
+	}
+	payload := map[string]any{
+		"type":        "response.interrupt",
+		"response_id": strings.TrimSpace(responseID),
+		"mode":        "discard_partial_items",
+	}
+	return writeResponsesWebsocketMessage(ctx, conn, websocket.MessageText, marshalResponsesMessage(payload))
+}
+
+// drainedAgentResponse builds the preempted result of a drained WebSocket
+// stream: the completed items and response ID are retained so the follow-up
+// request can continue from the server's history.
+func drainedAgentResponse(accumulator *responsesStreamAccumulator, request *AgentRequest, providerID string) *AgentResponse {
+	response := preemptedAgentResponse(request)
+	response.Drained = true
+	if accumulator == nil {
+		return response
+	}
+	response.ResponseID = accumulator.responseID
+	if built, err := accumulator.agentResponse(request, providerID); err == nil && built != nil {
+		built.Preempted = true
+		built.Drained = true
+		return built
+	}
+	return response
+}
+
+// newResponsesDrainStreamHandler defers item exposure while a preempted
+// response drains. Partial items may be discarded by the server, so their
+// added/delta events stay hidden; a completed item is exposed only once
+// `response.output_item.done` confirms it (Rust #55969).
+func newResponsesDrainStreamHandler(handler ResponsesStreamHandler) ResponsesStreamHandler {
+	if handler == nil {
+		return nil
+	}
+	pending := map[string]*ResponsesStreamEvent{}
+	return func(event *ResponsesStreamEvent) {
+		if event == nil {
+			return
+		}
+		switch event.Kind {
+		case ResponsesStreamEventOutputAdded:
+			pending[drainStreamEventKey(event)] = event
+		case ResponsesStreamEventOutputDone:
+			key := drainStreamEventKey(event)
+			added := pending[key]
+			delete(pending, key)
+			if added == nil {
+				added = &ResponsesStreamEvent{
+					Kind:       ResponsesStreamEventOutputAdded,
+					ResponseID: event.ResponseID,
+					Item:       event.Item,
+					RawItem:    event.RawItem,
+					ItemID:     event.ItemID,
+					CallID:     event.CallID,
+					RawType:    string(ResponsesStreamEventOutputAdded),
+				}
+			}
+			handler(added)
+			handler(event)
+		case ResponsesStreamEventOutputText,
+			ResponsesStreamEventToolInputDelta,
+			ResponsesStreamEventPlanDelta,
+			ResponsesStreamEventReasoningSummaryTextDelta,
+			ResponsesStreamEventReasoningTextDelta,
+			ResponsesStreamEventReasoningSummaryPartAdded:
+			return
+		default:
+			handler(event)
+		}
+	}
+}
+
+func drainStreamEventKey(event *ResponsesStreamEvent) string {
+	if event == nil {
+		return ""
+	}
+	return firstNonEmptyResponseValue(event.ItemID, event.CallID, agentItemID(event.Item), agentItemCallID(event.Item))
 }
 
 // Websocket client-metadata keys that carry the request's W3C trace context
@@ -1381,6 +1978,9 @@ func websocketResponseCreatePayload(apiRequest *responsesAgentRequest, previousR
 	if apiRequest.PromptCacheKey != "" {
 		payload["prompt_cache_key"] = apiRequest.PromptCacheKey
 	}
+	if apiRequest.PromptCacheOptions != nil {
+		payload["prompt_cache_options"] = apiRequest.PromptCacheOptions
+	}
 	if apiRequest.AccessPrograms != nil {
 		payload["access_programs"] = apiRequest.AccessPrograms
 	}
@@ -1427,25 +2027,36 @@ func websocketErrorEventAdviceHeaders(event map[string]any) http.Header {
 	return websocketEventHTTPHeaders(event)
 }
 
-// websocketErrorEventAPIError maps rate-limit and overload `error` events that
-// carry Retry-After advice to the shared retryable API error, preserving the
-// server deadline (Rust #51440). Headerless rate limits and all other codes stay
-// on the terminal generic-error path.
+// websocketErrorEventAPIError maps invalid-prompt, rate-limit and capacity
+// `error` events to the shared API error, preserving Retry-After advice
+// (Rust #47353/#51440). A headerless capacity failure keeps its terminal
+// classification (Rust #57452), while a headerless rate limit stays on the
+// generic-error path.
 func websocketErrorEventAPIError(event map[string]any) *codexapi.APIError {
+	status, _ := uint64FromAny(event["status"])
+	if status == http.StatusBadRequest && strings.EqualFold(strings.TrimSpace(websocketEventErrorCode(event)), "invalid_prompt") {
+		return &codexapi.APIError{
+			Kind:    codexapi.ErrorInvalidPrompt,
+			Status:  int(status),
+			Message: fallbackPolicyMessage(websocketEventErrorMessage(event), InvalidPromptFallbackMessage),
+		}
+	}
 	var kind codexapi.APIErrorKind
 	switch strings.ToLower(strings.TrimSpace(websocketEventErrorCode(event))) {
 	case "rate_limit_exceeded", "rate_limited", "rate_limit":
 		kind = codexapi.ErrorRateLimitExceeded
+	case "policy_capacity_unavailable":
+		kind = codexapi.ErrorPolicyCapacityUnavailable
 	case "server_is_overloaded", "overloaded":
 		kind = codexapi.ErrorServerOverloaded
 	default:
 		return nil
 	}
-	delay, ok := responsesRequestedRetryDelay(websocketErrorEventAdviceHeaders(event), time.Now())
-	if !ok {
+	delay, advised := responsesRequestedRetryDelay(websocketErrorEventAdviceHeaders(event), time.Now())
+	if !advised && kind == codexapi.ErrorRateLimitExceeded {
 		return nil
 	}
-	status, _ := uint64FromAny(event["status"])
+	status, _ = uint64FromAny(event["status"])
 	if status == 0 {
 		if value, ok := event["error"].(map[string]any); ok {
 			status, _ = uint64FromAny(value["status"])
@@ -1454,11 +2065,59 @@ func websocketErrorEventAPIError(event map[string]any) *codexapi.APIError {
 	if status > 65535 {
 		status = 0
 	}
-	return (&codexapi.APIError{
+	apiErr := &codexapi.APIError{
 		Kind:    kind,
 		Status:  int(status),
 		Message: websocketEventError(event),
-	}).WithRetryDelay(delay)
+	}
+	if advised {
+		return apiErr.WithRetryDelay(delay)
+	}
+	return apiErr
+}
+
+func websocketEventErrorMessage(event map[string]any) string {
+	if value, ok := event["error"].(map[string]any); ok {
+		return strings.TrimSpace(responseToolString(value["message"]))
+	}
+	return ""
+}
+
+// websocketTerminalProviderError maps a statusless or 400/403/404
+// `model_not_found` WebSocket error event, or a statusless/400 audio validation
+// code, to the terminal provider failure (Rust #56445/#58434). Like Rust, the
+// provider message is preserved and the event status, when present, must be one
+// of the eligible codes.
+func websocketTerminalProviderError(event map[string]any) *codexapi.APIError {
+	code := strings.TrimSpace(websocketEventErrorCode(event))
+	status, _ := uint64FromAny(event["status"])
+	if status > 65535 {
+		status = 0
+	}
+	switch code {
+	case "model_not_found":
+		switch status {
+		case 0, http.StatusBadRequest, http.StatusForbidden, http.StatusNotFound:
+		default:
+			return nil
+		}
+		message := strings.TrimSpace(websocketEventError(event))
+		if message == "" {
+			message = "model_not_found"
+		}
+		return &codexapi.APIError{Kind: codexapi.ErrorModelNotFound, Status: int(status), Message: message}
+	}
+	if audioValidationErrorCodes[code] {
+		if status != 0 && status != http.StatusBadRequest {
+			return nil
+		}
+		message := strings.TrimSpace(websocketEventErrorMessage(event))
+		if message == "" {
+			message = AudioInputFallbackMessage
+		}
+		return &codexapi.APIError{Kind: codexapi.ErrorInvalidAudioInput, Status: int(status), Message: message, AudioValidationCode: code}
+	}
+	return nil
 }
 
 // websocketUsageLimitError mirrors Rust's wrapped-WebSocket usage-limit
@@ -1505,6 +2164,52 @@ func websocketURLFromHTTP(value *url.URL) (string, error) {
 	return copy.String(), nil
 }
 
+// websocketHTTPClient adapts the runner's HTTP seam to the concrete client the
+// WebSocket handshake needs. Policy-wrapped doers expose the same policy on a
+// concrete client, so the dial keeps application network checks, custom
+// transports, proxies, and custom CA roots instead of silently using
+// http.DefaultClient.
+func (r *ResponsesAgentRunner) websocketHTTPClient() *http.Client {
+	if r == nil || r.HTTPClient == nil {
+		return nil
+	}
+	if client, ok := r.HTTPClient.(*http.Client); ok {
+		return responsesWebsocketClient(client)
+	}
+	type httpClientProvider interface {
+		HTTPClient() (*http.Client, bool)
+	}
+	if provider, ok := r.HTTPClient.(httpClientProvider); ok {
+		if client, ok := provider.HTTPClient(); ok {
+			return responsesWebsocketClient(client)
+		}
+	}
+	return responsesWebsocketClient(&http.Client{Transport: responsesHTTPDoerRoundTripper{doer: r.HTTPClient}})
+}
+
+func responsesWebsocketClient(client *http.Client) *http.Client {
+	if client == nil || client.Timeout == 0 {
+		return client
+	}
+	clone := *client
+	// A WebSocket response is a long-lived exchange. The handshake has its own
+	// WebsocketConnectTimeout; the HTTP client's whole-request timeout must not
+	// terminate an otherwise healthy stream.
+	clone.Timeout = 0
+	return &clone
+}
+
+type responsesHTTPDoerRoundTripper struct {
+	doer HTTPDoer
+}
+
+func (t responsesHTTPDoerRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	if t.doer == nil {
+		return http.DefaultTransport.RoundTrip(request)
+	}
+	return t.doer.Do(request)
+}
+
 func responseIDFromWebsocketEvent(event map[string]any) string {
 	if response, ok := event["response"].(map[string]any); ok {
 		return strings.TrimSpace(responseToolString(response["id"]))
@@ -1539,6 +2244,7 @@ var responsesRequestWireOrder = []string{
 	"stream_options",
 	"include",
 	"prompt_cache_key",
+	"prompt_cache_options",
 	"text",
 	"generate",
 	"client_metadata",
@@ -1613,18 +2319,19 @@ func NewResponsesAgentRunnerFromRuntimeProviderWithAuth(providerID string, runti
 		remote.ConfigureCache(filepath.Clean(codexHome))
 	}
 	return NewResponsesAgentRunner(&ResponsesAgentOptions{
-		Provider:                   &apiProvider,
-		Auth:                       &authHeaders,
-		HTTPClient:                 httpClient,
-		ProviderID:                 providerID,
-		ProviderCapabilities:       cloneProviderCapabilities(runtimeProvider.Capabilities()),
-		ProviderRequiresOpenAIAuth: providerInfo.RequiresOpenAIAuth,
-		ProviderUsesOwnCredentials: strings.TrimSpace(providerInfo.EnvKey) != "" || strings.TrimSpace(providerInfo.ExperimentalBearerToken) != "" || providerInfo.Auth != nil,
-		CodexHome:                  codexHome,
-		AuthSnapshot:               snapshot,
-		ModelsManager:              modelsManager,
-		IncludeAttestation:         runtimeProvider.SupportsAttestation(),
-		SupportsWebsockets:         providerInfo.SupportsWebsockets,
+		Provider:                     &apiProvider,
+		Auth:                         &authHeaders,
+		HTTPClient:                   httpClient,
+		ProviderID:                   providerID,
+		ProviderCapabilities:         cloneProviderCapabilities(runtimeProvider.Capabilities()),
+		ProviderUnauthorizedRecovery: runtimeProviderUnauthorizedRecovery(runtimeProvider),
+		ProviderRequiresOpenAIAuth:   providerInfo.RequiresOpenAIAuth,
+		ProviderUsesOwnCredentials:   strings.TrimSpace(providerInfo.EnvKey) != "" || strings.TrimSpace(providerInfo.ExperimentalBearerToken) != "" || providerInfo.Auth != nil,
+		CodexHome:                    codexHome,
+		AuthSnapshot:                 snapshot,
+		ModelsManager:                modelsManager,
+		IncludeAttestation:           runtimeProvider.SupportsAttestation(),
+		SupportsWebsockets:           providerInfo.SupportsWebsockets,
 		WebsocketConnectTimeout: func() time.Duration {
 			info := runtimeProvider.Info()
 			return (&info).EffectiveWebsocketConnectTimeout()
@@ -1652,23 +2359,57 @@ func (r *ResponsesAgentRunner) WithStreamHandler(handler ResponsesStreamHandler)
 	return &clone
 }
 
-func (r *ResponsesAgentRunner) Run(ctx context.Context, request *AgentRequest) (*AgentResponse, error) {
+func (r *ResponsesAgentRunner) responsesWebSocketEnabled() bool {
+	return r != nil && r.SupportsWebsockets && !r.websocketsDisabled()
+}
+
+// prepareResponsesRun applies the validation and auth resolution shared by the
+// HTTP and WebSocket transports. The transport decision itself stays in Run so
+// a failed WebSocket handshake can fall back to runHTTP without re-running
+// provider-owned auth recovery.
+func (r *ResponsesAgentRunner) prepareResponsesRun(ctx context.Context, request *AgentRequest) (context.Context, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return ctx, err
+	}
+	if r == nil {
+		return ctx, errors.New("responses agent runner is nil")
 	}
 	if request == nil {
-		return nil, ErrInvalidAgentRequest
+		return ctx, ErrInvalidAgentRequest
 	}
 	prompt := strings.TrimSpace(request.Prompt)
 	if prompt == "" && len(request.InputItems) == 0 {
-		return nil, errors.New("prompt or input items are required")
+		return ctx, errors.New("prompt or input items are required")
 	}
 	if err := r.resolveAgentIdentityAuth(ctx); err != nil {
+		return ctx, err
+	}
+	return ctx, nil
+}
+
+func (r *ResponsesAgentRunner) Run(ctx context.Context, request *AgentRequest) (*AgentResponse, error) {
+	ctx, err := r.prepareResponsesRun(ctx, request)
+	if err != nil {
 		return nil, err
 	}
+	// Rust ModelClientSession::stream prefers the Responses WebSocket transport
+	// whenever the provider advertises support and session fallback has not
+	// disabled it. The same choice applies to every Responses turn, not only the
+	// Guardian prewarm path.
+	if r.responsesWebSocketEnabled() {
+		return r.runWebSocket(ctx, request, "", "", false, &authRecoveryState{})
+	}
+	return r.runHTTP(ctx, request)
+}
+
+// buildResponsesAgentRequest is the single request builder shared by the HTTP
+// and WebSocket transports. Keeping this in one place prevents the WebSocket
+// path from drifting on hosted tools, Responses Lite, image-detail
+// normalization, timing metrics, beta headers, and access programs.
+func (r *ResponsesAgentRunner) buildResponsesAgentRequest(request *AgentRequest, stream bool) (*responsesAgentRequest, error) {
 	modelID := strings.TrimSpace(request.Model)
 	if modelID == "" {
 		modelID = "gpt-5.5"
@@ -1677,23 +2418,34 @@ func (r *ResponsesAgentRunner) Run(ctx context.Context, request *AgentRequest) (
 	instructions := responsesInstructions(request)
 	inputItems := responsesInputItemsForProviderWithStore(request, r.providerName(), r.imageStore())
 	tools := normalizeResponseToolParameters(cloneAnySlice(request.Tools))
+	if !r.ProviderCapabilities.CustomToolGrammar {
+		tools = DowngradeCustomToolGrammarsToText(tools)
+	}
 	if !request.DisableHostedImageGeneration {
 		tools = r.withHostedToolsForRequest(tools, &modelInfo)
 	}
 	tools = normalizeResponseToolParameters(tools)
 	parallelToolCalls := request.ParallelToolCalls && !modelInfo.UseResponsesLite
-	if modelInfo.UseResponsesLite {
+	// Rust #59832: incremental tool declarations cover Responses Lite windows
+	// and, behind `incremental_tools_legacy`, regular Responses windows served by
+	// Amazon Bedrock that already recorded their catalog in history (Rust #60040
+	// narrowed the legacy gate from OpenAI to Bedrock). Hosted web search stays
+	// in the top-level tools field instead of the history declarations.
+	incrementalLayout := modelInfo.UseResponsesLite ||
+		(request.IncrementalTools && responsesProviderPublishesLegacyIncrementalTools(r.providerName()))
+	if incrementalLayout {
 		// Rust #51480: an existing context window keeps the tool declarations it
 		// already recorded. Only a window that has no declarations builds the
 		// `additional_tools` / base-instruction prefix for this request, so a
 		// resumed window never moves or duplicates declarations it already sent.
+		declarationTools, hostedTools := splitHostedWebSearchTools(tools)
 		if WindowHasToolDeclarations(inputItems) {
 			inputItems = responsesLiteDeclaredInputItems(inputItems)
 		} else {
-			inputItems = responsesLiteInputItems(inputItems, tools, instructions, request.ThreadID)
+			inputItems = responsesLiteInputItems(inputItems, declarationTools, instructions, request.ThreadID)
 		}
 		instructions = ""
-		tools = nil
+		tools = hostedTools
 	} else {
 		// Rust #44249: request copies downgrade `original` image detail when the
 		// receiving model does not support it. Stored image details are left
@@ -1716,19 +2468,23 @@ func (r *ResponsesAgentRunner) Run(ctx context.Context, request *AgentRequest) (
 	if err != nil {
 		return nil, err
 	}
+	if err := ValidateRequiredCyberAccessPrograms(request.RequiredCyberAccessPrograms, accessPrograms); err != nil {
+		return nil, err
+	}
 	apiRequest := &responsesAgentRequest{
 		Model:                modelID,
 		Instructions:         instructions,
 		Input:                inputItems,
 		Tools:                tools,
 		ToolChoice:           "auto",
-		Stream:               r.Stream,
+		Stream:               stream,
 		Store:                request.Store,
 		ParallelToolCalls:    parallelToolCalls,
 		ServiceTier:          r.serviceTierForRequest(&modelInfo, request.ServiceTier),
 		PromptCacheKey:       strings.TrimSpace(request.PromptCacheKey),
+		PromptCacheOptions:   promptCacheOptionsForTTL(request.PromptCacheTTL),
 		AccessPrograms:       accessPrograms,
-		ClientMetadata:       cloneStringMap(request.ClientMetadata),
+		ClientMetadata:       responsesClientMetadataForRequest(request, r),
 		Text:                 responsesTextParamForRequest(request.OutputSchema, request.ModelVerbosity, &modelInfo),
 		UseResponsesLite:     modelInfo.UseResponsesLite,
 		IncludeTimingMetrics: request.IncludeTimingMetrics,
@@ -1740,6 +2496,64 @@ func (r *ResponsesAgentRunner) Run(ctx context.Context, request *AgentRequest) (
 		apiRequest.Include = r.responsesInclude()
 	}
 	apiRequest.Input = boundedInputForResponseMessage(apiRequest, request, r.Metrics)
+	if !r.ProviderCapabilities.CustomToolGrammar {
+		apiRequest.Input = FlattenTextCustomToolOutputsJSON(apiRequest.Input)
+	}
+	return apiRequest, nil
+}
+
+// McpAttributionClientMetadataKey is the body-only client-metadata member that
+// carries the thread's cumulative MCP tools/call attribution (Rust
+// `MCP_ATTRIBUTION_CLIENT_METADATA_KEY`).
+const McpAttributionClientMetadataKey = "mcp_attribution"
+
+// MaxMcpAttributionBytes bounds the serialized attribution document (Rust
+// `MAX_MCP_ATTRIBUTION_BYTES`).
+const MaxMcpAttributionBytes = 16 * 1024
+
+// responsesClientMetadataForRequest copies the request's client metadata and
+// appends the MCP attribution document for providers granted internal metadata
+// (Rust #47899). The document never becomes a compatibility header.
+func responsesClientMetadataForRequest(request *AgentRequest, runner *ResponsesAgentRunner) map[string]string {
+	if request == nil {
+		return nil
+	}
+	clientMetadata := cloneStringMap(request.ClientMetadata)
+	if request.MCPAttribution == nil || !runner.includeInternalMetadata() {
+		return clientMetadata
+	}
+	if clientMetadata == nil {
+		clientMetadata = map[string]string{}
+	}
+	clientMetadata[McpAttributionClientMetadataKey] = serializeMcpAttributionBounded(*request.MCPAttribution)
+	return clientMetadata
+}
+
+// serializeMcpAttributionBounded mirrors Rust's `to_json_string_bounded`
+// fallback: an oversized document becomes `payload_too_large`, and any other
+// serialization failure becomes `serialization_failed`.
+func serializeMcpAttributionBounded(attribution retainedctx.McpAttribution) string {
+	encoded, err := json.Marshal(attribution)
+	if err != nil {
+		return `{"status":"attribution_error","error_reason":"serialization_failed"}`
+	}
+	if len(encoded) > MaxMcpAttributionBytes {
+		return `{"status":"attribution_error","error_reason":"payload_too_large"}`
+	}
+	return string(encoded)
+}
+
+func (r *ResponsesAgentRunner) runHTTP(ctx context.Context, request *AgentRequest) (*AgentResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if request == nil {
+		return nil, ErrInvalidAgentRequest
+	}
+	apiRequest, err := r.buildResponsesAgentRequest(request, r.Stream)
+	if err != nil {
+		return nil, err
+	}
 	if apiRequest.Stream {
 		return r.runStreaming(ctx, request, apiRequest)
 	}
@@ -1971,6 +2785,32 @@ func responsesToolsContainType(tools []any, toolType string) bool {
 	return false
 }
 
+// responsesProviderPublishesLegacyIncrementalTools reports the providers whose
+// regular Responses route can publish incremental tool declarations. Rust
+// #60848 splits the former shared feature gate into `incremental_tools_legacy`
+// (Amazon Bedrock, default off) and `incremental_tools_legacy_gcp` (Google
+// Cloud Vertex AI, default on); both are resolved per turn in
+// incrementalToolsEnabledForTurn, so this only names the providers.
+func responsesProviderPublishesLegacyIncrementalTools(name string) bool {
+	info := ProviderInfo{Name: strings.TrimSpace(name)}
+	return info.IsAmazonBedrock() || info.IsGCP()
+}
+
+// splitHostedWebSearchTools separates hosted web search declarations from the
+// catalog an incremental window records in history. Rust #59832 keeps
+// WebSearch in top-level `tools` rather than `additional_tools`.
+func splitHostedWebSearchTools(tools []any) (declaration []any, hosted []any) {
+	for _, spec := range tools {
+		object, ok := spec.(map[string]any)
+		if ok && strings.EqualFold(strings.TrimSpace(responseToolString(object["type"])), "web_search") {
+			hosted = append(hosted, spec)
+			continue
+		}
+		declaration = append(declaration, spec)
+	}
+	return declaration, hosted
+}
+
 func responsesToolsContainNamespaceFunction(tools []any, namespace string, name string) bool {
 	namespace = strings.TrimSpace(namespace)
 	name = strings.TrimSpace(name)
@@ -2023,9 +2863,10 @@ func (r *ResponsesAgentRunner) newResponsesHTTPRequest(ctx context.Context, requ
 	guardianReviewer := r.isGuardianReviewerInference(apiRequest.Model, request)
 	if guardianReviewer || dedicatedGuardianEndpoint {
 		apiRequest.ServiceTier = ""
-	} else if r.usesCodexBackend() && r.supportsCodexBackendRoutes() {
-		// Rust #45736: ordinary Codex-backend traffic asks the backend to bill
-		// Guardian credits; reviewer traffic identifies itself by header instead.
+	} else if r.guardianCreditsEligible() {
+		// Rust #45736/#57439: ordinary Codex-backend traffic asks the backend to
+		// bill Guardian credits based on the provider and auth, independent of
+		// the base URL; reviewer traffic identifies itself by header instead.
 		apiRequest.ClientMetadata = withGuardianCreditsRequested(apiRequest.ClientMetadata)
 	}
 	body, err := json.Marshal(apiRequest)
@@ -2112,23 +2953,6 @@ func (r *ResponsesAgentRunner) usesCodexBackend() bool {
 	return authSnapshotUsesCodexBackend(r.AuthSnapshot)
 }
 
-// supportsCodexBackendRoutes reports whether the provider base URL permits the
-// dedicated Codex backend routes (Rust
-// ModelProviderInfo::supports_codex_backend_routes, #40892).
-func (r *ResponsesAgentRunner) supportsCodexBackendRoutes() bool {
-	if r == nil || !strings.EqualFold(r.providerName(), OpenAIProviderName) {
-		return false
-	}
-	baseURL := ""
-	if r.Provider != nil {
-		baseURL = strings.TrimRight(strings.TrimSpace(r.Provider.BaseURL), "/")
-	}
-	if baseURL == "" {
-		return true
-	}
-	return strings.HasSuffix(baseURL, "/backend-api/codex")
-}
-
 // approvalReviewPreferredModel mirrors Rust
 // RuntimeProvider::approval_review_preferred_model (#37103 / #40892).
 func (r *ResponsesAgentRunner) approvalReviewPreferredModel() string {
@@ -2136,6 +2960,21 @@ func (r *ResponsesAgentRunner) approvalReviewPreferredModel() string {
 		return APIKeyApprovalReviewPreferredModel
 	}
 	return DefaultApprovalReviewPreferredModel
+}
+
+// guardianCreditsEligible mirrors Rust's `set_guardian_metadata` guard: only a
+// ChatGPT-account auth on the Codex backend requests parent Guardian credits.
+// API-key, header-based, agent-identity, and other providers stay excluded.
+func (r *ResponsesAgentRunner) guardianCreditsEligible() bool {
+	if r == nil || !r.usesCodexBackend() || r.AuthSnapshot == nil {
+		return false
+	}
+	switch r.AuthSnapshot.Mode() {
+	case "chatgpt", "chatgptAuthTokens", "personal-access-token":
+		return true
+	default:
+		return false
+	}
 }
 
 // withGuardianCreditsRequested mirrors Rust's set_guardian_metadata arm: the
@@ -2179,8 +3018,8 @@ func isGuardianReviewRequest(request *AgentRequest) bool {
 // `x-codex-guardian: reviewer` (Rust #45736).
 //
 // Rust seeds the header on the reviewer session for the provider's preferred
-// review model and applies it only while the request still targets that model,
-// uses Codex backend auth, and the provider supports the backend routes.
+// review model and applies it while the request still targets that model on the
+// OpenAI provider with Codex backend auth, regardless of the base URL (#57439).
 // `features.guardianv2.free_guardian` is retained for config compatibility but
 // no longer gates this decision - the backend controls Guardian billing.
 func (r *ResponsesAgentRunner) isGuardianReviewerInference(model string, request *AgentRequest) bool {
@@ -2190,8 +3029,7 @@ func (r *ResponsesAgentRunner) isGuardianReviewerInference(model string, request
 	model = strings.TrimSpace(model)
 	return model != "" &&
 		model == r.approvalReviewPreferredModel() &&
-		r.usesCodexBackend() &&
-		r.supportsCodexBackendRoutes()
+		r.usesCodexBackend()
 }
 
 func (r *ResponsesAgentRunner) addAttestationHeader(ctx context.Context, headers http.Header, request *AgentRequest) error {
@@ -2276,7 +3114,7 @@ func authSnapshotUsesCodexBackend(snapshot *auth.AuthDotJSON) bool {
 		return false
 	}
 	switch snapshot.Mode() {
-	case "chatgpt", "chatgptAuthTokens", "personal-access-token", "agent-identity":
+	case "chatgpt", "chatgptAuthTokens", "personal-access-token", "agent-identity", "headers":
 		return true
 	default:
 		return false
@@ -2434,11 +3272,18 @@ func (r *ResponsesAgentRunner) doResponsesHTTPRequestWithRetry(ctx context.Conte
 			"retryable":       shouldRetry,
 		})
 		if shouldRetry && httpResponse != nil && httpResponse.StatusCode == http.StatusUnauthorized {
+			responseBody := ""
+			var responsesErr *ResponsesAPIError
+			if errors.As(err, &responsesErr) && responsesErr != nil {
+				responseBody = responsesErr.Body
+			}
 			debug := authRecoveryDebug{
 				RequestID:     responseHeaderValue(httpResponse.Header, responsesRequestIDHeader, responsesOAIRequestIDHeader),
 				CFRay:         responseHeaderValue(httpResponse.Header, "cf-ray"),
 				AuthError:     responseHeaderValue(httpResponse.Header, "x-openai-authorization-error"),
 				AuthErrorCode: responseAuthorizationErrorCode(httpResponse.Header),
+				StatusCode:    httpResponse.StatusCode,
+				ResponseBody:  responseBody,
 			}
 			mode, phase, recoverErr := r.recoverUnauthorizedAuth(ctx, recovery, debug)
 			if recoverErr != nil {
@@ -2534,7 +3379,8 @@ func responsesInputItemsWithStore(request *AgentRequest, store attachmentstore.S
 	if !request.Store && !request.ItemIDsEnabled {
 		items = stripResponseInputItemIDs(items)
 	}
-	items = prepareResponseInputImagesWithStore(items, store, responsesImagePrepOrigin(request))
+	items = prepareResponseInputImagesWithStoreMode(items, store, responsesImagePrepOrigin(request), responsesImagePrepMode(request))
+	items = replaceUnresolvableImageFiles(items, store)
 	return items
 }
 
@@ -2587,6 +3433,20 @@ func prepareResponseInputImages(items []any) []any {
 // prepareResponseInputImages, mirroring Rust `prepare_response_items` which
 // takes the thread origin and the session image store.
 func prepareResponseInputImagesWithStore(items []any, store attachmentstore.Store, origin eventmap.ImagePrepOrigin) []any {
+	return prepareResponseInputImagesWithStoreMode(items, store, origin, eventmap.ImagePrepModeDetailBased)
+}
+
+// responsesImagePrepMode mirrors Rust's ImagePreparationMode selection from
+// unified_image_budget_enabled: the unified budget ignores each image hint and
+// applies the original-detail budget.
+func responsesImagePrepMode(request *AgentRequest) eventmap.ImagePrepMode {
+	if request != nil && request.UnifiedImageBudget {
+		return eventmap.ImagePrepModeUnifiedBudget
+	}
+	return eventmap.ImagePrepModeDetailBased
+}
+
+func prepareResponseInputImagesWithStoreMode(items []any, store attachmentstore.Store, origin eventmap.ImagePrepOrigin, mode eventmap.ImagePrepMode) []any {
 	if len(items) == 0 {
 		return items
 	}
@@ -2603,28 +3463,28 @@ func prepareResponseInputImagesWithStore(items []any, store attachmentstore.Stor
 	if err := decoder.Decode(&normalized); err != nil {
 		return items
 	}
-	prepareResponseInputImageBlocks(normalized, store, origin)
+	prepareResponseInputImageBlocks(normalized, store, origin, mode)
 	return normalized
 }
 
-func prepareResponseInputImageBlocks(value any, store attachmentstore.Store, origin eventmap.ImagePrepOrigin) {
+func prepareResponseInputImageBlocks(value any, store attachmentstore.Store, origin eventmap.ImagePrepOrigin, mode eventmap.ImagePrepMode) {
 	switch typed := value.(type) {
 	case map[string]any:
-		prepareResponseInputImageBlock(typed, store, origin)
+		prepareResponseInputImageBlock(typed, store, origin, mode)
 		md, _ := typed["internal_chat_message_metadata_passthrough"].(map[string]any)
 		kinds, _ := md["content_item_kinds"].([]any)
 		for _, key := range []string{"content", "output", "content_items"} {
 			if child, ok := typed[key]; ok {
 				if key == "content" && kinds != nil {
-					prepareResponseInputImageContentWithKinds(child, kinds, store, origin)
+					prepareResponseInputImageContentWithKinds(child, kinds, store, origin, mode)
 				} else {
-					prepareResponseInputImageBlocks(child, store, origin)
+					prepareResponseInputImageBlocks(child, store, origin, mode)
 				}
 			}
 		}
 	case []any:
 		for _, child := range typed {
-			prepareResponseInputImageBlocks(child, store, origin)
+			prepareResponseInputImageBlocks(child, store, origin, mode)
 		}
 	}
 }
@@ -2633,14 +3493,14 @@ func prepareResponseInputImageBlocks(value any, store attachmentstore.Store, ori
 // while updating content_item_kinds for image-preparation failures, mirroring
 // Rust image_preparation.rs which tags failed images as images.preparation_error
 // (#40281).
-func prepareResponseInputImageContentWithKinds(value any, kinds []any, store attachmentstore.Store, origin eventmap.ImagePrepOrigin) {
+func prepareResponseInputImageContentWithKinds(value any, kinds []any, store attachmentstore.Store, origin eventmap.ImagePrepOrigin, mode eventmap.ImagePrepMode) {
 	content, ok := value.([]any)
 	if !ok {
-		prepareResponseInputImageBlocks(value, store, origin)
+		prepareResponseInputImageBlocks(value, store, origin, mode)
 		return
 	}
 	for i, block := range content {
-		prepareResponseInputImageBlock(block.(map[string]any), store, origin)
+		prepareResponseInputImageBlock(block.(map[string]any), store, origin, mode)
 		if i < len(kinds) && kinds[i] == "user.image" {
 			if m, ok := block.(map[string]any); ok && m["type"] == "input_text" && blockWasPreparationError(m) {
 				kinds[i] = "images.preparation_error"
@@ -2658,7 +3518,7 @@ func blockWasPreparationError(block map[string]any) bool {
 	return strings.HasPrefix(strings.TrimSpace(text), imagePrepErrorPrefix)
 }
 
-func prepareResponseInputImageBlock(block map[string]any, store attachmentstore.Store, origin eventmap.ImagePrepOrigin) {
+func prepareResponseInputImageBlock(block map[string]any, store attachmentstore.Store, origin eventmap.ImagePrepOrigin, mode eventmap.ImagePrepMode) {
 	itemType, _ := block["type"].(string)
 	if itemType != "input_image" && itemType != "image" {
 		return
@@ -2670,7 +3530,7 @@ func prepareResponseInputImageBlock(block map[string]any, store attachmentstore.
 		return
 	}
 	detail := eventmap.ImagePrepDetail(responseToolString(block["detail"]))
-	prepared, err := eventmap.PrepareImagePrepImageWithStoreResult(store, origin, imageURL, detail)
+	prepared, err := eventmap.PrepareImagePrepImageWithStoreResultMode(store, origin, imageURL, detail, mode)
 	if err != nil {
 		// Replace an image that cannot be processed with a placeholder text
 		// block, matching Rust image_preparation.rs.
@@ -2685,13 +3545,175 @@ func prepareResponseInputImageBlock(block map[string]any, store attachmentstore.
 	}
 	if prepared.FileID != "" {
 		// The store kept the prepared bytes as a file reference, mirroring
-		// Rust's `ImageReference::File { file_id }`.
-		delete(block, "detail")
+		// Rust's `ImageReference::File { file_id }`. Rust's prepare_image only
+		// replaces the reference; the item's detail hint survives next to the
+		// file id exactly as it did for an inline image.
 		delete(block, "image_url")
 		block["file_id"] = prepared.FileID
+	} else {
+		block["image_url"] = prepared.URL
+	}
+	if mode == eventmap.ImagePrepModeUnifiedBudget {
+		// Rust keeps an original-detail compatibility hint while the unified
+		// budget is active; Responses Lite strips it before sending.
+		block["detail"] = string(eventmap.ImagePrepDetailOriginal)
+	}
+}
+
+// UnavailableImagePlaceholder replaces a file image the attachment store
+// confirms is missing at request time (Rust #57585). Saved history keeps the
+// original reference; only the prepared request is projected.
+const UnavailableImagePlaceholder = "[image unavailable]"
+
+// maxConcurrentImageAvailabilityChecks bounds how many distinct file images are
+// probed at once (Rust #57835).
+const maxConcurrentImageAvailabilityChecks = 8
+
+// replaceUnresolvableImageFiles checks every distinct file image in the
+// prepared request concurrently and replaces the confirmed-missing ones with a
+// text placeholder in messages and tool outputs. References whose store cannot
+// answer (including the inline default) are retained, matching Rust #57585.
+func replaceUnresolvableImageFiles(items []any, store attachmentstore.Store) []any {
+	if len(items) == 0 || store == nil {
+		return items
+	}
+	candidates := map[string]struct{}{}
+	for _, item := range items {
+		collectFileImageIDs(item, candidates)
+	}
+	if len(candidates) == 0 {
+		return items
+	}
+	ids := make([]string, 0, len(candidates))
+	for fileID := range candidates {
+		ids = append(ids, fileID)
+	}
+	sort.Strings(ids)
+	var missing sync.Map
+	var wait sync.WaitGroup
+	semaphore := make(chan struct{}, maxConcurrentImageAvailabilityChecks)
+	for _, fileID := range ids {
+		fileID := fileID
+		semaphore <- struct{}{}
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			defer func() { <-semaphore }()
+			if !attachmentstore.IsResolvable(store, fileID) {
+				missing.Store(fileID, true)
+			}
+		}()
+	}
+	wait.Wait()
+	unavailable := map[string]bool{}
+	missing.Range(func(key, _ any) bool {
+		fileID, _ := key.(string)
+		unavailable[fileID] = true
+		return true
+	})
+	if len(unavailable) == 0 {
+		return items
+	}
+	for _, item := range items {
+		itemMap, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		replaceUnavailableImagesInItem(itemMap, unavailable)
+	}
+	return items
+}
+
+// collectFileImageIDs walks the request shapes that carry image references:
+// message `content`, and `output`/`content_items` for tool outputs.
+func collectFileImageIDs(value any, ids map[string]struct{}) {
+	switch typed := value.(type) {
+	case map[string]any:
+		if fileImageID(typed) != "" {
+			ids[fileImageID(typed)] = struct{}{}
+			return
+		}
+		for _, key := range []string{"content", "output", "content_items"} {
+			if child, ok := typed[key]; ok {
+				collectFileImageIDs(child, ids)
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			collectFileImageIDs(child, ids)
+		}
+	}
+}
+
+// fileImageID returns the file reference of an image block, or "" when the
+// block is not a file image.
+func fileImageID(block map[string]any) string {
+	if !isResponseImageBlock(block) {
+		return ""
+	}
+	fileID, _ := block["file_id"].(string)
+	return strings.TrimSpace(fileID)
+}
+
+func isResponseImageBlock(block map[string]any) bool {
+	itemType, _ := block["type"].(string)
+	return itemType == "input_image" || itemType == "image"
+}
+
+func replaceUnavailableImagesInItem(item map[string]any, unavailable map[string]bool) {
+	if content, ok := item["content"].([]any); ok {
+		for index, part := range content {
+			block, ok := part.(map[string]any)
+			if !ok || !unavailableFileImage(block, unavailable) {
+				continue
+			}
+			content[index] = map[string]any{"type": "input_text", "text": UnavailableImagePlaceholder}
+			setResponseContentItemKind(item, index, contextfrag.ImageUnavailableKind)
+		}
+	}
+	for _, key := range []string{"output", "content_items"} {
+		if child, ok := item[key]; ok {
+			replaceUnavailableImagesInOutput(child, unavailable)
+		}
+	}
+}
+
+func replaceUnavailableImagesInOutput(value any, unavailable map[string]bool) {
+	switch typed := value.(type) {
+	case []any:
+		for index, part := range typed {
+			block, ok := part.(map[string]any)
+			if ok && unavailableFileImage(block, unavailable) {
+				typed[index] = map[string]any{"type": "input_text", "text": UnavailableImagePlaceholder}
+				continue
+			}
+			replaceUnavailableImagesInOutput(part, unavailable)
+		}
+	case map[string]any:
+		for _, key := range []string{"content", "output", "content_items"} {
+			if child, ok := typed[key]; ok {
+				replaceUnavailableImagesInOutput(child, unavailable)
+			}
+		}
+	}
+}
+
+func unavailableFileImage(block map[string]any, unavailable map[string]bool) bool {
+	return unavailable[fileImageID(block)]
+}
+
+// setResponseContentItemKind reclassifies a replaced message content item so
+// annotations keep matching the projection (Rust `AnnotatedContent`).
+func setResponseContentItemKind(item map[string]any, index int, kind string) {
+	metadata, _ := item["internal_chat_message_metadata_passthrough"].(map[string]any)
+	if metadata == nil {
 		return
 	}
-	block["image_url"] = prepared.URL
+	kinds, _ := metadata["content_item_kinds"].([]any)
+	if index < 0 || index >= len(kinds) {
+		return
+	}
+	kinds[index] = kind
 }
 
 // gateContentItemKinds clears content_item_kinds from every request item when
@@ -3141,7 +4163,10 @@ func agentResponseFromResponses(apiResponse *responsesAgentAPIResponse, request 
 		if id == "" {
 			id = fmt.Sprintf("agent-message-%d", index+1)
 		}
-		items = append(items, AgentItem{ID: id, Type: "agent_message", Text: text})
+		items = append(items, AgentItem{
+			ID: id, Type: "agent_message", Text: text,
+			ContentTokenCount: contentTokenCountFromInternalMetadata(output.InternalMetadata),
+		})
 		messages = append(messages, text)
 	}
 	if len(items) > 0 && len(messages) == 0 {
@@ -3645,6 +4670,11 @@ func responsesHTTPError(providerName string, statusCode int, headers http.Header
 	if err := json.Unmarshal(body, &payload); err == nil && payload.Error != nil && strings.TrimSpace(payload.Error.Message) != "" {
 		message = strings.TrimSpace(payload.Error.Message)
 	}
+	// Rust #56445: a `model_not_found` provider error on 400/403/404 is
+	// terminal and preserves the provider message.
+	if apiErr := terminalProviderError(payload.Error, statusCode); apiErr != nil {
+		return apiErr
+	}
 	// Rust #38682: misalignment policy violations from HTTP 400/403 responses
 	// surface as a typed, non-retryable error.
 	if (statusCode == http.StatusBadRequest || statusCode == http.StatusForbidden) &&
@@ -3672,12 +4702,38 @@ func responsesHTTPError(providerName string, statusCode int, headers http.Header
 				Status:  statusCode,
 				Message: fallbackPolicyMessage(policyMessage, BioPolicyFallbackMessage),
 			}
+		case "invalid_prompt":
+			return &codexapi.APIError{
+				Kind:    codexapi.ErrorInvalidPrompt,
+				Status:  statusCode,
+				Message: fallbackPolicyMessage(policyMessage, InvalidPromptFallbackMessage),
+			}
 		}
+	}
+	// OpenAI-compatible servers (vLLM, DeepSeek, and similar) commonly report an
+	// oversized prompt as a plain 400 without an error code. Typed provider codes
+	// above win, as they do in Rust; the heuristic only classifies untyped bodies
+	// as context-window failures so the turn can compact before retrying.
+	if (statusCode == http.StatusBadRequest || statusCode == http.StatusRequestEntityTooLarge) &&
+		((payload.Error != nil && responseErrorCode(payload.Error) == "context_length_exceeded") ||
+			isContextWindowExceededMessage(message)) {
+		if strings.TrimSpace(message) == "" {
+			message = http.StatusText(statusCode)
+		}
+		return &codexapi.APIError{Kind: codexapi.ErrorContextWindowExceeded, Status: statusCode, Message: message}
 	}
 	// Rust #45602: a 503 body distinguishes model capacity from a retryable
 	// rate limit instead of treating both as one blanket overload.
 	if statusCode == http.StatusServiceUnavailable && payload.Error != nil {
 		switch responseErrorCode(payload.Error) {
+		case "policy_capacity_unavailable":
+			// Rust #57452 keeps the response's Retry-After advice and otherwise
+			// leaves the policy-capacity failure terminal.
+			policyCapacity := &codexapi.APIError{Kind: codexapi.ErrorPolicyCapacityUnavailable, Message: message}
+			if retryAfter, ok := responsesRequestedRetryAfter(headers, retryAfterReceivedAt); ok {
+				return policyCapacity.WithRetryAfter(retryAfter)
+			}
+			return policyCapacity
 		case "server_is_overloaded":
 			// `map_api_error` attaches the response's `Retry-After` advice to
 			// every transport classification it maps
@@ -3752,15 +4808,71 @@ func responsesHTTPError(providerName string, statusCode int, headers http.Header
 		apiError.retryAfter = retryAfter
 		apiError.hasRetryAfter = true
 	}
+	// Rust #60475/#60480/#60476 (api_bridge.rs): a 403 naming a workspace or
+	// access-program rejection becomes a typed terminal error that keeps the
+	// UnexpectedResponseError display, status and retry state untouched.
+	if kind := forbiddenProviderErrorKind(statusCode, body, headers); kind != "" {
+		return &codexapi.APIError{Kind: kind, Status: statusCode, Message: apiError.Error()}
+	}
 	return apiError
+}
+
+// forbiddenProviderErrorKind classifies the 403 provider codes Rust maps to
+// CodexErrorDetails::WorkspaceAccessDenied and AccessProgramNotEnabled
+// (#60475/#60476/#60480). The code comes from the body's `/detail/code`, then
+// `/error/code`, and falls back to the x-error-json identity header; a 403 with
+// any other code keeps the ordinary unexpected-status handling and its retry
+// policy.
+func forbiddenProviderErrorKind(status int, body []byte, headers http.Header) codexapi.APIErrorKind {
+	if status != http.StatusForbidden {
+		return ""
+	}
+	code := ""
+	var payload struct {
+		Detail struct {
+			Code string `json:"code"`
+		} `json:"detail"`
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &payload) == nil {
+		code = strings.TrimSpace(payload.Detail.Code)
+		if code == "" {
+			code = strings.TrimSpace(payload.Error.Code)
+		}
+	}
+	if code == "" {
+		code = strings.TrimSpace(responseAuthorizationErrorCode(headers))
+	}
+	switch code {
+	case "invalid_workspace_selected", "codex_workspace_access_denied":
+		return codexapi.ErrorWorkspaceAccessDenied
+	case "access_program_not_enabled":
+		return codexapi.ErrorAccessProgramNotEnabled
+	}
+	return ""
 }
 
 const bedrockExpiredSignatureMessage = "Amazon Bedrock rejected the request because its AWS signature has expired. Refresh your AWS credentials and retry. If `AWS_BEARER_TOKEN_BEDROCK` is set, update or unset it, then restart Codex"
 
 // Policy-refusal messages mirror Rust's codex-api constants (#46306).
 const (
-	CyberPolicyFallbackMessage = "This request has been flagged for possible cybersecurity risk."
-	BioPolicyFallbackMessage   = "This content was flagged for possible biological risk."
+	CyberPolicyFallbackMessage   = "This request has been flagged for possible cybersecurity risk."
+	BioPolicyFallbackMessage     = "This content was flagged for possible biological risk."
+	InvalidPromptFallbackMessage = "Invalid request."
+	// AudioInputFallbackMessage is Rust's copy for audio validation failures
+	// whose provider message is absent or blank (Rust #58434).
+	AudioInputFallbackMessage = "Invalid audio input."
+	// ContentPolicyFallbackMessage is Rust's copy for a content-policy
+	// refusal whose provider message is absent or blank (Rust #60479).
+	ContentPolicyFallbackMessage = "The input was rejected by the content policy."
+	// AccessProgramNotEnabledFallbackMessage mirrors Rust #60476.
+	AccessProgramNotEnabledFallbackMessage = "The requested access program is not enabled."
+	// InferenceHookDeniedFallbackMessage mirrors Rust #60511.
+	InferenceHookDeniedFallbackMessage = "Your workspace inference hook blocked this request."
+	// AccessProgramUnsupportedFallbackMessage mirrors Rust #60481.
+	AccessProgramUnsupportedFallbackMessage = "The requested access program cannot be used with this model."
 )
 
 func fallbackPolicyMessage(message string, fallback string) string {
@@ -3784,6 +4896,43 @@ func mapProviderAPIErrorMessage(providerName string, statusCode int, bodyText st
 		return bedrockExpiredSignatureMessage
 	}
 	return message
+}
+
+// isContextWindowExceededMessage recognizes the provider-specific wording used
+// by OpenAI-compatible Responses servers. The Responses protocol normally
+// carries `code: context_length_exceeded`, but local inference servers often
+// return only a human-readable 400 body.
+func isContextWindowExceededMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"context_length_exceeded",
+		"context length exceeded",
+		"context length limit",
+		"maximum context length",
+		"available context size",
+		"exceeds the available context",
+		"maximum number of tokens",
+		"token count exceeds",
+		"prompt is too long",
+		"input is too long",
+		"too many tokens",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	if strings.Contains(lower, "context window") {
+		for _, marker := range []string{"exceed", "maximum", "too long", "limit"} {
+			if strings.Contains(lower, marker) {
+				return true
+			}
+		}
+	}
+	return strings.Contains(lower, "reduce the length") &&
+		(strings.Contains(lower, "message") || strings.Contains(lower, "input") || strings.Contains(lower, "prompt"))
 }
 
 func responseAuthorizationErrorCode(headers http.Header) string {
@@ -3948,6 +5097,10 @@ type authRecoveryDebug struct {
 	CFRay         string
 	AuthError     string
 	AuthErrorCode string
+	// StatusCode and ResponseBody carry the denied response so a terminal runtime
+	// denial is recognized before any recovery step runs (Rust #60096).
+	StatusCode   int
+	ResponseBody string
 }
 
 // recordAuthRecovery reports one recovery step (Rust's record_auth_recovery).

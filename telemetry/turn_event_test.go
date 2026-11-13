@@ -58,9 +58,21 @@ func TestCodexTurnEventSerializesExpectedRustShape(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{
 		"event_type": "codex_turn_event",
 		"event_params": {
+			"critical_path_status": "disabled",
+			"critical_path_duration_ms": null,
+			"critical_path_inference_ms": null,
+			"critical_path_sampling_ms": null,
+			"critical_path_compaction_ms": null,
+			"critical_path_auto_review_ms": null,
+			"critical_path_auto_review_overhead_ms": null,
+			"critical_path_user_wait_ms": null,
+			"critical_path_tools_ms": null,
+			"critical_path_overhead_ms": null,
+			"critical_path_unknown_ms": null,
 			"thread_id": "thread-2",
 			"session_id": "session-thread-2",
 			"turn_id": "turn-2",
+			"voice_session_id": null,
 			"root_turn_id": "root-turn-2",
 			"active_plugin_ids_at_turn_start": ["plugins~Plugin_example", "test@marketplace"],
 			"turn_trigger": null,
@@ -191,6 +203,42 @@ func TestCodexTurnEventSerializesExpectedRustShape(t *testing.T) {
 // TestCodexTurnEventPluginInventoryNullabilityMatchesRust mirrors Rust #46323:
 // an unobserved inventory serializes as null while an observed empty inventory
 // stays an empty array.
+// TestCodexTurnEventCriticalPathDisabledMatchesRust mirrors Rust #57209: a turn
+// without critical-path capture reports `disabled` with null durations, so a
+// missing measurement is never serialized as zero.
+func TestCodexTurnEventCriticalPathDisabledMatchesRust(t *testing.T) {
+	event := NewCodexTurnEvent(CodexTurnEventInput{
+		ThreadID:  "thread-1",
+		SessionID: "session-1",
+		TurnID:    "turn-1",
+	})
+	var payload map[string]any
+	if err := marshalUnmarshalTelemetry(event, &payload); err != nil {
+		t.Fatalf("marshal event error = %v", err)
+	}
+	params := payload["event_params"].(map[string]any)
+	for _, key := range []string{
+		"critical_path_duration_ms",
+		"critical_path_inference_ms",
+		"critical_path_sampling_ms",
+		"critical_path_compaction_ms",
+		"critical_path_auto_review_ms",
+		"critical_path_auto_review_overhead_ms",
+		"critical_path_user_wait_ms",
+		"critical_path_tools_ms",
+		"critical_path_overhead_ms",
+		"critical_path_unknown_ms",
+	} {
+		value, ok := params[key]
+		if !ok || value != nil {
+			t.Fatalf("%s = %#v, want null", key, value)
+		}
+	}
+	if params["critical_path_status"] != CodexTurnCriticalPathStatusDisabled {
+		t.Fatalf("critical_path_status = %#v", params["critical_path_status"])
+	}
+}
+
 func TestCodexTurnEventPluginInventoryNullabilityMatchesRust(t *testing.T) {
 	for _, testCase := range []struct {
 		name string
@@ -256,7 +304,7 @@ func TestCodexTurnEventBoundsTriggerAndSource(t *testing.T) {
 		SessionID:       "session-3",
 		TurnID:          "turn-3",
 		TurnTrigger:     "realtime",
-		CodexTurnSource: "codex_vscode",
+		CodexTurnSource: stringPtrTelemetry("codex_vscode"),
 		AppServerClient: sampleAppServerClientMetadata(),
 		Runtime:         sampleRuntimeMetadata(),
 		TimingProfile:   CodexTurnTimingProfile{},
@@ -279,7 +327,7 @@ func TestCodexTurnEventBoundsTriggerAndSource(t *testing.T) {
 		SessionID:       "session-4",
 		TurnID:          "turn-4",
 		TurnTrigger:     strings.Repeat("x", 129),
-		CodexTurnSource: strings.Repeat("y", 200),
+		CodexTurnSource: stringPtrTelemetry(strings.Repeat("y", 200)),
 	})
 	data, err = json.Marshal(oversized)
 	if err != nil {
@@ -291,6 +339,52 @@ func TestCodexTurnEventBoundsTriggerAndSource(t *testing.T) {
 	params = decoded["event_params"].(map[string]any)
 	if params["turn_trigger"] != nil || params["codex_turn_source"] != nil {
 		t.Fatalf("oversized trigger/source should be omitted: %#v", params)
+	}
+}
+
+// TestCodexTurnEventPreservesTriggerAndSourceValuesLikeRust mirrors Rust #42003:
+// analytics reports the raw trigger/source values, keeps an explicitly empty
+// source, and applies the Responses metadata limit in bytes (128 included,
+// 129 omitted) rather than trimming or dropping whitespace.
+func TestCodexTurnEventPreservesTriggerAndSourceValuesLikeRust(t *testing.T) {
+	paramsFor := func(trigger string, source *string) map[string]any {
+		t.Helper()
+		event := NewCodexTurnEvent(CodexTurnEventInput{
+			ThreadID:        "thread-values",
+			SessionID:       "session-values",
+			TurnID:          "turn-values",
+			TurnTrigger:     trigger,
+			CodexTurnSource: source,
+		})
+		var decoded map[string]any
+		if err := marshalUnmarshalTelemetry(event, &decoded); err != nil {
+			t.Fatalf("marshal event error = %v", err)
+		}
+		return decoded["event_params"].(map[string]any)
+	}
+
+	empty := ""
+	params := paramsFor("  user  ", &empty)
+	if params["turn_trigger"] != "  user  " {
+		t.Fatalf("turn_trigger = %#v, want raw value with whitespace", params["turn_trigger"])
+	}
+	if source, ok := params["codex_turn_source"].(string); !ok || source != "" {
+		t.Fatalf("codex_turn_source = %#v, want explicitly empty string", params["codex_turn_source"])
+	}
+
+	boundary := strings.Repeat("é", 64)
+	params = paramsFor("", &boundary)
+	if params["turn_trigger"] != nil {
+		t.Fatalf("blank turn_trigger = %#v, want null", params["turn_trigger"])
+	}
+	if params["codex_turn_source"] != boundary {
+		t.Fatalf("128-byte source = %#v, want %q", params["codex_turn_source"], boundary)
+	}
+
+	oversized := strings.Repeat("é", 65)
+	params = paramsFor(strings.Repeat("x", 129), &oversized)
+	if params["turn_trigger"] != nil || params["codex_turn_source"] != nil {
+		t.Fatalf("values above 128 bytes should be omitted: %#v", params)
 	}
 }
 
@@ -501,6 +595,7 @@ func TestCodexCommandExecutionEventSerializesExpectedRustShape(t *testing.T) {
 			"failure_kind": null,
 			"requested_additional_permissions": false,
 			"requested_network_access": false,
+			"sandbox_backend": null,
 			"plugin_id": null,
 			"script_path": null,
 			"command_execution_source": "agent",
@@ -824,6 +919,7 @@ func TestCodexImageGenerationEventSerializesExpectedRustShape(t *testing.T) {
 		RevisedPromptPresent:  true,
 		SavedPathPresent:      true,
 		TransparentBackground: &transparent,
+		GenerationID:          stringPtrTelemetry("gen-image-123"),
 	})
 
 	var got map[string]any
@@ -837,7 +933,8 @@ func TestCodexImageGenerationEventSerializesExpectedRustShape(t *testing.T) {
 		params["failure_kind"] != "tool_error" ||
 		params["revised_prompt_present"] != true ||
 		params["saved_path_present"] != true ||
-		params["transparent_background"] != true {
+		params["transparent_background"] != true ||
+		params["generation_id"] != "gen-image-123" {
 		t.Fatalf("image generation event JSON = %#v", got)
 	}
 
@@ -926,6 +1023,29 @@ func TestCodexReviewEventSerializesExpectedRustShape(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("event JSON mismatch\ngot:  %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestCodexReviewEventSerializesGuardianContextModeWhenPresent(t *testing.T) {
+	mode := "independent"
+	event := NewCodexReviewEvent(CodexReviewEventParams{
+		ThreadID:            "thread-1",
+		TurnID:              "turn-1",
+		ReviewID:            "review-1",
+		SubjectKind:         ReviewSubjectKindCommandExecution,
+		SubjectName:         "command_execution",
+		Reviewer:            ReviewerGuardian,
+		Trigger:             ReviewTriggerInitial,
+		Status:              ReviewStatusApproved,
+		Resolution:          ReviewResolutionNone,
+		GuardianContextMode: &mode,
+	})
+	data, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if !jsonContainsString(data, `"guardian_context_mode":"independent"`) {
+		t.Fatalf("Marshal() = %s", data)
 	}
 }
 

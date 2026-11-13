@@ -6,10 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
+
+	"github.com/gofrs/flock"
 )
 
 const (
@@ -25,8 +29,45 @@ type AuthDotJSON struct {
 	LastRefresh         string         `json:"last_refresh,omitempty"`
 	AgentIdentity       any            `json:"agent_identity,omitempty"`
 	PersonalAccessToken string         `json:"personal_access_token,omitempty"`
-	BedrockAPIKey       any            `json:"bedrock_api_key,omitempty"`
-	BedrockAccessKeys   any            `json:"bedrock_access_keys,omitempty"`
+	// WorkloadIdentity marks an API key obtained from an API workload identity
+	// exchange (Rust #59275 ApiKeyAuth::workload_identity). Plain API keys leave
+	// it nil.
+	WorkloadIdentity  *WorkloadIdentityAPIMetadata `json:"workload_identity,omitempty"`
+	BedrockAPIKey     any                          `json:"bedrock_api_key,omitempty"`
+	BedrockAccessKeys any                          `json:"bedrock_access_keys,omitempty"`
+}
+
+// sameWorkloadIdentityMetadata compares API workload identity service account
+// metadata; a plain API key (nil) never matches a workload identity.
+func sameWorkloadIdentityMetadata(left *WorkloadIdentityAPIMetadata, right *WorkloadIdentityAPIMetadata) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+// Format redacts the API key from derived debug formatting (Rust #59275
+// ApiKeyAuth's manual Debug implementation).
+func (a *AuthDotJSON) Format(f fmt.State, verb rune) {
+	if a == nil {
+		fmt.Fprint(f, "<nil>")
+		return
+	}
+	const redacted = "<redacted>"
+	apiKey := a.OpenAIAPIKey
+	if strings.TrimSpace(apiKey) != "" {
+		apiKey = redacted
+	}
+	personal := a.PersonalAccessToken
+	if strings.TrimSpace(personal) != "" {
+		personal = redacted
+	}
+	if verb == 'v' && f.Flag('+') {
+		fmt.Fprintf(f, "{AuthMode:%q OpenAIAPIKey:%q Tokens:%v LastRefresh:%q AgentIdentity:%v PersonalAccessToken:%q BedrockAPIKey:%v BedrockAccessKeys:%v WorkloadIdentity:%v}",
+			a.AuthMode, apiKey, a.Tokens, a.LastRefresh, a.AgentIdentity, personal, a.BedrockAPIKey, a.BedrockAccessKeys, a.WorkloadIdentity)
+		return
+	}
+	fmt.Fprintf(f, "auth.AuthDotJSON{AuthMode:%q, OpenAIAPIKey:%q}", a.AuthMode, apiKey)
 }
 
 type BedrockAPIKeyAuth struct {
@@ -126,6 +167,9 @@ type StoreOptions struct {
 	Mode           AuthCredentialsStoreMode
 	KeyringBackend KeyringBackendKind
 	KeyringStore   *KeyringStore
+	// Originator is the bounded client attribution carried by credential
+	// storage observations (Rust AuthStorageOriginator).
+	Originator string
 	// WorkloadIdentity, when set, configures process-scoped workload identity
 	// authentication selected from OPENAI_FEDERATION_RULE_ID /
 	// OPENAI_IDENTITY_TOKEN_FILE (Rust 96c8be200c, #38188).
@@ -134,6 +178,9 @@ type StoreOptions struct {
 
 type authStorageBackend interface {
 	Load() (*AuthDotJSON, error)
+	// LoadAccountGrant loads the credential for an account grant check, where an
+	// unavailable secure store is an error instead of a fallback (Rust #55546).
+	LoadAccountGrant() (*AuthDotJSON, error)
 	Save(auth AuthDotJSON) error
 	Delete() (bool, error)
 	Source() string
@@ -154,6 +201,7 @@ func NewStoreWithOptions(codexHome string, options *StoreOptions) *Store {
 	if store.options.KeyringBackend == "" || store.options.KeyringBackend == KeyringBackendAuto {
 		store.options.KeyringBackend = KeyringBackendDirect
 	}
+	store.options.Originator = normalizeStorageOriginator(store.options.Originator)
 	return store
 }
 
@@ -190,24 +238,61 @@ func (s *Store) Path() string {
 	return filepath.Join(s.CodexHome, "auth.json")
 }
 
-func (s *Store) Load() (auth *AuthDotJSON, err error) {
+// authStorageCommitMu serializes in-process auth storage reads and writes that
+// participate in credential updates. It never spans a network request
+// (Rust #55646 AUTH_STORAGE_COMMIT).
+var authStorageCommitMu sync.Mutex
+
+// authWriteGuard serializes a read/modify/write across every manager in this
+// process and every cooperating process holding <codex home>/auth.lock
+// (Rust #57514 AuthStorageBackend::lock_for_write). Ephemeral stores have no
+// persistent home and therefore only take the process-wide mutex.
+type authWriteGuard struct {
+	lock *flock.Flock
+}
+
+func (s *Store) lockForWrite() (*authWriteGuard, error) {
+	authStorageCommitMu.Lock()
+	if s == nil || s.options.Mode == AuthCredentialsStoreEphemeral {
+		return &authWriteGuard{}, nil
+	}
+	lock := flock.New(filepath.Join(s.CodexHome, "auth.lock"))
+	if err := lock.Lock(); err != nil {
+		authStorageCommitMu.Unlock()
+		return nil, fmt.Errorf("failed to lock auth credentials: %w", err)
+	}
+	return &authWriteGuard{lock: lock}, nil
+}
+
+func (g *authWriteGuard) release() {
+	if g == nil {
+		return
+	}
+	if g.lock != nil {
+		_ = g.lock.Unlock()
+		g.lock = nil
+	}
+	authStorageCommitMu.Unlock()
+}
+
+// Load reads the stored credential.
+func (s *Store) Load() (*AuthDotJSON, error) {
+	authStorageCommitMu.Lock()
+	defer authStorageCommitMu.Unlock()
+	return s.loadLocked()
+}
+
+func (s *Store) loadLocked() (auth *AuthDotJSON, err error) {
 	backend := s.backend()
-	actualStore := authStorageBackendName(backend.Source())
-	attempt := newStorageAttempt(s.options.Mode, "load")
-	secureOutcome := "not_attempted"
-	secureError := "none"
-	defer func() {
-		if secureOutcome == "not_attempted" && (actualStore == "direct_keyring" || s.options.Mode == AuthCredentialsStoreAuto) {
-			secureOutcome = authStorageLoadOutcome(auth, err)
-			if err != nil {
-				secureError = classifyAuthStorageError(err)
-			}
-		}
-		attempt.finish(actualStore, authStorageLoadOutcome(auth, err), secureOutcome, secureError)
-	}()
+	if _, ok := backend.(*autoAuthStorage); ok {
+		return backend.Load()
+	}
+	attempt := newStorageAttempt(s.options.Mode, s.options.KeyringBackend, "load", s.options.Originator)
+	defer attempt.finish()
 	auth, err = backend.Load()
-	if err != nil {
-		secureError = classifyAuthStorageError(err)
+	attempt.recordLoadAttempt(storageTelemetryStoreName(backend), auth, err)
+	if s.options.Mode == AuthCredentialsStoreKeyring && err != nil {
+		attempt.recordSecureError(err)
 	}
 	return auth, err
 }
@@ -233,12 +318,13 @@ func (s *Store) Resolve() (*ResolvedAuth, error) {
 	} else if resolved != nil {
 		return resolved, nil
 	}
-	backend := s.backend()
-	loaded, err := backend.Load()
+	authStorageCommitMu.Lock()
+	loaded, err := s.loadLocked()
+	authStorageCommitMu.Unlock()
 	if err != nil || loaded == nil {
 		return nil, err
 	}
-	return &ResolvedAuth{Auth: *loaded, Source: backend.Source()}, nil
+	return &ResolvedAuth{Auth: *loaded, Source: s.backend().Source()}, nil
 }
 
 // resolveWorkloadIdentity resolves process-configured workload identity when
@@ -250,11 +336,7 @@ func (s *Store) resolveWorkloadIdentity() (*ResolvedAuth, error) {
 		return nil, nil
 	}
 	opts := s.options.WorkloadIdentity
-	config, err := resolveWorkloadIdentityConfig(
-		opts.baseURL(),
-		env,
-		opts.chatgptLoginAllowed(),
-	)
+	config, err := resolveWorkloadIdentityConfig(opts.baseURL(), env)
 	if err != nil {
 		return nil, err
 	}
@@ -266,54 +348,164 @@ func (s *Store) resolveWorkloadIdentity() (*ResolvedAuth, error) {
 	if err != nil {
 		return nil, err
 	}
-	auth, err := (&WorkloadIdentityAuth{session: session}).ResolveAuth(context.Background())
+	auth, err := (&WorkloadIdentityAuth{
+		session:                 session,
+		chatgptLoginAllowed:     opts.chatgptLoginAllowed(),
+		apiLoginAllowed:         opts.apiLoginAllowed(),
+		forcedChatGPTWorkspaces: append([]string(nil), opts.forcedChatGPTWorkspaces()...),
+	}).ResolveAuth(context.Background())
 	if err != nil {
 		return nil, err
 	}
 	return &ResolvedAuth{Auth: *auth, Source: WorkloadIdentitySource}, nil
 }
 
-func (s *Store) Save(auth AuthDotJSON) (err error) {
+// Save writes the credential atomically with other in-process commits.
+func (s *Store) Save(auth AuthDotJSON) error {
+	guard, err := s.lockForWrite()
+	if err != nil {
+		return err
+	}
+	defer guard.release()
+	commit, err := s.lockCommit()
+	if err != nil {
+		return err
+	}
+	defer commit.release()
+	return s.saveLocked(auth)
+}
+
+// ReplaceIfCurrent writes updated only while the stored account grant is still
+// expected. The comparison and write happen under one write lock so a
+// concurrent login or logout cannot be overwritten (Rust #57514
+// replace_if_current).
+func (s *Store) ReplaceIfCurrent(expected *AuthDotJSON, updated AuthDotJSON) error {
+	guard, err := s.lockForWrite()
+	if err != nil {
+		return err
+	}
+	defer guard.release()
+	commit, err := s.lockCommit()
+	if err != nil {
+		return err
+	}
+	defer commit.release()
+	current, err := s.backend().LoadAccountGrant()
+	if err != nil {
+		return err
+	}
+	if !authDotJSONEqual(current, expected) {
+		return errAccountCredentialsChanged
+	}
+	return s.saveLocked(updated)
+}
+
+// errAccountCredentialsChanged reports a conditional credential write that lost
+// a race with another auth operation.
+var errAccountCredentialsChanged = errors.New("Account credentials changed")
+
+// IsAccountCredentialsChanged reports whether err is the conditional-write
+// conflict raised by ReplaceIfCurrent.
+func IsAccountCredentialsChanged(err error) bool {
+	return errors.Is(err, errAccountCredentialsChanged)
+}
+
+func authDotJSONEqual(left *AuthDotJSON, right *AuthDotJSON) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return reflect.DeepEqual(*left, *right)
+}
+
+func (s *Store) saveLocked(auth AuthDotJSON) (err error) {
 	backend := s.backend()
-	actualStore := authStorageBackendName(backend.Source())
-	attempt := newStorageAttempt(s.options.Mode, "save")
-	secureOutcome := "not_attempted"
-	secureError := "none"
-	defer func() {
-		if actualStore == "direct_keyring" || s.options.Mode == AuthCredentialsStoreAuto {
-			secureOutcome = authStorageSaveOutcome(err)
-			if err != nil {
-				secureError = classifyAuthStorageError(err)
-			}
+	if _, ok := backend.(*autoAuthStorage); ok {
+		if err = backend.Save(auth); err != nil {
+			return err
 		}
-		attempt.finish(actualStore, authStorageSaveOutcome(err), secureOutcome, secureError)
-	}()
-	if err = backend.Save(auth); err != nil {
+		ClearPermanentRefreshFailure(s.CodexHome)
+		return nil
+	}
+	attempt := newStorageAttempt(s.options.Mode, s.options.KeyringBackend, "save", s.options.Originator)
+	defer attempt.finish()
+	err = backend.Save(auth)
+	attempt.recordSaveAttempt(storageTelemetryStoreName(backend), err)
+	if s.options.Mode == AuthCredentialsStoreKeyring && err != nil {
+		attempt.recordSecureError(err)
+	}
+	if err != nil {
 		return err
 	}
 	ClearPermanentRefreshFailure(s.CodexHome)
 	return nil
 }
 
-func (s *Store) Delete() (removed bool, err error) {
+// saveRefreshedFallbackLocked persists rotated fallback tokens to the file
+// store when the keyring could not be read, leaving a keyring generation whose
+// contents are unknown untouched (Rust #58343 AutoAuthStorage::compare_and_save).
+// Ordinary saves still prefer the keyring.
+func (s *Store) saveRefreshedFallbackLocked(auth AuthDotJSON, keyringErr error) error {
+	auto, ok := s.backend().(*autoAuthStorage)
+	if !ok {
+		return s.saveLocked(auth)
+	}
+	attempt := newStorageAttempt(AuthCredentialsStoreAuto, auto.keyring.backend, "save", auto.originator)
+	defer attempt.finish()
+	attempt.recordLoadAttempt(auto.keyring.telemetryStoreName(), nil, keyringErr)
+	attempt.recordSecureError(keyringErr)
+	err := auto.file.Save(auth)
+	attempt.recordSaveAttempt("file", err)
+	if err != nil {
+		return err
+	}
+	ClearPermanentRefreshFailure(s.CodexHome)
+	return nil
+}
+
+// Delete removes the stored credential atomically with other in-process
+// commits.
+func (s *Store) Delete() (bool, error) {
+	// A missing file-store home contains no credentials to delete; never create
+	// one just to leave a lock behind (Rust #58251).
+	if s.options.Mode == AuthCredentialsStoreFile {
+		if _, err := os.Stat(s.CodexHome); errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+	}
+	guard, err := s.lockForWrite()
+	if err != nil {
+		return false, err
+	}
+	defer guard.release()
+	commit, err := s.lockCommit()
+	if err != nil {
+		return false, err
+	}
+	defer commit.release()
+	return s.deleteLocked()
+}
+
+func (s *Store) deleteLocked() (removed bool, err error) {
 	backend := s.backend()
-	actualStore := authStorageBackendName(backend.Source())
-	if actualStore == "direct_keyring" {
+	if _, ok := backend.(*autoAuthStorage); ok {
+		removed, err = backend.Delete()
+		if err != nil {
+			return false, err
+		}
+		ClearPermanentRefreshFailure(s.CodexHome)
+		return removed, nil
+	}
+	attempt := newStorageAttempt(s.options.Mode, s.options.KeyringBackend, "delete", s.options.Originator)
+	defer attempt.finish()
+	removed, err = backend.Delete()
+	actualStore := storageTelemetryStoreName(backend)
+	if isSecureStorageStore(actualStore) {
+		// The keyring backend also removes the plaintext fallback, so the
+		// logical operation touches more than one store (Rust Store::Multiple)
+		// and never attributes a secure outcome to a delete.
 		actualStore = "multiple"
 	}
-	attempt := newStorageAttempt(s.options.Mode, "delete")
-	secureOutcome := "not_attempted"
-	secureError := "none"
-	defer func() {
-		if actualStore == "multiple" || s.options.Mode == AuthCredentialsStoreAuto {
-			secureOutcome = authStorageDeleteOutcome(removed, err)
-			if err != nil {
-				secureError = classifyAuthStorageError(err)
-			}
-		}
-		attempt.finish(actualStore, authStorageDeleteOutcome(removed, err), secureOutcome, secureError)
-	}()
-	removed, err = backend.Delete()
+	attempt.recordDeleteAttempt(actualStore, removed, err)
 	if err != nil {
 		return false, err
 	}
@@ -321,15 +513,29 @@ func (s *Store) Delete() (removed bool, err error) {
 	return removed, nil
 }
 
+// LoadAccountGrant reads the credential for an identity-provider exchange.
+// Unlike ordinary login loading, an unavailable keyring must not authorize an
+// exchange using an older file fallback (Rust #55546/#55646).
+func (s *Store) LoadAccountGrant() (*AuthDotJSON, error) {
+	guard, err := s.lockForWrite()
+	if err != nil {
+		return nil, err
+	}
+	defer guard.release()
+	return s.backend().LoadAccountGrant()
+}
+
 func (s *Store) backend() authStorageBackend {
 	mode := s.options.Mode
 	switch mode {
 	case AuthCredentialsStoreKeyring:
-		return newKeyringAuthStorage(s.CodexHome, s.options.KeyringBackend, s.options.KeyringStore)
+		return newKeyringAuthStorage(s.CodexHome, s.options.KeyringBackend, s.options.KeyringStore, mode, s.options.Originator)
 	case AuthCredentialsStoreAuto:
+		keyringStorage := newKeyringAuthStorage(s.CodexHome, s.options.KeyringBackend, s.options.KeyringStore, mode, s.options.Originator)
 		return &autoAuthStorage{
-			keyring: newKeyringAuthStorage(s.CodexHome, s.options.KeyringBackend, s.options.KeyringStore),
-			file:    &fileAuthStorage{store: s},
+			keyring:    keyringStorage,
+			file:       &fileAuthStorage{store: s},
+			originator: s.options.Originator,
 		}
 	case AuthCredentialsStoreEphemeral:
 		return &ephemeralAuthStorage{codexHome: s.CodexHome}
@@ -343,18 +549,18 @@ type fileAuthStorage struct {
 }
 
 func (s *fileAuthStorage) Load() (*AuthDotJSON, error) {
-	data, err := os.ReadFile(s.store.Path())
+	data, err := readAuthFile(s.store.Path())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	var auth AuthDotJSON
-	if err := json.Unmarshal(data, &auth); err != nil {
-		return nil, err
-	}
-	return &auth, nil
+	return decodeStoredAuthDotJSON("failed to deserialize CLI auth from file", data)
+}
+
+func (s *fileAuthStorage) LoadAccountGrant() (*AuthDotJSON, error) {
+	return s.Load()
 }
 
 func (s *fileAuthStorage) Save(auth AuthDotJSON) error {
@@ -365,10 +571,7 @@ func (s *fileAuthStorage) Save(auth AuthDotJSON) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(s.store.Path(), append(data, '\n'), 0o600); err != nil {
-		return err
-	}
-	return nil
+	return writeAuthFileAtomically(s.store.Path(), append(data, '\n'))
 }
 
 func (s *fileAuthStorage) Delete() (bool, error) {
@@ -387,15 +590,18 @@ func (s *fileAuthStorage) Source() string {
 }
 
 type keyringAuthStorage struct {
-	codexHome string
-	keyring   *KeyringStore
+	codexHome  string
+	keyring    *KeyringStore
+	backend    KeyringBackendKind
+	mode       AuthCredentialsStoreMode
+	originator string
 	// available reports whether the keyring can durably hold credentials: an
 	// explicitly injected store is the test seam, otherwise this build has no OS
 	// keyring.
 	available bool
 }
 
-func newKeyringAuthStorage(codexHome string, backend KeyringBackendKind, store *KeyringStore) *keyringAuthStorage {
+func newKeyringAuthStorage(codexHome string, backend KeyringBackendKind, store *KeyringStore, mode AuthCredentialsStoreMode, originator string) *keyringAuthStorage {
 	injected := store != nil
 	if store == nil {
 		if OSKeyringAvailable {
@@ -404,7 +610,14 @@ func newKeyringAuthStorage(codexHome string, backend KeyringBackendKind, store *
 			store = NewKeyringStore(backend)
 		}
 	}
-	return &keyringAuthStorage{codexHome: codexHome, keyring: store, available: injected || OSKeyringAvailable}
+	return &keyringAuthStorage{
+		codexHome:  codexHome,
+		keyring:    store,
+		backend:    backend,
+		mode:       mode,
+		originator: originator,
+		available:  injected || OSKeyringAvailable,
+	}
 }
 
 // keyringUnavailable reports the Rust "keyring when available, otherwise fail"
@@ -425,13 +638,13 @@ func (s *keyringAuthStorage) Load() (*AuthDotJSON, error) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("failed to load CLI auth from keyring: %w", err)
+		return nil, credentialStorageContext("failed to load CLI auth from keyring", err)
 	}
-	var auth AuthDotJSON
-	if err := json.Unmarshal([]byte(value), &auth); err != nil {
-		return nil, fmt.Errorf("failed to deserialize CLI auth from keyring: %w", err)
-	}
-	return &auth, nil
+	return decodeStoredAuthDotJSON("failed to deserialize CLI auth from keyring", []byte(value))
+}
+
+func (s *keyringAuthStorage) LoadAccountGrant() (*AuthDotJSON, error) {
+	return s.Load()
 }
 
 func (s *keyringAuthStorage) Save(auth AuthDotJSON) error {
@@ -443,10 +656,18 @@ func (s *keyringAuthStorage) Save(auth AuthDotJSON) error {
 		return err
 	}
 	if err := s.keyring.Set(authKeyringService, authStoreKey(s.codexHome), string(data)); err != nil {
-		return fmt.Errorf("failed to write OAuth tokens to keyring: %w", err)
-	}
-	if _, err := (&fileAuthStorage{store: NewStore(s.codexHome)}).Delete(); err != nil {
+		err = credentialStorageContext("failed to write OAuth tokens to keyring", err)
+		if s.mode == AuthCredentialsStoreKeyring {
+			slog.Warn(err.Error())
+		}
 		return err
+	}
+	attempt := newStorageAttempt(s.mode, s.backend, "cleanup", s.originator)
+	removed, cleanupErr := (&fileAuthStorage{store: NewStore(s.codexHome)}).Delete()
+	attempt.recordDeleteAttempt("file", removed, cleanupErr)
+	attempt.finish()
+	if cleanupErr != nil {
+		slog.Warn("failed to remove CLI auth fallback file", "error", cleanupErr)
 	}
 	return nil
 }
@@ -457,7 +678,7 @@ func (s *keyringAuthStorage) Delete() (bool, error) {
 	}
 	keyringRemoved, err := s.keyring.Delete(authKeyringService, authStoreKey(s.codexHome))
 	if err != nil {
-		return false, fmt.Errorf("failed to delete auth from keyring: %w", err)
+		return false, credentialStorageContext("failed to delete auth from keyring", err)
 	}
 	fileRemoved, err := (&fileAuthStorage{store: NewStore(s.codexHome)}).Delete()
 	if err != nil {
@@ -470,43 +691,94 @@ func (s *keyringAuthStorage) Source() string {
 	return "keyring"
 }
 
+func (s *keyringAuthStorage) telemetryStoreName() string {
+	if s == nil {
+		return "direct_keyring"
+	}
+	return keyringStoreName(s.backend)
+}
+
 type autoAuthStorage struct {
-	keyring authStorageBackend
-	file    authStorageBackend
+	keyring    *keyringAuthStorage
+	file       authStorageBackend
+	originator string
 }
 
 func (s *autoAuthStorage) Load() (*AuthDotJSON, error) {
+	attempt := newStorageAttempt(AuthCredentialsStoreAuto, s.keyring.backend, "load", s.originator)
+	defer attempt.finish()
 	auth, err := s.keyring.Load()
+	attempt.recordLoadAttempt(s.keyring.telemetryStoreName(), auth, err)
 	if err == nil && auth != nil {
+		return auth, nil
+	}
+	if err != nil {
+		attempt.recordSecureError(err)
+		slog.Warn("failed to load CLI auth from keyring, falling back to file storage", "error", err)
+	}
+	auth, err = s.file.Load()
+	attempt.recordLoadAttempt("file", auth, err)
+	return auth, err
+}
+
+// LoadAccountGrant propagates an unavailable keyring instead of falling back to
+// an older file record, while ordinary Load keeps the fallback behavior.
+func (s *autoAuthStorage) LoadAccountGrant() (*AuthDotJSON, error) {
+	auth, err := s.keyring.Load()
+	if err != nil {
+		return nil, err
+	}
+	if auth != nil {
 		return auth, nil
 	}
 	return s.file.Load()
 }
 
 func (s *autoAuthStorage) Save(auth AuthDotJSON) error {
-	if err := s.keyring.Save(auth); err == nil {
+	attempt := newStorageAttempt(AuthCredentialsStoreAuto, s.keyring.backend, "save", s.originator)
+	defer attempt.finish()
+	err := s.keyring.Save(auth)
+	attempt.recordSaveAttempt(s.keyring.telemetryStoreName(), err)
+	if err == nil {
 		return nil
 	}
-	return s.file.Save(auth)
+	attempt.recordSecureError(err)
+	slog.Warn("failed to save auth to keyring, falling back to file storage", "error", err)
+	err = s.file.Save(auth)
+	attempt.recordSaveAttempt("file", err)
+	return err
 }
 
 func (s *autoAuthStorage) Delete() (bool, error) {
+	attempt := newStorageAttempt(AuthCredentialsStoreAuto, s.keyring.backend, "delete", s.originator)
+	defer attempt.finish()
 	keyringRemoved, keyringErr := s.keyring.Delete()
 	fileRemoved, fileErr := s.file.Delete()
 	if keyringErr != nil && fileErr != nil {
+		attempt.recordDeleteAttempt("multiple", false, keyringErr)
 		return false, keyringErr
 	}
 	if fileErr != nil {
+		attempt.recordDeleteAttempt("multiple", false, fileErr)
 		return false, fileErr
 	}
 	if keyringErr != nil {
+		attempt.recordDeleteAttempt("multiple", fileRemoved, nil)
 		return fileRemoved, nil
 	}
+	attempt.recordDeleteAttempt("multiple", keyringRemoved || fileRemoved, nil)
 	return keyringRemoved || fileRemoved, nil
 }
 
 func (s *autoAuthStorage) Source() string {
 	return "auto"
+}
+
+func storageTelemetryStoreName(backend authStorageBackend) string {
+	if named, ok := backend.(interface{ telemetryStoreName() string }); ok {
+		return named.telemetryStoreName()
+	}
+	return authStorageBackendName(backend.Source())
 }
 
 var ephemeralAuthStore = struct {
@@ -526,6 +798,10 @@ func (s *ephemeralAuthStorage) Load() (*AuthDotJSON, error) {
 		return nil, nil
 	}
 	return cloneAuthDotJSON(&auth), nil
+}
+
+func (s *ephemeralAuthStorage) LoadAccountGrant() (*AuthDotJSON, error) {
+	return s.Load()
 }
 
 func (s *ephemeralAuthStorage) Save(auth AuthDotJSON) error {

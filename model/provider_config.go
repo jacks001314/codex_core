@@ -4,16 +4,56 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 )
 
 func ProvidersFromConfig(values map[string]any, openAIBaseURL string) (map[string]ProviderInfo, error) {
+	return ProvidersFromConfigForCWD(values, openAIBaseURL, "")
+}
+
+// ProvidersFromConfigForCWD resolves the configured providers for a host whose
+// startup working directory is cwd. Rust's apply_default_gcp_auth binds the
+// default gcloud command to the startup cwd, so credential paths and an
+// explicitly relative auth `cwd` resolve against it rather than against the
+// process working directory or CODEX_HOME.
+func ProvidersFromConfigForCWD(values map[string]any, openAIBaseURL string, cwd string) (map[string]ProviderInfo, error) {
 	configured, err := ConfiguredProviderMap(configValue(values, "model_providers"))
 	if err != nil {
 		return nil, err
 	}
-	return MergeConfiguredProviders(BuiltInProviders(openAIBaseURL), configured)
+	providers, err := MergeConfiguredProviders(BuiltInProviders(openAIBaseURL), configured)
+	if err != nil {
+		return nil, err
+	}
+	// Rust config::apply_default_gcp_auth: a GCP provider without configured
+	// auth uses gcloud Application Default Credentials.
+	if gcp, ok := providers[GCPProviderID]; ok && gcp.Auth == nil {
+		authCWD := resolveProviderAuthCWD(cwd)
+		if authCWD == "" {
+			authCWD = resolveProviderAuthCWD(stringConfig(values, "cwd"))
+		}
+		if authCWD == "" {
+			authCWD = defaultProviderAuthCWD()
+		}
+		gcp.Auth = &ProviderAuthInfo{
+			Command:           gcpAuthCommand(),
+			Args:              []string{"auth", "application-default", "print-access-token"},
+			TimeoutMS:         GCPAuthCommandTimeoutMS,
+			RefreshIntervalMS: GCPAuthRefreshMS,
+			CWD:               authCWD,
+		}
+		providers[GCPProviderID] = gcp
+	}
+	return providers, nil
+}
+
+func gcpAuthCommand() string {
+	if runtime.GOOS == "windows" {
+		return "gcloud.cmd"
+	}
+	return "gcloud"
 }
 
 // RequiredModelProviderDefinition resolves one managed `model_providers`
@@ -24,6 +64,13 @@ func ProvidersFromConfig(values map[string]any, openAIBaseURL string) (map[strin
 // policy that cannot describe a usable provider rejects the request instead of
 // silently passing the comparison.
 func RequiredModelProviderDefinition(providerID string, definition any) (*ProviderInfo, error) {
+	return RequiredModelProviderDefinitionWithBaseURL(providerID, definition, "")
+}
+
+// RequiredModelProviderDefinitionWithBaseURL is the retained-thread form: the
+// built-in OpenAI provider's inference endpoint comes from the thread route so
+// a catalog-only override never redirects inference (Rust #57567).
+func RequiredModelProviderDefinitionWithBaseURL(providerID string, definition any, openAIBaseURL string) (*ProviderInfo, error) {
 	providerID = strings.TrimSpace(providerID)
 	if providerID == "" {
 		return nil, nil
@@ -40,8 +87,8 @@ func RequiredModelProviderDefinition(providerID string, definition any) (*Provid
 	if !ok {
 		return nil, nil
 	}
-	if isBedrockProviderID(providerID) {
-		merged, err := MergeConfiguredProviders(BuiltInProviders(""), map[string]ProviderInfo{providerID: provider})
+	if isBedrockProviderID(providerID) || providerID == GCPProviderID || providerID == OpenAIProviderID {
+		merged, err := MergeConfiguredProviders(BuiltInProviders(openAIBaseURL), map[string]ProviderInfo{providerID: provider})
 		if err != nil {
 			return nil, err
 		}
@@ -60,7 +107,7 @@ func providerCapabilitiesOverrideFromConfig(values map[string]any) (*ProviderCap
 	}
 	out := &ProviderCapabilitiesOverride{}
 	for key := range values {
-		if key != "external_web_access" && key != "remote_compaction" {
+		if key != "external_web_access" && key != "remote_compaction" && key != "cyber_access_programs" && key != "custom_tool_grammar" {
 			return nil, fmt.Errorf("model_providers capabilities has unknown field `%s`", key)
 		}
 	}
@@ -70,6 +117,20 @@ func providerCapabilitiesOverrideFromConfig(values map[string]any) (*ProviderCap
 			return nil, fmt.Errorf("model_providers capabilities.external_web_access must be a boolean")
 		}
 		out.ExternalWebAccess = &value
+	}
+	if raw, ok := values["cyber_access_programs"]; ok {
+		value, ok := raw.(bool)
+		if !ok {
+			return nil, fmt.Errorf("model_providers capabilities.cyber_access_programs must be a boolean")
+		}
+		out.CyberAccessPrograms = &value
+	}
+	if raw, ok := values["custom_tool_grammar"]; ok {
+		value, ok := raw.(bool)
+		if !ok {
+			return nil, fmt.Errorf("model_providers capabilities.custom_tool_grammar must be a boolean")
+		}
+		out.CustomToolGrammar = &value
 	}
 	if raw, ok := values["remote_compaction"]; ok {
 		text, ok := raw.(string)
@@ -103,6 +164,12 @@ func providerCredentialExportTimeoutMSConfig(values map[string]any) (uint64, err
 }
 
 func ProviderForConfigID(values map[string]any, providerID string, openAIBaseURL string) (*ProviderInfo, error) {
+	return ProviderForConfigIDForCWD(values, providerID, openAIBaseURL, "")
+}
+
+// ProviderForConfigIDForCWD is ProviderForConfigID with the host's startup
+// working directory, which the default GCP command auth binds to.
+func ProviderForConfigIDForCWD(values map[string]any, providerID string, openAIBaseURL string, cwd string) (*ProviderInfo, error) {
 	providerID = strings.TrimSpace(providerID)
 	if providerID == "" {
 		providerID = OpenAIProviderID
@@ -110,7 +177,7 @@ func ProviderForConfigID(values map[string]any, providerID string, openAIBaseURL
 	if err := ValidateProviderID(providerID); err != nil {
 		return nil, err
 	}
-	providers, err := ProvidersFromConfig(values, openAIBaseURL)
+	providers, err := ProvidersFromConfigForCWD(values, openAIBaseURL, cwd)
 	if err != nil {
 		return nil, err
 	}
@@ -142,10 +209,11 @@ func ConfiguredProviderMap(value any) (map[string]ProviderInfo, error) {
 		if err != nil {
 			return nil, fmt.Errorf("model_providers.%s: %w", id, err)
 		}
-		if !isBedrockProviderID(id) {
+		if !isBedrockProviderID(id) && id != GCPProviderID && id != OpenAIProviderID {
 			// Mirrors Rust validate_model_providers (config/src/config_toml.rs):
 			// aws is only supported for the two bundled Bedrock providers and
-			// a custom provider name must not be empty.
+			// a custom provider name must not be empty. The built-in OpenAI
+			// provider accepts a catalog-only override (Rust #57567).
 			if provider.AWS != nil {
 				return nil, fmt.Errorf("model_providers.%s: provider aws is only supported for `%s` or `%s`", id, AmazonBedrockProviderID, AmazonBedrockRuntimeProviderID)
 			}
@@ -153,7 +221,8 @@ func ConfiguredProviderMap(value any) (map[string]ProviderInfo, error) {
 				return nil, fmt.Errorf("model_providers.%s: provider name must not be empty", id)
 			}
 		}
-		if isBedrockProviderID(id) {
+		switch {
+		case isBedrockProviderID(id):
 			if provider.Auth != nil && strings.TrimSpace(provider.Auth.Command) == "" {
 				return nil, fmt.Errorf("model_providers.%s: provider auth.command must not be empty", id)
 			}
@@ -162,7 +231,17 @@ func ConfiguredProviderMap(value any) (map[string]ProviderInfo, error) {
 					return nil, fmt.Errorf("model_providers.%s: %w", id, err)
 				}
 			}
-		} else {
+		case id == GCPProviderID:
+			// Rust validates the credential path before defaults are merged, so a
+			// partial `model_providers.gcp` block can supply project/location/auth
+			// without a name.
+			if err := provider.ValidateGCPCredentialFile(); err != nil {
+				return nil, fmt.Errorf("model_providers.%s: %w", id, err)
+			}
+			if err := provider.Validate(); err != nil {
+				return nil, fmt.Errorf("model_providers.%s: %w", id, err)
+			}
+		default:
 			if err := provider.Validate(); err != nil {
 				return nil, fmt.Errorf("model_providers.%s: %w", id, err)
 			}
@@ -182,6 +261,14 @@ var reservedModelProviderIDs = map[string]bool{
 	LMStudioOSSProviderID:          true,
 	AmazonBedrockProviderID:        true,
 	AmazonBedrockRuntimeProviderID: true,
+	GCPProviderID:                  true,
+}
+
+// isReservedProviderOverrideID reports the reserved ids whose config blocks
+// only extend the bundled provider (Rust's validate_reserved_model_provider_ids
+// exemption for the two Bedrock ids and GCP).
+func isReservedProviderOverrideID(id string) bool {
+	return isBedrockProviderID(id) || id == GCPProviderID
 }
 
 func isBedrockProviderID(id string) bool {
@@ -198,8 +285,16 @@ func IsBedrockProviderID(id string) bool {
 
 func validateReservedModelProviderIDs(rawProviders map[string]any) error {
 	var conflicts []string
-	for id := range rawProviders {
-		if reservedModelProviderIDs[id] && !isBedrockProviderID(id) {
+	for id, raw := range rawProviders {
+		if id == OpenAIProviderID {
+			// Rust #57567: `[model_providers.openai]` may only set
+			// `model_catalog_url`; everything else stays built-in.
+			if !openAIProviderCatalogOnlyOverride(raw) {
+				conflicts = append(conflicts, "`"+id+"`")
+			}
+			continue
+		}
+		if reservedModelProviderIDs[id] && !isReservedProviderOverrideID(id) {
 			conflicts = append(conflicts, "`"+id+"`")
 		}
 	}
@@ -208,6 +303,21 @@ func validateReservedModelProviderIDs(rawProviders map[string]any) error {
 	}
 	sort.Strings(conflicts)
 	return fmt.Errorf("model_providers contains reserved built-in provider IDs: %s. Built-in providers cannot be overridden. Rename your custom provider (for example, `openai-custom`).", strings.Join(conflicts, ", "))
+}
+
+// openAIProviderCatalogOnlyOverride reports whether an
+// `[model_providers.openai]` block only sets `model_catalog_url`.
+func openAIProviderCatalogOnlyOverride(raw any) bool {
+	values, ok := raw.(map[string]any)
+	if !ok {
+		return false
+	}
+	provider, err := providerInfoFromConfig(values, false)
+	if err != nil || provider == nil {
+		return false
+	}
+	provider.ModelCatalogURL = ""
+	return provider.isZero()
 }
 
 func ProviderInfoFromConfig(values map[string]any) (*ProviderInfo, error) {
@@ -236,6 +346,9 @@ func providerInfoFromConfig(values map[string]any, validate bool) (*ProviderInfo
 		RequiresOpenAIAuth:          boolConfig(values, "requires_openai_auth"),
 		SupportsWebsockets:          boolConfig(values, "supports_websockets"),
 		SupportsStandaloneWebSearch: boolConfig(values, "supports_standalone_web_search"),
+		ProjectID:                   optionalStringConfig(values, "project_id"),
+		Location:                    optionalStringConfig(values, "location"),
+		CredentialFile:              optionalStringConfig(values, "credential_file"),
 	}
 	if capabilitiesConfig, ok := configValue(values, "capabilities").(map[string]any); ok {
 		capabilities, err := providerCapabilitiesOverrideFromConfig(capabilitiesConfig)
@@ -306,9 +419,12 @@ func providerInfoFromConfig(values map[string]any, validate bool) (*ProviderInfo
 func gatewayOAuthConfigFromConfig(values map[string]any) (*GatewayOAuthConfig, error) {
 	gateway := &GatewayOAuthConfig{
 		AuthorizationURL: stringConfig(values, "authorization_url"),
-		TokenURL:         stringConfig(values, "token_url"),
-		ClientID:         stringConfig(values, "client_id"),
-		Scopes:           stringSliceConfig(values, "scopes"),
+		// Rust #59822/#60486: the device authorization endpoint enables
+		// device-code sign-in for both the TUI and app-server clients.
+		DeviceAuthorizationURL: stringConfig(values, "device_authorization_url"),
+		TokenURL:               stringConfig(values, "token_url"),
+		ClientID:               stringConfig(values, "client_id"),
+		Scopes:                 stringSliceConfig(values, "scopes"),
 	}
 	if resource, ok := configValue(values, "resource").(string); ok {
 		gateway.Resource = &resource
@@ -324,7 +440,31 @@ func gatewayOAuthConfigFromConfig(values map[string]any) (*GatewayOAuthConfig, e
 		value := uint16(port)
 		gateway.RedirectPort = &value
 	}
-	delivery, ok := configValue(values, "delivery").(map[string]any)
+	if rawStore := configValue(values, "credentials_store"); rawStore != nil {
+		// Rust #58219: OAuthCredentialsStore accepts only `keyring` (the
+		// default, normalized away so the serialized provider identity is
+		// unchanged) and `file`.
+		store, ok := rawStore.(string)
+		if !ok {
+			return nil, fmt.Errorf("gateway_oauth.credentials_store must be a string")
+		}
+		switch strings.TrimSpace(store) {
+		case "keyring":
+			gateway.CredentialsStore = ""
+		case "file":
+			gateway.CredentialsStore = "file"
+		default:
+			return nil, fmt.Errorf("gateway_oauth.credentials_store must be `keyring` or `file`")
+		}
+	}
+	rawDelivery := configValue(values, "delivery")
+	if rawDelivery == nil {
+		// Rust #57313: an omitted delivery sends the gateway token as
+		// Authorization: Bearer.
+		gateway.Delivery = GatewayOAuthDelivery{Kind: "header", Name: "Authorization", Scheme: "Bearer"}
+		return gateway, nil
+	}
+	delivery, ok := rawDelivery.(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("gateway_oauth.delivery must be a table")
 	}
@@ -434,6 +574,11 @@ func (p *ProviderInfo) ValidateForConfigID(providerID string) error {
 	if isBedrockProviderID(providerID) {
 		return nil
 	}
+	if providerID == GCPProviderID {
+		if err := p.ValidateGCPCredentialFile(); err != nil {
+			return err
+		}
+	}
 	if err := p.Validate(); err != nil {
 		return err
 	}
@@ -450,6 +595,18 @@ func configValue(values map[string]any, key string) any {
 func stringConfig(values map[string]any, key string) string {
 	value, _ := configValue(values, key).(string)
 	return strings.TrimSpace(value)
+}
+
+// optionalStringConfig preserves the difference between an absent key and an
+// explicitly empty value. Rust models GCP project_id/location/credential_file
+// as Option<String>: a configured empty value must be rejected instead of
+// falling back to an environment variable or default.
+func optionalStringConfig(values map[string]any, key string) *string {
+	value, ok := configValue(values, key).(string)
+	if !ok {
+		return nil
+	}
+	return &value
 }
 
 func boolConfig(values map[string]any, key string) bool {

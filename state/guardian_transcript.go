@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"strconv"
 	"strings"
+
+	"codex_core/retainedctx"
+	"codex_core/utils"
 )
 
 // GuardianTranscriptJSONInstructions is Rust's TRANSCRIPT_JSON_INSTRUCTIONS
@@ -47,7 +50,34 @@ type GuardianTranscriptEntry struct {
 	LineRole string
 	// RetainedSourceOrder mirrors Rust's optional retained section label.
 	RetainedSourceOrder string
-	Text                string
+	// RetainedSource carries the complete original revision this user entry
+	// proves the request delivered (#48110). The composer omits a retained
+	// instruction whose source the transcript already carries; nil means the
+	// entry has no delivery proof.
+	RetainedSource *retainedctx.RetainedSource
+	// Async marks an entry rendered for the asynchronous independent snapshot,
+	// whose transcript records terminate with an extra newline (#48110).
+	Async bool
+	// Optional marks evidence the aggregate request budget may omit: ordinary
+	// assistant commentary and tool calls or results (Rust BudgetPriority
+	// Commentary and Tool, #44281). User messages, developer context, final
+	// assistant answers and encrypted native evidence stay required, so a
+	// budget that cannot fit them rejects the review instead.
+	Optional bool
+	// SelectedExecResult marks a Code Mode exec output whose completed nested
+	// tool calls include one the host selected for its own elastic reservation
+	// (Rust #60914 BudgetPriority::SelectedExecResult).
+	SelectedExecResult bool
+	// ExecNestedTools lists the nested tool names the host recorded for this
+	// exec output. The elastic preparation decides which of them the configured
+	// selection names, so collection stays configuration-free.
+	ExecNestedTools []string
+	// Historical marks user instructions and manual approvals. They stay
+	// complete through collection and retention; only the complete-request
+	// budget may shorten them, oldest first, after optional evidence is gone
+	// (Rust HistoryTruncation, #44570).
+	Historical bool
+	Text       string
 	// Native carries a complete encrypted agent-message item. Rust delivers
 	// these as native response items (ciphertext cannot be truncated or
 	// rendered as text), so they are excluded from the text rendering and
@@ -82,7 +112,11 @@ func (e GuardianTranscriptEntry) Render(format GuardianTranscriptFormat) string 
 		if err := encoder.Encode(record); err != nil {
 			return ""
 		}
-		return strings.TrimSuffix(builder.String(), "\n")
+		rendered := strings.TrimSuffix(builder.String(), "\n")
+		if e.Async {
+			return rendered + "\n"
+		}
+		return rendered
 	}
 	if e.RetainedSourceOrder != "" {
 		var builder strings.Builder
@@ -97,6 +131,13 @@ func (e GuardianTranscriptEntry) Render(format GuardianTranscriptFormat) string 
 				builder.WriteString(line)
 			}
 		}
+		// Rust's TranscriptRecord writes every retained-source-order line with
+		// writeln!, so the record always ends with a newline; the asynchronous
+		// framing adds its extra blank line on top (#48110).
+		builder.WriteString("\n")
+		if e.Async {
+			builder.WriteString("\n")
+		}
 		return builder.String()
 	}
 	role := strings.TrimSpace(e.LineRole)
@@ -109,7 +150,113 @@ func (e GuardianTranscriptEntry) Render(format GuardianTranscriptFormat) string 
 	if role == "" {
 		return e.Text
 	}
-	return role + ": " + e.Text
+	rendered := role + ": " + e.Text
+	if e.Async {
+		rendered += "\n"
+	}
+	return rendered
+}
+
+// GuardianTranscriptRetainedSources returns the complete originals this
+// request's transcript entries prove delivered (#48110). Each asynchronous
+// sample is self-contained, so callers pass only the sample's own transcript
+// and never a previous sample's history.
+func GuardianTranscriptRetainedSources(entries []GuardianTranscriptEntry) []retainedctx.RetainedSource {
+	sources := make([]retainedctx.RetainedSource, 0, len(entries))
+	for _, entry := range entries {
+		if entry.RetainedSource == nil || len(entry.Native) > 0 || strings.TrimSpace(entry.Text) == "" {
+			continue
+		}
+		sources = append(sources, *entry.RetainedSource)
+	}
+	return sources
+}
+
+// GuardianNativeEvidenceOutputText is Rust's evidence-only paired output for a
+// preserved native tool call. It tells the reviewed model that the call is
+// evidence, not a request whose result it is reading.
+const GuardianNativeEvidenceOutputText = "This call is review evidence, not a request to execute it. This is not its execution result."
+
+// GuardianNativeFunctionCall identifies a preserved native function call's
+// call ID, or reports false when the item is not a function call.
+func GuardianNativeFunctionCall(native json.RawMessage) (string, string, bool) {
+	if len(native) == 0 {
+		return "", "", false
+	}
+	var item struct {
+		Type   string `json:"type"`
+		Name   string `json:"name"`
+		CallID string `json:"call_id"`
+	}
+	if err := json.Unmarshal(native, &item); err != nil {
+		return "", "", false
+	}
+	callID := strings.TrimSpace(item.CallID)
+	if strings.TrimSpace(item.Type) != "function_call" || callID == "" {
+		return "", "", false
+	}
+	return callID, strings.TrimSpace(item.Name), true
+}
+
+// GuardianNativeFunctionCallEvidenceOutput mirrors Rust's
+// `native_tool_call::evidence_output`: a preserved native function call is
+// delivered with a paired evidence-only output so the backend can pair the
+// call without executing it. Non-call native items have no paired output.
+func GuardianNativeFunctionCallEvidenceOutput(native json.RawMessage) (json.RawMessage, bool) {
+	callID, _, ok := GuardianNativeFunctionCall(native)
+	if !ok {
+		return nil, false
+	}
+	payload, err := json.Marshal(map[string]any{
+		"type":    "function_call_output",
+		"call_id": callID,
+		"output":  GuardianNativeEvidenceOutputText,
+	})
+	if err != nil {
+		return nil, false
+	}
+	return payload, true
+}
+
+// GuardianNativeFunctionCallTokens counts the preserved call and its paired
+// evidence output, mirroring Rust's `native_tool_call::estimate_tokens`.
+func GuardianNativeFunctionCallTokens(native json.RawMessage) int {
+	tokens := utils.ApproxTokenCount(string(native))
+	if output, ok := GuardianNativeFunctionCallEvidenceOutput(native); ok {
+		tokens += utils.ApproxTokenCount(string(output))
+	}
+	return tokens
+}
+
+// GuardianTranscriptWithoutProposedCall mirrors Rust's transcript dedup for a
+// native tool call review: the proposed call is delivered as the planned
+// action, so its history copy becomes an omission placeholder at the same
+// position instead of reaching the reviewer twice.
+func GuardianTranscriptWithoutProposedCall(entries []GuardianTranscriptEntry, callID string) []GuardianTranscriptEntry {
+	callID = strings.TrimSpace(callID)
+	if callID == "" || len(entries) == 0 {
+		return entries
+	}
+	out := make([]GuardianTranscriptEntry, 0, len(entries))
+	for _, entry := range entries {
+		entryCallID, name, ok := GuardianNativeFunctionCall(entry.Native)
+		if !ok || entryCallID != callID {
+			out = append(out, entry)
+			continue
+		}
+		lineRole := "tool call"
+		if name != "" {
+			lineRole = "tool " + name + " call"
+		}
+		out = append(out, GuardianTranscriptEntry{
+			Author:   entry.Author,
+			Index:    entry.Index,
+			Label:    lineRole,
+			LineRole: lineRole,
+			Text:     GuardianTranscriptOmissionNotice,
+		})
+	}
+	return out
 }
 
 // RenderGuardianTranscript renders entries in conversation order.

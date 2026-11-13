@@ -149,7 +149,7 @@ prefix_rule(pattern = PATTERN)
 PATTERN = ["git"]
 `)
 	_, err := Check(&CheckOptions{Rules: []string{path}, Command: []string{"git"}})
-	if err == nil || !strings.Contains(err.Error(), "expected list, got PATTERN") {
+	if err == nil || !strings.Contains(err.Error(), "Local variable `PATTERN` referenced before assignment") {
 		t.Fatalf("Check() error = %v, want unresolved forward constant error", err)
 	}
 }
@@ -233,12 +233,12 @@ func TestCheckRejectsInvalidPositionalArgumentOrder(t *testing.T) {
 		{
 			name: "duplicate",
 			body: `prefix_rule(["git"], pattern = ["git"])`,
-			want: "multiple values for argument pattern",
+			want: "Argument `pattern` occurs more than once",
 		},
 		{
 			name: "positional after named",
 			body: `prefix_rule(pattern = ["git"], "prompt")`,
-			want: "positional argument follows named argument",
+			want: "positional argument after non positional",
 		},
 	}
 	for _, tt := range tests {
@@ -257,7 +257,7 @@ func TestCheckRejectsUnknownPolicyFunction(t *testing.T) {
 prefix_rules(pattern = ["git"], decision = "allow")
 `)
 	_, err := Check(&CheckOptions{Rules: []string{path}, Command: []string{"git"}})
-	if err == nil || !strings.Contains(err.Error(), "unknown execpolicy function prefix_rules") {
+	if err == nil || !strings.Contains(err.Error(), "Variable `prefix_rules` not found, did you mean `prefix_rule`?") {
 		t.Fatalf("Check() error = %v, want unknown policy function", err)
 	}
 }
@@ -271,7 +271,7 @@ prefix_rule(
 )
 `)
 	_, err := Check(&CheckOptions{Rules: []string{path}, Command: []string{"git"}})
-	if err == nil || !strings.Contains(err.Error(), "prefix_rule got unexpected argument examples") {
+	if err == nil || !strings.Contains(err.Error(), "Found `examples` extra named parameter(s) for call to prefix_rule") {
 		t.Fatalf("Check() error = %v, want unexpected argument", err)
 	}
 }
@@ -343,23 +343,23 @@ func TestCheckRejectsNonStringPolicyValues(t *testing.T) {
 	}{
 		{
 			name: "pattern token",
-			body: `prefix_rule(pattern = [git])`,
-			want: "pattern element must be a string literal",
+			body: `prefix_rule(pattern = [1])`,
+			want: "invalid pattern element: pattern element must be a string or list of strings (got int)",
 		},
 		{
 			name: "decision",
-			body: `prefix_rule(pattern = ["git"], decision = allow)`,
-			want: "decision must be a string literal",
+			body: `prefix_rule(pattern = ["git"], decision = 1)`,
+			want: "Type of parameter `decision` doesn't match, expected `str`, actual `int (repr: 1)`",
 		},
 		{
 			name: "host path",
-			body: `host_executable(name = "git", paths = [git])`,
-			want: "list item must be a string literal",
+			body: `host_executable(name = "git", paths = [1])`,
+			want: "invalid rule: host_executable paths must be strings (got int)",
 		},
 		{
 			name: "example",
-			body: `prefix_rule(pattern = ["git"], match = [git])`,
-			want: "example must be a string literal",
+			body: `prefix_rule(pattern = ["git"], match = [1])`,
+			want: "invalid example: example must be a string or list of strings (got int)",
 		},
 	}
 	for _, tt := range tests {
@@ -470,6 +470,21 @@ func TestCheckRejectsInvalidNetworkRule(t *testing.T) {
 	}
 }
 
+func TestLoadPoliciesMissingFileMatchesRustContextChain(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.rules")
+	_, err := LoadPolicies([]string{path})
+	if err == nil {
+		t.Fatalf("LoadPolicies() error = nil, want failure")
+	}
+	prefix := "failed to read policy at " + path + "\n\nCaused by:\n    "
+	if !strings.HasPrefix(err.Error(), prefix) {
+		t.Fatalf("error = %q, want prefix %q", err.Error(), prefix)
+	}
+	if !strings.Contains(err.Error(), "(os error 2)") {
+		t.Fatalf("error = %q, want a Rust-style os error code", err.Error())
+	}
+}
+
 func TestCheckNoMatchRendersEmptyMatchedRules(t *testing.T) {
 	path := writePolicy(t, `
 prefix_rule(
@@ -534,7 +549,7 @@ host_executable(
 )
 `)
 	_, err := Check(&CheckOptions{Rules: []string{path}, Command: []string{"git"}})
-	if err == nil || !strings.Contains(err.Error(), "host_executable missing paths") {
+	if err == nil || !strings.Contains(err.Error(), "Missing parameter `paths` for call to `host_executable`") {
 		t.Fatalf("Check() error = %v, want missing paths error", err)
 	}
 }
@@ -688,5 +703,32 @@ func TestExecutableLookupKeyForPlatform(t *testing.T) {
 	}
 	if got := executableLookupKeyForPlatform("Git.EXE", DangerousCommandPlatformPosix); got != "Git.EXE" {
 		t.Fatalf("posix lookup key = %q, want Git.EXE", got)
+	}
+}
+
+func TestCanonicalMatchingAppliesToEveryPrefixTokenLikeRust(t *testing.T) {
+	policy := &Policy{}
+	if err := policy.Parse("test.rules", `prefix_rule(pattern=["bash", ["run", "exec"]], canonical_matching=True, decision="forbidden")`); err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	for _, command := range [][]string{{"bAſh", "RUN"}, {"BASH", "exec"}} {
+		out := policy.EvaluateCommand(command)
+		if out.Decision == nil || *out.Decision != DecisionForbidden {
+			t.Fatalf("command %v decision = %#v", command, out.Decision)
+		}
+	}
+	exact := &Policy{}
+	if err := exact.Parse("test.rules", `prefix_rule(pattern=["bash"], decision="forbidden")`); err != nil {
+		t.Fatalf("Parse(exact) error = %v", err)
+	}
+	if out := exact.EvaluateCommand([]string{"BASH"}); out.Decision != nil {
+		t.Fatalf("exact rule matched different case: %#v", out.Decision)
+	}
+	accented := &Policy{}
+	if err := accented.Parse("test.rules", `prefix_rule(pattern=["café"], canonical_matching=True, decision="forbidden")`); err != nil {
+		t.Fatalf("Parse(accented) error = %v", err)
+	}
+	if out := accented.EvaluateCommand([]string{"CAFE\u0301"}); out.Decision == nil || *out.Decision != DecisionForbidden {
+		t.Fatalf("canonical accent decision = %#v", out.Decision)
 	}
 }

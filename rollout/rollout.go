@@ -10,6 +10,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -58,15 +60,30 @@ type Config struct {
 // history base when it belongs to the parent thread or this is the thread's
 // original rollout (Rust rollout::forked_from_ordinal_exclusive, #40987).
 func ForkedFromOrdinal(meta *SessionMeta) *uint64 {
+	return ForkedFromOrdinalAtPath(meta, "")
+}
+
+// ForkedFromOrdinalAtPath also accepts the rollout path so a thread's original
+// rollout can fall back to its own history base even when the base names an
+// earlier rollout of that same thread (Rust #40987).
+func ForkedFromOrdinalAtPath(meta *SessionMeta, path string) *uint64 {
 	if meta == nil || strings.TrimSpace(meta.ForkedFromID) == "" {
 		return nil
 	}
 	if meta.ForkedFromOrdinalExclusive != nil {
 		return meta.ForkedFromOrdinalExclusive
 	}
-	if base := meta.HistoryBase; base != nil && base.ThreadID == meta.ForkedFromID {
-		out := base.EndOrdinalExclusive
-		return &out
+	if base := meta.HistoryBase; base != nil {
+		ownRollout := false
+		if strings.TrimSpace(path) != "" {
+			if id, err := ThreadIDFromPath(path); err == nil && id == meta.ID {
+				ownRollout = true
+			}
+		}
+		if base.ThreadID == meta.ForkedFromID || ownRollout {
+			out := base.EndOrdinalExclusive
+			return &out
+		}
 	}
 	return nil
 }
@@ -82,7 +99,10 @@ type Item struct {
 	Data       map[string]any  `json:"data,omitempty"`
 	Raw        json.RawMessage `json:"raw,omitempty"`
 	ResponseID string          `json:"response_id,omitempty"`
-	Metadata   map[string]any  `json:"metadata,omitempty"`
+	// ResponseItemID is the Responses item identity when it differs from ID
+	// (Rust #57538).
+	ResponseItemID string         `json:"response_item_id,omitempty"`
+	Metadata       map[string]any `json:"metadata,omitempty"`
 }
 
 type ContentPart struct {
@@ -97,6 +117,10 @@ type SessionMeta struct {
 	SessionID     string `json:"session_id"`
 	SessionPrefix string `json:"session_prefix,omitempty"`
 	ForkedFromID  string `json:"forked_from_id,omitempty"`
+	// AttachedThread marks a persisted fork attached to ForkedFromID (Rust
+	// #56351). Attached threads are hidden from ordinary listings and cannot
+	// outlive their source thread.
+	AttachedThread bool `json:"attached_thread,omitempty"`
 	// ForkedFromOrdinalExclusive persists the fork cutoff ordinal separately
 	// from the physical history base so fork lineage stays accurate after
 	// reverts and cold resumes (Rust #40987).
@@ -243,7 +267,11 @@ type Line struct {
 	// of a `retained_context` line (Rust RolloutItem::RetainedContext). The wire
 	// form is Rust's `payload` key, so this field is only populated by the reader.
 	RetainedContext json.RawMessage `json:"-"`
-	Data            map[string]any  `json:"data,omitempty"`
+	// RealtimeItem carries the canonical timeline item of a `realtime_item`
+	// line (Rust RolloutItem::RealtimeItem). The wire form is Rust's `payload`
+	// key, so this field is only populated by the reader.
+	RealtimeItem json.RawMessage `json:"-"`
+	Data         map[string]any  `json:"data,omitempty"`
 }
 
 type RollbackEvent struct {
@@ -319,6 +347,7 @@ type CreateParams struct {
 	SessionPrefix               string
 	ThreadID                    string
 	ForkedFromID                string
+	AttachedThread              bool
 	Source                      string
 	ThreadSource                string
 	Originator                  string
@@ -391,6 +420,7 @@ func NewRecorder(params *CreateParams) (*Recorder, error) {
 		SessionID:                   sessionID,
 		SessionPrefix:               params.SessionPrefix,
 		ForkedFromID:                params.ForkedFromID,
+		AttachedThread:              params.AttachedThread,
 		Timestamp:                   now.UTC().Format(time.RFC3339),
 		CWD:                         params.CWD,
 		Model:                       params.Model,
@@ -445,7 +475,38 @@ func PathForThread(codexHome string, threadID string, now time.Time) string {
 }
 
 func Resume(path string) (*Recorder, error) {
-	lines, _, err := Load(path)
+	return resume(path)
+}
+
+// ResumeWithWriter opens an existing rollout for appends while the caller keeps
+// cross-process ownership of the thread (Rust's `open_rollout_for_append` with a
+// writer lock and `RolloutRecorder::new_with_writer_lock`). Materializing a
+// compressed rollout and opening the plain file both happen under the lock, and
+// the caller releases it only after the append has been flushed.
+func ResumeWithWriter(path string, writer *session.WriterLock) (*Recorder, error) {
+	if writer == nil {
+		return nil, errors.New("writer lock is required")
+	}
+	return resume(path)
+}
+
+func resume(path string) (*Recorder, error) {
+	plain := PlainRolloutPath(strings.TrimSpace(path))
+	if plain == "" {
+		return nil, errors.New("rollout path is required")
+	}
+	refreshModifiedTime := false
+	if _, err := os.Stat(plain); errors.Is(err, os.ErrNotExist) {
+		refreshModifiedTime = true
+		if _, compressedErr := os.Stat(plain + ".zst"); compressedErr == nil {
+			if _, err := MaterializeRolloutForReference(plain); err != nil {
+				return nil, err
+			}
+		}
+	} else if err != nil {
+		return nil, err
+	}
+	lines, _, err := Load(plain)
 	if err != nil {
 		return nil, err
 	}
@@ -463,11 +524,29 @@ func Resume(path string) (*Recorder, error) {
 			nextOrdinal = *lines[i].Ordinal + 1
 		}
 	}
-	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	file, err := os.OpenFile(plain, os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	return &Recorder{path: path, file: file, paginated: paginated, threadID: threadID, nextOrdinal: nextOrdinal}, nil
+	if refreshModifiedTime {
+		if err := refreshRolloutModifiedTime(plain); err != nil {
+			_ = file.Close()
+			return nil, err
+		}
+	}
+	return &Recorder{path: plain, file: file, paginated: paginated, threadID: threadID, nextOrdinal: nextOrdinal}, nil
+}
+
+// refreshRolloutModifiedTime makes a restored transcript look active. A
+// preserved ACL can allow appending while denying explicit timestamp updates;
+// the append itself updates mtime, so that denial must not prevent it.
+func refreshRolloutModifiedTime(path string) error {
+	now := time.Now()
+	err := os.Chtimes(path, now, now)
+	if errors.Is(err, os.ErrPermission) {
+		return nil
+	}
+	return err
 }
 
 func (line Line) MarshalJSON() ([]byte, error) {
@@ -675,17 +754,65 @@ func (r *Recorder) AppendThreadSettingsAppliedWithSnapshot(threadID, approvalPol
 // (Rust #43848). A non-nil roots pointer preserves an explicit empty list,
 // which is distinct from an unknown/omitted selection.
 func (r *Recorder) AppendThreadSettingsAppliedWithWorkspaceRoots(threadID, approvalPolicy, cwd string, collaborationMode json.RawMessage, runtimeWorkspaceRoots *[]string, now time.Time) error {
-	approvalPolicy = strings.TrimSpace(approvalPolicy)
+	return r.AppendThreadSettingsAppliedSnapshot(threadID, ThreadSettingsApplied{
+		ApprovalPolicy:        approvalPolicy,
+		CWD:                   cwd,
+		CollaborationMode:     collaborationMode,
+		RuntimeWorkspaceRoots: runtimeWorkspaceRoots,
+	}, now)
+}
+
+// ThreadSettingsApplied is the full thread-owned settings snapshot persisted by
+// a `thread_settings_applied` rollout event (Rust ThreadSettingsSnapshot).
+// ApprovalsReviewer, PermissionProfile, and ActivePermissionProfile let a
+// resumed or forked thread restore the permissions the thread acknowledged
+// instead of a stale TurnContext (Rust #57227).
+type ThreadSettingsApplied struct {
+	ApprovalPolicy string
+	// ApprovalsReviewer is the effective reviewer after managed requirements;
+	// RequestedApprovalsReviewer keeps the explicit choice so removing a
+	// requirement can restore it on resume (Rust #59272).
+	ApprovalsReviewer          string
+	RequestedApprovalsReviewer *string
+	PermissionProfile          json.RawMessage
+	ActivePermissionProfile    json.RawMessage
+	CWD                        string
+	ServiceTier                *string
+	ReasoningSummary           *string
+	Personality                *string
+	CollaborationMode          json.RawMessage
+	RuntimeWorkspaceRoots      *[]string
+}
+
+// AppendThreadSettingsAppliedSnapshot persists a full thread-owned settings
+// snapshot. A non-nil roots pointer preserves an explicit empty list, which is
+// distinct from an unknown/omitted selection.
+func (r *Recorder) AppendThreadSettingsAppliedSnapshot(threadID string, settings ThreadSettingsApplied, now time.Time) error {
+	approvalPolicy := strings.TrimSpace(settings.ApprovalPolicy)
+	approvalsReviewer := strings.TrimSpace(settings.ApprovalsReviewer)
+	var requestedApprovalsReviewer *string
+	if settings.RequestedApprovalsReviewer != nil {
+		if value := strings.TrimSpace(*settings.RequestedApprovalsReviewer); value != "" {
+			requestedApprovalsReviewer = &value
+		}
+	}
 	threadID = strings.TrimSpace(threadID)
-	cwd = strings.TrimSpace(cwd)
-	collaborationMode = append(json.RawMessage(nil), collaborationMode...)
+	cwd := strings.TrimSpace(settings.CWD)
+	collaborationMode := append(json.RawMessage(nil), settings.CollaborationMode...)
+	permissionProfile := cloneRawJSON(settings.PermissionProfile)
+	activePermissionProfile := cloneRawJSON(settings.ActivePermissionProfile)
 	var roots *[]string
-	if runtimeWorkspaceRoots != nil {
-		copied := make([]string, len(*runtimeWorkspaceRoots))
-		copy(copied, *runtimeWorkspaceRoots)
+	if settings.RuntimeWorkspaceRoots != nil {
+		copied := make([]string, len(*settings.RuntimeWorkspaceRoots))
+		copy(copied, *settings.RuntimeWorkspaceRoots)
 		roots = &copied
 	}
-	if approvalPolicy == "" && cwd == "" && len(collaborationMode) == 0 && roots == nil {
+	serviceTier := cloneStringPtr(settings.ServiceTier)
+	reasoningSummary := cloneStringPtr(settings.ReasoningSummary)
+	personality := cloneStringPtr(settings.Personality)
+	if approvalPolicy == "" && approvalsReviewer == "" && cwd == "" && len(collaborationMode) == 0 &&
+		roots == nil && permissionProfile == nil && activePermissionProfile == nil &&
+		serviceTier == nil && reasoningSummary == nil && personality == nil {
 		return errors.New("thread settings require an approval policy or cwd")
 	}
 	if now.IsZero() {
@@ -695,25 +822,135 @@ func (r *Recorder) AppendThreadSettingsAppliedWithWorkspaceRoots(threadID, appro
 		Type           string `json:"type"`
 		ThreadID       string `json:"thread_id,omitempty"`
 		ThreadSettings struct {
-			ApprovalPolicy        string          `json:"approval_policy"`
-			CWD                   string          `json:"cwd,omitempty"`
-			CollaborationMode     json.RawMessage `json:"collaboration_mode,omitempty"`
-			RuntimeWorkspaceRoots *[]string       `json:"runtime_workspace_roots,omitempty"`
+			ApprovalPolicy             string          `json:"approval_policy"`
+			ApprovalsReviewer          string          `json:"approvals_reviewer,omitempty"`
+			RequestedApprovalsReviewer *string         `json:"requested_approvals_reviewer,omitempty"`
+			PermissionProfile          json.RawMessage `json:"permission_profile,omitempty"`
+			ActivePermissionProfile    json.RawMessage `json:"active_permission_profile,omitempty"`
+			CWD                        string          `json:"cwd,omitempty"`
+			ServiceTier                *string         `json:"service_tier,omitempty"`
+			ReasoningSummary           *string         `json:"reasoning_summary,omitempty"`
+			Personality                *string         `json:"personality,omitempty"`
+			CollaborationMode          json.RawMessage `json:"collaboration_mode,omitempty"`
+			RuntimeWorkspaceRoots      *[]string       `json:"runtime_workspace_roots,omitempty"`
 		} `json:"thread_settings"`
 	}{
 		Type:     "thread_settings_applied",
 		ThreadID: threadID,
 		ThreadSettings: struct {
-			ApprovalPolicy        string          `json:"approval_policy"`
-			CWD                   string          `json:"cwd,omitempty"`
-			CollaborationMode     json.RawMessage `json:"collaboration_mode,omitempty"`
-			RuntimeWorkspaceRoots *[]string       `json:"runtime_workspace_roots,omitempty"`
-		}{ApprovalPolicy: approvalPolicy, CWD: cwd, CollaborationMode: collaborationMode, RuntimeWorkspaceRoots: roots},
+			ApprovalPolicy             string          `json:"approval_policy"`
+			ApprovalsReviewer          string          `json:"approvals_reviewer,omitempty"`
+			RequestedApprovalsReviewer *string         `json:"requested_approvals_reviewer,omitempty"`
+			PermissionProfile          json.RawMessage `json:"permission_profile,omitempty"`
+			ActivePermissionProfile    json.RawMessage `json:"active_permission_profile,omitempty"`
+			CWD                        string          `json:"cwd,omitempty"`
+			ServiceTier                *string         `json:"service_tier,omitempty"`
+			ReasoningSummary           *string         `json:"reasoning_summary,omitempty"`
+			Personality                *string         `json:"personality,omitempty"`
+			CollaborationMode          json.RawMessage `json:"collaboration_mode,omitempty"`
+			RuntimeWorkspaceRoots      *[]string       `json:"runtime_workspace_roots,omitempty"`
+		}{
+			ApprovalPolicy:             approvalPolicy,
+			ApprovalsReviewer:          approvalsReviewer,
+			RequestedApprovalsReviewer: requestedApprovalsReviewer,
+			PermissionProfile:          permissionProfile,
+			ActivePermissionProfile:    activePermissionProfile,
+			CWD:                        cwd,
+			ServiceTier:                serviceTier,
+			ReasoningSummary:           reasoningSummary,
+			Personality:                personality,
+			CollaborationMode:          collaborationMode,
+			RuntimeWorkspaceRoots:      roots,
+		},
 	})
 	if err != nil {
 		return err
 	}
 	return r.AppendLine(Line{Type: "event_msg", Timestamp: now.UTC().Format(time.RFC3339Nano), Payload: payload})
+}
+
+// ThreadSettingsAppliedEqual reports whether two snapshots would persist as the
+// same thread-owned checkpoint, applying the same trimming and omission rules as
+// AppendThreadSettingsAppliedSnapshot (Rust #56250).
+func ThreadSettingsAppliedEqual(left, right ThreadSettingsApplied) bool {
+	left = normalizeThreadSettingsApplied(left)
+	right = normalizeThreadSettingsApplied(right)
+	return left.ApprovalPolicy == right.ApprovalPolicy &&
+		left.ApprovalsReviewer == right.ApprovalsReviewer &&
+		left.CWD == right.CWD &&
+		rawJSONEqual(left.PermissionProfile, right.PermissionProfile) &&
+		rawJSONEqual(left.ActivePermissionProfile, right.ActivePermissionProfile) &&
+		stringPtrsEqual(left.ServiceTier, right.ServiceTier) &&
+		stringPtrsEqual(left.ReasoningSummary, right.ReasoningSummary) &&
+		stringPtrsEqual(left.Personality, right.Personality) &&
+		rawJSONEqual(left.CollaborationMode, right.CollaborationMode) &&
+		stringSlicesPtrEqual(left.RuntimeWorkspaceRoots, right.RuntimeWorkspaceRoots)
+}
+
+func normalizeThreadSettingsApplied(settings ThreadSettingsApplied) ThreadSettingsApplied {
+	settings.ApprovalPolicy = strings.TrimSpace(settings.ApprovalPolicy)
+	settings.ApprovalsReviewer = strings.TrimSpace(settings.ApprovalsReviewer)
+	settings.CWD = strings.TrimSpace(settings.CWD)
+	settings.PermissionProfile = cloneRawJSON(settings.PermissionProfile)
+	settings.ActivePermissionProfile = cloneRawJSON(settings.ActivePermissionProfile)
+	settings.ServiceTier = cloneTrimmedStringPtr(settings.ServiceTier)
+	settings.ReasoningSummary = cloneTrimmedStringPtr(settings.ReasoningSummary)
+	settings.Personality = cloneTrimmedStringPtr(settings.Personality)
+	settings.CollaborationMode = cloneRawJSON(settings.CollaborationMode)
+	if settings.RuntimeWorkspaceRoots != nil {
+		roots := make([]string, len(*settings.RuntimeWorkspaceRoots))
+		copy(roots, *settings.RuntimeWorkspaceRoots)
+		settings.RuntimeWorkspaceRoots = &roots
+	}
+	return settings
+}
+
+func rawJSONEqual(left, right json.RawMessage) bool {
+	if len(left) == 0 || len(right) == 0 {
+		return len(left) == 0 && len(right) == 0
+	}
+	var leftValue, rightValue any
+	if json.Unmarshal(left, &leftValue) != nil || json.Unmarshal(right, &rightValue) != nil {
+		return bytes.Equal(left, right)
+	}
+	return reflect.DeepEqual(leftValue, rightValue)
+}
+
+func stringPtrsEqual(left, right *string) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+// cloneTrimmedStringPtr normalizes a persisted setting the same way the event is
+// written, where an empty value is omitted rather than serialized.
+func cloneTrimmedStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*value)
+	if trimmed == "" {
+		return nil
+	}
+	return &trimmed
+}
+
+func stringSlicesPtrEqual(left, right *[]string) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return slices.Equal(*left, *right)
+}
+
+// cloneRawJSON returns a copy of raw, treating absent and JSON null values as
+// nil so an omitted field stays omitted.
+func cloneRawJSON(raw json.RawMessage) json.RawMessage {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil
+	}
+	return append(json.RawMessage(nil), raw...)
 }
 
 // SecurityRiskScorePayload is the durable, rollout-only snapshot of a security
@@ -842,10 +1079,14 @@ type TurnContextRecord struct {
 	// across recovery (Rust `TurnContextItem::root_turn_id`, Rust #51402
 	// `551bd409eb`). Rust's rollout reconstruction falls back to it when a
 	// `turn_started` record predates the persisted `turn_attribution`.
-	RootTurnID     string `json:"root_turn_id,omitempty"`
-	CWD            string `json:"cwd,omitempty"`
-	ApprovalPolicy string `json:"approval_policy,omitempty"`
-	SandboxPolicy  any    `json:"sandbox_policy,omitempty"`
+	RootTurnID string `json:"root_turn_id,omitempty"`
+	// DirectOnlyToolNamespaces is an explicit per-turn Code Mode routing
+	// override (Rust #59481). Nil inherits the thread defaults; a non-nil empty
+	// slice records that the turn cleared direct-only routing.
+	DirectOnlyToolNamespaces *[]string `json:"direct_only_tool_namespaces,omitempty"`
+	CWD                      string    `json:"cwd,omitempty"`
+	ApprovalPolicy           string    `json:"approval_policy,omitempty"`
+	SandboxPolicy            any       `json:"sandbox_policy,omitempty"`
 	// PermissionProfile is the turn's unnamed runtime permission profile
 	// (Rust TurnContextItem::permission_profile, #53419). It lets a cold resume
 	// restore the profile the turn actually ran with instead of the current
@@ -887,6 +1128,33 @@ func (r *Recorder) AppendTurnContext(record TurnContextRecord, now time.Time) er
 	})
 }
 
+// AppendWorldState persists a full world-state comparison baseline. Rust
+// compacted replacement histories write this immediately after the Compacted
+// item and before the replacement TurnContext (#51117).
+func (r *Recorder) AppendWorldState(state json.RawMessage, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if len(state) == 0 || string(state) == "null" {
+		state = json.RawMessage(`{}`)
+	}
+	payload, err := json.Marshal(struct {
+		Full  bool            `json:"full"`
+		State json.RawMessage `json:"state"`
+	}{
+		Full:  true,
+		State: state,
+	})
+	if err != nil {
+		return err
+	}
+	return r.AppendLine(Line{
+		Type:      "world_state",
+		Timestamp: now.UTC().Format(time.RFC3339Nano),
+		Payload:   payload,
+	})
+}
+
 // AppendTokenUsageRecord persists one response's usage observation.
 func (r *Recorder) AppendTokenUsageRecord(record TokenUsageRecord, now time.Time) error {
 	payload, err := json.Marshal(record)
@@ -922,12 +1190,97 @@ func (r *Recorder) AppendRetainedContext(event retainedctx.RetainedContextEvent,
 	})
 }
 
+// AppendDynamicToolsUpdated persists a complete dynamic-tool catalog for
+// subsequent model steps (Rust #57553 RolloutItem::DynamicToolsUpdated). An
+// empty catalog is persisted explicitly so a clear survives resume.
+func (r *Recorder) AppendDynamicToolsUpdated(threadID string, tools []json.RawMessage, now time.Time) error {
+	if tools == nil {
+		tools = []json.RawMessage{}
+	}
+	payload, err := json.Marshal(DynamicToolsSnapshot{
+		ThreadID: strings.TrimSpace(threadID),
+		Tools:    tools,
+	})
+	if err != nil {
+		return err
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	return r.AppendLine(Line{
+		Type:      "dynamic_tools_updated",
+		Timestamp: now.UTC().Format(time.RFC3339Nano),
+		Payload:   payload,
+	})
+}
+
+// LatestDynamicTools returns the catalog the next model step must use (Rust
+// #57553 `latest_dynamic_tools`). It prefers the newest update or compaction
+// snapshot that belongs to this rollout's thread, preserving explicit clears,
+// and otherwise falls back to the creation metadata.
+func LatestDynamicTools(lines []Line) ([]json.RawMessage, bool) {
+	var metadata *SessionMeta
+	for i := range lines {
+		if lines[i].Meta != nil {
+			metadata = lines[i].Meta
+			break
+		}
+	}
+	for i := len(lines) - 1; i >= 0; i-- {
+		var snapshot *DynamicToolsSnapshot
+		switch lines[i].Type {
+		case "dynamic_tools_updated":
+			var decoded DynamicToolsSnapshot
+			if err := json.Unmarshal(lines[i].Payload, &decoded); err != nil {
+				continue
+			}
+			snapshot = &decoded
+		case "compacted":
+			snapshot = compactedDynamicToolsSnapshot(lines[i].Payload)
+		default:
+			continue
+		}
+		if snapshot == nil {
+			continue
+		}
+		if metadata != nil && strings.TrimSpace(metadata.ID) != "" && snapshot.ThreadID != metadata.ID {
+			continue
+		}
+		tools := snapshot.Tools
+		if len(tools) == 0 {
+			return []json.RawMessage{}, true
+		}
+		return cloneRawMessages(tools), true
+	}
+	if metadata != nil && metadata.DynamicTools != nil {
+		if len(metadata.DynamicTools) == 0 {
+			return []json.RawMessage{}, true
+		}
+		return cloneRawMessages(metadata.DynamicTools), true
+	}
+	return nil, false
+}
+
+func compactedDynamicToolsSnapshot(payload json.RawMessage) *DynamicToolsSnapshot {
+	if len(payload) == 0 {
+		return nil
+	}
+	var compacted struct {
+		ResumeMetadata *CompactionResumeMetadata `json:"resume_metadata"`
+	}
+	if err := json.Unmarshal(payload, &compacted); err != nil || compacted.ResumeMetadata == nil {
+		return nil
+	}
+	return compacted.ResumeMetadata.DynamicTools
+}
+
 // RetainedContextEvents returns the sparse retained-context events a rollout
 // carries, oldest first. A resumed thread restores its newest checkpoint's
 // snapshot and then replays these; re-recording an event the checkpoint already
 // holds is idempotent (Rust's `RetainedContext::record`).
 func RetainedContextEvents(lines []Line) []retainedctx.RetainedContextEvent {
 	events := []retainedctx.RetainedContextEvent{}
+	plan := newRetainedRollbackPlan(lines)
 	for i := range lines {
 		if lines[i].Type != "retained_context" {
 			continue
@@ -941,6 +1294,9 @@ func RetainedContextEvents(lines []Line) []retainedctx.RetainedContextEvent {
 		}
 		var event retainedctx.RetainedContextEvent
 		if err := json.Unmarshal(payload, &event); err != nil {
+			continue
+		}
+		if !plan.keepAnswer(&event.Answer) {
 			continue
 		}
 		events = append(events, event)
@@ -996,6 +1352,13 @@ func TurnContextSettings(raw json.RawMessage) (model string, compHash string, cy
 }
 
 func (r *Recorder) AppendTurnComplete(turnID string, completedAt time.Time, durationMS int64) error {
+	return r.AppendTurnCompleteWithRoot("", turnID, completedAt, durationMS)
+}
+
+// AppendTurnCompleteWithRoot persists completion together with the turn's
+// resolved causal root (Rust #51415). An empty root is omitted, matching older
+// rollout writers and Rust's absent `root_turn_id`.
+func (r *Recorder) AppendTurnCompleteWithRoot(rootTurnID string, turnID string, completedAt time.Time, durationMS int64) error {
 	turnID = strings.TrimSpace(turnID)
 	if turnID == "" {
 		return nil
@@ -1005,11 +1368,13 @@ func (r *Recorder) AppendTurnComplete(turnID string, completedAt time.Time, dura
 	}
 	payload, err := json.Marshal(struct {
 		Type        string `json:"type"`
+		RootTurnID  string `json:"root_turn_id,omitempty"`
 		TurnID      string `json:"turn_id"`
 		CompletedAt int64  `json:"completed_at"`
 		DurationMS  int64  `json:"duration_ms"`
 	}{
 		Type:        "task_complete",
+		RootTurnID:  strings.TrimSpace(rootTurnID),
 		TurnID:      turnID,
 		CompletedAt: completedAt.UTC().Unix(),
 		DurationMS:  durationMS,
@@ -1050,6 +1415,26 @@ func (r *Recorder) AppendTurnError(message string, now time.Time) error {
 }
 
 func (r *Recorder) AppendTurnAborted(turnID string, reason string, completedAt time.Time, durationMS int64) error {
+	return r.AppendTurnAbortedWithRoot("", turnID, reason, completedAt, durationMS)
+}
+
+// TurnAbortedError is the structured ErrorEvent persisted on an interrupted
+// turn (Rust #48796). Rollout events use the core protocol's snake_case field
+// names, unlike the app-server notification's camelCase schema.
+type TurnAbortedError struct {
+	Message        string `json:"message"`
+	CodexErrorInfo any    `json:"codex_error_info,omitempty"`
+}
+
+// AppendTurnAbortedWithRoot persists an interruption together with the turn's
+// resolved causal root (Rust #51415).
+func (r *Recorder) AppendTurnAbortedWithRoot(rootTurnID string, turnID string, reason string, completedAt time.Time, durationMS int64) error {
+	return r.AppendTurnAbortedWithRootAndError(rootTurnID, turnID, reason, nil, completedAt, durationMS)
+}
+
+// AppendTurnAbortedWithRootAndError persists an interruption together with its
+// resolved causal root and optional structured error (Rust #48796).
+func (r *Recorder) AppendTurnAbortedWithRootAndError(rootTurnID string, turnID string, reason string, turnError *TurnAbortedError, completedAt time.Time, durationMS int64) error {
 	turnID = strings.TrimSpace(turnID)
 	if turnID == "" {
 		return nil
@@ -1062,15 +1447,19 @@ func (r *Recorder) AppendTurnAborted(turnID string, reason string, completedAt t
 		completedAt = time.Now().UTC()
 	}
 	payload, err := json.Marshal(struct {
-		Type        string `json:"type"`
-		TurnID      string `json:"turn_id"`
-		Reason      string `json:"reason"`
-		CompletedAt int64  `json:"completed_at"`
-		DurationMS  int64  `json:"duration_ms"`
+		Type        string            `json:"type"`
+		RootTurnID  string            `json:"root_turn_id,omitempty"`
+		TurnID      string            `json:"turn_id"`
+		Reason      string            `json:"reason"`
+		Error       *TurnAbortedError `json:"error,omitempty"`
+		CompletedAt int64             `json:"completed_at"`
+		DurationMS  int64             `json:"duration_ms"`
 	}{
 		Type:        "turn_aborted",
+		RootTurnID:  strings.TrimSpace(rootTurnID),
 		TurnID:      turnID,
 		Reason:      reason,
+		Error:       turnError,
 		CompletedAt: completedAt.UTC().Unix(),
 		DurationMS:  durationMS,
 	})
@@ -1102,6 +1491,17 @@ type CompactionResumeMetadata struct {
 	// TurnAttribution is the provenance of the newest regular turn, independent
 	// of continuation eligibility. Rust #51402 (`state.turn_attribution`).
 	TurnAttribution *TurnAttribution `json:"turn_attribution,omitempty"`
+	// DynamicTools is the producing thread's persisted dynamic-tool catalog at
+	// checkpoint time (Rust #57553 CompactionResumeMetadata::dynamic_tools).
+	// An explicit resume override is not persisted here.
+	DynamicTools *DynamicToolsSnapshot `json:"dynamic_tools,omitempty"`
+}
+
+// DynamicToolsSnapshot is one thread's dynamic-tool catalog, including an
+// empty catalog after an explicit clear (Rust #57553).
+type DynamicToolsSnapshot struct {
+	ThreadID string            `json:"thread_id"`
+	Tools    []json.RawMessage `json:"tools"`
 }
 
 func (r *Recorder) AppendCompacted(message string, replacement []Item, now time.Time) error {
@@ -1629,7 +2029,9 @@ func materializeRolloutForReferenceLocked(plain string, stage *string) (string, 
 		}
 	}
 	*stage = "create_temp"
-	temporary, err := os.CreateTemp(filepath.Dir(plain), "."+filepath.Base(plain)+".decompress-*")
+	// Restoration timestamps can make the staged file look stale. Keep the
+	// managed name distinct from the compressed-worker's "*.tmp" cleanup.
+	temporary, err := os.CreateTemp(filepath.Dir(plain), ".rollout-materialize-*")
 	if err != nil {
 		return "", "", err
 	}
@@ -1639,9 +2041,6 @@ func materializeRolloutForReferenceLocked(plain string, stage *string) (string, 
 		_ = temporary.Close()
 		_ = os.Remove(temporaryPath)
 	}()
-	if err := temporary.Chmod(metadata.Mode().Perm()); err != nil {
-		return "", "", err
-	}
 	*stage = "open_source"
 	input, err := os.Open(compressed)
 	if err != nil {
@@ -1662,16 +2061,27 @@ func materializeRolloutForReferenceLocked(plain string, stage *string) (string, 
 	if closeInputErr != nil {
 		return "", "", closeInputErr
 	}
+	*stage = "flush"
+	if err := temporary.Sync(); err != nil {
+		return "", "", err
+	}
+	*stage = "set_metadata"
+	if err := preserveRolloutAccessMetadata(compressed, temporaryPath, metadata); err != nil {
+		return "", "", err
+	}
+	*stage = "verify"
+	reopened, err := os.Open(temporaryPath)
+	if err != nil {
+		return "", "", err
+	}
+	if err := reopened.Close(); err != nil {
+		return "", "", err
+	}
 	*stage = "sync"
 	if err := temporary.Sync(); err != nil {
 		return "", "", err
 	}
-	*stage = "flush"
 	if err := temporary.Close(); err != nil {
-		return "", "", err
-	}
-	*stage = "set_metadata"
-	if err := os.Chtimes(temporaryPath, metadata.ModTime(), metadata.ModTime()); err != nil {
 		return "", "", err
 	}
 	*stage = "publish"
@@ -1691,23 +2101,38 @@ func materializeRolloutForReferenceLocked(plain string, stage *string) (string, 
 		}
 		_, copyErr = io.Copy(destination, source)
 		_ = source.Close()
-		if copyErr == nil {
-			copyErr = destination.Sync()
-		}
-		if closeErr := destination.Close(); copyErr == nil {
-			copyErr = closeErr
-		}
 		if copyErr != nil {
+			_ = destination.Close()
 			_ = os.Remove(plain)
 			return "", "", copyErr
+		}
+		if err := preserveRolloutAccessMetadata(compressed, plain, metadata); err != nil {
+			_ = destination.Close()
+			_ = os.Remove(plain)
+			return "", "", err
+		}
+		if reopened, err := os.Open(plain); err != nil {
+			_ = destination.Close()
+			_ = os.Remove(plain)
+			return "", "", err
+		} else if err := reopened.Close(); err != nil {
+			_ = destination.Close()
+			_ = os.Remove(plain)
+			return "", "", err
+		}
+		if err := destination.Sync(); err != nil {
+			_ = destination.Close()
+			_ = os.Remove(plain)
+			return "", "", err
+		}
+		if err := destination.Close(); err != nil {
+			_ = os.Remove(plain)
+			return "", "", err
 		}
 		published = true
 	}
 	if published {
 		*stage = "remove_source"
-		if err := os.Chtimes(plain, metadata.ModTime(), metadata.ModTime()); err != nil {
-			return "", "", err
-		}
 		if err := os.Remove(compressed); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return "", "", err
 		}
@@ -1785,6 +2210,8 @@ func unmarshalLine(data []byte, line *Line) error {
 				line.SecurityRiskScore = append(json.RawMessage(nil), payload...)
 			case "retained_context":
 				line.RetainedContext = append(json.RawMessage(nil), payload...)
+			case "realtime_item":
+				line.RealtimeItem = append(json.RawMessage(nil), payload...)
 			}
 		}
 		if line.ThreadRolledBack == nil {
@@ -1810,6 +2237,11 @@ func unmarshalLine(data []byte, line *Line) error {
 		if len(line.RetainedContext) == 0 {
 			if payload, ok := raw["retained_context"]; ok {
 				line.RetainedContext = append(json.RawMessage(nil), payload...)
+			}
+		}
+		if len(line.RealtimeItem) == 0 {
+			if payload, ok := raw["realtime_item"]; ok {
+				line.RealtimeItem = append(json.RawMessage(nil), payload...)
 			}
 		}
 	}
@@ -1924,6 +2356,7 @@ func ItemsFromLines(lines []Line) []Item {
 // resume rule of reading `CompactedItem::retained_context` from the newest
 // checkpoint before replaying later evidence.
 func CompactedRetainedContext(lines []Line) *retainedctx.RetainedContext {
+	plan := newRetainedRollbackPlan(lines)
 	for i := len(lines) - 1; i >= 0; i-- {
 		if lines[i].Type != "compacted" {
 			continue
@@ -1932,9 +2365,26 @@ func CompactedRetainedContext(lines []Line) *retainedctx.RetainedContext {
 		if event == nil || event.RetainedContext == nil {
 			continue
 		}
-		return event.RetainedContext
+		return plan.filterContext(event.RetainedContext)
 	}
 	return nil
+}
+
+// HasCompactionCheckpoint reports whether the rollout contains a compaction
+// checkpoint, whether or not that checkpoint carries retained context. A
+// checkpoint written before retained context existed still replaced the model
+// window, so a resumed thread cannot prove its earlier user instructions are
+// complete.
+func HasCompactionCheckpoint(lines []Line) bool {
+	for i := range lines {
+		if lines[i].Type != "compacted" {
+			continue
+		}
+		if compactedEventFromPayload(lines[i].Payload) != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func compactedReplacementItems(payload json.RawMessage) ([]Item, bool) {
@@ -2136,7 +2586,9 @@ func canonicalResponseItemPayload(item *Item) (any, bool) {
 	if !ok || object == nil {
 		return nil, false
 	}
-	if strings.TrimSpace(item.ID) != "" {
+	if responseItemID := strings.TrimSpace(item.ResponseItemID); responseItemID != "" {
+		object["id"] = responseItemID
+	} else if strings.TrimSpace(item.ID) != "" {
 		object["id"] = item.ID
 	}
 	if object["type"] == "message" {
@@ -2283,6 +2735,9 @@ type ThreadItem struct {
 	UpdatedAt        time.Time
 	RecencyAt        time.Time
 	Archived         bool
+	// AttachedThread marks a saved fork that is attached to its source. The
+	// default rollout listing hides these rows (Rust #56351).
+	AttachedThread bool
 }
 
 type Page struct {
@@ -2302,6 +2757,9 @@ type ListOptions struct {
 	ModelProviders []string
 	CWDFilters     []string
 	Search         string
+	// IncludeAttachedThreads keeps saved attached forks in the result. Ordinary
+	// resume and history listings leave this false (Rust #56351).
+	IncludeAttachedThreads bool
 }
 
 func ListThreads(codexHome string, options ListOptions) (*Page, error) {
@@ -2370,6 +2828,7 @@ func BuildThreadItem(path string, archived bool) (ThreadItem, bool) {
 			item.Source = line.Meta.Source
 			item.HistoryMode = line.Meta.HistoryMode
 			item.ParentThreadID = line.Meta.ParentThreadID
+			item.AttachedThread = line.Meta.AttachedThread
 			item.AgentNickname = line.Meta.AgentNickname
 			item.AgentRole = line.Meta.AgentRole
 			item.Model = line.Meta.Model
@@ -2377,6 +2836,14 @@ func BuildThreadItem(path string, archived bool) (ThreadItem, bool) {
 			item.CLIVersion = line.Meta.CLIVersion
 			if created, err := time.Parse(time.RFC3339, line.Meta.Timestamp); err == nil {
 				item.CreatedAt = created.UTC()
+			}
+			if session.IsGuardianReviewSource(item.Source) {
+				// Rust #47302 (codex-rs/rollout/src/list.rs): a Guardian review
+				// thread's synthetic approval prompt is not display metadata. The
+				// summary uses the compact preview and stops scanning user messages.
+				item.Preview = session.GuardianThreadPreview
+				item.FirstUserMessage = ""
+				break
 			}
 			continue
 		}
@@ -2560,6 +3027,56 @@ func FindThreadPath(codexHome string, threadID string, archived bool) (string, e
 	return "", fmt.Errorf("rollout thread not found: %s", threadID)
 }
 
+// FindThreadRolloutCopies returns every representation of one thread's
+// rollout in recovery order: unarchived copies newest first, then archived
+// copies newest first. A plain sibling hides its compressed partner, matching
+// FindThreadPath. Rust #58959/#58960 use this ordering to retry an ancestor
+// read against another copy when the preferred rollout is truncated; the
+// caller still validates each copy's owner and exact history boundary.
+func FindThreadRolloutCopies(codexHome string, threadID string) ([]string, error) {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return nil, errors.New("rollout thread id is required")
+	}
+	var copies []string
+	seen := map[string]struct{}{}
+	for _, subdir := range []string{SessionsSubdir, ArchivedSessionsSubdir} {
+		paths, err := collectRolloutPaths(filepath.Join(codexHome, subdir))
+		if err != nil {
+			return nil, err
+		}
+		type rolloutCopy struct {
+			path   string
+			parsed RolloutFileName
+		}
+		found := make([]rolloutCopy, 0, 1)
+		for _, path := range paths {
+			parsed, ok := ParseRolloutFileName(filepath.Base(path))
+			if !ok || parsed.ThreadID != threadID {
+				continue
+			}
+			if existing, ok := ExistingRolloutPath(PlainRolloutPath(path)); ok {
+				path = existing
+			}
+			if _, ok := seen[path]; ok {
+				continue
+			}
+			seen[path] = struct{}{}
+			found = append(found, rolloutCopy{path: path, parsed: parsed})
+		}
+		sort.SliceStable(found, func(i, j int) bool {
+			if !found[i].parsed.Timestamp.Equal(found[j].parsed.Timestamp) {
+				return found[i].parsed.Timestamp.After(found[j].parsed.Timestamp)
+			}
+			return found[i].parsed.RolloutID > found[j].parsed.RolloutID
+		})
+		for _, copy := range found {
+			copies = append(copies, copy.path)
+		}
+	}
+	return copies, nil
+}
+
 // FindRolloutPathByRolloutID mirrors Rust `find_rollout_path_by_rollout_id`
 // (codex-rs/rollout/src/list.rs, Rust #47653): locate one immutable rollout file
 // by its rollout id across the unarchived and archived trees. Unlike
@@ -2634,6 +3151,21 @@ func ParseRolloutFileName(name string) (RolloutFileName, bool) {
 		ThreadID:  threadID,
 		RolloutID: rolloutID,
 	}, true
+}
+
+// ThreadIDFromRolloutPath returns the stable thread ID encoded in a canonical
+// rollout filename, including a reverted rollout's name (Rust #57483). It reads
+// the name only and never opens the file.
+func ThreadIDFromRolloutPath(path string) (string, bool) {
+	parsed, ok := ParseRolloutFileName(path)
+	if !ok {
+		return "", false
+	}
+	threadID := strings.TrimSpace(parsed.ThreadID)
+	if threadID == "" {
+		return "", false
+	}
+	return threadID, true
 }
 
 // OwnedUnarchivedThreadRollouts mirrors Rust's `scan_unarchived_threads`
@@ -2832,6 +3364,9 @@ func moveRollout(path string, targetDir string) (string, error) {
 }
 
 func matchesOptions(item *ThreadItem, options *ListOptions) bool {
+	if item.AttachedThread && (options == nil || !options.IncludeAttachedThreads) {
+		return false
+	}
 	if len(options.AllowedSources) > 0 && !contains(options.AllowedSources, item.Source) {
 		return false
 	}

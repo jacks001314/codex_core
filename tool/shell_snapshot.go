@@ -41,6 +41,10 @@ const (
 const (
 	snapshotBrokeredValueEnvPrefix = "CODEX_NETWORK_PROXY_SNAPSHOT_BROKERED_VALUE_"
 	snapshotBrokeredUnsetEnvPrefix = "CODEX_NETWORK_PROXY_SNAPSHOT_BROKERED_UNSET_"
+	// snapshotBrokeredPreparedEnvKey marks a launch whose snapshot was captured
+	// under an active broker, even when the broker had no environment credential
+	// keys to copy. It is removed before the command runs.
+	snapshotBrokeredPreparedEnvKey = "CODEX_NETWORK_PROXY_SNAPSHOT_BROKERED_PREPARED"
 )
 
 // snapshotProxyOverrideVariablePrefix mirrors the capture prefix Rust uses for
@@ -353,6 +357,7 @@ func buildProxyEnvExports(env map[string]string) (string, string) {
 	keys := append([]string(nil), network.ProxyEnvKeys...)
 	keys = append(keys, network.ProxyBrokeredCredentialEnvKeys(env)...)
 	keys = append(keys, network.ProxyCustomCAEnvKeys...)
+	keys = append(keys, network.AWSProxyCABundleEnvVar)
 	if env[network.CredentialBrokerActiveEnvKey] == "1" {
 		keys = append(keys, "BASH_ENV")
 	}
@@ -455,6 +460,9 @@ func hasEnvKey(env map[string]string, key string) bool {
 // for the creation side (which writes the same keys into a brokered snapshot's
 // launch environment) so a plain snapshot is never replayed under the broker.
 func brokeredSnapshotPrepared(env map[string]string) bool {
+	if env[snapshotBrokeredPreparedEnvKey] == "1" {
+		return true
+	}
 	for key := range env {
 		if strings.HasPrefix(key, snapshotBrokeredValueEnvPrefix) ||
 			strings.HasPrefix(key, snapshotBrokeredUnsetEnvPrefix) ||
@@ -529,9 +537,9 @@ func brokeredSnapshotWrap(
 	// child-visible dummy values survive until the command shell finished startup.
 	outerCredentialExports := buildBrokeredCredentialExports(env, false)
 	innerCredentialExports := buildBrokeredCredentialExports(env, true)
-	originalScript := command[2]
+	originalScript := "unset " + snapshotBrokeredPreparedEnvKey + "\n" + command[2]
 	if innerCredentialExports != "" {
-		originalScript = innerCredentialExports + "\n" + command[2]
+		originalScript = innerCredentialExports + "\n" + originalScript
 	}
 	pathExports := (*RuntimePathPrepends)(nil)
 	if len(runtimePathPrepends) > 0 {

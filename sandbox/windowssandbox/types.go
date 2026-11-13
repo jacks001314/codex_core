@@ -52,7 +52,6 @@ type CaptureRequest struct {
 	Env                              map[string]string
 	TimeoutMS                        *int64
 	Cancellation                     CancellationToken
-	UsePrivateDesktop                bool
 	TTY                              bool
 	StdinOpen                        bool
 	ProxyEnforced                    bool
@@ -65,6 +64,7 @@ type CaptureRequest struct {
 	DenyReadPaths                    []string
 	DenyWritePaths                   []string
 	DisallowSetupElevation           bool
+	PrivateDesktopName               string
 }
 
 func (r *CaptureRequest) Validate() error {
@@ -82,6 +82,11 @@ func (r *CaptureRequest) Validate() error {
 	}
 	if strings.TrimSpace(r.PermissionProfileID) == "" && r.PermissionProfile == nil {
 		return fmt.Errorf("%w: permission profile is required", ErrInvalidRequest)
+	}
+	if name := strings.TrimSpace(r.PrivateDesktopName); name != "" {
+		if err := ValidatePrivateDesktopName(name); err != nil {
+			return err
+		}
 	}
 	return nil
 }

@@ -65,6 +65,33 @@ func TestPrepareResponseInputImagesUploadsWithPersistenceIntentLikeRust(t *testi
 	}
 }
 
+// TestPrepareResponseInputImagesUploadsToolOutputsWithThreadIDLikeRust covers
+// the tool-output half of Rust #47121: prepare_tool_output's ImageOrigin now
+// carries the receiving thread id, so images embedded in a
+// function_call_output reach the store with the same thread id as message
+// images.
+func TestPrepareResponseInputImagesUploadsToolOutputsWithThreadIDLikeRust(t *testing.T) {
+	items := append(attachmentStoreTestItems(), map[string]any{
+		"type":    "function_call_output",
+		"call_id": "call-1",
+		"output": []any{map[string]any{
+			"type":      "input_image",
+			"image_url": "data:image/png;base64," + attachmentStoreTestPNG,
+			"detail":    "high",
+		}},
+	})
+	store := &recordingModelImageStore{}
+	prepareResponseInputImagesWithStore(items, store, eventmap.ImagePrepOrigin{ThreadID: "thread-tool"})
+	if len(store.requests) != 2 {
+		t.Fatalf("uploads = %d, want 2 (message and tool output)", len(store.requests))
+	}
+	for _, request := range store.requests {
+		if got := request.ThreadID; got != "thread-tool" {
+			t.Fatalf("upload thread id = %q, want thread-tool", got)
+		}
+	}
+}
+
 // TestPrepareResponseInputImagesCarriesEphemeralIntentLikeRust covers the
 // ephemeral half of Rust #51517: an ephemeral thread's uploads are marked so the
 // store can skip durable persistence.
@@ -88,7 +115,8 @@ func TestPrepareResponseInputImagesCarriesEphemeralIntentLikeRust(t *testing.T) 
 
 // TestPrepareResponseInputImagesFileReferenceReplacesInlineURLLikeRust covers
 // Rust's `UploadResult::File` branch on the request path: the block keeps the
-// store's file id instead of the inline data URL.
+// store's file id instead of the inline data URL, while prepare_image leaves the
+// captured detail hint untouched (Rust only replaces the image reference).
 func TestPrepareResponseInputImagesFileReferenceReplacesInlineURLLikeRust(t *testing.T) {
 	fileResult := attachmentstore.FileUploadResult("file_request")
 	store := &recordingModelImageStore{result: &fileResult}
@@ -104,8 +132,25 @@ func TestPrepareResponseInputImagesFileReferenceReplacesInlineURLLikeRust(t *tes
 	if _, ok := block["image_url"]; ok {
 		t.Fatalf("inline url was kept next to the file reference: %#v", block)
 	}
-	if _, ok := block["detail"]; ok {
-		t.Fatalf("detail was kept next to the file reference: %#v", block)
+	if block["detail"] != "high" {
+		t.Fatalf("detail = %#v, want the captured high hint next to the file reference", block["detail"])
+	}
+}
+
+// A unified-budget upload that the store keeps as a file reference carries
+// Rust's original-detail compatibility hint next to the file id.
+func TestPrepareResponseInputImagesFileReferenceKeepsUnifiedDetailLikeRust(t *testing.T) {
+	fileResult := attachmentstore.FileUploadResult("file_unified")
+	store := &recordingModelImageStore{result: &fileResult}
+	out := prepareResponseInputImagesWithStoreMode(
+		attachmentStoreTestItems(),
+		store,
+		eventmap.ImagePrepOrigin{ThreadID: "thread-1"},
+		eventmap.ImagePrepModeUnifiedBudget,
+	)
+	block := out[0].(map[string]any)["content"].([]any)[0].(map[string]any)
+	if block["file_id"] != "file_unified" || block["detail"] != "original" {
+		t.Fatalf("unified file block = %#v, want file_unified with original detail", block)
 	}
 }
 

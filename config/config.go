@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"codex_core/auth"
 	"codex_core/keymapschema"
 	"codex_core/network"
 
@@ -26,6 +28,10 @@ var embeddedDefaultsTOML string
 type Config struct {
 	Values       map[string]any
 	Requirements *ConfigRequirements
+	// featureLayers preserves the precedence-bearing configuration sources used
+	// to resolve project agent opt-ins (Rust #59476/#59496). It is never
+	// serialized.
+	featureLayers []Layer
 	// allowedSymlinkedCodexHome is the macOS Seatbelt opt-out resolved only from
 	// the host's top-level user config (Rust #42716). Project config, CLI
 	// overrides, and selected profiles cannot set it.
@@ -39,6 +45,12 @@ type Config struct {
 	// generation publishes, so a transport can tell whether binding it would
 	// restrict anything. It is never serialized.
 	ApplicationDestinationPolicy *network.DestinationPolicy `json:"-"`
+	// ApplicationNetworkPolicyOwner is the host-owned live policy this config
+	// was resolved under (Rust `EmbeddedNetworkPolicy`). Configs rebuilt by the
+	// same host carry it forward so existing clients observe policy reloads and
+	// failures instead of each load creating a private generation. It is never
+	// serialized.
+	ApplicationNetworkPolicyOwner *EmbeddedNetworkPolicy `json:"-"`
 	// isProjectless records that configuration discovery found no project-root
 	// marker, no Git checkout root and no project-local config directory
 	// (Rust #46328 ConfigLayerStack::is_projectless). Discovery that was
@@ -49,6 +61,25 @@ type Config struct {
 	// ConfigLayerStack::cloud_config_binding). It does not change the
 	// configuration contents and is never serialized.
 	cloudConfigBinding *CloudConfigBundleBinding
+	// cloudConfigLoader is the managed-configuration loader this configuration
+	// was resolved from. Long-lived hosts keep it so every later read observes
+	// the latest config-server bundle (Rust #57175
+	// ConfigManager::current_managed_config_loader). It is never serialized.
+	cloudConfigLoader *CloudConfigLoader
+	// resolvedMemoryVersion is the memory pipeline selected during config load.
+	// Fresh profiles with memories enabled select V2 when no V1 workspace exists
+	// (Rust #56211); an explicit `memories.version` still wins. It is never
+	// serialized.
+	resolvedMemoryVersion MemoryVersion
+	// chatgptBaseURLExplicit records that a configuration layer above packaged
+	// defaults selected chatgpt_base_url (Rust #57178
+	// Config::chatgpt_base_url_is_explicit). An explicit commercial default must
+	// not be replaced by a credential-dependent government endpoint.
+	chatgptBaseURLExplicit bool
+	// filesystemRequirementsSource records which requirement layer supplied the
+	// managed [permissions.filesystem] policy (Rust RequirementSource). Doctor
+	// reports it without exposing the denied paths.
+	filesystemRequirementsSource string
 }
 
 type ForcedLoginMethod string
@@ -147,6 +178,46 @@ func (c *Config) SQLiteHome() string {
 		return ""
 	}
 	return strings.TrimSpace(stringFromConfigValue(c.Values["sqlite_home"]))
+}
+
+// ConfiguredLogDir returns the explicitly configured `log_dir`, either from
+// user configuration or from managed requirements. It reports false when the
+// key is absent so callers can keep the default SQLite log location (Rust
+// Config::configured_log_dir, #55978).
+func (c *Config) ConfiguredLogDir() (string, bool) {
+	if c == nil || c.Values == nil {
+		return "", false
+	}
+	value, ok := c.Values["log_dir"]
+	if !ok {
+		return "", false
+	}
+	path := strings.TrimSpace(stringFromConfigValue(value))
+	if path == "" {
+		return "", false
+	}
+	return path, true
+}
+
+// HasManagedSQLiteHomeRequirement reports whether managed requirements pin the
+// SQLite home. A required sqlite_home keeps every database, including logs,
+// there even when `log_dir` is configured (Rust #55978).
+func (c *Config) HasManagedSQLiteHomeRequirement() bool {
+	return c != nil && c.Requirements != nil && c.Requirements.SQLiteHome != nil
+}
+
+// UnsafeEnforceSQLiteJournalMode reports whether managed policy requires
+// existing NFS databases to be migrated to DELETE journaling (Rust #57225
+// `unsafe_enforce_sqlite_journal_mode`).
+//
+// Like Rust, this is a managed requirement only: ConfigToml has no such field,
+// so the value comes from the merged requirement layers (local management and
+// cloud policy) rather than user configuration.
+func (c *Config) UnsafeEnforceSQLiteJournalMode() bool {
+	if c == nil || c.Requirements == nil || c.Requirements.UnsafeEnforceSQLiteJournalMode == nil {
+		return false
+	}
+	return *c.Requirements.UnsafeEnforceSQLiteJournalMode
 }
 
 // SuppressUnstableFeaturesWarning reports whether the under-development
@@ -259,6 +330,10 @@ func ResolveResumeCWD(mode ResumeCWDMode, currentCWD, sessionCWD string) string 
 
 const DefaultChatGPTBaseURL = "https://chatgpt.com/backend-api/"
 
+// FedRAMPChatGPTBaseURL is the default ChatGPT backend for API keys with a
+// FedRAMP issuance marker (Rust #57178).
+const FedRAMPChatGPTBaseURL = "https://gov.chatgpt.com/backend-api/"
+
 const DefaultProjectDocMaxBytes = 32 * 1024
 
 type LoadOptions struct {
@@ -272,6 +347,16 @@ type LoadOptions struct {
 	// configuration layers (Rust LoaderOverrides::ignore_project_config,
 	// #38647). Other configuration sources stay active.
 	IgnoreProjectConfig bool
+	// IgnoreUserConfig mirrors --ignore-user-config
+	// (Rust LoaderOverrides::ignore_user_config). CODEX_HOME/config.toml is
+	// never read, so a broken or hostile user config cannot influence the run,
+	// but the User layer stays in the stack with no values: layer precedence --
+	// and therefore every project-trust decision derived from the layers above
+	// the project -- stays comparable with a normal load. Packaged defaults,
+	// managed config, project layers and CLI overrides are unaffected, and the
+	// user's exec-policy rule files are a separate input that this flag does not
+	// touch (Rust ignores only the config file).
+	IgnoreUserConfig bool
 }
 
 type EffectiveOptions struct {
@@ -286,6 +371,7 @@ type EffectiveOptions struct {
 	ManagedConfigPath    string
 	CloudConfigBundle    *CloudConfigLoader
 	IgnoreProjectConfig  bool
+	IgnoreUserConfig     bool
 }
 
 func Load(codexHome string) (*Config, error) {
@@ -316,12 +402,36 @@ func LoadWithOptions(codexHome string, opts *LoadOptions) (*Config, error) {
 		}
 		values = embedded
 	}
-	userValues, err := loadConfigFile(ConfigPath(codexHome))
-	if err != nil {
-		return nil, err
+	featureLayers := []Layer{{
+		Name:   LayerSource{Type: LayerSourcePackagedDefaults, File: packagedDefaultsPath},
+		Config: cloneMap(values),
+	}}
+	ignoreUserConfig := opts != nil && opts.IgnoreUserConfig
+	// Rust's load_user_config_layer (codex-rs/config/src/loader/mod.rs)
+	// returns an empty User layer when ignore_user_config is set instead of
+	// reading the file, which is why an
+	// ignored file may even be syntactically invalid without failing the load.
+	// The layer itself is kept so precedence (and project trust) still sees a
+	// user layer, just with no values.
+	var userValues map[string]any
+	if ignoreUserConfig {
+		userValues = map[string]any{}
+	} else {
+		loaded, loadErr := loadConfigFile(ConfigPath(codexHome))
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		userValues = loaded
 	}
 	allowedSymlinkedCodexHome := resolveAllowedSymlinkedCodexHome(codexHome, userValues)
+	// Packaged defaults always supply a URL, so explicitness needs the layers
+	// above them rather than the merged value (Rust #57178).
+	chatgptBaseURLExplicit := configValuePresent(userValues, "chatgpt_base_url")
 	mergeConfigMaps(values, userValues)
+	featureLayers = append(featureLayers, Layer{
+		Name:   LayerSource{Type: LayerSourceUser, File: ConfigPath(codexHome)},
+		Config: cloneMap(userValues),
+	})
 	profile := ""
 	cwd := ""
 	if opts != nil {
@@ -354,7 +464,16 @@ func LoadWithOptions(codexHome string, opts *LoadOptions) (*Config, error) {
 			if exists {
 				resolveProjectRelativeConfigValues(projectValues, filepath.Dir(path))
 				sanitizeProjectConfigValues(projectValues, brokerState, trustedProviderEnvKeys)
+				chatgptBaseURLExplicit = chatgptBaseURLExplicit || configValuePresent(projectValues, "chatgpt_base_url")
 				mergeConfigMaps(values, projectValues)
+				featureLayers = append(featureLayers, Layer{
+					Name: LayerSource{
+						Type:           LayerSourceProject,
+						File:           path,
+						DotCodexFolder: filepath.Dir(path),
+					},
+					Config: cloneMap(projectValues),
+				})
 			}
 		}
 	}
@@ -366,10 +485,20 @@ func LoadWithOptions(codexHome string, opts *LoadOptions) (*Config, error) {
 	if cwd != "" && !ignoreProjectConfig {
 		isProjectless = projectDiscoveryIsProjectless(cwd, codexHome, projectRootMarkersFromValues(discoveryValues))
 	}
-	if profile != "" {
-		if err := applyProfileLayer(codexHome, values, profile); err != nil {
+	// A selected profile is user configuration: with --ignore-user-config Rust
+	// keeps only the empty User layer (its metadata still records the profile),
+	// so the profile file and any [profiles.*] table contribute nothing and an
+	// unknown profile is not an error either.
+	if profile != "" && !ignoreUserConfig {
+		profileSetsBaseURL, profileValues, err := applyProfileLayer(codexHome, values, profile)
+		if err != nil {
 			return nil, err
 		}
+		chatgptBaseURLExplicit = chatgptBaseURLExplicit || profileSetsBaseURL
+		featureLayers = append(featureLayers, Layer{
+			Name:   LayerSource{Type: LayerSourceUser, Profile: stringPtrIfNotEmpty(profile)},
+			Config: cloneMap(profileValues),
+		})
 	}
 	if opts != nil && opts.IncludeManagedConfig {
 		if shouldIgnoreDefaultManagedConfig(opts.ManagedConfigPath) {
@@ -383,7 +512,12 @@ func LoadWithOptions(codexHome string, opts *LoadOptions) (*Config, error) {
 				return nil, err
 			}
 			if exists {
+				chatgptBaseURLExplicit = chatgptBaseURLExplicit || configValuePresent(managedValues, "chatgpt_base_url")
 				mergeConfigMaps(values, managedValues)
+				featureLayers = append(featureLayers, Layer{
+					Name:   LayerSource{Type: LayerSourceLegacyManagedConfigFromFile, File: managedConfigPath(codexHome, opts.ManagedConfigPath)},
+					Config: cloneMap(managedValues),
+				})
 			}
 		}
 	}
@@ -391,7 +525,10 @@ func LoadWithOptions(codexHome string, opts *LoadOptions) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	requirementsHadFilesystem := requirementsHaveFilesystem(requirements)
+	cloudRequirementsHadFilesystem := false
 	var cloudConfigBinding *CloudConfigBundleBinding
+	var cloudConfigLoader *CloudConfigLoader
 	if opts != nil && opts.IncludeManagedConfig && opts.CloudConfigBundle != nil {
 		// Rust #49269: the loader returns the bundle together with the policy
 		// revision binding it was resolved from, and the binding travels with
@@ -402,32 +539,78 @@ func LoadWithOptions(codexHome string, opts *LoadOptions) (*Config, error) {
 			return nil, snapshot.Err
 		}
 		if bundle := snapshot.Bundle; bundle != nil && !bundle.IsEmpty() {
-			cloudRequirements, err := applyCloudConfigBundle(values, requirements, *bundle, codexHome)
+			bundleLayers, err := CloudConfigLayersFromBundle(*bundle, codexHome)
+			if err != nil {
+				return nil, err
+			}
+			for _, layer := range bundleLayers.EnterpriseManagedConfig {
+				featureLayers = append(featureLayers, Layer{
+					Name: LayerSource{
+						Type: LayerSourceEnterpriseManaged,
+						ID:   layer.Source.ID,
+						Name: layer.Source.Name,
+					},
+					Config: cloneMap(layer.Values),
+				})
+			}
+			cloudRequirements, cloudFilesystem, err := applyCloudConfigBundleWithFilesystemSource(values, requirements, *bundle, codexHome)
 			if err != nil {
 				return nil, err
 			}
 			requirements = cloudRequirements
+			cloudRequirementsHadFilesystem = cloudFilesystem
 		}
 		cloudConfigBinding = snapshot.Binding
+		cloudConfigLoader = opts.CloudConfigBundle
 	}
 	applyManagedApprovalsReviewerGuardianV2Override(values, requirements)
 	applyManagedAuthBackendOverride(values, requirements)
 	applyManagedModelProviderOverride(values, requirements)
 	applyManagedExactOverrides(values, requirements)
+	applyManagedOtelOverrides(values, requirements)
 	if err := applyManagedConstrainedOverrides(values, requirements); err != nil {
 		return nil, err
 	}
+	if requirements != nil && requirements.ChatgptBaseURL != nil {
+		chatgptBaseURLExplicit = true
+	}
+	filesystemRequirementsSource := ""
+	switch {
+	case !requirementsHadFilesystem && !cloudRequirementsHadFilesystem:
+	case requirementsHadFilesystem && cloudRequirementsHadFilesystem:
+		filesystemRequirementsSource = "multiple layers"
+	case cloudRequirementsHadFilesystem:
+		filesystemRequirementsSource = "cloud"
+	default:
+		filesystemRequirementsSource = "system"
+	}
 	cfg := &Config{
-		Values:                    values,
-		Requirements:              requirements,
-		allowedSymlinkedCodexHome: allowedSymlinkedCodexHome,
-		isProjectless:             isProjectless,
-		cloudConfigBinding:        cloudConfigBinding,
+		Values:                       values,
+		Requirements:                 requirements,
+		featureLayers:                featureLayers,
+		allowedSymlinkedCodexHome:    allowedSymlinkedCodexHome,
+		isProjectless:                isProjectless,
+		cloudConfigBinding:           cloudConfigBinding,
+		cloudConfigLoader:            cloudConfigLoader,
+		chatgptBaseURLExplicit:       chatgptBaseURLExplicit,
+		filesystemRequirementsSource: filesystemRequirementsSource,
 	}
 	if err := cfg.ValidateWindowsMXCRequirement(); err != nil {
 		return nil, err
 	}
+	if err := cfg.ValidateGuardianSyncElasticBudget(); err != nil {
+		return nil, err
+	}
 	return cfg, nil
+}
+
+// ValidateGuardianDenialReconsiderationPrompt is retained for callers but no
+// longer rejects anything: Rust #59659 retired the reconsideration prompt, so
+// the key stays parse-compatible and is ignored.
+//
+// Deprecated: Guardian retries replay the original request without a prompt.
+func (c *Config) ValidateGuardianDenialReconsiderationPrompt() error {
+	return nil
 }
 
 // AllowedSymlinkedCodexHome returns the configured CODEX_HOME path whose
@@ -519,6 +702,41 @@ func (c *Config) CloudConfigBinding() *CloudConfigBundleBinding {
 		return nil
 	}
 	return c.cloudConfigBinding
+}
+
+// CloudConfigLoader returns the managed-configuration loader this
+// configuration was resolved from (Rust #57175). Hosts that outlive one
+// configuration load re-read it so managed values stay fresh.
+func (c *Config) CloudConfigLoader() *CloudConfigLoader {
+	if c == nil {
+		return nil
+	}
+	return c.cloudConfigLoader
+}
+
+// FilesystemRequirementsSource reports where the managed filesystem policy was
+// supplied from, using Rust's RequirementSource display values. It returns
+// "none" when no [permissions.filesystem] requirement is active and "unknown"
+// when a Config was assembled without load-time provenance.
+func (c *Config) FilesystemRequirementsSource() string {
+	if c == nil || !requirementsHaveFilesystem(c.Requirements) {
+		return "none"
+	}
+	if source := strings.TrimSpace(c.filesystemRequirementsSource); source != "" {
+		return source
+	}
+	return "unknown"
+}
+
+// requirementsHaveFilesystem reports whether a requirements layer carries the
+// managed [permissions.filesystem] table (Rust ConfigRequirementsToml
+// permissions.filesystem).
+func requirementsHaveFilesystem(requirements *ConfigRequirements) bool {
+	if requirements == nil || requirements.Permissions == nil {
+		return false
+	}
+	value, ok := requirements.Permissions["filesystem"]
+	return ok && value != nil
 }
 
 // applyManagedExactOverrides mirrors Rust ConfigRequirementsToml::apply_to_config
@@ -656,6 +874,7 @@ func LoadEffectiveWithOptions(codexHome string, opts *EffectiveOptions) (*Config
 		loadOpts.ManagedConfigPath = opts.ManagedConfigPath
 		loadOpts.CloudConfigBundle = opts.CloudConfigBundle
 		loadOpts.IgnoreProjectConfig = opts.IgnoreProjectConfig
+		loadOpts.IgnoreUserConfig = opts.IgnoreUserConfig
 	}
 	cfg, err := LoadWithOptions(codexHome, loadOpts)
 	if err != nil {
@@ -685,8 +904,16 @@ func LoadEffectiveWithOptions(codexHome string, opts *EffectiveOptions) (*Config
 			Value: false,
 		})
 	}
-	ApplyOverrides(cfg.Values, overrides)
+	cfg.ApplyOverrides(overrides)
+	if err := cfg.ValidateGuardianSyncElasticBudget(); err != nil {
+		return nil, err
+	}
 	applyDisablePasteBurstOverride(overrides, cfg.Values)
+	// Rust #58428: app settings from enabled plugins apply connector-wide.
+	mergePluginApps(cfg.Values)
+	// Feature overrides can enable memories, so the fresh-profile memory version
+	// is resolved again after the CLI layers land (Rust #56211).
+	cfg.resolveFreshMemoryVersion(codexHome)
 	// Rust #39630: the untrusted approval policy is retired. Explicit
 	// `approval_policy = "untrusted"` settings fail with an actionable error
 	// regardless of strict mode so callers cannot silently fall back.
@@ -747,6 +974,18 @@ func LoadEffectiveWithOptions(codexHome string, opts *EffectiveOptions) (*Config
 			}
 		}
 	}
+	// Rust #41243: `features.sleep_tool.mode` is a closed enum
+	// (SleepToolMode::ModelDriven | AlwaysOn), so an unrecognized value fails
+	// config load instead of silently falling back to model_driven.
+	if err := validateSleepToolConfigValues(cfg.Values); err != nil {
+		return nil, err
+	}
+	// Rust #42320 deserializes `thread_unload_delay_secs` as an optional u64 and
+	// rejects a deadline that cannot fit a monotonic clock. Validate at load time
+	// instead of letting the accessor silently fall back to the default.
+	if err := validateThreadUnloadDelayValue(cfg.Values); err != nil {
+		return nil, err
+	}
 	// Rust #46541: the post-turn compaction threshold is a percentage of the
 	// usable context window; values above 100 are rejected at load time.
 	if percent, ok := configInt(cfg.Values["model_post_turn_compact_threshold_percent"]); ok && percent > 100 {
@@ -768,7 +1007,18 @@ func LoadEffectiveWithOptions(codexHome string, opts *EffectiveOptions) (*Config
 			return nil, err
 		}
 	}
+	cfg.resolveFreshMemoryVersion(codexHome)
 	return cfg, nil
+}
+
+// resolveFreshMemoryVersion records the fresh-profile memory pipeline for this
+// configuration (Rust #56211).
+func (c *Config) resolveFreshMemoryVersion(codexHome string) {
+	if c == nil {
+		return
+	}
+	c.resolvedMemoryVersion = ResolveFreshMemoryVersion(
+		codexHome, c.memoriesFromValues(), featureflags.Enabled(c.FeatureSettings(), "memories"))
 }
 
 // applyDisablePasteBurstOverride keeps CLI top-level overrides ahead of a
@@ -1009,7 +1259,9 @@ var knownTuiConfigFields = map[string]struct{}{
 	"question_esc_back":               {},
 	"raw_output_mode":                 {},
 	"fullscreen_transcript":           {},
+	"collapse_turn_details":           {},
 	"mouse_scroll_speed":              {},
+	"sidebar_width_percent":           {},
 	"copy_on_select":                  {},
 	"right_click_paste":               {},
 	"alternate_screen":                {},
@@ -1356,6 +1608,15 @@ func validateKnownFeatureFieldsAt(value any, prefix string) error {
 			return fmt.Errorf("unknown configuration field `%s.%s`", prefix, key)
 		}
 	}
+	if guardianV3, ok := features["guardianv3"].(map[string]any); ok {
+		// Rust GuardianV3ConfigToml (#56459) denies unknown fields and only
+		// carries the shared `enabled` toggle.
+		for key := range guardianV3 {
+			if key != "enabled" {
+				return fmt.Errorf("unknown configuration field `%s.guardianv3.%s`", prefix, key)
+			}
+		}
+	}
 	if tokenBudget, ok := features["token_budget"].(map[string]any); ok {
 		known := map[string]bool{"enabled": true, "reminder_threshold_tokens": true, "reminder_message_template": true, "guidance_message": true, "auto_compact_fallback_prompt": true, "auto_compact_fallback_buffer_tokens": true}
 		for key := range tokenBudget {
@@ -1415,7 +1676,7 @@ func validateKnownFeatureFieldsAt(value any, prefix string) error {
 	if rolloutBudget, ok := features["rollout_budget"].(map[string]any); ok {
 		// Mirrors Rust RolloutBudgetConfigToml (serde deny_unknown_fields).
 		known := map[string]bool{
-			"enabled": true, "limit_tokens": true, "reminder_at_remaining_tokens": true,
+			"enabled": true, "enforce_limit": true, "limit_tokens": true, "reminder_at_remaining_tokens": true,
 			"sampling_token_weight": true, "prefill_token_weight": true,
 		}
 		for key := range rolloutBudget {
@@ -1431,6 +1692,17 @@ func validateKnownFeatureFieldsAt(value any, prefix string) error {
 		for key := range asyncCompaction {
 			if !known[key] {
 				return fmt.Errorf("unknown configuration field `%s.async_compaction.%s`", prefix, key)
+			}
+		}
+	}
+	if sleepTool, ok := features["sleep_tool"].(map[string]any); ok {
+		// Mirrors Rust SleepToolConfigToml (#41243, serde
+		// deny_unknown_fields). The `mode` enum itself is validated during the
+		// load path (validateSleepToolConfigValues).
+		known := map[string]bool{"enabled": true, "mode": true}
+		for key := range sleepTool {
+			if !known[key] {
+				return fmt.Errorf("unknown configuration field `%s.sleep_tool.%s`", prefix, key)
 			}
 		}
 	}
@@ -1739,10 +2011,10 @@ func (c *Config) GuardianPolicyConfig() (string, bool) {
 	return autoReviewConfigValue(c.Values, "policy")
 }
 
-// GuardianExtraPolicy mirrors Rust Config::guardian_extra_policy (#47125): the
-// managed `guardian_extra_policy` requirement wins over the `[auto_review]
-// extra_policy` config value, and a blank value in either layer is ignored so
-// the lower-priority layer can still apply.
+// GuardianExtraPolicy mirrors Rust Config::guardian_extra_policy: only the
+// managed `guardian_extra_policy` requirement supplies additional rules after
+// #60646 retired `[auto_review] extra_policy`. A blank managed value is treated
+// as unset.
 func (c *Config) GuardianExtraPolicy() (string, bool) {
 	if c == nil {
 		return "", false
@@ -1752,18 +2024,44 @@ func (c *Config) GuardianExtraPolicy() (string, bool) {
 			return value, true
 		}
 	}
-	return autoReviewConfigValue(c.Values, "extra_policy")
+	return "", false
 }
 
-// GuardianPolicyTemplate mirrors Rust Config::guardian_policy_template
-// (`[auto_review] experimental_policy_template`): the full reviewer prompt
-// template whose `{{ tenant_policy_config }}` placeholder receives the resolved
-// policy.
+// GuardianPolicyTemplate reports a host-provided reviewer prompt template.
+// Config.toml no longer supplies one: #60646 retired
+// `[auto_review] experimental_policy_template` so managed rules always use the
+// bundled trusted template.
 func (c *Config) GuardianPolicyTemplate() (string, bool) {
+	return "", false
+}
+
+// GuardianReviewTimeout mirrors Rust Config::guardian_review_timeout (#56371):
+// the overall Guardian review budget configured by `auto_review.timeout_ms`,
+// including setup and retries. It defaults to
+// `state.ReviewTimeout` (90 seconds); a configured zero disables the deadline,
+// which the second result reports as false. Cancellation and the independent
+// transport timeouts still apply when the review is unlimited.
+func (c *Config) GuardianReviewTimeout() (time.Duration, bool) {
+	const defaultReviewTimeout = 90 * time.Second
 	if c == nil {
-		return "", false
+		return defaultReviewTimeout, true
 	}
-	return autoReviewConfigValue(c.Values, "experimental_policy_template")
+	autoReview, ok := c.Values["auto_review"].(map[string]any)
+	if !ok {
+		return defaultReviewTimeout, true
+	}
+	raw, configured := autoReview["timeout_ms"]
+	if !configured {
+		return defaultReviewTimeout, true
+	}
+	timeoutMS, ok := nonNegativeIntFromConfigValue(raw)
+	if !ok {
+		return defaultReviewTimeout, true
+	}
+	if timeoutMS == 0 {
+		return 0, false
+	}
+	return time.Duration(timeoutMS) * time.Millisecond, true
 }
 
 // GuardianConversationHistoryPrompt returns the optional reviewer-only history
@@ -1780,6 +2078,16 @@ func (c *Config) GuardianConversationHistoryPrompt() (string, bool) {
 	}
 	value, ok := autoReview["experimental_conversation_history_prompt"].(string)
 	return value, ok
+}
+
+// GuardianDenialReconsiderationPrompt returns the optional bounded developer
+// message for the gated denial reconsideration pass (Rust #59107). Blank
+// values are treated as unset, like other Guardian policy overrides.
+func (c *Config) GuardianDenialReconsiderationPrompt() (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	return autoReviewConfigValue(c.Values, "experimental_denial_reconsideration_prompt")
 }
 
 // GuardianConversationHistoryMaxOutputTokens returns the positive per-call
@@ -2032,9 +2340,9 @@ func (c *Config) AllowSymlinkedCodexHome() bool {
 
 // ThreadUnloadDelaySecs returns how long the app server keeps an unloaded
 // thread resident before evicting it, mirroring Rust thread_unload_delay_secs
-// (default 1800 seconds, Rust #52081).
+// (default 60 seconds, Rust #57242).
 func (c *Config) ThreadUnloadDelaySecs() time.Duration {
-	const defaultThreadUnloadDelay = 1800 * time.Second
+	const defaultThreadUnloadDelay = 60 * time.Second
 	if c == nil || c.Values == nil {
 		return defaultThreadUnloadDelay
 	}
@@ -2053,6 +2361,35 @@ func (c *Config) ThreadUnloadDelaySecs() time.Duration {
 		return defaultThreadUnloadDelay
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+func validateThreadUnloadDelayValue(values map[string]any) error {
+	if values == nil {
+		return nil
+	}
+	raw, ok := values["thread_unload_delay_secs"]
+	if !ok || raw == nil {
+		return nil
+	}
+	const maxSeconds = float64((1<<63 - 1) / int64(time.Second))
+	var seconds float64
+	switch value := raw.(type) {
+	case int:
+		seconds = float64(value)
+	case int64:
+		seconds = float64(value)
+	case float64:
+		seconds = value
+	default:
+		return fmt.Errorf("`thread_unload_delay_secs` must be a non-negative integer")
+	}
+	if seconds < 0 || math.Trunc(seconds) != seconds {
+		return fmt.Errorf("`thread_unload_delay_secs` must be a non-negative integer")
+	}
+	if seconds > maxSeconds {
+		return fmt.Errorf("`thread_unload_delay_secs` is too large")
+	}
+	return nil
 }
 
 func (c *Config) WaitAgentEnabled() bool {
@@ -2152,21 +2489,6 @@ func (c *Config) CodeModeExperimentalShowCellOverhead() bool {
 	}
 	value, ok := codeMode["experimental_show_cell_overhead"].(bool)
 	return ok && value
-}
-
-// CodeModeToolDescriptionFirst reports whether nested Code Mode tool
-// definitions put the tool description before its namespace description
-// (Rust #51690/#51704). The feature is disabled by default.
-func (c *Config) CodeModeToolDescriptionFirst() bool {
-	if c == nil || c.Values == nil {
-		return false
-	}
-	features, ok := c.Values["features"].(map[string]any)
-	if !ok {
-		return false
-	}
-	enabled, _ := features["code_mode_tool_description_first"].(bool)
-	return enabled
 }
 
 // CodeModeDirectOnlyToolNamespaces returns the exact namespaces that must be
@@ -2307,6 +2629,9 @@ func (c *Config) FeatureSettingsWithLegacyUsages() (map[string]bool, []featurefl
 		values["experimental_use_unified_exec_tool"] = enabled
 	}
 	settings, usages := featureflags.ResolveSettings(values)
+	if !settings["multi_agent"] && agentsExplicitlyEnabled(c.Values) && projectOverridesLegacySubagentOptOut(c.featureLayers) {
+		settings["multi_agent"] = true
+	}
 	if c.Requirements != nil {
 		requirementValues := make(map[string]any, len(c.Requirements.FeatureRequirements))
 		for key, enabled := range c.Requirements.FeatureRequirements {
@@ -2496,6 +2821,61 @@ func (c *Config) SleepToolMode() SleepToolMode {
 	}
 }
 
+// validateSleepToolConfigValues mirrors Rust FeaturesToml/sleep_tool
+// (config/src/features, #41243): the structured table is typed as
+// SleepToolConfigToml, whose `mode` field is a closed enum. Rust fails the
+// config load on an unknown variant, so Go rejects it here as well; the lenient
+// SleepToolMode accessor only exists for programmatic configs.
+func validateSleepToolConfigValues(values map[string]any) error {
+	if values == nil {
+		return nil
+	}
+	if err := validateSleepToolModeAt(values["features"], "features"); err != nil {
+		return err
+	}
+	profiles, ok := values["profiles"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	names := make([]string, 0, len(profiles))
+	for name := range profiles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		profile, ok := profiles[name].(map[string]any)
+		if !ok {
+			continue
+		}
+		if err := validateSleepToolModeAt(profile["features"], "profiles."+name+".features"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateSleepToolModeAt(value any, prefix string) error {
+	featuresValue, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	sleepTool, ok := featuresValue["sleep_tool"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	rawMode, ok := sleepTool["mode"]
+	if !ok {
+		return nil
+	}
+	if text, ok := rawMode.(string); ok {
+		if text == string(SleepToolModeModelDriven) || text == string(SleepToolModeAlwaysOn) {
+			return nil
+		}
+		return fmt.Errorf("invalid %s.sleep_tool.mode %q; expected \"model_driven\" or \"always_on\"", prefix, text)
+	}
+	return fmt.Errorf("invalid %s.sleep_tool.mode; expected \"model_driven\" or \"always_on\"", prefix)
+}
+
 func (c *Config) ChatGPTBaseURL() string {
 	if c == nil {
 		return DefaultChatGPTBaseURL
@@ -2505,6 +2885,67 @@ func (c *Config) ChatGPTBaseURL() string {
 		return DefaultChatGPTBaseURL
 	}
 	return value
+}
+
+func configValuePresent(values map[string]any, key string) bool {
+	if values == nil {
+		return false
+	}
+	_, ok := values[key]
+	return ok
+}
+
+// ChatGPTBackendURL is a ChatGPT backend endpoint that remembers whether
+// configuration supplied an override (Rust ChatgptBaseUrl, #57178).
+type ChatGPTBackendURL struct {
+	// configured is empty for the default endpoint. A non-empty value keeps the
+	// configured URL across credential changes, including an explicit
+	// commercial default.
+	configured string
+}
+
+// ChatGPTBackendURL returns backend routing that resolves defaults against the
+// credentials that will authenticate the request.
+func (c *Config) ChatGPTBackendURL() ChatGPTBackendURL {
+	if c == nil {
+		return ChatGPTBackendURL{}
+	}
+	value := stringFromConfigValue(c.Values["chatgpt_base_url"])
+	if value == "" {
+		value = DefaultChatGPTBaseURL
+	}
+	if !c.chatgptBaseURLExplicit && value == DefaultChatGPTBaseURL {
+		return ChatGPTBackendURL{}
+	}
+	return ChatGPTBackendURL{configured: value}
+}
+
+// NewConfigFromRead returns the runtime view of an effective configuration
+// read. Origin metadata identifies an explicitly configured chatgpt_base_url,
+// because packaged defaults are excluded from origins (Rust #38179).
+func NewConfigFromRead(read *ConfigReadResponse) *Config {
+	if read == nil {
+		return &Config{Values: map[string]any{}}
+	}
+	_, explicit := read.Origins["chatgpt_base_url"]
+	return &Config{
+		Values:                 read.Config,
+		featureLayers:          cloneLayers(read.featureLayers),
+		chatgptBaseURLExplicit: explicit,
+	}
+}
+
+// Resolve returns the backend URL for the credentials that authenticate the
+// request. Only an API key with a FedRAMP issuance marker selects the
+// government default, and only when configuration did not override the URL.
+func (u ChatGPTBackendURL) Resolve(authMode string, apiKey string) string {
+	if u.configured != "" {
+		return u.configured
+	}
+	if authMode == "api-key" && auth.IsFedrampAPIKey(apiKey) {
+		return FedRAMPChatGPTBaseURL
+	}
+	return DefaultChatGPTBaseURL
 }
 
 // ProjectDocMaxBytes is the aggregate project-instruction budget. The current
@@ -2782,6 +3223,46 @@ func embeddedDefaultsValues() (map[string]any, error) {
 	return values, nil
 }
 
+// ParseConfigDocumentValues decodes one config.toml document the way the
+// loader does, so a caller can replay serde's shape checks before the loader
+// applies its own semantic validation.
+func ParseConfigDocumentValues(data []byte) (map[string]any, error) {
+	var values map[string]any
+	if err := toml.Unmarshal(stripUTF8BOM(data), &values); err != nil {
+		return nil, err
+	}
+	if values == nil {
+		values = map[string]any{}
+	}
+	return values, nil
+}
+
+// ReadConfigDocumentValues decodes the config.toml at path.
+func ReadConfigDocumentValues(path string) (map[string]any, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return ParseConfigDocumentValues(data)
+}
+
+// ReadConfigDocumentFile decodes the config.toml at path and also returns the
+// text the parser saw, so diagnostics can quote a line and column. A syntax
+// failure is reported with the wording and span Rust prints for the same
+// document.
+func ReadConfigDocumentFile(path string) (map[string]any, string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", err
+	}
+	text := string(stripUTF8BOM(data))
+	values, err := ParseConfigDocumentValues([]byte(text))
+	if err != nil {
+		return nil, text, TOMLDiagnostic(path, text, err)
+	}
+	return values, text, nil
+}
+
 func loadConfigFileIfExists(path string) (map[string]any, bool, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -2794,7 +3275,7 @@ func loadConfigFileIfExists(path string) (map[string]any, bool, error) {
 	if err := toml.Unmarshal(stripUTF8BOM(data), &values); err != nil {
 		// Rust #46962: keep the failure typed so diagnostics can report the
 		// location instead of echoing values that may be credentials.
-		return nil, false, newConfigLoadError(path, err)
+		return nil, false, newConfigLoadError(path, string(stripUTF8BOM(data)), err)
 	}
 	if values == nil {
 		values = map[string]any{}
@@ -3466,27 +3947,32 @@ func resolveConfigFileRelativePath(value string, baseDir string) string {
 	return filepath.Clean(filepath.Join(baseDir, value))
 }
 
-func applyProfileLayer(codexHome string, values map[string]any, profile string) error {
+// applyProfileLayer merges a selected profile and reports whether that profile
+// selected chatgpt_base_url, together with the profile's own values for layer
+// precedence checks.
+func applyProfileLayer(codexHome string, values map[string]any, profile string) (bool, map[string]any, error) {
 	profilePath, err := ResolveProfileConfigPath(codexHome, profile)
 	if err != nil {
-		return err
+		return false, nil, err
 	}
 	profileValues, exists, err := loadConfigFileIfExists(profilePath)
 	if err != nil {
-		return err
+		return false, nil, err
 	}
 	if exists {
+		setsBaseURL := configValuePresent(profileValues, "chatgpt_base_url")
 		mergeConfigMaps(values, profileValues)
-		return nil
+		return setsBaseURL, profileValues, nil
 	}
 	if legacyProfile, ok, err := legacyProfileValues(values, profile); ok || err != nil {
 		if err != nil {
-			return err
+			return false, nil, err
 		}
+		setsBaseURL := configValuePresent(legacyProfile, "chatgpt_base_url")
 		mergeConfigMaps(values, legacyProfile)
-		return nil
+		return setsBaseURL, legacyProfile, nil
 	}
-	return fmt.Errorf("profile %q not found", profile)
+	return false, nil, fmt.Errorf("profile %q not found", profile)
 }
 
 func legacyProfileValues(values map[string]any, profile string) (map[string]any, bool, error) {
@@ -3597,13 +4083,6 @@ func mergeConfigMapsAt(dst map[string]any, src map[string]any, path []string) {
 	}
 }
 
-func isMultiAgentV2FeaturePath(path []string) bool {
-	if len(path) == 2 && path[0] == "features" && path[1] == "multi_agent_v2" {
-		return true
-	}
-	return len(path) == 4 && path[0] == "profiles" && path[2] == "features" && path[3] == "multi_agent_v2"
-}
-
 // structuredFeatureName mirrors Rust is_structured_feature_path
 // (config/src/merge.rs): the named feature paths whose legacy boolean toggle
 // converts to an `enabled` field when merged with a nested table.
@@ -3618,7 +4097,7 @@ func structuredFeatureName(path []string) (string, bool) {
 		return "", false
 	}
 	switch feature {
-	case "multi_agent_v2", "network_proxy", "sleep_tool":
+	case "code_mode", "multi_agent_v2", "network_proxy", "sleep_tool":
 		return feature, true
 	default:
 		return "", false

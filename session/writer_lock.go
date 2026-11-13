@@ -7,16 +7,35 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/gofrs/flock"
 )
 
 const writerLockDir = "thread-writer-locks"
 
+// Rust #57360: contention on the coordination lock must not block writer
+// cleanup indefinitely, so acquisition retries and then reports a timeout.
+const writerLockCoordinationRetry = 50 * time.Millisecond
+
+// writerLockCoordinationTimeout is a variable so tests can shorten the wait.
+var writerLockCoordinationTimeout = 30 * time.Second
+
 type WriterLock struct {
 	coordinator *writerLockCoordinator
 	path        string
 	lock        *flock.Flock
+	once        sync.Once
+}
+
+// PublicationLock keeps the home coordination lock held while a rollout file is
+// replaced. Rust #44138 (`WriterLockCoordinator::try_acquire_for_publication`)
+// probes the thread lock under coordination and keeps only coordination: every
+// writer takes coordination before opening its thread lock, so no writer can
+// start between the final file-state check and the publish/remove pair.
+type PublicationLock struct {
+	coordinator *writerLockCoordinator
+	probe       *flock.Flock
 	once        sync.Once
 }
 
@@ -62,6 +81,21 @@ func (s *Store) AcquireWriters(threadIDs []ThreadID) ([]*WriterLock, error) {
 	return locks, nil
 }
 
+// TryAcquireForPublication probes a thread while holding the home coordination
+// lock. It reports ErrConflict while a live writer owns the thread and
+// otherwise returns a guard that keeps coordination locked until Release.
+// The probe never creates a thread lock file, so a missing file means the
+// thread is idle (Rust opens the lock without O_CREATE for the same reason).
+func (s *Store) TryAcquireForPublication(threadID ThreadID) (*PublicationLock, error) {
+	if s == nil {
+		return nil, fmt.Errorf("thread store is nil")
+	}
+	if err := validateThreadID(threadID); err != nil {
+		return nil, err
+	}
+	return s.writerLocks().tryAcquireForPublication(threadID)
+}
+
 func (s *Store) writerLocks() *writerLockCoordinator {
 	s.writerLocksOnce.Do(func() {
 		s.writerLockCoordinator = newWriterLockCoordinator(s.root)
@@ -73,8 +107,8 @@ func (c *writerLockCoordinator) acquire(threadID ThreadID) (*WriterLock, error) 
 	if err := os.MkdirAll(c.directory, 0o700); err != nil {
 		return nil, fmt.Errorf("create thread writer lock directory: %w", err)
 	}
-	if err := c.coordination.Lock(); err != nil {
-		return nil, fmt.Errorf("acquire thread writer coordination lock: %w", err)
+	if err := lockWriterCoordination(c.coordination); err != nil {
+		return nil, err
 	}
 	defer func() { _ = c.coordination.Unlock() }()
 
@@ -90,23 +124,84 @@ func (c *writerLockCoordinator) acquire(threadID ThreadID) (*WriterLock, error) 
 	return &WriterLock{coordinator: c, path: path, lock: fileLock}, nil
 }
 
+func (c *writerLockCoordinator) tryAcquireForPublication(threadID ThreadID) (*PublicationLock, error) {
+	if err := os.MkdirAll(c.directory, 0o700); err != nil {
+		return nil, fmt.Errorf("create thread writer lock directory: %w", err)
+	}
+	if err := lockWriterCoordination(c.coordination); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(c.directory, string(threadID)+".lock")
+	probe := flock.New(path, flock.SetFlag(os.O_RDWR))
+	locked, err := probe.TryLock()
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// No lock file means no writer ever owned the thread; coordination
+			// alone guards publication and the file stays absent.
+			return &PublicationLock{coordinator: c}, nil
+		}
+		_ = c.coordination.Unlock()
+		return nil, fmt.Errorf("probe thread writer lock %s: %w", path, err)
+	}
+	if !locked {
+		_ = c.coordination.Unlock()
+		return nil, fmt.Errorf("%w: thread %s already has an active writer", ErrConflict, threadID)
+	}
+	return &PublicationLock{coordinator: c, probe: probe}, nil
+}
+
+// Release drops the probe and the coordination lock without deleting the thread
+// lock file: publication is not the thread's owner, so the file belongs to the
+// next real writer.
+func (p *PublicationLock) Release() error {
+	if p == nil {
+		return nil
+	}
+	var releaseErr error
+	p.once.Do(func() {
+		if p.probe != nil {
+			if err := p.probe.Unlock(); err != nil {
+				releaseErr = err
+			}
+			p.probe = nil
+		}
+		if err := p.coordinator.coordination.Unlock(); releaseErr == nil && err != nil {
+			releaseErr = err
+		}
+	})
+	return releaseErr
+}
+
+// Close drops thread ownership. Rust #59969: the close path is not allowed to
+// queue behind another process's coordination hold, because cleanup retries
+// every 50 ms for the whole 30 s budget and that amplification shows up as a
+// latency cliff under cross-process contention. Cleanup therefore takes a
+// shared coordination lock without waiting: two closers never exclude each
+// other, a writer inside its critical section is detected and the lock file is
+// left for the next writer's stale-lock cleanup instead of racing it.
 func (l *WriterLock) Close() error {
 	if l == nil {
 		return nil
 	}
 	var closeErr error
 	l.once.Do(func() {
-		if err := l.coordinator.coordination.Lock(); err != nil {
-			closeErr = fmt.Errorf("acquire thread writer coordination lock: %w", err)
+		coordination, shared, err := l.coordinator.tryRLock()
+		if err != nil {
+			closeErr = err
 			return
 		}
-		defer func() {
-			if err := l.coordinator.coordination.Unlock(); closeErr == nil && err != nil {
-				closeErr = err
-			}
-		}()
+		if shared {
+			defer func() {
+				if unlockErr := coordination.Unlock(); closeErr == nil && unlockErr != nil {
+					closeErr = unlockErr
+				}
+			}()
+		}
 		if err := l.lock.Unlock(); err != nil {
 			closeErr = err
+			return
+		}
+		if !shared {
 			return
 		}
 		if err := os.Remove(l.path); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -114,6 +209,51 @@ func (l *WriterLock) Close() error {
 		}
 	})
 	return closeErr
+}
+
+// openCoordination prepares the directory and returns the shared coordination
+// lock handle without locking it.
+func (c *writerLockCoordinator) openCoordination() (*flock.Flock, error) {
+	if err := os.MkdirAll(c.directory, 0o700); err != nil {
+		return nil, fmt.Errorf("create thread writer lock directory: %w", err)
+	}
+	return c.coordination, nil
+}
+
+// tryRLock probes the coordination lock with a shared, non-blocking acquire.
+// The boolean reports whether the probe succeeded; a failed probe is not an
+// error, it only means another process is inside a coordination critical
+// section right now.
+func (c *writerLockCoordinator) tryRLock() (*flock.Flock, bool, error) {
+	lock, err := c.openCoordination()
+	if err != nil {
+		return nil, false, err
+	}
+	locked, err := lock.TryRLock()
+	if err != nil {
+		return lock, false, fmt.Errorf("acquire thread writer coordination read lock: %w", err)
+	}
+	return lock, locked, nil
+}
+
+// lockWriterCoordination mirrors Rust's bounded coordination wait: retry every
+// 50 ms and report a timeout instead of blocking forever when another process
+// holds the lock.
+func lockWriterCoordination(lock *flock.Flock) error {
+	deadline := time.Now().Add(writerLockCoordinationTimeout)
+	for {
+		locked, err := lock.TryLock()
+		if err != nil {
+			return fmt.Errorf("acquire thread writer coordination lock: %w", err)
+		}
+		if locked {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("acquire thread writer coordination lock: %w: timed out waiting for the thread writer coordination lock; another Codex process may be suspended on this or another host", os.ErrDeadlineExceeded)
+		}
+		time.Sleep(writerLockCoordinationRetry)
+	}
 }
 
 func releaseWriterLocks(locks []*WriterLock) {

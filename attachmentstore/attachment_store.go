@@ -220,11 +220,13 @@ func (m AttachmentMetadata) Debug() string {
 func (m AttachmentMetadata) GoString() string { return m.Debug() }
 
 // FormatSpecificMetadata is metadata specific to an attachment format,
-// mirroring Rust's tagged `FormatSpecificMetadata` enum (`kind: "image"`).
+// mirroring Rust's tagged `FormatSpecificMetadata` enum (`kind: "image"` or
+// `kind: "audio"`, the latter added by #59268).
 type FormatSpecificMetadata struct {
-	// Kind is the format tag (`"image"`).
+	// Kind is the format tag (`"image"` or `"audio"`).
 	Kind  string         `json:"kind"`
 	Image *ImageMetadata `json:"-"`
+	Audio *AudioMetadata `json:"-"`
 }
 
 // ImageFormatSpecificMetadata builds the image variant.
@@ -251,6 +253,12 @@ func (f *FormatSpecificMetadata) Debug() string {
 	if f.Kind == "image" {
 		return fmt.Sprintf("Image(%s)", f.ImageOrZero().Debug())
 	}
+	if f.Kind == "audio" {
+		return fmt.Sprintf("Audio(%s)", f.AudioOrZero().Debug())
+	}
+	if f.Kind == "audio" {
+		return fmt.Sprintf("Audio(%s)", f.AudioOrZero().Debug())
+	}
 	return fmt.Sprintf("FormatSpecific(kind: %s)", rustDebugString(f.Kind))
 }
 
@@ -260,6 +268,41 @@ func (f *FormatSpecificMetadata) ImageOrZero() *ImageMetadata {
 		return &ImageMetadata{}
 	}
 	return f.Image
+}
+
+// AudioFormatSpecificMetadata builds the audio variant.
+func AudioFormatSpecificMetadata(audio *AudioMetadata) *FormatSpecificMetadata {
+	if audio == nil {
+		audio = &AudioMetadata{}
+	}
+	return &FormatSpecificMetadata{Kind: "audio", Audio: audio}
+}
+
+// AudioOrZero returns the audio metadata, defaulting to an empty value.
+func (f *FormatSpecificMetadata) AudioOrZero() *AudioMetadata {
+	if f == nil || f.Audio == nil {
+		return &AudioMetadata{}
+	}
+	return f.Audio
+}
+
+// AudioMetadata is metadata specific to an audio attachment, mirroring Rust
+// `AudioMetadata` (#59268). DurationMs carries the store's measured duration
+// when the backend knows it.
+type AudioMetadata struct {
+	DurationMs *uint64 `json:"duration_ms,omitempty"`
+}
+
+// String returns the Rust `Debug` rendering of the metadata.
+func (m AudioMetadata) String() string { return m.Debug() }
+
+// Debug mirrors Rust's derived `Debug` for `AudioMetadata`.
+func (m AudioMetadata) Debug() string {
+	duration := "None"
+	if m.DurationMs != nil {
+		duration = fmt.Sprintf("Some(%d)", *m.DurationMs)
+	}
+	return fmt.Sprintf("AudioMetadata { duration_ms: %s }", duration)
 }
 
 // ImageMetadata is metadata specific to an image attachment, mirroring Rust
@@ -291,6 +334,29 @@ type Store interface {
 	// Resolve returns metadata, and when requested a fresh URL, for a stored
 	// attachment.
 	Resolve(request ResolveRequest) (AttachmentMetadata, error)
+}
+
+// ResolvableStore is a Store that can confirm whether a file reference is
+// still available (Rust #57585 `AttachmentStore::is_resolvable`). Returning
+// false asserts the file is confirmed missing; backend and access errors must
+// keep the reference, so implementations report true when unsure.
+type ResolvableStore interface {
+	Store
+	IsResolvable(fileID string) bool
+}
+
+// IsResolvable reports whether fileID should stay in a model request. Stores
+// that do not implement ResolvableStore - including InlineStore and stores that
+// only know provider-owned IDs - retain every reference, matching Rust's
+// default trait method.
+func IsResolvable(store Store, fileID string) bool {
+	if store == nil {
+		return true
+	}
+	if checker, ok := store.(ResolvableStore); ok {
+		return checker.IsResolvable(fileID)
+	}
+	return true
 }
 
 // InlineStore leaves attachments inline instead of storing them, mirroring Rust

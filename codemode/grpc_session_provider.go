@@ -29,16 +29,25 @@ import (
 // like Rust 85f331772f (#38087), and the shared HTTP client's transport
 // supplies proxy and custom-CA dialing.
 type GrpcCodeModeSessionProvider struct {
-	endpoint   string
-	httpClient *http.Client
+	endpoint    string
+	httpClient  *http.Client
+	completions *completionWindow
 
-	mu          sync.Mutex
-	connection  *remoteConnection
-	nextSession atomic.Uint64
+	mu                 sync.Mutex
+	connection         *remoteConnection
+	nextSession        atomic.Uint64
+	nextCellGeneration atomic.Uint64
 }
 
 func NewGrpcCodeModeSessionProvider(endpoint string, httpClient *http.Client) *GrpcCodeModeSessionProvider {
-	return &GrpcCodeModeSessionProvider{endpoint: strings.TrimSpace(endpoint), httpClient: httpClient}
+	return &GrpcCodeModeSessionProvider{endpoint: strings.TrimSpace(endpoint), httpClient: httpClient, completions: newCompletionWindow()}
+}
+
+func (p *GrpcCodeModeSessionProvider) completionWindow() *completionWindow {
+	if p == nil {
+		return nil
+	}
+	return p.completions
 }
 
 // UsesGrpcCodeModeEndpoint reports whether the code-mode host URL selects the
@@ -58,8 +67,20 @@ func (p *GrpcCodeModeSessionProvider) Availability() error {
 func (p *GrpcCodeModeSessionProvider) TakeUnavailableWarning(string) string { return "" }
 
 func (p *GrpcCodeModeSessionProvider) NewSession(delegate tool.CodeModeRemoteDelegate) tool.CodeModeRemoteSession {
+	return p.NewSessionWithOptions(delegate, tool.CodeModeSessionOptions{})
+}
+
+// NewSessionWithOptions honors the requested session options (Rust
+// CodeModeSessionProvider::create_session_with_options, #58125).
+func (p *GrpcCodeModeSessionProvider) NewSessionWithOptions(delegate tool.CodeModeRemoteDelegate, options tool.CodeModeSessionOptions) tool.CodeModeRemoteSession {
 	value := p.nextSession.Add(1)
-	return &remoteSession{provider: p, delegate: delegate, id: SessionID(fmt.Sprintf("session-%d", value))}
+	return &remoteSession{provider: p, delegate: delegate, id: SessionID(fmt.Sprintf("session-%d", value)), options: sessionOptionsFromTool(options)}
+}
+
+// nextGeneration keeps replacement sessions from reusing cell IDs after a
+// thread reload (Rust #57615).
+func (p *GrpcCodeModeSessionProvider) nextGeneration() uint64 {
+	return p.nextCellGeneration.Add(1)
 }
 
 func (p *GrpcCodeModeSessionProvider) Prewarm(ctx context.Context) error {
@@ -96,6 +117,7 @@ func (p *GrpcCodeModeSessionProvider) connect(ctx context.Context) (*remoteConne
 	if p.connection != nil && p.connection.Alive() {
 		return p.connection, nil
 	}
+	ensureGrpcZstdRegistered()
 	// Rust #38087 preserves gRPC frame-size limits: the code-mode protocol
 	// permits frames up to ProtocolMaxFrameBytes, so raise gRPC's 4 MiB
 	// defaults to match.

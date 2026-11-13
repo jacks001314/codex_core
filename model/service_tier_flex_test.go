@@ -12,33 +12,68 @@ import (
 // without fast mode or catalog support, while every other tier still requires
 // fast mode and catalog support.
 func TestServiceTierForConfiguredRequestLikeRust(t *testing.T) {
-	supported := &ModelInfo{ServiceTiers: []string{"priority", "flex"}}
+	supported := &ModelInfo{ServiceTiers: []string{"priority", "ultrafast", "flex"}}
 	for _, fastModeEnabled := range []bool{false, true} {
-		if got := ServiceTierForConfiguredRequest(supported, "flex", fastModeEnabled); got != "flex" {
+		if got := ServiceTierForConfiguredRequest(supported, "flex", map[string]bool{"fast_mode": fastModeEnabled}); got != "flex" {
 			t.Fatalf("flex (fast_mode=%v) = %q, want flex", fastModeEnabled, got)
 		}
 	}
 	// Flex survives a catalog that does not advertise it.
 	noTiers := &ModelInfo{}
-	if got := ServiceTierForConfiguredRequest(noTiers, "flex", false); got != "flex" {
+	if got := ServiceTierForConfiguredRequest(noTiers, "flex", nil); got != "flex" {
 		t.Fatalf("flex without catalog support = %q, want flex", got)
 	}
 	// Ordinary tiers still need fast mode and support.
-	if got := ServiceTierForConfiguredRequest(supported, "priority", false); got != "" {
+	if got := ServiceTierForConfiguredRequest(supported, "priority", map[string]bool{"fast_mode": false}); got != "" {
 		t.Fatalf("priority without fast mode = %q, want empty", got)
 	}
-	if got := ServiceTierForConfiguredRequest(supported, "priority", true); got != "priority" {
+	if got := ServiceTierForConfiguredRequest(supported, "priority", map[string]bool{"fast_mode": true}); got != "priority" {
 		t.Fatalf("priority with fast mode = %q, want priority", got)
 	}
-	if got := ServiceTierForConfiguredRequest(noTiers, "priority", true); got != "" {
+	if got := ServiceTierForConfiguredRequest(noTiers, "priority", map[string]bool{"fast_mode": true}); got != "" {
 		t.Fatalf("unsupported priority = %q, want empty", got)
 	}
-	if got := ServiceTierForConfiguredRequest(supported, "default", true); got != "" {
+	if got := ServiceTierForConfiguredRequest(supported, "default", map[string]bool{"fast_mode": true}); got != "" {
 		t.Fatalf("default = %q, want empty on the wire", got)
+	}
+	// Rust #51253: Ultra Fast follows its own policy, not Fast mode.
+	if got := ServiceTierForConfiguredRequest(supported, "ultrafast", map[string]bool{"fast_mode": false, "ultrafast_mode": true}); got != "ultrafast" {
+		t.Fatalf("ultrafast with fast disabled = %q, want ultrafast", got)
+	}
+	if got := ServiceTierForConfiguredRequest(supported, "ultrafast", map[string]bool{"fast_mode": true, "ultrafast_mode": false}); got != "" {
+		t.Fatalf("ultrafast with ultrafast mode disabled = %q, want empty", got)
+	}
+	if got := ServiceTierForConfiguredRequest(supported, "ultrafast", nil); got != "ultrafast" {
+		t.Fatalf("ultrafast defaults to enabled = %q, want ultrafast", got)
 	}
 	// Rust compares the configured value exactly, so only whitespace is trimmed.
 	if !IsFlexServiceTier("  flex  ") || IsFlexServiceTier("FLEX") || IsFlexServiceTier("priority") {
 		t.Fatal("IsFlexServiceTier did not match Rust's exact comparison")
+	}
+}
+
+// Mirrors Rust #55923's get_service_tier split: the selected tier is retained
+// for persistence while the request-visible value is filtered against the
+// model catalog, and flex is always preserved.
+func TestServiceTierForSelectedRequestLikeRust(t *testing.T) {
+	priorityOnly := &ModelInfo{ServiceTiers: []string{"priority"}}
+	if got := ServiceTierForSelectedRequest(priorityOnly, "flex"); got != "flex" {
+		t.Fatalf("flex = %q, want flex", got)
+	}
+	if got := ServiceTierForSelectedRequest(&ModelInfo{}, "flex"); got != "flex" {
+		t.Fatalf("flex without catalog support = %q, want flex", got)
+	}
+	if got := ServiceTierForSelectedRequest(priorityOnly, "priority"); got != "priority" {
+		t.Fatalf("supported priority = %q, want priority", got)
+	}
+	if got := ServiceTierForSelectedRequest(priorityOnly, "fast"); got != "priority" {
+		t.Fatalf("fast = %q, want priority", got)
+	}
+	if got := ServiceTierForSelectedRequest(&ModelInfo{}, "priority"); got != "" {
+		t.Fatalf("unsupported priority = %q, want empty", got)
+	}
+	if got := ServiceTierForSelectedRequest(priorityOnly, "default"); got != "" {
+		t.Fatalf("default = %q, want empty", got)
 	}
 }
 

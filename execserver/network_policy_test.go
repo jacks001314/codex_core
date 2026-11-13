@@ -1,6 +1,7 @@
 package execserver
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -47,6 +48,7 @@ func TestRemoteNetworkProxyConfigRoundTripsSupportedRustFields(t *testing.T) {
 	settings.DangerouslyAllowAllUnixSockets = &allowAllUnixSockets
 	settings.Mode = network.ProxyModeLimited
 	settings.AllowLocalBinding = true
+	settings.ReviewDomains = []string{"review.example.com"}
 	settings.Domains = &network.ProxyDomainPermissions{Entries: []network.ProxyDomainPermissionEntry{
 		{Pattern: "allowed.example", Permission: network.ProxyDomainAllow},
 		{Pattern: "blocked.example", Permission: network.ProxyDomainDeny},
@@ -69,6 +71,45 @@ func TestRemoteNetworkProxyConfigRoundTripsSupportedRustFields(t *testing.T) {
 	}
 	if got.Domains == nil || len(got.Domains.Entries) != 2 || got.UnixSockets == nil || len(got.UnixSockets.Entries) != 2 {
 		t.Fatalf("round-trip permissions = domains=%#v sockets=%#v", got.Domains, got.UnixSockets)
+	}
+	if len(got.ReviewDomains) != 1 || got.ReviewDomains[0] != "review.example.com" {
+		t.Fatalf("round-trip review domains = %#v", got.ReviewDomains)
+	}
+	wire, err := json.Marshal(remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(wire), `"reviewDomains":["review.example.com"]`) {
+		t.Fatalf("review domains missing from wire: %s", wire)
+	}
+	empty, err := json.Marshal(RemoteNetworkProxyConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(empty), "reviewDomains") {
+		t.Fatalf("empty review domains should be omitted: %s", empty)
+	}
+}
+
+func TestStartRequiresNetworkReviewDomainsCapabilityLikeRust(t *testing.T) {
+	launch := &ExecParams{NetworkProxy: &RemoteNetworkProxyLaunchConfig{
+		Proxy: RemoteNetworkProxyConfig{ReviewDomains: []string{"review.example.com"}},
+	}}
+	legacy := &Client{}
+	legacy.rememberEnvironmentInfo(&EnvironmentInfo{Capabilities: EnvironmentCapabilities{NetworkProxyLaunch: true}})
+	if err := legacy.ensureNetworkReviewCapability(context.Background(), launch); err == nil || !strings.Contains(err.Error(), "does not support managed network review domains") {
+		t.Fatalf("legacy capability error = %v", err)
+	}
+	supported := &Client{}
+	supported.rememberEnvironmentInfo(&EnvironmentInfo{Capabilities: EnvironmentCapabilities{
+		NetworkProxyLaunch:        true,
+		NetworkProxyReviewDomains: true,
+	}})
+	if err := supported.ensureNetworkReviewCapability(context.Background(), launch); err != nil {
+		t.Fatalf("supported capability error = %v", err)
+	}
+	if err := legacy.ensureNetworkReviewCapability(context.Background(), &ExecParams{}); err != nil {
+		t.Fatalf("launch without review domains should not require the capability: %v", err)
 	}
 }
 
@@ -132,16 +173,73 @@ func TestRemoteCredentialMaskingCarriesOnlyBrokerActivationLikeRust(t *testing.T
 		t.Fatal("legacy conversion unexpectedly accepted credential brokerage")
 	}
 
-	// Configured providers are not transported, so the same launch falls back
-	// to an unmasked remote proxy instead of failing the command.
+	// Rust #56049: configured provider rules travel with the launch, so the
+	// executor-local broker can resolve them.
 	settings.CredentialProviders = map[string]network.CredentialProviderConfig{
-		"vendor": {Env: []string{"VENDOR_TOKEN"}},
+		"vendor": {Env: []string{"VENDOR_TOKEN"}, Patterns: []string{"v-[a-z]+"}, Auth: []network.CredentialAuthMethod{network.CredentialAuthToken}},
 	}
-	fallback, err := RemoteNetworkProxyConfigFromProxyConfigWithCredentialMasking(network.ProxyConfig{Network: settings}, true)
+	configured, err := RemoteNetworkProxyConfigFromProxyConfigWithCredentialMasking(network.ProxyConfig{Network: settings}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fallback.CredentialMasking {
-		t.Fatalf("configured providers were transported as masking: %#v", fallback)
+	if !configured.CredentialMasking || len(configured.CredentialProviders) != 1 {
+		t.Fatalf("configured providers were not transported: %#v", configured)
+	}
+	data, err = json.Marshal(configured)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"credentialMasking":true`) ||
+		!strings.Contains(string(data), `"credentialProviders":{"vendor":{"env":["VENDOR_TOKEN"],"patterns":["v-[a-z]+"],"auth":["token"]}}`) {
+		t.Fatalf("configured remote wire = %s", data)
+	}
+	roundTrip, err = configured.ProxyConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !roundTrip.Network.CredentialBroker || len(roundTrip.Network.CredentialProviders) != 1 {
+		t.Fatalf("round-trip providers = %#v", roundTrip.Network)
+	}
+
+	// An executor that masks only built-in providers keeps the unmasked
+	// fallback for configured providers.
+	fallback, err := RemoteNetworkProxyConfigFromProxyConfigWithCredentialMaskingMode(network.ProxyConfig{Network: settings}, RemoteCredentialMaskingBuiltInOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fallback.CredentialMasking || len(fallback.CredentialProviders) != 0 {
+		t.Fatalf("built-in-only masking accepted configured providers: %#v", fallback)
+	}
+
+	// Provider rules sent with masking off are discarded on decode.
+	var normalized RemoteNetworkProxyConfig
+	if err := json.Unmarshal([]byte(`{"enabled":true,"mode":"full","credentialProviders":{"vendor":{"env":["VENDOR_TOKEN"]}}}`), &normalized); err != nil {
+		t.Fatal(err)
+	}
+	if len(normalized.CredentialProviders) != 0 {
+		t.Fatalf("providers survived disabled masking: %#v", normalized)
+	}
+}
+
+func TestEnvironmentCapabilitiesNetworkProxyModesLikeRust(t *testing.T) {
+	tests := []struct {
+		name     string
+		info     EnvironmentCapabilities
+		expected RemoteCredentialMasking
+	}{
+		{name: "disabled", expected: RemoteCredentialMaskingDisabled},
+		{name: "custom providers without masking", info: EnvironmentCapabilities{CredentialMaskingCustomProviders: true}, expected: RemoteCredentialMaskingDisabled},
+		{name: "built-in only", info: EnvironmentCapabilities{CredentialMasking: true}, expected: RemoteCredentialMaskingBuiltInOnly},
+		{name: "configured providers", info: EnvironmentCapabilities{CredentialMasking: true, CredentialMaskingCustomProviders: true}, expected: RemoteCredentialMaskingWithConfiguredProviders},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.info.NetworkProxy().CredentialMasking; got != test.expected {
+				t.Fatalf("NetworkProxy().CredentialMasking = %v, want %v", got, test.expected)
+			}
+		})
+	}
+	if !(EnvironmentCapabilities{NetworkProxyLaunch: true}).NetworkProxy().Launch {
+		t.Fatal("NetworkProxy().Launch = false, want true")
 	}
 }

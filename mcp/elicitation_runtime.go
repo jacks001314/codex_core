@@ -112,9 +112,12 @@ func parseMCPElicitationRequest(serverName string, method string, id json.RawMes
 	// The OpenAI elicitation arrives on the umbrella method
 	// `openai/elicitation/create` with its kind in the payload's mode.
 	request.Mode = stringFromAnyMap(raw, "mode")
-	if request.Mode == "" && request.Method == "openai/userVerification" {
+	if request.Mode == "" && request.Method == UserVerificationMode {
 		request.Mode = request.Method
 	}
+	request.Title = stringFromAnyMap(raw, "title")
+	request.Description = stringFromAnyMap(raw, "description")
+	request.Challenge = stringFromAnyMap(raw, "challenge")
 	request.URL = stringFromAnyMap(raw, "url")
 	request.ElicitationID = stringFromAnyMap(raw, "elicitationId")
 	if request.ElicitationID == "" {
@@ -130,7 +133,27 @@ func parseMCPElicitationRequest(serverName string, method string, id json.RawMes
 	} else if value, ok := raw["meta"]; ok {
 		request.Meta = cloneJSONValue(value)
 	}
+	if IsUserVerificationElicitation(request) {
+		// Rust restore_context_meta (#46952) drops the transport progress token
+		// from user-verification metadata before forwarding it to clients.
+		request.Meta = userVerificationMetaWithoutProgressToken(request.Meta)
+	}
 	return request
+}
+
+func userVerificationMetaWithoutProgressToken(meta any) any {
+	object, ok := meta.(map[string]any)
+	if !ok {
+		return meta
+	}
+	stripped := make(map[string]any, len(object))
+	for key, value := range object {
+		if key == "progressToken" || key == "progress_token" {
+			continue
+		}
+		stripped[key] = value
+	}
+	return stripped
 }
 
 type mcpElicitationContextKey struct{}

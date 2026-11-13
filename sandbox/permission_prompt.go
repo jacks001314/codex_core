@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -68,6 +69,20 @@ type PermissionPromptPermissionMessages struct {
 	DangerFullAccess *string
 	WorkspaceWrite   *string
 	ReadOnly         *string
+	ApprovedPrefixes *string
+	// WritableRoot/WritableRoots replace the bundled writable-root sentence
+	// when it has exactly one `{{ roots }}` placeholder (Rust #56309).
+	WritableRoot  *string
+	WritableRoots *string
+	// OmittedPaths adds catalog presentation ahead of the harness-owned
+	// omission warning (Rust #57263).
+	OmittedPaths *string
+	// DeniedReads wraps the harness-owned denied-reads facts with exactly one
+	// `{{ denied_reads }}` placeholder (Rust #57263).
+	DeniedReads *string
+	// ApprovedCommandPrefixSaved is a plain-text heading for the saved-prefix
+	// notice (Rust #57599). Invalid headings fall back to the bundled marker.
+	ApprovedCommandPrefixSaved *string
 }
 
 // PermissionPromptApprovalMessages mirrors Rust
@@ -77,6 +92,24 @@ type PermissionPromptApprovalMessages struct {
 	OnRequestAutoReview *string
 	Never               *string
 	UnlessTrusted       *string
+	// RequestPermissions replaces the first line of the request_permissions tool
+	// instructions when it is a valid single-line heading (Rust #57581).
+	RequestPermissions *string
+	// AutoReviewSuffix introduces the harness-owned auto-review guidance
+	// (Rust #57581).
+	AutoReviewSuffix *string
+	// Granular carries the catalog's granular-approval templates (Rust
+	// #57325). Templates are preserved verbatim; consumers validate size and
+	// markers before rendering.
+	Granular *PermissionPromptGranularApprovalMessages
+}
+
+// PermissionPromptGranularApprovalMessages preserves the catalog's optional
+// granular-approval presentation templates.
+type PermissionPromptGranularApprovalMessages struct {
+	Intro              *string
+	PromptedCategories *string
+	RejectedCategories *string
 }
 
 // BuildPermissionPrompt ports Rust prompts::PermissionsInstructions: sections
@@ -97,14 +130,14 @@ func BuildPermissionPrompt(config *PermissionPromptConfig) string {
 		text = appendPermissionSection(text, sandbox)
 	}
 	text = appendPermissionSection(text, approvalPromptText(config))
-	if roots := writableRootsText(writableRoots); roots != "" {
+	if roots := writableRootsText(writableRoots, config.PermissionMessages); roots != "" {
 		text = appendPermissionSection(text, roots)
 	}
-	if denied := deniedReadsText(deniedReadPaths, deniedReadGlobs); denied != "" {
+	if denied := deniedReadsText(deniedReadPaths, deniedReadGlobs, config.PermissionMessages); denied != "" {
 		text = appendPermissionSection(text, denied)
 	}
 	if pathsOmitted {
-		text = appendPermissionSection(text, permissionPromptOmittedPathsText)
+		text = appendPermissionSection(text, omittedPathsText(config.PermissionMessages))
 	}
 	if !strings.HasSuffix(text, "\n") {
 		text += "\n"
@@ -118,6 +151,21 @@ const (
 	maxPermissionPromptPathBytes = 32 * 1024
 	// permissionPromptOmittedPathsText is Rust's OMITTED_PERMISSION_PATHS.
 	permissionPromptOmittedPathsText = "Additional permission paths/globs are omitted. All restrictions still apply; do not use escalation or additional permissions to bypass omitted read denials."
+	// permissionPromptDeniedReadsPolicy is the harness-owned denial explanation
+	// Rust always renders ahead of the path/glob list.
+	permissionPromptDeniedReadsPolicy      = "The active permission profile denies reading these paths/globs. Do not request escalation or additional permissions to read them; these denials are policy restrictions."
+	permissionPromptDeniedReadsTemplate    = "## Denied filesystem reads\n{{ denied_reads }}"
+	permissionPromptDeniedReadsPlaceholder = "{{ denied_reads }}"
+	permissionPromptWritableRootTemplate   = " The writable root is {{ roots }}."
+	permissionPromptWritableRootsTemplate  = " The writable roots are {{ roots }}."
+	permissionPromptRootsPlaceholder       = "{{ roots }}"
+	// maxPermissionPresentationBytes bounds each catalog presentation override
+	// (Rust #57263): omitted_paths and denied_reads contribute at most 1,000
+	// bytes together.
+	maxPermissionPresentationBytes = 500
+	// maxWritableRootsTemplateBytes bounds the catalog writable-root sentence;
+	// replacing the 11-byte marker leaves at most 989 bytes of wording.
+	maxWritableRootsTemplateBytes = 1000
 )
 
 // boundPermissionPromptPaths applies the shared display budget, omitting whole
@@ -204,6 +252,17 @@ func permissionPromptSandboxTemplate(mode PermissionPromptSandboxMode) string {
 // approvalPromptText ports Rust approval_text.
 func approvalPromptText(config *PermissionPromptConfig) string {
 	if selected := approvalMessageForPolicy(config); selected != nil {
+		// A catalog approval message replaces the bundled approval prose, but
+		// an explicitly supplied approved-prefix template still renders for
+		// on-request approvals (Rust #55366).
+		if config.ApprovalPolicy == PermissionPromptApprovalOnRequest && approvedPrefixTemplate(config) != nil {
+			if prefixes := approvedPrefixesText(config.ApprovedCommandPrefixes, approvedPrefixTemplate(config)); prefixes != "" {
+				if strings.TrimSpace(*selected) == "" {
+					return prefixes
+				}
+				return strings.TrimSuffix(*selected, "\n") + "\n\n" + prefixes
+			}
+		}
 		return *selected
 	}
 	var text string
@@ -211,7 +270,7 @@ func approvalPromptText(config *PermissionPromptConfig) string {
 	case PermissionPromptApprovalNever:
 		text = permissionPromptApprovalNever
 	case PermissionPromptApprovalUnlessTrusted:
-		text = withRequestPermissions(permissionPromptApprovalUnlessTrusted, config.RequestPermissionsToolEnabled)
+		text = withRequestPermissions(config, permissionPromptApprovalUnlessTrusted)
 	case PermissionPromptApprovalGranular:
 		text = granularText(config)
 	default:
@@ -221,15 +280,15 @@ func approvalPromptText(config *PermissionPromptConfig) string {
 		}
 		sections := []string{strings.TrimSuffix(onRequestRule, "\n")}
 		if config.RequestPermissionsToolEnabled {
-			sections = append(sections, requestPermissionsToolText())
+			sections = append(sections, approvalToolText(config))
 		}
-		if prefixes := approvedPrefixesText(config.ApprovedCommandPrefixes); prefixes != "" {
+		if prefixes := approvedPrefixesText(config.ApprovedCommandPrefixes, approvedPrefixTemplate(config)); prefixes != "" {
 			sections = append(sections, prefixes)
 		}
 		text = strings.Join(sections, "\n\n")
 	}
 	if config.ApprovalsReviewer == PermissionPromptAutoReview && config.ApprovalPolicy != PermissionPromptApprovalNever {
-		text = strings.TrimSuffix(text, "\n") + "\n\n" + autoReviewText()
+		text = strings.TrimSuffix(text, "\n") + "\n\n" + approvalAutoReviewText(config)
 	}
 	return text
 }
@@ -268,9 +327,9 @@ func granularText(config *PermissionPromptConfig) string {
 		sections = append(sections, strings.TrimSuffix(permissionPromptApprovalOnRequestRuleRequestPermission, "\n"))
 	}
 	if config.RequestPermissionsToolEnabled {
-		sections = append(sections, requestPermissionsToolText())
+		sections = append(sections, approvalToolText(config))
 	}
-	if prefixes := approvedPrefixesText(config.ApprovedCommandPrefixes); prefixes != "" {
+	if prefixes := approvedPrefixesText(config.ApprovedCommandPrefixes, approvedPrefixTemplate(config)); prefixes != "" {
 		sections = append(sections, prefixes)
 	}
 	return strings.Join(sections, "\n\n")
@@ -285,12 +344,89 @@ func granularCategoryAllowed(categories []string, category string) bool {
 	return false
 }
 
-func withRequestPermissions(text string, enabled bool) string {
-	if !enabled {
+func withRequestPermissions(config *PermissionPromptConfig, text string) string {
+	if config == nil || !config.RequestPermissionsToolEnabled {
 		return text
 	}
-	return text + "\n\n" + requestPermissionsToolText()
+	return text + "\n\n" + approvalToolText(config)
 }
+
+// approvalToolText replaces the bundled request_permissions heading with a
+// validated catalog heading while keeping the instruction body (Rust #57581).
+func approvalToolText(config *PermissionPromptConfig) string {
+	bundled := requestPermissionsToolText()
+	var heading string
+	if config != nil && config.ApprovalMessages != nil {
+		heading = ValidApprovalHeading(config.ApprovalMessages.RequestPermissions)
+	}
+	if heading == "" {
+		return bundled
+	}
+	if index := strings.IndexAny(bundled, "\r\n"); index >= 0 {
+		return heading + bundled[index:]
+	}
+	return heading
+}
+
+// approvalAutoReviewText prepends a validated catalog heading to the bundled
+// auto-review guidance (Rust #57581).
+func approvalAutoReviewText(config *PermissionPromptConfig) string {
+	bundled := autoReviewText()
+	var heading string
+	if config != nil && config.ApprovalMessages != nil {
+		heading = ValidApprovalHeading(config.ApprovalMessages.AutoReviewSuffix)
+	}
+	if heading == "" {
+		return bundled
+	}
+	return heading + "\n\n" + bundled
+}
+
+// ValidApprovalHeading reports the catalog heading when it is a bounded,
+// single-line plain-text heading (Rust #57581 ApprovalInstructions::valid_heading).
+func ValidApprovalHeading(value *string) string {
+	if value == nil {
+		return ""
+	}
+	text := *value
+	if len(text) > maxApprovalHeadingBytes || strings.TrimSpace(text) == "" {
+		return ""
+	}
+	for _, char := range text {
+		if unicode.IsControl(char) || char == '\u2028' || char == '\u2029' {
+			return ""
+		}
+	}
+	if strings.ContainsAny(text, "{}") ||
+		strings.Contains(text, PermissionInstructionsOpenTag) ||
+		strings.Contains(text, PermissionInstructionsCloseTag) {
+		return ""
+	}
+	return text
+}
+
+// ValidSavedPrefixHeading bounds the standalone saved-prefix heading
+// (Rust #57599): plain text, no markup-like characters.
+func ValidSavedPrefixHeading(value *string) string {
+	if value == nil {
+		return ""
+	}
+	text := *value
+	if len(text) > maxApprovalHeadingBytes || strings.TrimSpace(text) == "" {
+		return ""
+	}
+	for _, char := range text {
+		if unicode.IsControl(char) || char == '\u2028' || char == '\u2029' {
+			return ""
+		}
+	}
+	if strings.ContainsAny(text, "<>{}") {
+		return ""
+	}
+	return text
+}
+
+const maxApprovalHeadingBytes = 500
 
 func requestPermissionsToolText() string {
 	return "# request_permissions Tool\n\nThe built-in `request_permissions` tool is available in this session. Invoke it when you need to request additional `network` or `file_system` permissions before later shell-like commands need them. Request only the specific permissions required for the task."
@@ -300,7 +436,7 @@ func autoReviewText() string {
 	return "`approvals_reviewer` is `auto_review`: Sandbox escalations with require_escalated will be reviewed for compliance with the policy. If a rejection happens, you should proceed only with a materially safer alternative, or inform the user of the risk and send a final message to ask for approval."
 }
 
-func writableRootsText(roots []string) string {
+func writableRootsText(roots []string, messages *PermissionPromptPermissionMessages) string {
 	if len(roots) == 0 {
 		return ""
 	}
@@ -310,15 +446,57 @@ func writableRootsText(roots []string) string {
 	for i, root := range roots {
 		wrapped[i] = "`" + root + "`"
 	}
+	rootsList := strings.Join(wrapped, ", ")
+	fallback := permissionPromptWritableRootsTemplate
+	var override *string
 	if len(wrapped) == 1 {
-		// The leading space mirrors Rust writable_roots_text, which is appended
-		// to the preceding section.
-		return " The writable root is " + wrapped[0] + "."
+		fallback = permissionPromptWritableRootTemplate
 	}
-	return " The writable roots are " + strings.Join(wrapped, ", ") + "."
+	if messages != nil {
+		if len(wrapped) == 1 {
+			override = messages.WritableRoot
+		} else {
+			override = messages.WritableRoots
+		}
+	}
+	if override != nil {
+		if rendered, ok := renderWritableRootsOverride(*override, rootsList); ok {
+			return rendered
+		}
+	}
+	return strings.ReplaceAll(fallback, permissionPromptRootsPlaceholder, rootsList)
 }
 
-func deniedReadsText(paths []string, globs []string) string {
+// renderWritableRootsOverride validates one catalog writable-root sentence
+// (Rust #56309). The caller has already bounded paths at whole-entry
+// boundaries, so this only bounds presentation.
+func renderWritableRootsOverride(template string, roots string) (string, bool) {
+	if len(template) > maxWritableRootsTemplateBytes {
+		return "", false
+	}
+	for _, value := range template {
+		if unicode.IsControl(value) || value == '\u2028' || value == '\u2029' {
+			return "", false
+		}
+	}
+	index := strings.Index(template, permissionPromptRootsPlaceholder)
+	if index < 0 {
+		return "", false
+	}
+	before := template[:index]
+	after := template[index+len(permissionPromptRootsPlaceholder):]
+	if strings.ContainsAny(before+after, "{}") ||
+		strings.Contains(template, PermissionInstructionsOpenTag) ||
+		strings.Contains(template, PermissionInstructionsCloseTag) {
+		return "", false
+	}
+	if len(before)+len(roots)+len(after) > maxPermissionPromptPathBytes+maxWritableRootsTemplateBytes {
+		return "", false
+	}
+	return before + roots + after, true
+}
+
+func deniedReadsText(paths []string, globs []string, messages *PermissionPromptPermissionMessages) string {
 	// Rust emits the denied roots first, then the denied globs.
 	sortedPaths := append([]string(nil), paths...)
 	sort.Strings(sortedPaths)
@@ -340,10 +518,71 @@ func deniedReadsText(paths []string, globs []string) string {
 	if len(entries) == 0 {
 		return ""
 	}
-	return "## Denied filesystem reads\nThe active permission profile denies reading these paths/globs. Do not request escalation or additional permissions to read them; these denials are policy restrictions.\n" + strings.Join(entries, "\n")
+	facts := permissionPromptDeniedReadsPolicy + "\n" + strings.Join(entries, "\n")
+	var before, after string
+	overrideApplied := false
+	if messages != nil && messages.DeniedReads != nil && validPermissionPresentation(*messages.DeniedReads) {
+		if templateBefore, templateAfter, ok := splitPermissionTemplate(*messages.DeniedReads, permissionPromptDeniedReadsPlaceholder); ok &&
+			!strings.ContainsAny(templateBefore+templateAfter, "{}") &&
+			len(templateBefore)+len(facts)+len(templateAfter) <= maxPermissionPromptPathBytes+len(permissionPromptDeniedReadsPolicy)+1+maxPermissionPresentationBytes {
+			before, after = templateBefore, templateAfter
+			overrideApplied = true
+		}
+	}
+	if !overrideApplied {
+		before, after, _ = splitPermissionTemplate(permissionPromptDeniedReadsTemplate, permissionPromptDeniedReadsPlaceholder)
+	}
+	return before + facts + after
 }
 
-func approvedPrefixesText(prefixes [][]string) string {
+// omittedPathsText renders the harness-owned omission warning, optionally
+// preceded by bounded catalog presentation (Rust #57263).
+func omittedPathsText(messages *PermissionPromptPermissionMessages) string {
+	if messages != nil && messages.OmittedPaths != nil {
+		override := *messages.OmittedPaths
+		if validPermissionPresentation(override) && !strings.ContainsAny(override, "{}") {
+			return override + "\n" + permissionPromptOmittedPathsText
+		}
+	}
+	return permissionPromptOmittedPathsText
+}
+
+// validPermissionPresentation bounds catalog presentation text (Rust #57263):
+// non-empty, at most 500 UTF-8 bytes, no control characters other than
+// newlines, no Unicode line separators, and no permission-fragment markers.
+func validPermissionPresentation(text string) bool {
+	if strings.TrimSpace(text) == "" || len(text) > maxPermissionPresentationBytes {
+		return false
+	}
+	if strings.Contains(text, PermissionInstructionsOpenTag) || strings.Contains(text, PermissionInstructionsCloseTag) {
+		return false
+	}
+	for _, value := range text {
+		if (unicode.IsControl(value) && value != '\n') || value == '\u2028' || value == '\u2029' {
+			return false
+		}
+	}
+	return true
+}
+
+func splitPermissionTemplate(template string, placeholder string) (string, string, bool) {
+	index := strings.Index(template, placeholder)
+	if index < 0 {
+		return "", "", false
+	}
+	return template[:index], template[index+len(placeholder):], true
+}
+
+func approvedPrefixTemplate(config *PermissionPromptConfig) *string {
+	if config == nil || config.PermissionMessages == nil {
+		return nil
+	}
+	return config.PermissionMessages.ApprovedPrefixes
+}
+
+const bundledApprovedPrefixTemplate = "## Approved command prefixes\nThe following prefix rules have already been approved: {{ approved_prefixes }}"
+
+func approvedPrefixesText(prefixes [][]string, template *string) string {
 	copied := make([][]string, 0, len(prefixes))
 	for _, prefix := range prefixes {
 		if len(prefix) == 0 {
@@ -360,7 +599,14 @@ func approvedPrefixesText(prefixes [][]string) string {
 	if rendered == "" {
 		return ""
 	}
-	return "## Approved command prefixes\nThe following prefix rules have already been approved: " + rendered
+	section := bundledApprovedPrefixTemplate
+	if template != nil {
+		section = *template
+	}
+	if section == "" {
+		return ""
+	}
+	return strings.ReplaceAll(section, "{{ approved_prefixes }}", rendered)
 }
 
 const (

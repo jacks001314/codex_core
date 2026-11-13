@@ -1,9 +1,20 @@
 package context
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
+	"image"
 	"strings"
 	"sync"
+
+	// Inline image dimensions are read through image.DecodeConfig, which only
+	// parses the header; the decoders below mirror the formats the rest of the
+	// host accepts (session/, exec/, tool/view_image.go).
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 
 	"codex_core/eventmap"
 )
@@ -34,7 +45,22 @@ type HistoryManager struct {
 	mu             sync.Mutex
 	items          []HistoryItem
 	historyVersion uint64
-	tokenInfo      *TokenUsageInfo
+	// userMessageRevision is a host-owned monotonic revision that advances only
+	// for genuine user input and history resets (Rust #41660). Compaction and
+	// internal context injection rewrite the model-visible conversation without
+	// changing what the user authorized, so Guardian must keep reusing an
+	// otherwise valid review across them.
+	userMessageRevision uint64
+	tokenInfo           *TokenUsageInfo
+	// lastServerReportedUsageItemCount is the history boundary covered by the
+	// last usable usage report: items at or after it are estimated on top of the
+	// saved token count (Rust ContextManager last_server_reported_usage_item_count,
+	// #58404). Failed responses and spending-only updates leave it unchanged.
+	lastServerReportedUsageItemCount int
+	// lastModelOutputItemCount is the index just after the latest model output,
+	// including failed responses. Restored or rewritten history uses it as the
+	// approximate boundary.
+	lastModelOutputItemCount int
 	// referenceContextItem mirrors Rust's `ContextManager::reference_context_item`
 	// baseline: the persisted per-turn `TurnContextItem` (a JSON object) that the
 	// next real turn diffs against. Go has no typed `TurnContextItem` at this
@@ -73,6 +99,12 @@ func (m *HistoryManager) RecordItems(items ...HistoryItem) {
 			continue
 		}
 		m.items = append(m.items, cloneItem(item))
+		if IsModelGeneratedHistoryItem(&item) {
+			m.lastModelOutputItemCount = len(m.items)
+		}
+		if IsUserAuthorizationMessage(&item) {
+			m.userMessageRevision++
+		}
 	}
 }
 
@@ -82,10 +114,27 @@ func (m *HistoryManager) RawItems() []HistoryItem {
 	return cloneItems(m.items)
 }
 
+// Replace performs a destructive history replacement (Rust's
+// `HistoryReplacement::Reset`). A reset discards the model-visible conversation
+// entirely, so it also invalidates prior Guardian authorization.
 func (m *HistoryManager) Replace(items []HistoryItem) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.items = cloneItems(items)
+	m.resetUsageBoundaryLocked()
+	m.historyVersion++
+	m.userMessageRevision++
+}
+
+// ReplaceCompacted installs a compacted history (Rust's
+// `HistoryReplacement::Compaction`). The conversation generation advances, but
+// the user-message revision is preserved: compaction changes what the model
+// sees, not what the user authorized.
+func (m *HistoryManager) ReplaceCompacted(items []HistoryItem) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.items = cloneItems(items)
+	m.resetUsageBoundaryLocked()
 	m.historyVersion++
 }
 
@@ -93,6 +142,14 @@ func (m *HistoryManager) HistoryVersion() uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.historyVersion
+}
+
+// UserMessageRevision returns the monotonic user-input/reset revision (Rust
+// `ConversationHistorySnapshot::user_message_revision`).
+func (m *HistoryManager) UserMessageRevision() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.userMessageRevision
 }
 
 func (m *HistoryManager) RemoveFirstItem() {
@@ -104,6 +161,7 @@ func (m *HistoryManager) RemoveFirstItem() {
 	removed := m.items[0]
 	m.items = m.items[1:]
 	removeCorrespondingFor(&m.items, &removed)
+	m.resetUsageBoundaryLocked()
 	m.historyVersion++
 }
 
@@ -115,6 +173,9 @@ func (m *HistoryManager) DropLastUserTurns(count uint32) {
 	defer m.mu.Unlock()
 	positions := userTurnPositions(m.items)
 	if len(positions) == 0 {
+		// Rust still replaces the history in this branch, which advances the
+		// user-message revision even though no turn was removed.
+		m.userMessageRevision++
 		return
 	}
 	firstInstructionTurn := positions[0]
@@ -130,6 +191,9 @@ func (m *HistoryManager) DropLastUserTurns(count uint32) {
 		m.items = cloneItems(m.items[:cut])
 	}
 	m.historyVersion++
+	// Rollback is a history reset in Rust (`replace_annotated`), so it
+	// invalidates prior Guardian authorization.
+	m.userMessageRevision++
 }
 
 // trimPreTurnContextUpdates mirrors Rust's `trim_pre_turn_context_updates`: it
@@ -294,6 +358,122 @@ func (m *HistoryManager) TokenInfo() *TokenUsageInfo {
 	return &cloned
 }
 
+// UpdateTokenInfoWithBoundary records a sampling usage report together with the
+// history it covered (Rust ContextManager::update_token_info input_item_count,
+// #58404). Coverage is max(last model output, inputItemCount), so a response
+// with usable usage covers the request input even when it returns no output
+// items; anything at or after that index is estimated on top of this count.
+func (m *HistoryManager) UpdateTokenInfoWithBoundary(usage TokenUsage, contextWindow *int64, inputItemCount int) {
+	m.UpdateTokenInfo(usage, contextWindow)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	covered := clampUsageBoundary(inputItemCount, len(m.items))
+	if m.lastModelOutputItemCount > covered {
+		covered = clampUsageBoundary(m.lastModelOutputItemCount, len(m.items))
+	}
+	m.lastServerReportedUsageItemCount = covered
+}
+
+// SetUsageBoundary records a recomputed context count that covers coveredItemCount
+// items (Rust ContextManager::set_token_info_with_boundary). Local
+// re-estimation already charges every retained reasoning item, so callers pass
+// the current history length.
+func (m *HistoryManager) SetUsageBoundary(coveredItemCount int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastServerReportedUsageItemCount = clampUsageBoundary(coveredItemCount, len(m.items))
+}
+
+// ResetUsageBoundary re-derives the boundary after history was restored or
+// rewritten (Rust ContextManager::reset_last_usage_boundary): the latest model
+// output is the approximation, or the whole history when there is none.
+func (m *HistoryManager) ResetUsageBoundary() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.resetUsageBoundaryLocked()
+}
+
+// UsageBoundary returns the number of history items covered by the last usable
+// usage report.
+func (m *HistoryManager) UsageBoundary() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return clampUsageBoundary(m.lastServerReportedUsageItemCount, len(m.items))
+}
+
+// ItemsSinceLastUsage returns the items at or after the last usage boundary.
+// These are not reflected in the saved token count and must be estimated.
+func (m *HistoryManager) ItemsSinceLastUsage() []HistoryItem {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	boundary := clampUsageBoundary(m.lastServerReportedUsageItemCount, len(m.items))
+	if boundary >= len(m.items) {
+		return nil
+	}
+	return cloneItems(m.items[boundary:])
+}
+
+// EstimatedTokensSinceLastUsage sums token estimates for the items the last
+// usable usage report did not cover.
+func (m *HistoryManager) EstimatedTokensSinceLastUsage() int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	boundary := clampUsageBoundary(m.lastServerReportedUsageItemCount, len(m.items))
+	var total int64
+	for i := boundary; i < len(m.items); i++ {
+		total += EstimateItemTokens(&m.items[i])
+	}
+	return total
+}
+
+func (m *HistoryManager) resetUsageBoundaryLocked() {
+	m.lastModelOutputItemCount = 0
+	for i := range m.items {
+		if IsModelGeneratedHistoryItem(&m.items[i]) {
+			m.lastModelOutputItemCount = i + 1
+		}
+	}
+	if m.lastModelOutputItemCount > 0 {
+		m.lastServerReportedUsageItemCount = m.lastModelOutputItemCount
+		return
+	}
+	m.lastServerReportedUsageItemCount = len(m.items)
+}
+
+func clampUsageBoundary(boundary int, length int) int {
+	if boundary < 0 {
+		return 0
+	}
+	if boundary > length {
+		return length
+	}
+	return boundary
+}
+
+// IsModelGeneratedHistoryItem mirrors Rust is_model_generated_item for the
+// history view: assistant messages and model-produced call/reasoning items.
+func IsModelGeneratedHistoryItem(item *HistoryItem) bool {
+	if item == nil {
+		return false
+	}
+	switch item.Kind {
+	case eventmap.ResponseReasoning, eventmap.ResponseWebSearchCall, eventmap.ResponseImageGeneration:
+		return true
+	case eventmap.ResponseMessage:
+		return strings.EqualFold(strings.TrimSpace(item.Role), "assistant")
+	case eventmap.ResponseOther:
+		// The lossy history view keeps model-emitted call items as Other with the
+		// raw type in WebSearchAction. Rust's ResponseItem::Other is local, so
+		// unknown Other items stay non-generated (is_model_generated_item).
+		switch item.WebSearchAction {
+		case "function_call", "custom_tool_call", "tool_search_call", "local_shell_call",
+			"compaction", "context_compaction":
+			return true
+		}
+	}
+	return false
+}
+
 func IsAPIMessage(item *HistoryItem) bool {
 	if item == nil {
 		return false
@@ -308,27 +488,58 @@ func IsAPIMessage(item *HistoryItem) bool {
 	}
 }
 
+// callOutputTypeForCall maps a model-emitted call to the output type Rust's
+// ensure_call_outputs_present pairs it with. A forked or recovered history can
+// restore a call before its output was written, so the caller synthesizes an
+// aborted output instead of leaving the call unpaired (Rust #60519).
+func callOutputTypeForCall(action string) (string, bool) {
+	switch action {
+	case "function_call", "local_shell_call":
+		// Local shell calls are represented upstream by a function_call_output.
+		return "function_call_output", true
+	case "custom_tool_call":
+		return "custom_tool_call_output", true
+	case "tool_search_call":
+		return "tool_search_output", true
+	default:
+		return "", false
+	}
+}
+
+func callOutputKey(action, id string) string {
+	return action + "\x00" + id
+}
+
 func EnsureCallOutputsPresent(items *[]HistoryItem) {
 	if items == nil {
 		return
 	}
 	outputs := map[string]bool{}
 	for _, item := range *items {
-		if item.Kind == eventmap.ResponseOther && item.WebSearchAction == "function_call_output" {
-			outputs[item.ID] = true
+		if item.Kind == eventmap.ResponseOther {
+			outputs[callOutputKey(item.WebSearchAction, item.ID)] = true
 		}
 	}
 	insertions := make([]insertion, 0)
 	for index, item := range *items {
-		if item.Kind != eventmap.ResponseOther || item.WebSearchAction != "function_call" || item.ID == "" || outputs[item.ID] {
+		if item.Kind != eventmap.ResponseOther || item.ID == "" {
 			continue
 		}
-		insertions = append(insertions, insertion{Index: index + 1, Item: HistoryItem{
+		outputType, ok := callOutputTypeForCall(item.WebSearchAction)
+		if !ok || outputs[callOutputKey(outputType, item.ID)] {
+			continue
+		}
+		synthetic := HistoryItem{
 			Kind:            eventmap.ResponseOther,
 			ID:              item.ID,
-			WebSearchAction: "function_call_output",
-			ImageResult:     "aborted",
-		}})
+			WebSearchAction: outputType,
+		}
+		if outputType != "tool_search_output" {
+			// Tool search outputs carry no text payload; the others report the
+			// interrupted work as an aborted result.
+			synthetic.ImageResult = "aborted"
+		}
+		insertions = append(insertions, insertion{Index: index + 1, Item: synthetic})
 	}
 	for i := len(insertions) - 1; i >= 0; i-- {
 		insert := insertions[i]
@@ -342,7 +553,12 @@ func RemoveOrphanOutputs(items *[]HistoryItem) {
 	}
 	calls := map[string]bool{}
 	for _, item := range *items {
-		if item.Kind == eventmap.ResponseOther && item.WebSearchAction == "function_call" {
+		if item.Kind != eventmap.ResponseOther {
+			continue
+		}
+		// Local shell calls are paired with a function_call_output upstream, so
+		// their synthetic or recorded output is not an orphan (Rust #60519).
+		if item.WebSearchAction == "function_call" || item.WebSearchAction == "local_shell_call" {
 			calls[item.ID] = true
 		}
 	}
@@ -424,13 +640,162 @@ func EstimateItemTokens(item *HistoryItem) int64 {
 	for _, content := range item.Content {
 		if content.Kind == eventmap.ContentInputImage {
 			bytes -= int64(len(content.ImageURL))
-			bytes += 7373
+			bytes += EstimateImageReferenceBytes(content.ImageURL, content.FileID, content.Detail)
 		}
 	}
 	if bytes < 0 {
 		bytes = 0
 	}
 	return ApproxTokensFromBytes(bytes)
+}
+
+// resizedImageBytesEstimate mirrors Rust RESIZED_IMAGE_BYTES_ESTIMATE
+// (context_manager/history.rs:1313): the fixed charge for an inline image
+// unless the request asks for `original` detail.
+const resizedImageBytesEstimate = 7373
+
+// originalImagePatchSize mirrors Rust ORIGINAL_IMAGE_PATCH_SIZE: `original`
+// detail images are charged one token per 32x32 patch.
+const originalImagePatchSize = 32
+
+// originalImageMaxPatches mirrors Rust ORIGINAL_IMAGE_MAX_PATCHES.
+const originalImageMaxPatches = 10_000
+
+// originalImageEstimateCacheSize mirrors Rust ORIGINAL_IMAGE_ESTIMATE_CACHE_SIZE.
+// The dimension estimate is a pure function of the data URL, so a small bounded
+// cache keeps repeated history accounting from decoding the same payload again.
+const originalImageEstimateCacheSize = 32
+
+// approxImageBytesPerToken mirrors Rust approx_bytes_for_tokens: one estimated
+// token is charged four bytes.
+const approxImageBytesPerToken = 4
+
+// imageDetailOriginal reports whether one image reference asked for `original`
+// detail (Rust ImageDetail::Original). Any other value, including empty,
+// keeps the resized-image estimate.
+func imageDetailOriginal(detail string) bool {
+	return strings.EqualFold(strings.TrimSpace(detail), "original")
+}
+
+// EstimateImageReferenceBytes mirrors Rust estimate_image_reference_bytes
+// (#54776): an inline `original` image is charged from its measured dimensions,
+// a file-backed reference cannot expose dimensions and reserves the maximum
+// patch count, and every other reference keeps the fixed resized estimate.
+func EstimateImageReferenceBytes(imageURL string, fileID string, detail string) int64 {
+	if strings.TrimSpace(fileID) == "" {
+		return EstimateInlineImageBytes(imageURL, detail)
+	}
+	if imageDetailOriginal(detail) {
+		return originalImageMaxPatches * approxImageBytesPerToken
+	}
+	return resizedImageBytesEstimate
+}
+
+// EstimateInlineImageBytes mirrors Rust estimate_image_bytes: only an
+// `original` detail data URL is measured, and anything the estimator cannot read
+// (non-base64 URL, undecodable payload, unknown format) falls back to the fixed
+// resized-image estimate, exactly like Rust's unwrap_or(RESIZED_IMAGE_BYTES_ESTIMATE).
+func EstimateInlineImageBytes(imageURL string, detail string) int64 {
+	if !imageDetailOriginal(detail) {
+		return resizedImageBytesEstimate
+	}
+	if bytes, ok := estimateOriginalImageBytes(imageURL); ok {
+		return bytes
+	}
+	return resizedImageBytesEstimate
+}
+
+// imageEstimate is one cached estimator result; ok=false records a payload the
+// estimator refused so repeated accounting stays cheap.
+type imageEstimate struct {
+	bytes int64
+	ok    bool
+}
+
+var originalImageEstimates = struct {
+	mu      sync.Mutex
+	order   [][sha256.Size]byte
+	entries map[[sha256.Size]byte]imageEstimate
+}{entries: map[[sha256.Size]byte]imageEstimate{}}
+
+// estimateOriginalImageBytes mirrors Rust estimate_original_image_bytes: decode
+// the inline payload, read only its dimensions, and charge one token per 32x32
+// patch capped at ORIGINAL_IMAGE_MAX_PATCHES.
+func estimateOriginalImageBytes(imageURL string) (int64, bool) {
+	key := sha256.Sum256([]byte(imageURL))
+	originalImageEstimates.mu.Lock()
+	cached, hit := originalImageEstimates.entries[key]
+	originalImageEstimates.mu.Unlock()
+	if hit {
+		return cached.bytes, cached.ok
+	}
+	estimate := imageEstimate{}
+	if payload, ok := parseBase64ImageDataURL(imageURL); ok {
+		if raw, err := base64.StdEncoding.DecodeString(payload); err == nil {
+			if config, _, err := image.DecodeConfig(bytes.NewReader(raw)); err == nil &&
+				config.Width > 0 && config.Height > 0 {
+				estimate = imageEstimate{bytes: originalImagePatchBytes(int64(config.Width), int64(config.Height)), ok: true}
+			}
+		}
+	}
+	originalImageEstimates.mu.Lock()
+	if _, exists := originalImageEstimates.entries[key]; !exists {
+		for len(originalImageEstimates.order) >= originalImageEstimateCacheSize {
+			oldest := originalImageEstimates.order[0]
+			originalImageEstimates.order = originalImageEstimates.order[1:]
+			delete(originalImageEstimates.entries, oldest)
+		}
+		originalImageEstimates.order = append(originalImageEstimates.order, key)
+		originalImageEstimates.entries[key] = estimate
+	}
+	originalImageEstimates.mu.Unlock()
+	return estimate.bytes, estimate.ok
+}
+
+// originalImagePatchBytes turns measured dimensions into the charged bytes:
+// ceil(width/32) * ceil(height/32) patches, capped, at four bytes per patch.
+func originalImagePatchBytes(width int64, height int64) int64 {
+	patch := int64(originalImagePatchSize)
+	wide := (width + patch - 1) / patch
+	high := (height + patch - 1) / patch
+	patches := wide * high
+	if patches <= 0 {
+		return 0
+	}
+	if patches > originalImageMaxPatches {
+		patches = originalImageMaxPatches
+	}
+	return patches * approxImageBytesPerToken
+}
+
+// parseBase64ImageDataURL mirrors Rust parse_base64_image_data_url: only an
+// `image/*;base64,` data URL can be measured, and the media type is parsed
+// without decoding so the estimator stays cheap.
+func parseBase64ImageDataURL(url string) (string, bool) {
+	if len(url) < len("data:") || !strings.EqualFold(url[:len("data:")], "data:") {
+		return "", false
+	}
+	comma := strings.IndexByte(url, ',')
+	if comma < 0 {
+		return "", false
+	}
+	metadata := url[len("data:"):comma]
+	payload := url[comma+1:]
+	parts := strings.Split(metadata, ";")
+	mimeType := parts[0]
+	hasBase64Marker := false
+	for _, part := range parts[1:] {
+		if strings.EqualFold(part, "base64") {
+			hasBase64Marker = true
+		}
+	}
+	if len(mimeType) < len("image/") || !strings.EqualFold(mimeType[:len("image/")], "image/") {
+		return "", false
+	}
+	if !hasBase64Marker {
+		return "", false
+	}
+	return payload, true
 }
 
 func ApproxTokenCount(text string) int64 {

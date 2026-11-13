@@ -20,7 +20,7 @@ func TestModelMessagesParseRustWireNames(t *testing.T) {
 			"never": "c",
 			"unless_trusted": "d"
 		},
-		"permissions": {"danger_full_access": "x", "workspace_write": "y", "read_only": "z"},
+		"permissions": {"danger_full_access": "x", "workspace_write": "y", "read_only": "z", "approved_prefixes": "{{ approved_prefixes }}"},
 		"persistent_instructions": "persist",
 		"collaboration_modes": {"default": "cm", "plan": "pm"},
 		"auto_review": {"policy": "policy"},
@@ -48,6 +48,9 @@ func TestModelMessagesParseRustWireNames(t *testing.T) {
 	}
 	if messages.PersistentInstructions == nil || *messages.PersistentInstructions != "persist" {
 		t.Fatalf("persistent_instructions = %#v", messages.PersistentInstructions)
+	}
+	if messages.Permissions == nil || messages.Permissions.ApprovedPrefixes == nil || *messages.Permissions.ApprovedPrefixes != "{{ approved_prefixes }}" {
+		t.Fatalf("permissions.approved_prefixes = %#v", messages.Permissions)
 	}
 	if messages.TokenBudget == nil || !messages.TokenBudget.Enabled || !messages.TokenBudget.UseHistoryNotesExtension {
 		t.Fatalf("token_budget activation = %#v", messages.TokenBudget)
@@ -121,5 +124,115 @@ func TestModelMessagesParsesGuardianV2LikeRust(t *testing.T) {
 	}
 	if len(messages.GuardianV2.Transcript) == 0 {
 		t.Fatal("transcript was not retained")
+	}
+}
+
+// TestGranularApprovalMessagesParseRustWireNames mirrors Rust #57325: the
+// catalog's optional approvals.granular object preserves sparse template
+// strings verbatim, treats null as absent, and distinguishes an empty object
+// from a null value.
+func TestGranularApprovalMessagesParseRustWireNames(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "null", raw: `null`, want: ``},
+		{name: "empty object", raw: `{}`, want: `{}`},
+		{name: "null fields", raw: `{"intro":null,"prompted_categories":null,"rejected_categories":null}`, want: `{}`},
+		{name: "empty template", raw: `{"intro":""}`, want: `{"intro":""}`},
+		{
+			name: "populated",
+			raw:  `{"intro":"Catalog: {{ policy }}","prompted_categories":"Allowed: {{ categories }}","rejected_categories":"Denied: {{ categories }}"}`,
+			want: `{"intro":"Catalog: {{ policy }}","prompted_categories":"Allowed: {{ categories }}","rejected_categories":"Denied: {{ categories }}"}`,
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			var messages ModelMessages
+			if err := json.Unmarshal([]byte(`{"approvals":{"on_request":"existing override","granular":`+test.raw+`}}`), &messages); err != nil {
+				t.Fatalf("Unmarshal() error = %v", err)
+			}
+			if messages.Approvals == nil || messages.Approvals.OnRequest == nil || *messages.Approvals.OnRequest != "existing override" {
+				t.Fatalf("approvals.on_request = %#v", messages.Approvals)
+			}
+			encoded, err := json.Marshal(messages.Approvals)
+			if err != nil {
+				t.Fatalf("Marshal() error = %v", err)
+			}
+			var got map[string]json.RawMessage
+			if err := json.Unmarshal(encoded, &got); err != nil {
+				t.Fatalf("round-trip Unmarshal() error = %v", err)
+			}
+			granular, present := got["granular"]
+			if test.want == "" {
+				if present {
+					t.Fatalf("granular = %s, want absent", granular)
+				}
+				return
+			}
+			if !present || string(granular) != test.want {
+				t.Fatalf("granular = %s, want %s", granular, test.want)
+			}
+		})
+	}
+}
+
+// TestPermissionMessagesParsePathWordingLikeRust pins the Rust #56309/#57263
+// catalog wire keys for writable-root and permission-path presentation.
+func TestPermissionMessagesParsePathWordingLikeRust(t *testing.T) {
+	var empty PermissionMessages
+	if err := json.Unmarshal([]byte(`{}`), &empty); err != nil {
+		t.Fatalf("empty Unmarshal() error = %v", err)
+	}
+	if empty.WritableRoot != nil || empty.WritableRoots != nil || empty.OmittedPaths != nil || empty.DeniedReads != nil {
+		t.Fatalf("empty permission messages = %#v", empty)
+	}
+	encoded, err := json.Marshal(empty)
+	if err != nil {
+		t.Fatalf("empty Marshal() error = %v", err)
+	}
+	if string(encoded) != "{}" {
+		t.Fatalf("sparse permission messages = %s, want {}", encoded)
+	}
+
+	raw := []byte(`{
+		"writable_root": " Root: {{ roots }}.",
+		"writable_roots": "Roots: {{ roots }}.",
+		"omitted_paths": "Some paths are omitted.",
+		"denied_reads": "Blocked reads:\n{{ denied_reads }}"
+	}`)
+	var messages PermissionMessages
+	if err := json.Unmarshal(raw, &messages); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	for name, value := range map[string]*string{
+		"writable_root":  messages.WritableRoot,
+		"writable_roots": messages.WritableRoots,
+		"omitted_paths":  messages.OmittedPaths,
+		"denied_reads":   messages.DeniedReads,
+	} {
+		if value == nil {
+			t.Fatalf("permissions.%s did not parse", name)
+		}
+	}
+	if *messages.DeniedReads != "Blocked reads:\n{{ denied_reads }}" {
+		t.Fatalf("denied_reads = %q", *messages.DeniedReads)
+	}
+
+	// Explicit nulls behave like omitted fields and never render `null`.
+	var sparse PermissionMessages
+	if err := json.Unmarshal([]byte(`{"writable_root":null,"writable_roots":null,"omitted_paths":null,"denied_reads":null}`), &sparse); err != nil {
+		t.Fatalf("sparse Unmarshal() error = %v", err)
+	}
+	if sparse.WritableRoot != nil || sparse.WritableRoots != nil || sparse.OmittedPaths != nil || sparse.DeniedReads != nil {
+		t.Fatalf("null permission messages = %#v", sparse)
+	}
+	encoded, err = json.Marshal(sparse)
+	if err != nil {
+		t.Fatalf("sparse Marshal() error = %v", err)
+	}
+	if string(encoded) != "{}" {
+		t.Fatalf("null permission messages = %s, want {}", encoded)
 	}
 }

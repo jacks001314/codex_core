@@ -19,16 +19,17 @@ func ItemFromSessionItem(item *session.Item) *Item {
 		return nil
 	}
 	out := &Item{
-		ID:         item.ID,
-		Type:       item.Type,
-		Role:       item.Role,
-		Text:       item.Text,
-		Name:       item.Name,
-		CallID:     item.CallID,
-		Data:       cloneAnyMap(item.Data),
-		Raw:        append(json.RawMessage(nil), item.Raw...),
-		ResponseID: item.ResponseID,
-		Metadata:   cloneAnyMap(item.Metadata),
+		ID:             item.ID,
+		Type:           item.Type,
+		Role:           item.Role,
+		Text:           item.Text,
+		Name:           item.Name,
+		CallID:         item.CallID,
+		Data:           cloneAnyMap(item.Data),
+		Raw:            append(json.RawMessage(nil), item.Raw...),
+		ResponseID:     item.ResponseID,
+		ResponseItemID: item.ResponseItemID,
+		Metadata:       cloneAnyMap(item.Metadata),
 	}
 	if len(item.Content) > 0 {
 		out.Content = make([]ContentPart, len(item.Content))
@@ -50,6 +51,23 @@ func AppendSessionItems(recorder *Recorder, items []session.Item, now time.Time)
 	}
 	for i := range items {
 		if recorder.IsPaginated() {
+			// Additional-context tool outputs keep their ResponseItem shape and
+			// provenance instead of being rewritten as DynamicToolCall items.
+			if payload, metadata, ok := additionalContextToolOutputRolloutItem(&items[i]); ok {
+				createdAt := itemTime(items[i].CreatedAt, now)
+				line := Line{
+					Type:         "response_item",
+					Timestamp:    createdAt.UTC().Format(time.RFC3339Nano),
+					Item:         payload,
+					ItemMetadata: metadata,
+					ItemID:       items[i].ID,
+					TurnID:       sessionItemTurnID(&items[i], i),
+				}
+				if err := recorder.AppendLine(line); err != nil {
+					return fmt.Errorf("append paginated additional-context item %d (%s): %w", i, items[i].ID, err)
+				}
+				continue
+			}
 			// Harness-authored configuration updates have no core TurnItem
 			// variant; persist them as trusted response_item lines (Rust #43110).
 			if payload, metadata, ok := configurationUpdateRolloutItem(&items[i]); ok {
@@ -108,6 +126,9 @@ func AppendSessionItems(recorder *Recorder, items []session.Item, now time.Time)
 			if err := recorder.AppendItemCompleted(raw, turnID, startedAt, completedAt); err != nil {
 				return fmt.Errorf("append paginated completed item %d (%s/%s): %w", i, items[i].Type, items[i].ID, err)
 			}
+			if err := appendModelSearchCheckpoint(recorder, &items[i], now); err != nil {
+				return fmt.Errorf("append paginated model-search checkpoint %d (%s): %w", i, items[i].ID, err)
+			}
 			continue
 		}
 		item := ItemFromSessionItem(&items[i])
@@ -124,6 +145,9 @@ func AppendSessionItems(recorder *Recorder, items []session.Item, now time.Time)
 		}
 		if err := recorder.AppendLine(*line); err != nil {
 			return err
+		}
+		if err := appendModelSearchCheckpoint(recorder, &items[i], now); err != nil {
+			return fmt.Errorf("append legacy model-search checkpoint %d (%s): %w", i, items[i].ID, err)
 		}
 	}
 	return nil
@@ -291,10 +315,14 @@ func EnsureRustCompatibleSessionHistory(path string, record *session.Record) (bo
 			currentTurnID = turnID
 			if currentTurnID != "" {
 				startedAt := createdAt
+				rootTurnID := ""
 				if snapshot, ok := snapshots[currentTurnID]; ok && snapshot.StartedAt != nil {
 					startedAt = time.Unix(*snapshot.StartedAt, 0).UTC()
 				}
-				if err := recorder.AppendTurnStarted(currentTurnID, startedAt); err != nil {
+				if snapshot, ok := snapshots[currentTurnID]; ok {
+					rootTurnID = strings.TrimSpace(snapshot.RootTurnID)
+				}
+				if err := recorder.AppendTurnStartedWithRoot(rootTurnID, currentTurnID, startedAt); err != nil {
 					return false, err
 				}
 			}
@@ -342,13 +370,24 @@ func appendReplayedTurnTerminal(recorder *Recorder, turnID string, snapshot sess
 	}
 	switch status {
 	case "interrupted", "aborted", "cancelled", "canceled":
-		return recorder.AppendTurnAborted(turnID, firstNonEmptyString(snapshot.ErrorMessage, "interrupted"), completedAt, durationMS)
+		reason := "interrupted"
+		var turnError *TurnAbortedError
+		if message := strings.TrimSpace(snapshot.ErrorMessage); message != "" || snapshot.CodexErrorInfo != nil {
+			if snapshot.CodexErrorInfo != nil {
+				turnError = &TurnAbortedError{Message: message, CodexErrorInfo: snapshot.CodexErrorInfo}
+			} else {
+				// Older snapshots used the error message as the free-form abort
+				// reason; keep that shape when no structured classification exists.
+				reason = message
+			}
+		}
+		return recorder.AppendTurnAbortedWithRootAndError(snapshot.RootTurnID, turnID, reason, turnError, completedAt, durationMS)
 	case "failed", "error":
 		if err := recorder.AppendTurnError(snapshot.ErrorMessage, completedAt); err != nil {
 			return err
 		}
 	}
-	return recorder.AppendTurnComplete(turnID, completedAt, durationMS)
+	return recorder.AppendTurnCompleteWithRoot(snapshot.RootTurnID, turnID, completedAt, durationMS)
 }
 
 func coreTurnItemIsInProgress(raw json.RawMessage) bool {
@@ -425,6 +464,13 @@ func RecordFromPath(path string, archived bool) (*session.Record, error) {
 		createdAt = time.Now().UTC()
 	}
 	items, rolloutTurns := sessionItemsFromRolloutLines(lines, createdAt)
+	// Rust #57553: a resumed thread uses the newest dynamic-tool catalog in its
+	// rollout, including an explicit clear, instead of only the creation
+	// metadata.
+	dynamicTools := cloneRawMessages(meta.DynamicTools)
+	if latest, ok := LatestDynamicTools(lines); ok {
+		dynamicTools = cloneRawMessages(latest)
+	}
 	updatedAt := createdAt
 	recencyAt := createdAt
 	if info, statErr := os.Stat(path); statErr == nil {
@@ -435,15 +481,16 @@ func RecordFromPath(path string, archived bool) (*session.Record, error) {
 		recencyAt = items[len(items)-1].CreatedAt
 	}
 	record := &session.Record{
-		ID:             session.ThreadID(meta.ID),
-		SessionID:      firstNonEmptyString(meta.SessionID, meta.ID),
-		ForkedFromID:   session.ThreadID(meta.ForkedFromID),
-		ParentThreadID: session.ThreadID(meta.ParentThreadID),
-		Preview:        previewFromSessionItems(items),
-		Archived:       archived,
-		CreatedAt:      createdAt,
-		UpdatedAt:      updatedAt,
-		RecencyAt:      recencyAt,
+		ID:                     session.ThreadID(meta.ID),
+		SessionID:              firstNonEmptyString(meta.SessionID, meta.ID),
+		ForkedFromID:           session.ThreadID(meta.ForkedFromID),
+		AttachedThreadParentID: attachedThreadParentID(meta),
+		ParentThreadID:         session.ThreadID(meta.ParentThreadID),
+		Preview:                previewFromSessionItems(items),
+		Archived:               archived,
+		CreatedAt:              createdAt,
+		UpdatedAt:              updatedAt,
+		RecencyAt:              recencyAt,
 		Metadata: session.Metadata{
 			CWD:                        meta.CWD,
 			Model:                      meta.Model,
@@ -462,7 +509,7 @@ func RecordFromPath(path string, archived bool) (*session.Record, error) {
 			AgentNickname:              meta.AgentNickname,
 			AgentRole:                  meta.AgentRole,
 			AgentPath:                  meta.AgentPath,
-			DynamicTools:               cloneRawMessages(meta.DynamicTools),
+			DynamicTools:               dynamicTools,
 			SelectedCapabilityRoots:    cloneRawMessages(meta.SelectedCapabilityRoots),
 			MultiAgentVersion:          meta.MultiAgentVersion,
 			ContextWindow:              append(json.RawMessage(nil), meta.ContextWindow...),
@@ -502,6 +549,16 @@ func RecordFromPath(path string, archived bool) (*session.Record, error) {
 	return record, nil
 }
 
+// attachedThreadParentID mirrors Rust's
+// `forked_from_id.filter(|_| attached_thread)`: the durable attachment edge is
+// derived from the fork source and only exists for attached threads.
+func attachedThreadParentID(meta *SessionMeta) session.ThreadID {
+	if meta == nil || !meta.AttachedThread {
+		return ""
+	}
+	return session.ThreadID(meta.ForkedFromID)
+}
+
 // applyRolloutTurnAttributionMetadata records the provenance of the newest
 // surviving regular turn (Rust #51402 `551bd409eb`), which a cold recovery
 // restores as the turn's start options. It is reconstructed from the surviving
@@ -517,13 +574,16 @@ func applyRolloutContextMetadata(record *session.Record, lines []Line) {
 	if record == nil {
 		return
 	}
+	// Rust reconstructs the context baseline from surviving replay segments
+	// (#41424): a full world-state snapshot keeps a fork's inherited context
+	// baseline alive even when the user message was removed, while partial
+	// snapshots and snapshots superseded by compaction do not.
+	baseline := ReconstructContextBaseline(lines)
+	record.Metadata.TurnContext = baseline.TurnContext
+	record.Metadata.WorldState = baseline.WorldState
 	for i := range lines {
 		if len(lines[i].TurnContext) > 0 {
-			record.Metadata.TurnContext = append(json.RawMessage(nil), lines[i].TurnContext...)
 			applyTurnContextMetadata(&record.Metadata, lines[i].TurnContext)
-		}
-		if len(lines[i].WorldState) > 0 {
-			record.Metadata.WorldState = append(json.RawMessage(nil), lines[i].WorldState...)
 		}
 	}
 	if approvalPolicy, ok := LatestPersistedApprovalPolicy(lines); ok {
@@ -612,8 +672,12 @@ func LastPersistedOwnedThreadCWD(threadID string, lines []Line) string {
 // intentionally omitted the field, and non-nil (possibly empty) when the
 // snapshot recorded a selection.
 type ThreadSettingsSnapshot struct {
-	CWD                   string
-	RuntimeWorkspaceRoots *[]string
+	CWD                     string
+	RuntimeWorkspaceRoots   *[]string
+	ApprovalPolicy          string
+	ApprovalsReviewer       string
+	PermissionProfile       json.RawMessage
+	ActivePermissionProfile json.RawMessage
 }
 
 // LatestPersistedOwnedThreadSettings returns the newest settings snapshot
@@ -631,17 +695,273 @@ func LatestPersistedOwnedThreadSettings(threadID string, lines []Line) (ThreadSe
 			continue
 		}
 		return ThreadSettingsSnapshot{
-			CWD:                   snapshot.CWD,
-			RuntimeWorkspaceRoots: snapshot.RuntimeWorkspaceRoots,
+			CWD:                     snapshot.CWD,
+			RuntimeWorkspaceRoots:   snapshot.RuntimeWorkspaceRoots,
+			ApprovalPolicy:          snapshot.ApprovalPolicy,
+			ApprovalsReviewer:       snapshot.ApprovalsReviewer,
+			PermissionProfile:       snapshot.PermissionProfile,
+			ActivePermissionProfile: snapshot.ActivePermissionProfile,
 		}, true
 	}
 	return ThreadSettingsSnapshot{}, false
 }
 
+// LatestPersistedOwnedThreadSettingsApplied returns the newest full settings
+// snapshot owned by threadID, including collaboration mode, so a resume can skip
+// a checkpoint that would not change the persisted settings (Rust #56250).
+func LatestPersistedOwnedThreadSettingsApplied(threadID string, lines []Line) (ThreadSettingsApplied, bool) {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return ThreadSettingsApplied{}, false
+	}
+	for index := len(lines) - 1; index >= 0; index-- {
+		snapshot, ok := threadSettingsSnapshotFromEvent(lines[index].Payload)
+		if !ok || snapshot.ThreadID != threadID {
+			continue
+		}
+		return ThreadSettingsApplied{
+			ApprovalPolicy:          snapshot.ApprovalPolicy,
+			ApprovalsReviewer:       snapshot.ApprovalsReviewer,
+			PermissionProfile:       snapshot.PermissionProfile,
+			ActivePermissionProfile: snapshot.ActivePermissionProfile,
+			CWD:                     snapshot.CWD,
+			ServiceTier:             cloneStringPtr(snapshot.ServiceTier),
+			ReasoningSummary:        cloneStringPtr(snapshot.ReasoningSummary),
+			Personality:             cloneStringPtr(snapshot.Personality),
+			CollaborationMode:       snapshot.CollaborationMode,
+			RuntimeWorkspaceRoots:   snapshot.RuntimeWorkspaceRoots,
+		}, true
+	}
+	return ThreadSettingsApplied{}, false
+}
+
+// PersistedModelSettings holds the model selections restored on a cold resume
+// (Rust #55923): the requested service tier, reasoning summary, and personality.
+type PersistedModelSettings struct {
+	ServiceTier      *string
+	ReasoningSummary *string
+	Personality      *string
+}
+
+// LatestPersistedModelSettings resolves the model selections a resume restores
+// (Rust latest_persisted_model_settings, #55923). Only thread-owned settings
+// snapshots are considered: an ownerless legacy snapshot is accepted while no
+// foreign snapshot has been crossed, but a snapshot owned by another thread
+// invalidates older ownerless entries. TurnContext entries never supply model
+// settings because a running turn can record stale values.
+func LatestPersistedModelSettings(threadID string, lines []Line) (PersistedModelSettings, bool) {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return PersistedModelSettings{}, false
+	}
+	crossedForeignSnapshot := false
+	for index := len(lines) - 1; index >= 0; index-- {
+		snapshot, ok := threadSettingsSnapshotFromEvent(lines[index].Payload)
+		if !ok {
+			continue
+		}
+		switch {
+		case snapshot.ThreadID == threadID:
+			return persistedModelSettingsFromSnapshot(snapshot), true
+		case snapshot.ThreadID != "":
+			crossedForeignSnapshot = true
+		case !crossedForeignSnapshot:
+			return persistedModelSettingsFromSnapshot(snapshot), true
+		}
+	}
+	return PersistedModelSettings{}, false
+}
+
+func persistedModelSettingsFromSnapshot(snapshot persistedThreadSettingsEvent) PersistedModelSettings {
+	return PersistedModelSettings{
+		ServiceTier:      cloneStringPtr(snapshot.ServiceTier),
+		ReasoningSummary: cloneStringPtr(snapshot.ReasoningSummary),
+		Personality:      cloneStringPtr(snapshot.Personality),
+	}
+}
+
+// PersistedResumeSettings is the set of thread settings a cold resume or fork
+// restores from rollout history (Rust PersistedResumeSettings, #57227).
+// ActivePermissionProfile is a named profile selection; UnnamedPermissionProfile
+// is the raw inferred base profile that is restored only when no named profile
+// applies.
+type PersistedResumeSettings struct {
+	ApprovalPolicy string
+	// ApprovalsReviewer is the requested reviewer when a snapshot recorded one;
+	// older histories fall back to the effective reviewer (Rust #59272).
+	ApprovalsReviewer          string
+	RequestedApprovalsReviewer *string
+	ActivePermissionProfile    json.RawMessage
+	UnnamedPermissionProfile   json.RawMessage
+}
+
+// LatestPersistedResumeSettings resolves persisted settings for a resume or
+// fork of threadID (Rust PersistedResumeSettings::from_history, #57227).
+//
+// A running turn can record stale permissions after the thread accepts a
+// settings update, so a snapshot explicitly owned by threadID wins over a
+// TurnContext. An ownerless (legacy) snapshot following that owner's checkpoint
+// is treated as the thread's latest update; an ownerless snapshot that precedes
+// a snapshot owned by another thread belongs to that other thread. Only an
+// owned snapshot can supply the unnamed base profile: raw grants recorded
+// without an identifiable owner may describe another thread or executor.
+func LatestPersistedResumeSettings(threadID string, lines []Line) (PersistedResumeSettings, bool) {
+	threadID = strings.TrimSpace(threadID)
+	var latestLegacy *persistedThreadSettingsEvent
+	for index := len(lines) - 1; index >= 0; index-- {
+		snapshot, ok := threadSettingsSnapshotFromEvent(lines[index].Payload)
+		if !ok {
+			continue
+		}
+		switch {
+		case snapshot.ThreadID == "":
+			if latestLegacy == nil {
+				copied := snapshot
+				latestLegacy = &copied
+			}
+		case snapshot.ThreadID == threadID:
+			chosen := snapshot
+			if latestLegacy != nil {
+				chosen = *latestLegacy
+			}
+			return persistedResumeSettingsFromSnapshot(chosen), true
+		default:
+			latestLegacy = nil
+		}
+	}
+	return latestPersistedResumeSettingsWithoutOwner(lines)
+}
+
+func persistedResumeSettingsFromSnapshot(snapshot persistedThreadSettingsEvent) PersistedResumeSettings {
+	reviewer := snapshot.RequestedApprovalsReviewer
+	if reviewer == nil && strings.TrimSpace(snapshot.ApprovalsReviewer) != "" {
+		effective := strings.TrimSpace(snapshot.ApprovalsReviewer)
+		reviewer = &effective
+	}
+	settings := PersistedResumeSettings{
+		ApprovalPolicy:             snapshot.ApprovalPolicy,
+		ApprovalsReviewer:          strings.TrimSpace(snapshot.ApprovalsReviewer),
+		RequestedApprovalsReviewer: cloneTrimmedStringPtr(reviewer),
+		ActivePermissionProfile:    cloneRawJSON(snapshot.ActivePermissionProfile),
+	}
+	if reviewer != nil {
+		settings.ApprovalsReviewer = strings.TrimSpace(*reviewer)
+	}
+	if settings.ActivePermissionProfile == nil {
+		settings.UnnamedPermissionProfile = cloneRawJSON(snapshot.PermissionProfile)
+	}
+	return settings
+}
+
+// latestPersistedResumeSettingsWithoutOwner mirrors Rust's fallback when no
+// settings snapshot identifies the resumed thread: the newest TurnContext, or
+// else the newest ThreadSettingsApplied event of any owner. Turn contexts never
+// supply an unnamed permission profile (Rust #53419/#57227).
+func latestPersistedResumeSettingsWithoutOwner(lines []Line) (PersistedResumeSettings, bool) {
+	for index := len(lines) - 1; index >= 0; index-- {
+		if len(lines[index].TurnContext) > 0 {
+			context := lines[index].TurnContext
+			policy, _ := approvalPolicyFromTurnContext(context)
+			reviewer := firstNonEmptyString(requestedApprovalsReviewerFromTurnContext(context), approvalsReviewerFromTurnContext(context))
+			if reviewer == "" {
+				reviewer = previousApprovalsReviewer(lines, index)
+			}
+			return PersistedResumeSettings{
+				ApprovalPolicy:          policy,
+				ApprovalsReviewer:       reviewer,
+				ActivePermissionProfile: activePermissionProfileFromTurnContext(context),
+			}, true
+		}
+		if snapshot, ok := threadSettingsSnapshotFromEvent(lines[index].Payload); ok {
+			return PersistedResumeSettings{
+				ApprovalPolicy:          snapshot.ApprovalPolicy,
+				ApprovalsReviewer:       snapshot.ApprovalsReviewer,
+				ActivePermissionProfile: cloneRawJSON(snapshot.ActivePermissionProfile),
+			}, true
+		}
+	}
+	return PersistedResumeSettings{}, false
+}
+
+func previousApprovalsReviewer(lines []Line, before int) string {
+	for index := before - 1; index >= 0; index-- {
+		if len(lines[index].TurnContext) > 0 {
+			if reviewer := approvalsReviewerFromTurnContext(lines[index].TurnContext); reviewer != "" {
+				return reviewer
+			}
+		}
+		if snapshot, ok := threadSettingsSnapshotFromEvent(lines[index].Payload); ok {
+			if snapshot.RequestedApprovalsReviewer != nil && strings.TrimSpace(*snapshot.RequestedApprovalsReviewer) != "" {
+				return strings.TrimSpace(*snapshot.RequestedApprovalsReviewer)
+			}
+			if snapshot.ApprovalsReviewer != "" {
+				return snapshot.ApprovalsReviewer
+			}
+		}
+	}
+	return ""
+}
+
+// requestedApprovalsReviewerFromTurnContext reads the explicit reviewer a turn
+// captured before model requirements replaced it (Rust #59272).
+func requestedApprovalsReviewerFromTurnContext(raw json.RawMessage) string {
+	var values map[string]any
+	if len(raw) == 0 || json.Unmarshal(raw, &values) != nil {
+		return ""
+	}
+	for _, key := range []string{"requested_approvals_reviewer", "requestedApprovalsReviewer"} {
+		if reviewer := strings.TrimSpace(stringFromAny(values[key])); reviewer != "" {
+			return reviewer
+		}
+	}
+	return ""
+}
+
+func approvalsReviewerFromTurnContext(raw json.RawMessage) string {
+	var values map[string]any
+	if len(raw) == 0 || json.Unmarshal(raw, &values) != nil {
+		return ""
+	}
+	for _, key := range []string{"approvals_reviewer", "approvalsReviewer"} {
+		if reviewer := strings.TrimSpace(stringFromAny(values[key])); reviewer != "" {
+			return reviewer
+		}
+	}
+	return ""
+}
+
+func activePermissionProfileFromTurnContext(raw json.RawMessage) json.RawMessage {
+	var values map[string]any
+	if len(raw) == 0 || json.Unmarshal(raw, &values) != nil {
+		return nil
+	}
+	encoded, ok := rawMapValue(values, "active_permission_profile")
+	if !ok {
+		encoded, ok = rawMapValue(values, "activePermissionProfile")
+	}
+	if !ok {
+		return nil
+	}
+	data, err := json.Marshal(encoded)
+	if err != nil {
+		return nil
+	}
+	return cloneRawJSON(data)
+}
+
 type persistedThreadSettingsEvent struct {
-	ThreadID              string
-	CWD                   string
-	RuntimeWorkspaceRoots *[]string
+	ThreadID                   string
+	CWD                        string
+	RuntimeWorkspaceRoots      *[]string
+	ApprovalPolicy             string
+	ApprovalsReviewer          string
+	RequestedApprovalsReviewer *string
+	PermissionProfile          json.RawMessage
+	ActivePermissionProfile    json.RawMessage
+	ServiceTier                *string
+	ReasoningSummary           *string
+	Personality                *string
+	CollaborationMode          json.RawMessage
 }
 
 func threadSettingsSnapshotFromEvent(raw json.RawMessage) (persistedThreadSettingsEvent, bool) {
@@ -649,8 +969,17 @@ func threadSettingsSnapshotFromEvent(raw json.RawMessage) (persistedThreadSettin
 		Type           string `json:"type"`
 		ThreadID       string `json:"thread_id"`
 		ThreadSettings struct {
-			CWD                   string    `json:"cwd"`
-			RuntimeWorkspaceRoots *[]string `json:"runtime_workspace_roots"`
+			ApprovalPolicy             string          `json:"approval_policy"`
+			ApprovalsReviewer          string          `json:"approvals_reviewer"`
+			RequestedApprovalsReviewer *string         `json:"requested_approvals_reviewer"`
+			PermissionProfile          json.RawMessage `json:"permission_profile"`
+			ActivePermissionProfile    json.RawMessage `json:"active_permission_profile"`
+			CWD                        string          `json:"cwd"`
+			ServiceTier                *string         `json:"service_tier"`
+			ReasoningSummary           *string         `json:"reasoning_summary"`
+			Personality                *string         `json:"personality"`
+			CollaborationMode          json.RawMessage `json:"collaboration_mode"`
+			RuntimeWorkspaceRoots      *[]string       `json:"runtime_workspace_roots"`
 		} `json:"thread_settings"`
 	}
 	if len(raw) == 0 {
@@ -665,9 +994,18 @@ func threadSettingsSnapshotFromEvent(raw json.RawMessage) (persistedThreadSettin
 		roots = &copied
 	}
 	return persistedThreadSettingsEvent{
-		ThreadID:              strings.TrimSpace(event.ThreadID),
-		CWD:                   strings.TrimSpace(event.ThreadSettings.CWD),
-		RuntimeWorkspaceRoots: roots,
+		ThreadID:                   strings.TrimSpace(event.ThreadID),
+		CWD:                        strings.TrimSpace(event.ThreadSettings.CWD),
+		RuntimeWorkspaceRoots:      roots,
+		ApprovalPolicy:             strings.TrimSpace(event.ThreadSettings.ApprovalPolicy),
+		ApprovalsReviewer:          strings.TrimSpace(event.ThreadSettings.ApprovalsReviewer),
+		RequestedApprovalsReviewer: cloneTrimmedStringPtr(event.ThreadSettings.RequestedApprovalsReviewer),
+		PermissionProfile:          cloneRawJSON(event.ThreadSettings.PermissionProfile),
+		ActivePermissionProfile:    cloneRawJSON(event.ThreadSettings.ActivePermissionProfile),
+		ServiceTier:                cloneTrimmedStringPtr(event.ThreadSettings.ServiceTier),
+		ReasoningSummary:           cloneTrimmedStringPtr(event.ThreadSettings.ReasoningSummary),
+		Personality:                cloneTrimmedStringPtr(event.ThreadSettings.Personality),
+		CollaborationMode:          cloneRawJSON(event.ThreadSettings.CollaborationMode),
 	}, true
 }
 
@@ -991,6 +1329,9 @@ type rolloutReplayTurn struct {
 	itemCount        int
 	openedExplicitly bool
 	sawCompaction    bool
+	// hasGeneratedID marks a turn the rollout opened without an explicit ID.
+	// A late abort for an unknown turn may only fall back to such a turn.
+	hasGeneratedID bool
 }
 
 type rolloutEventPayload struct {
@@ -1106,7 +1447,8 @@ func (b *rolloutReplayBuilder) handleEventLine(line *Line, lineIndex int) bool {
 
 func (b *rolloutReplayBuilder) handleTurnStarted(payload rolloutEventPayload, lineIndex int) {
 	b.finishCurrentTurn()
-	turnID := firstNonEmptyString(payload.TurnID, payload.TurnIDCamel, fmt.Sprintf("rollout-%d", lineIndex))
+	explicitTurnID := firstNonEmptyString(payload.TurnID, payload.TurnIDCamel)
+	turnID := firstNonEmptyString(explicitTurnID, fmt.Sprintf("rollout-%d", lineIndex))
 	rootTurnID := ""
 	switch {
 	case payload.RootTurnID != nil:
@@ -1122,11 +1464,13 @@ func (b *rolloutReplayBuilder) handleTurnStarted(payload rolloutEventPayload, li
 			StartedAt:  firstNonNilInt64(payload.StartedAt, payload.StartedAtCamel),
 		},
 		openedExplicitly: true,
+		hasGeneratedID:   explicitTurnID == "",
 	}
 }
 
 func (b *rolloutReplayBuilder) handleTurnComplete(payload rolloutEventPayload) {
 	turnID := firstNonEmptyString(payload.TurnID, payload.TurnIDCamel)
+	rootTurnID := rolloutEventRootTurnID(payload)
 	errorMessage, codexErrorInfo, hasTerminalError, readable := rolloutEventError(payload.Error)
 	if !readable {
 		// Rust #46482: a known classification with an invalid payload makes the
@@ -1139,6 +1483,9 @@ func (b *rolloutReplayBuilder) handleTurnComplete(payload rolloutEventPayload) {
 	apply := func(snapshot *session.TurnSnapshot) {
 		if snapshot == nil {
 			return
+		}
+		if rootTurnID != "" {
+			snapshot.RootTurnID = rootTurnID
 		}
 		if hasTerminalError {
 			snapshot.Status = "failed"
@@ -1169,16 +1516,53 @@ func (b *rolloutReplayBuilder) handleTurnComplete(payload rolloutEventPayload) {
 
 func (b *rolloutReplayBuilder) handleTurnAborted(payload rolloutEventPayload, lineIndex int) {
 	turnID := firstNonEmptyString(payload.TurnID, payload.TurnIDCamel)
+	rootTurnID := rolloutEventRootTurnID(payload)
+	errorMessage, codexErrorInfo, hasError, readable := rolloutEventError(payload.Error)
+	if !readable {
+		return
+	}
 	apply := func(snapshot *session.TurnSnapshot) {
 		if snapshot == nil {
 			return
 		}
+		if rootTurnID != "" {
+			snapshot.RootTurnID = rootTurnID
+		}
 		snapshot.Status = "interrupted"
+		if hasError {
+			snapshot.ErrorMessage = errorMessage
+			snapshot.CodexErrorInfo = codexErrorInfo
+		} else {
+			snapshot.ErrorMessage = ""
+			snapshot.CodexErrorInfo = nil
+		}
 		snapshot.CompletedAt = firstNonNilInt64(payload.CompletedAt, payload.CompletedAtCamel)
 		snapshot.DurationMS = firstNonNilInt64(payload.DurationMS, payload.DurationMSCamel)
 	}
-	if b.current != nil && (turnID == "" || b.current.snapshot.ID == turnID) {
+	if b.current != nil && turnID != "" && b.current.snapshot.ID == turnID {
 		apply(&b.current.snapshot)
+		b.finishCurrentTurn()
+		return
+	}
+	if turnID != "" {
+		for i := range b.turns {
+			if b.turns[i].ID == turnID {
+				apply(&b.turns[i])
+				return
+			}
+		}
+	}
+	// Rust #60700: fall back to the active turn only when the abort has no ID or
+	// the active turn was opened with a generated ID. A late abort for an
+	// unrelated turn must not interrupt an explicitly identified turn.
+	if b.current != nil && (turnID == "" || b.current.hasGeneratedID) {
+		apply(&b.current.snapshot)
+		b.finishCurrentTurn()
+		return
+	}
+	if turnID != "" {
+		// The abort names a turn this rollout never observed; leave the
+		// explicitly identified active turn untouched.
 		return
 	}
 	if turnID == "" && len(b.items) > 0 {
@@ -1193,13 +1577,22 @@ func (b *rolloutReplayBuilder) handleTurnAborted(payload rolloutEventPayload, li
 			return
 		}
 	}
-	if b.current != nil {
-		apply(&b.current.snapshot)
-		return
-	}
 	snapshot := session.TurnSnapshot{ID: turnID}
 	apply(&snapshot)
 	b.turns = append(b.turns, snapshot)
+}
+
+// rolloutEventRootTurnID reads the optional causal root Rust #51415 persists on
+// completion and abort events; older writers omit it.
+func rolloutEventRootTurnID(payload rolloutEventPayload) string {
+	switch {
+	case payload.RootTurnID != nil:
+		return strings.TrimSpace(*payload.RootTurnID)
+	case payload.RootTurnIDCamel != nil:
+		return strings.TrimSpace(*payload.RootTurnIDCamel)
+	default:
+		return ""
+	}
 }
 
 func (b *rolloutReplayBuilder) handleTurnError(payload rolloutEventPayload, lineIndex int) {
@@ -1673,18 +2066,19 @@ func SessionItemFromRolloutItem(item *Item, createdAt time.Time, index int) sess
 		metadata["turnId"] = turnID
 	}
 	sessionItem := session.Item{
-		ID:         firstNonEmptyString(item.ID, fallbackItemID(index)),
-		Type:       firstNonEmptyString(itemType, "raw_response_item"),
-		Role:       role,
-		Text:       text,
-		Name:       item.Name,
-		CallID:     item.CallID,
-		Content:    sessionContentPartsFromRollout(item.Content),
-		Data:       cloneAnyMap(item.Data),
-		Raw:        append(json.RawMessage(nil), item.Raw...),
-		CreatedAt:  createdAt,
-		ResponseID: item.ResponseID,
-		Metadata:   metadata,
+		ID:             firstNonEmptyString(item.ID, fallbackItemID(index)),
+		Type:           firstNonEmptyString(itemType, "raw_response_item"),
+		Role:           role,
+		Text:           text,
+		Name:           item.Name,
+		CallID:         item.CallID,
+		Content:        sessionContentPartsFromRollout(item.Content),
+		Data:           cloneAnyMap(item.Data),
+		Raw:            append(json.RawMessage(nil), item.Raw...),
+		CreatedAt:      createdAt,
+		ResponseID:     item.ResponseID,
+		ResponseItemID: item.ResponseItemID,
+		Metadata:       metadata,
 	}
 	if sessionItem.Role == "user" && strings.HasPrefix(strings.TrimSpace(sessionItem.Text), "<turn_aborted>") {
 		sessionItem.Metadata["kind"] = "turn_aborted"
@@ -2597,4 +2991,31 @@ func validateThreadHistoryMode(mode string) error {
 	default:
 		return fmt.Errorf("invalid session metadata history_mode %q: expected `legacy` or `paginated`", mode)
 	}
+}
+
+// AppendRealtimeItems persists canonical realtime timeline items as
+// `realtime_item` rollout records, preserving the caller's event order
+// (Rust RolloutItem::RealtimeItem, #41924).
+func AppendRealtimeItems(recorder *Recorder, items []json.RawMessage, now time.Time) error {
+	if recorder == nil {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	timestamp := now.UTC().Format(time.RFC3339Nano)
+	for i, payload := range items {
+		if len(payload) == 0 {
+			continue
+		}
+		line := Line{
+			Type:      "realtime_item",
+			Timestamp: timestamp,
+			Payload:   append(json.RawMessage(nil), payload...),
+		}
+		if err := recorder.AppendLine(line); err != nil {
+			return fmt.Errorf("append realtime item %d: %w", i, err)
+		}
+	}
+	return nil
 }

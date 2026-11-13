@@ -7,7 +7,9 @@ import (
 	"strings"
 
 	"codex_core/codexapi"
+	"codex_core/network"
 	"codex_core/protocol"
+	"codex_core/retainedctx"
 	"codex_core/sandbox"
 )
 
@@ -30,13 +32,32 @@ type AgentRequest struct {
 	// input so they follow the user message in the request.
 	PostPromptInputItems []any
 	Tools                []any
-	Model                string
-	ProviderID           string
+	// IncrementalTools reports an incremental-tool context window (Rust
+	// #59832 StepContext::incremental_tools_enabled). Regular OpenAI Responses
+	// fold their catalog into `additional_tools` history items once the window
+	// recorded declarations, while hosted web search stays in top-level tools.
+	IncrementalTools bool
+	// PrewarmTools mirrors Rust #47635: the startup prewarm captures the turn's
+	// step tools (including MCP discovery) concurrently with the websocket
+	// handshake and sends the generate=false warmup with those tools. Prewarm
+	// calls it at most once, after dialing a fresh socket.
+	PrewarmTools func(ctx context.Context) []any
+	Model        string
+	// UnifiedImageBudget mirrors Rust's unified_image_budget_enabled: request
+	// image preparation ignores each image detail hint and applies the
+	// original-detail budget instead.
+	UnifiedImageBudget bool
+	ProviderID         string
 	// Endpoint selects the Responses-compatible backend route. The zero value
 	// is the standard /responses route; Guardian callers may opt into /guardian.
 	Endpoint ResponsesEndpoint
-	TaskKind AgentTaskKind
-	ThreadID string
+	// RoutingAffinity is the transport-only routing pin captured with the
+	// reviewed parent response (Rust #57710). Only a Guardian reviewer request
+	// carries it, and it is never projected into prompts, history, or
+	// serialized metadata.
+	RoutingAffinity *network.RoutingAffinity
+	TaskKind        AgentTaskKind
+	ThreadID        string
 	// SessionID is the session (rollout) identity that Rust passes to
 	// ResponsesOptions::session_id. Go keeps one rollout per thread, so an
 	// empty value falls back to ThreadID (see addSessionIdentityHeaders).
@@ -45,9 +66,16 @@ type AgentRequest struct {
 	Originator         string
 	Store              bool
 	PreviousResponseID string
-	ParallelToolCalls  bool
-	ReasoningEffort    string
-	ReasoningSummary   string
+	// PreviousResponseFromPrewarm reports that PreviousResponseID was prepared
+	// by a session startup or idle-history prewarm. Rust #48812 tags the
+	// websocket continuation of that request with after_prewarm.
+	PreviousResponseFromPrewarm bool
+	// PrewarmInputMode labels a Prewarm call as "base" (startup) or "history"
+	// (idle-thread warmup). It only affects prewarm telemetry (Rust #48812).
+	PrewarmInputMode  string
+	ParallelToolCalls bool
+	ReasoningEffort   string
+	ReasoningSummary  string
 	// DropReasoningEffortUpdates mirrors Rust ModelClient's request-time filter
 	// (#46530): when reasoning-effort updates are unsupported for the effective
 	// model or provider, saved configuration_update items are removed from the
@@ -60,15 +88,28 @@ type AgentRequest struct {
 	ItemIDsEnabled               bool
 	ServiceTier                  string
 	PromptCacheKey               string
+	// PromptCacheTTL requests a minimum prompt-cache lifetime for this turn
+	// ("30m" or "12h"). It maps to prompt_cache_options.ttl and is omitted when
+	// empty (Rust #59480).
+	PromptCacheTTL string
 	// Ephemeral mirrors Rust's `turn_context.config.ephemeral`: the thread
 	// intentionally skips durable persistence, so every attachment upload made
 	// while preparing this request carries that intent (Rust #51517).
 	Ephemeral bool
+	// RequiredCyberAccessPrograms is the host-installed per-thread requirement
+	// (Rust #59754). Every request must resolve to one of these explicit
+	// programs; an empty slice leaves the thread unconstrained.
+	RequiredCyberAccessPrograms []string
 	// CyberAccessProgram is the turn's selected cyber access program (core
 	// snake_case, empty when the turn selected none). It reaches the request body
 	// only for a ChatGPT-authenticated account (Rust #44893 / for_auth).
 	CyberAccessProgram string
 	ClientMetadata     map[string]string
+	// MCPAttribution is the thread's cumulative MCP tools/call attribution
+	// snapshot (Rust CodexResponsesMetadata::mcp_attribution). It is body-only
+	// and reaches the request only when the resolved provider is granted
+	// internal metadata (Rust #47899).
+	MCPAttribution *retainedctx.McpAttribution
 	// Trace is the W3C trace context of the request that started this turn
 	// (Rust's `request_trace`): the websocket payload carries it so the model
 	// call stays inside the caller's trace.
@@ -96,6 +137,12 @@ type AgentRequest struct {
 	// reaches the model without waiting for the unfinished response. A
 	// preempted request returns a response with Preempted set and no output.
 	Preempt <-chan struct{}
+	// InterruptOnCancel mirrors Rust #57864's `features.interrupt_on_cancel`:
+	// when a Responses Lite turn is cancelled the request tells the server to
+	// interrupt the response and drains the terminal event (bounded by one
+	// second) instead of abandoning the socket. The completed part keeps its
+	// usage accounting and the connection stays reusable.
+	InterruptOnCancel bool
 }
 
 type AgentUsage struct {
@@ -128,6 +175,11 @@ type AgentItem struct {
 	Execution             string
 	Search                map[string]any
 	Data                  map[string]any
+	// ContentTokenCount is the producer-supplied native content-token count
+	// for a completed assistant message, including any sampled footer.
+	// It is completion telemetry only: it never enters stored items or model
+	// requests, so it is excluded from JSON.
+	ContentTokenCount *uint64 `json:"-"`
 
 	// Locally observed metadata is intentionally private so JSON input cannot
 	// forge warehouse-only executed-tool records.
@@ -387,26 +439,45 @@ type responsesReasoningTextContent struct {
 }
 
 type AgentResponse struct {
-	ResponseID        string
-	Message           string
-	Items             []AgentItem
-	Usage             AgentUsage
-	Model             string
-	ProviderID        string
-	RequestID         string
-	ServerModel       string
-	TurnState         string
-	ModelsETag        string
-	Headers           map[string]string
-	RateLimits        []ResponsesRateLimitSnapshot
-	ReasoningIncluded *bool
-	TimingMetrics     map[string]any
+	ResponseID string
+	// SampledThroughSequence is the highest persisted history identity included
+	// in the regular inference request that produced this response. It is
+	// internal harness state and never serialized to storage as model output.
+	SampledThroughSequence *uint64 `json:"-"`
+	Message                string
+	Items                  []AgentItem
+	Usage                  AgentUsage
+	Model                  string
+	ProviderID             string
+	RequestID              string
+	ServerModel            string
+	TurnState              string
+	ModelsETag             string
+	Headers                map[string]string
+	RateLimits             []ResponsesRateLimitSnapshot
+	ReasoningIncluded      *bool
+	TimingMetrics          map[string]any
 	// Preempted reports that the sampling request was interrupted by new user
 	// input before it produced a response (Rust #48141's
 	// `SamplingRequestResult { needs_follow_up: true }` for a signaled step). The
 	// turn continues with the queued input instead of treating the step as a
 	// failure.
 	Preempted bool
+	// Drained reports that a preempted Responses Lite WebSocket stream was
+	// interrupted gracefully and drained to its terminal event (Rust #55969).
+	// Items and ResponseID are the completed parts the server retained, so the
+	// turn records them and continues from ResponseID instead of resending full
+	// history.
+	Drained bool
+	// Canceled reports that the turn was cancelled while sampling and the
+	// upstream response was interrupted (Rust #57864). Items and Usage are the
+	// completed part the server retained; the turn still ends as aborted but
+	// the usage is accounted for.
+	Canceled bool
+	// RoutingAffinity is the routing pin from the WebSocket handshake that
+	// produced this response, kept so a Guardian review of it can reuse the
+	// same edge route (Rust #57710's ResponseStream::routing_affinity).
+	RoutingAffinity *network.RoutingAffinity
 }
 
 func AgentResponseMetadata(response *AgentResponse) map[string]any {

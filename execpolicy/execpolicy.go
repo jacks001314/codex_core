@@ -2,6 +2,7 @@ package execpolicy
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,14 +10,18 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 )
 
 type Decision string
 
 const (
-	DecisionAllow     Decision = "allow"
-	DecisionPrompt    Decision = "prompt"
-	DecisionForbidden Decision = "forbidden"
+	DecisionAllow      Decision = "allow"
+	DecisionPrompt     Decision = "prompt"
+	DecisionPromptUser Decision = "prompt-user"
+	DecisionForbidden  Decision = "forbidden"
 )
 
 type CheckOptions struct {
@@ -33,12 +38,50 @@ type Policy struct {
 }
 
 type PrefixRule struct {
-	Pattern          [][]string
-	Decision         Decision
-	Justification    string
-	MatchExamples    [][]string
-	NotMatchExamples [][]string
-	Source           string
+	Pattern [][]string
+	// CanonicalMatching applies Unicode canonical caseless matching to every
+	// prefix token, including alternatives (Rust #59535). Exact matching stays
+	// the default.
+	CanonicalMatching bool
+	Decision          Decision
+	Justification     string
+	MatchExamples     [][]string
+	NotMatchExamples  [][]string
+	Source            string
+}
+
+// Clone returns a deep copy of the policy so an independent manager can apply
+// later amendments without changing the source session (Rust
+// ExecPolicyManager::from_snapshot clones the transported policy, #58406).
+func (p *Policy) Clone() *Policy {
+	if p == nil {
+		return nil
+	}
+	clone := &Policy{NetworkRules: append([]NetworkRule(nil), p.NetworkRules...)}
+	clone.Rules = make([]PrefixRule, 0, len(p.Rules))
+	for _, rule := range p.Rules {
+		cloned := rule
+		cloned.Pattern = make([][]string, 0, len(rule.Pattern))
+		for _, token := range rule.Pattern {
+			cloned.Pattern = append(cloned.Pattern, append([]string(nil), token...))
+		}
+		cloned.MatchExamples = clonePolicyCommands(rule.MatchExamples)
+		cloned.NotMatchExamples = clonePolicyCommands(rule.NotMatchExamples)
+		clone.Rules = append(clone.Rules, cloned)
+	}
+	clone.HostExecutables = cloneHostExecutables(p.HostExecutables)
+	return clone
+}
+
+func clonePolicyCommands(commands [][]string) [][]string {
+	if len(commands) == 0 {
+		return nil
+	}
+	out := make([][]string, 0, len(commands))
+	for _, command := range commands {
+		out = append(out, append([]string(nil), command...))
+	}
+	return out
 }
 
 // AllowedPrefixes ports Rust Policy::get_allowed_prefixes: every allow rule's
@@ -138,6 +181,21 @@ func Check(opts *CheckOptions) (*CheckOutput, error) {
 	return output, nil
 }
 
+// EvaluateCommand matches a tokenized command against the policy's prefix
+// rules without probing the filesystem for executable mappings. It mirrors
+// `Policy::check` for callers that already have the command tokens (Rust
+// #58045's managed command checkpoints).
+func (p *Policy) EvaluateCommand(command []string) *CheckOutput {
+	if p == nil {
+		return &CheckOutput{MatchedRules: []RuleMatch{}}
+	}
+	output := &CheckOutput{MatchedRules: p.matchesForCommand(command, false)}
+	if decision := strictestDecision(output.MatchedRules); decision != "" {
+		output.Decision = &decision
+	}
+	return output
+}
+
 func (p *Policy) matchesForCommand(command []string, resolveHostExecutables bool) []RuleMatch {
 	matches := []RuleMatch{}
 	for _, rule := range p.Rules {
@@ -175,50 +233,125 @@ func LoadPolicies(paths []string) (*Policy, error) {
 	for _, path := range paths {
 		data, err := os.ReadFile(path)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read policy at %s: %w", path, err)
+			return nil, policyContextError("failed to read policy at "+path, err)
 		}
 		if err := policy.Parse(path, string(data)); err != nil {
-			return nil, fmt.Errorf("failed to parse policy at %s: %w", path, err)
+			var diagnostic *policyDiagnostic
+			if errors.As(err, &diagnostic) {
+				return nil, policyContextError("failed to parse policy at "+path, fmt.Errorf("starlark error: %s", diagnostic))
+			}
+			return nil, policyContextError("failed to parse policy at "+path, err)
 		}
 	}
 	return policy, nil
 }
 
+// LoadPolicyDirectory loads every `*.rules` file in dir in lexical order,
+// mirroring Rust collect_policy_files: a missing directory is an empty policy
+// and only regular files with the `.rules` extension are read.
+func LoadPolicyDirectory(dir string) (*Policy, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return &Policy{HostExecutables: map[string][]string{}}, nil
+		}
+		return nil, err
+	}
+	paths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".rules") {
+			continue
+		}
+		paths = append(paths, filepath.Join(dir, entry.Name()))
+	}
+	sort.Strings(paths)
+	if len(paths) == 0 {
+		return &Policy{HostExecutables: map[string][]string{}}, nil
+	}
+	return LoadPolicies(paths)
+}
+
+// policyContextError renders anyhow's context chain for a policy file: the
+// context line, a blank line, then the cause indented by four spaces.
+func policyContextError(context string, err error) error {
+	cause := err.Error()
+	if message, ok := rustOSErrorMessage(err); ok {
+		cause = message
+	}
+	return fmt.Errorf("%s\n\nCaused by:\n    %s", context, strings.ReplaceAll(cause, "\n", "\n    "))
+}
 func (p *Policy) Parse(identifier string, input string) error {
 	if p == nil {
 		return fmt.Errorf("policy is nil")
 	}
-	statements, err := collectPolicyStatements(input)
-	if err != nil {
-		return err
+	src := newPolicySource(identifier, input)
+	statements, diag := parsePolicyProgram(src)
+	if diag != nil {
+		return diag
+	}
+	declared := make(map[string]bool, len(statements))
+	for _, statement := range statements {
+		if statement.call == nil && statement.assignName != "" {
+			declared[statement.assignName] = true
+		}
+	}
+	assigned := make(map[string]bool, len(declared))
+	for _, statement := range statements {
+		if statement.call == nil {
+			if diag := policyValueDiagnostic(src, statement.assignSpan, declared, assigned); diag != nil {
+				return diag
+			}
+			assigned[statement.assignName] = true
+			continue
+		}
+		call := statement.call
+		if !isPolicyGlobalName(call.name) {
+			return policyVariableNotFoundDiagnostic(src, call)
+		}
+		if diag := policyCallShapeDiagnostic(call, src); diag != nil {
+			return diag
+		}
+		for _, arg := range call.args {
+			if diag := policyValueDiagnostic(src, arg.span, declared, assigned); diag != nil {
+				return diag
+			}
+		}
 	}
 	eval := newPolicyEval()
 	for _, statement := range statements {
-		if statement.AssignName != "" {
-			eval.assign(statement.AssignName, statement.AssignValue)
+		if statement.call == nil {
+			eval.assign(statement.assignName, statement.assignValue)
 			continue
 		}
-		switch statement.CallName {
+		call := statement.call
+		body, bindDiag := bindPolicyCallArguments(call, src)
+		if bindDiag != nil {
+			return bindDiag
+		}
+		var err error
+		switch call.name {
 		case "prefix_rule":
-			rule, err := parsePrefixRule(eval, identifier, statement.CallBody)
-			if err != nil {
-				return err
+			var rule PrefixRule
+			rule, err = parsePrefixRule(eval, identifier, body)
+			if err == nil {
+				p.Rules = append(p.Rules, rule)
 			}
-			p.Rules = append(p.Rules, rule)
 		case "host_executable":
-			name, paths, err := parseHostExecutable(eval, statement.CallBody)
-			if err != nil {
-				return err
-			}
-			if name != "" {
+			var name string
+			var paths []string
+			name, paths, err = parseHostExecutable(eval, body)
+			if err == nil && name != "" {
 				p.HostExecutables[name] = paths
 			}
 		case "network_rule":
-			rule, err := parseNetworkRule(eval, statement.CallBody)
-			if err != nil {
-				return err
+			var rule NetworkRule
+			rule, err = parseNetworkRule(eval, body)
+			if err == nil {
+				p.NetworkRules = append(p.NetworkRules, rule)
 			}
-			p.NetworkRules = append(p.NetworkRules, rule)
+		}
+		if err != nil {
+			return newPolicyRuntimeDiagnostic(src, call, err.Error())
 		}
 	}
 	return p.validateExamples()
@@ -234,17 +367,17 @@ func (p *Policy) matchRule(rule *PrefixRule, command []string, resolveHostExecut
 		token := command[i]
 		if i == 0 && resolveHostExecutables && filepath.IsAbs(token) {
 			basename := executableLookupKey(filepath.Base(token))
-			if containsPolicyToken(alternatives, token) {
+			if containsPolicyTokenWithMode(alternatives, token, rule.CanonicalMatching) {
 				matched = append(matched, token)
 				continue
 			}
-			if containsString(alternatives, basename) && p.hostExecutableAllows(basename, token) {
+			if containsPolicyTokenWithMode(alternatives, basename, rule.CanonicalMatching) && p.hostExecutableAllows(basename, token) {
 				matched = append(matched, basename)
 				resolvedProgram = token
 				continue
 			}
 		}
-		if !containsPolicyToken(alternatives, token) {
+		if !containsPolicyTokenWithMode(alternatives, token, rule.CanonicalMatching) {
 			return nil, "", false
 		}
 		matched = append(matched, token)
@@ -253,13 +386,29 @@ func (p *Policy) matchRule(rule *PrefixRule, command []string, resolveHostExecut
 }
 
 func containsPolicyToken(alternatives []string, token string) bool {
+	return containsPolicyTokenWithMode(alternatives, token, false)
+}
+
+func containsPolicyTokenWithMode(alternatives []string, token string, canonical bool) bool {
 	normalizedToken := normalizePolicyTokenPath(token)
 	for _, alternative := range alternatives {
 		if alternative == token || normalizePolicyTokenPath(alternative) == normalizedToken {
 			return true
 		}
+		if canonical {
+			if canonicalPolicyToken(alternative) == canonicalPolicyToken(token) {
+				return true
+			}
+		}
 	}
 	return false
+}
+
+// canonicalPolicyToken implements Unicode canonical caseless matching without
+// resolving executables. NFKC plus full case folding matches case and
+// canonically equivalent spellings such as "bash" and "bAſh".
+func canonicalPolicyToken(value string) string {
+	return cases.Fold().String(norm.NFKC.String(value))
 }
 
 func normalizePolicyTokenPath(value string) string {
@@ -307,7 +456,7 @@ func (p *Policy) validateExamples() error {
 }
 
 func parsePrefixRule(eval *policyEval, source string, body string) (PrefixRule, error) {
-	fields, err := bindCallArguments("prefix_rule", body, []string{"pattern", "decision", "match", "not_match", "justification"})
+	fields, err := bindCallArguments("prefix_rule", body, []string{"pattern", "decision", "match", "not_match", "justification", "canonical_matching"})
 	if err != nil {
 		return PrefixRule{}, err
 	}
@@ -323,25 +472,31 @@ func parsePrefixRule(eval *policyEval, source string, body string) (PrefixRule, 
 	if raw, ok := fields["decision"]; ok {
 		value, err := parsePolicyString(eval, raw, "decision")
 		if err != nil {
+			if message, ok := policyParameterTypeMessage("decision", "str", err); ok {
+				return PrefixRule{}, errors.New(message)
+			}
 			return PrefixRule{}, err
 		}
 		parsed := Decision(value)
 		switch parsed {
-		case DecisionAllow, DecisionPrompt, DecisionForbidden:
+		case DecisionAllow, DecisionPrompt, DecisionPromptUser, DecisionForbidden:
 			decision = parsed
 		default:
-			return PrefixRule{}, fmt.Errorf("unsupported decision %q", parsed)
+			return PrefixRule{}, fmt.Errorf("invalid decision: %s", value)
 		}
 	}
 	justification := ""
 	if raw, ok := fields["justification"]; ok {
 		value, err := parsePolicyString(eval, raw, "justification")
 		if err != nil {
+			if message, ok := policyParameterTypeMessage("justification", "str", err); ok {
+				return PrefixRule{}, errors.New(message)
+			}
 			return PrefixRule{}, err
 		}
 		justification = value
 		if strings.TrimSpace(justification) == "" {
-			return PrefixRule{}, fmt.Errorf("justification cannot be empty")
+			return PrefixRule{}, fmt.Errorf("invalid rule: justification cannot be empty")
 		}
 	}
 	matchExamples, err := parseExamplesField(eval, fields, "match")
@@ -352,13 +507,26 @@ func parsePrefixRule(eval *policyEval, source string, body string) (PrefixRule, 
 	if err != nil {
 		return PrefixRule{}, err
 	}
+	canonicalMatching := false
+	if raw, ok := fields["canonical_matching"]; ok {
+		value := strings.TrimSpace(raw)
+		switch value {
+		case "True", "true":
+			canonicalMatching = true
+		case "False", "false":
+			canonicalMatching = false
+		default:
+			return PrefixRule{}, fmt.Errorf("canonical_matching must be a boolean")
+		}
+	}
 	return PrefixRule{
-		Pattern:          pattern,
-		Decision:         decision,
-		Justification:    justification,
-		MatchExamples:    matchExamples,
-		NotMatchExamples: notMatchExamples,
-		Source:           source,
+		Pattern:           pattern,
+		CanonicalMatching: canonicalMatching,
+		Decision:          decision,
+		Justification:     justification,
+		MatchExamples:     matchExamples,
+		NotMatchExamples:  notMatchExamples,
+		Source:            source,
 	}, nil
 }
 
@@ -369,33 +537,47 @@ func parseHostExecutable(eval *policyEval, body string) (string, []string, error
 	}
 	name := ""
 	if raw, ok := fields["name"]; ok {
-		value, err := parsePolicyString(eval, raw, "host_executable name")
+		value, err := parsePolicyString(eval, raw, "name")
 		if err != nil {
+			if message, ok := policyParameterTypeMessage("name", "str", err); ok {
+				return "", nil, errors.New(message)
+			}
 			return "", nil, err
 		}
 		name = value
 	}
 	if name == "" {
-		return "", nil, fmt.Errorf("host_executable name cannot be empty")
+		return "", nil, fmt.Errorf("invalid rule: host_executable name cannot be empty")
 	}
 	if filepath.Base(name) != name {
-		return "", nil, fmt.Errorf("host_executable name must be a bare executable name (got %s)", name)
+		return "", nil, fmt.Errorf("invalid rule: host_executable name must be a bare executable name (got %s)", name)
 	}
 	var paths []string
 	raw, ok := fields["paths"]
 	if !ok {
 		return "", nil, fmt.Errorf("host_executable missing paths")
 	}
-	values, err := parseStringList(eval, raw)
+	items, err := parsePolicyList(eval, raw)
 	if err != nil {
+		if message, ok := policyParameterTypeMessage("paths", "list", err); ok {
+			return "", nil, errors.New(message)
+		}
 		return "", nil, err
 	}
-	for _, path := range values {
+	for _, item := range items {
+		path, err := parsePolicyString(eval, item, "path")
+		if err != nil {
+			var typeErr *policyTypeError
+			if errors.As(err, &typeErr) {
+				return "", nil, fmt.Errorf("invalid rule: host_executable paths must be strings (got %s)", starlarkTypeName(typeErr.raw))
+			}
+			return "", nil, err
+		}
 		if !filepath.IsAbs(path) {
-			return "", nil, fmt.Errorf("host_executable paths must be absolute (got %s)", path)
+			return "", nil, fmt.Errorf("invalid rule: host_executable paths must be absolute (got %s)", path)
 		}
 		if executableLookupKey(filepath.Base(path)) != executableLookupKey(name) {
-			return "", nil, fmt.Errorf("host_executable path `%s` must have basename `%s`", path, name)
+			return "", nil, fmt.Errorf("invalid rule: host_executable path `%s` must have basename `%s`", path, name)
 		}
 		if !containsString(paths, path) {
 			paths = append(paths, path)
@@ -413,8 +595,11 @@ func parseNetworkRule(eval *policyEval, body string) (NetworkRule, error) {
 	if !ok {
 		return NetworkRule{}, fmt.Errorf("network_rule missing host")
 	}
-	hostValue, err := parsePolicyString(eval, hostRaw, "network_rule host")
+	hostValue, err := parsePolicyString(eval, hostRaw, "host")
 	if err != nil {
+		if message, ok := policyParameterTypeMessage("host", "str", err); ok {
+			return NetworkRule{}, errors.New(message)
+		}
 		return NetworkRule{}, err
 	}
 	host, err := normalizeNetworkRuleHost(hostValue)
@@ -425,8 +610,11 @@ func parseNetworkRule(eval *policyEval, body string) (NetworkRule, error) {
 	if !ok {
 		return NetworkRule{}, fmt.Errorf("network_rule missing protocol")
 	}
-	protocolValue, err := parsePolicyString(eval, protocolRaw, "network_rule protocol")
+	protocolValue, err := parsePolicyString(eval, protocolRaw, "protocol")
 	if err != nil {
+		if message, ok := policyParameterTypeMessage("protocol", "str", err); ok {
+			return NetworkRule{}, errors.New(message)
+		}
 		return NetworkRule{}, err
 	}
 	protocol, err := parseNetworkRuleProtocol(protocolValue)
@@ -437,8 +625,11 @@ func parseNetworkRule(eval *policyEval, body string) (NetworkRule, error) {
 	if !ok {
 		return NetworkRule{}, fmt.Errorf("network_rule missing decision")
 	}
-	decisionValue, err := parsePolicyString(eval, decisionRaw, "network_rule decision")
+	decisionValue, err := parsePolicyString(eval, decisionRaw, "decision")
 	if err != nil {
+		if message, ok := policyParameterTypeMessage("decision", "str", err); ok {
+			return NetworkRule{}, errors.New(message)
+		}
 		return NetworkRule{}, err
 	}
 	decision, err := parseNetworkRuleDecision(decisionValue)
@@ -449,11 +640,14 @@ func parseNetworkRule(eval *policyEval, body string) (NetworkRule, error) {
 	if raw, ok := fields["justification"]; ok {
 		value, err := parsePolicyString(eval, raw, "justification")
 		if err != nil {
+			if message, ok := policyParameterTypeMessage("justification", "str", err); ok {
+				return NetworkRule{}, errors.New(message)
+			}
 			return NetworkRule{}, err
 		}
 		justification = value
 		if strings.TrimSpace(justification) == "" {
-			return NetworkRule{}, fmt.Errorf("justification cannot be empty")
+			return NetworkRule{}, fmt.Errorf("invalid rule: justification cannot be empty")
 		}
 	}
 	return NetworkRule{Host: host, Protocol: protocol, Decision: decision, Justification: justification}, nil
@@ -542,7 +736,7 @@ func parseNetworkRuleProtocol(raw string) (string, error) {
 	case "socks5_udp":
 		return "socks5_udp", nil
 	default:
-		return "", fmt.Errorf("network_rule protocol must be one of http, https, socks5_tcp, socks5_udp (got %s)", raw)
+		return "", fmt.Errorf("invalid rule: network_rule protocol must be one of http, https, socks5_tcp, socks5_udp (got %s)", raw)
 	}
 }
 
@@ -555,27 +749,27 @@ func parseNetworkRuleDecision(raw string) (Decision, error) {
 	case DecisionAllow, DecisionPrompt, DecisionForbidden:
 		return decision, nil
 	default:
-		return "", fmt.Errorf("unsupported decision %q", decision)
+		return "", fmt.Errorf("invalid decision: %s", raw)
 	}
 }
 
 func normalizeNetworkRuleHost(raw string) (string, error) {
 	host := strings.TrimSpace(raw)
 	if host == "" {
-		return "", fmt.Errorf("network_rule host cannot be empty")
+		return "", fmt.Errorf("invalid rule: network_rule host cannot be empty")
 	}
 	if strings.Contains(host, "://") || strings.ContainsAny(host, "/?#") {
-		return "", fmt.Errorf("network_rule host must be a hostname or IP literal (without scheme or path)")
+		return "", fmt.Errorf("invalid rule: network_rule host must be a hostname or IP literal (without scheme or path)")
 	}
 	if strings.HasPrefix(host, "[") {
 		inside, rest, ok := strings.Cut(strings.TrimPrefix(host, "["), "]")
 		if !ok {
-			return "", fmt.Errorf("network_rule host has an invalid bracketed IPv6 literal")
+			return "", fmt.Errorf("invalid rule: network_rule host has an invalid bracketed IPv6 literal")
 		}
 		if rest != "" {
 			port, ok := strings.CutPrefix(rest, ":")
 			if !ok || port == "" || !allASCIIDigits(port) {
-				return "", fmt.Errorf("network_rule host contains an unsupported suffix: %s", raw)
+				return "", fmt.Errorf("invalid rule: network_rule host contains an unsupported suffix: %s", raw)
 			}
 		}
 		host = inside
@@ -587,13 +781,15 @@ func normalizeNetworkRuleHost(raw string) (string, error) {
 	}
 	normalized := strings.ToLower(strings.TrimSpace(strings.TrimRight(host, ".")))
 	if normalized == "" {
-		return "", fmt.Errorf("network_rule host cannot be empty")
+		return "", fmt.Errorf("invalid rule: network_rule host cannot be empty")
 	}
 	if strings.Contains(normalized, "*") {
-		return "", fmt.Errorf("network_rule host must be a specific host; wildcards are not allowed")
+		return "", fmt.Errorf("invalid rule: network_rule host must be a specific host; wildcards are not allowed")
 	}
-	if strings.IndexFunc(normalized, func(r rune) bool { return r == ' ' || r == '\t' || r == '\n' || r == '\r' }) >= 0 {
-		return "", fmt.Errorf("network_rule host cannot contain whitespace")
+	if strings.IndexFunc(normalized, func(r rune) bool {
+		return r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	}) >= 0 {
+		return "", fmt.Errorf("invalid rule: network_rule host cannot contain whitespace")
 	}
 	return normalized, nil
 }
@@ -610,27 +806,34 @@ func allASCIIDigits(value string) bool {
 func parsePattern(eval *policyEval, raw string) ([][]string, error) {
 	values, err := parsePolicyList(eval, strings.TrimSpace(raw))
 	if err != nil {
+		if message, ok := policyParameterTypeMessage("pattern", "list", err); ok {
+			return nil, errors.New(message)
+		}
 		return nil, err
 	}
 	if len(values) == 0 {
-		return nil, fmt.Errorf("pattern cannot be empty")
+		return nil, fmt.Errorf("invalid pattern element: pattern cannot be empty")
 	}
 	pattern := make([][]string, 0, len(values))
 	for _, value := range values {
 		value = strings.TrimSpace(value)
 		if isPolicyListExpression(eval, value) {
-			alternatives, err := parseStringList(eval, value)
+			alternatives, err := parseTypedStringList(eval, value, "pattern alternative must be a string (got %s)")
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("invalid pattern element: %s", err)
 			}
 			if len(alternatives) == 0 {
-				return nil, fmt.Errorf("pattern alternatives cannot be empty")
+				return nil, fmt.Errorf("invalid pattern element: pattern alternatives cannot be empty")
 			}
 			pattern = append(pattern, alternatives)
 			continue
 		}
 		token, err := parsePolicyString(eval, value, "pattern element")
 		if err != nil {
+			var typeErr *policyTypeError
+			if errors.As(err, &typeErr) {
+				return nil, fmt.Errorf("invalid pattern element: pattern element must be a string or list of strings (got %s)", starlarkTypeName(typeErr.raw))
+			}
 			return nil, err
 		}
 		pattern = append(pattern, []string{token})
@@ -638,7 +841,9 @@ func parsePattern(eval *policyEval, raw string) ([][]string, error) {
 	return pattern, nil
 }
 
-func parseStringList(eval *policyEval, raw string) ([]string, error) {
+// parseTypedStringList decodes a list of string literals, reporting a
+// non-string element with the caller's starlark_rst wording.
+func parseTypedStringList(eval *policyEval, raw string, message string) ([]string, error) {
 	values, err := parsePolicyList(eval, raw)
 	if err != nil {
 		return nil, err
@@ -647,6 +852,10 @@ func parseStringList(eval *policyEval, raw string) ([]string, error) {
 	for _, value := range values {
 		parsed, err := parsePolicyString(eval, value, "list item")
 		if err != nil {
+			var typeErr *policyTypeError
+			if errors.As(err, &typeErr) {
+				return nil, fmt.Errorf(message, starlarkTypeName(typeErr.raw))
+			}
 			return nil, err
 		}
 		out = append(out, parsed)
@@ -661,32 +870,39 @@ func parseExamplesField(eval *policyEval, fields map[string]string, name string)
 	}
 	values, err := parsePolicyList(eval, raw)
 	if err != nil {
+		if message, ok := policyParameterTypeMessage(name, "list", err); ok {
+			return nil, errors.New(message)
+		}
 		return nil, err
 	}
 	examples := make([][]string, 0, len(values))
 	for _, value := range values {
 		value = strings.TrimSpace(value)
 		if isPolicyListExpression(eval, value) {
-			tokens, err := parseStringList(eval, value)
+			tokens, err := parseTypedStringList(eval, value, "example tokens must be strings (got %s)")
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("invalid example: %s", err)
 			}
 			if len(tokens) == 0 {
-				return nil, fmt.Errorf("example cannot be an empty list")
+				return nil, fmt.Errorf("invalid example: example cannot be an empty list")
 			}
 			examples = append(examples, tokens)
 			continue
 		}
 		rawExample, err := parsePolicyString(eval, value, "example")
 		if err != nil {
+			var typeErr *policyTypeError
+			if errors.As(err, &typeErr) {
+				return nil, fmt.Errorf("invalid example: example must be a string or list of strings (got %s)", starlarkTypeName(typeErr.raw))
+			}
 			return nil, err
 		}
 		tokens, err := splitShellWords(rawExample)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("invalid example: example string has invalid shell syntax")
 		}
 		if len(tokens) == 0 {
-			return nil, fmt.Errorf("example cannot be an empty string")
+			return nil, fmt.Errorf("invalid example: example cannot be an empty string")
 		}
 		examples = append(examples, tokens)
 	}
@@ -712,7 +928,7 @@ func parsePolicyList(eval *policyEval, raw string) ([]string, error) {
 		return out, nil
 	}
 	if !strings.HasPrefix(raw, "[") || !strings.HasSuffix(raw, "]") {
-		return nil, fmt.Errorf("expected list, got %s", raw)
+		return nil, &policyTypeError{raw: raw}
 	}
 	body := strings.TrimSpace(raw[1 : len(raw)-1])
 	if body == "" {
@@ -1062,7 +1278,7 @@ func parsePolicyString(eval *policyEval, raw string, label string) (string, erro
 			return value, nil
 		}
 	}
-	return "", fmt.Errorf("%s must be a string literal", label)
+	return "", &policyTypeError{raw: raw}
 }
 
 func isPolicyFString(raw string) bool {
@@ -1187,8 +1403,10 @@ func decisionRank(decision Decision) int {
 		return 1
 	case DecisionPrompt:
 		return 2
-	case DecisionForbidden:
+	case DecisionPromptUser:
 		return 3
+	case DecisionForbidden:
+		return 4
 	default:
 		return 0
 	}
@@ -1226,15 +1444,26 @@ func HostDangerousCommandPlatform() DangerousCommandPlatform {
 
 func executableLookupKeyForPlatform(raw string, platform DangerousCommandPlatform) string {
 	if platform != DangerousCommandPlatformWindows {
+		if index := strings.LastIndex(raw, "/"); index >= 0 {
+			return raw[index+1:]
+		}
 		return raw
 	}
-	raw = strings.ToLower(raw)
+	name := raw
+	if index := strings.LastIndexAny(name, `/\`); index >= 0 {
+		name = name[index+1:]
+	}
+	if len(name) >= 2 && name[1] == ':' &&
+		(name[0] >= 'a' && name[0] <= 'z' || name[0] >= 'A' && name[0] <= 'Z') {
+		name = name[2:]
+	}
+	name = strings.ToLower(name)
 	for _, suffix := range []string{".exe", ".cmd", ".bat", ".com"} {
-		if strings.HasSuffix(raw, suffix) {
-			return strings.TrimSuffix(raw, suffix)
+		if strings.HasSuffix(name, suffix) {
+			return strings.TrimSuffix(name, suffix)
 		}
 	}
-	return raw
+	return name
 }
 
 func executableLookupKey(raw string) string {

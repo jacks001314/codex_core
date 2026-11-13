@@ -53,6 +53,12 @@ func (r *ResponsesAgentRunner) recoverUnauthorizedAuth(ctx context.Context, stat
 	if state == nil {
 		state = &authRecoveryState{}
 	}
+	// Rust #60096: a terminal runtime denial cannot be repaired by refreshing the
+	// original credential or by retrying the request, so it surfaces as the
+	// sign-in error without spending a recovery step.
+	if !r.isRecoverableAuthError(debug.StatusCode, debug.ResponseBody, debug.AuthErrorCode) {
+		return "", "", errTerminalRuntimeAuthDenial
+	}
 	// The provider owns one recovery attempt per request (Rust's
 	// `provider_auth_recovery_attempted`): a Bedrock credential refresh or a
 	// workload-identity refresh recovers the provider's own credentials, and Rust
@@ -93,6 +99,11 @@ func (r *ResponsesAgentRunner) recoverUnauthorizedAuth(ctx context.Context, stat
 	return "", "", errNoAuthRecoveryStep
 }
 
+// errTerminalRuntimeAuthDenial reports a 401 that is a terminal runtime denial
+// (Rust #60096): the original response, not a refreshed credential, is what the
+// caller must surface.
+var errTerminalRuntimeAuthDenial = errors.New("terminal runtime authentication denial")
+
 // errNoAuthRecoveryStep reports a 401 that ran no recovery step (Rust's
 // recovery_not_run): the caller surfaces the original error instead of retrying.
 var errNoAuthRecoveryStep = errors.New("no auth recovery step is available")
@@ -131,6 +142,17 @@ func (r *ResponsesAgentRunner) recoverProviderAuth(ctx context.Context) bool {
 	messages := r.providerAuthRecoveryMessages()
 	if messages != nil {
 		r.emitProviderAuthRecovery(ProviderAuthRecoveryPhaseStarted, messages.Started)
+	}
+	if r.ProviderUnauthorizedRecovery != nil {
+		// Rust's provider.recover_from_unauthorized runs once per request, ahead
+		// of the shared plan, so a gateway credential export can retry with a
+		// freshly exported token (#59816).
+		if recovered, recoverErr := r.ProviderUnauthorizedRecovery(ctx); recoverErr == nil && recovered {
+			if messages != nil {
+				r.emitProviderAuthRecovery(ProviderAuthRecoveryPhaseCompleted, messages.Succeeded)
+			}
+			return true
+		}
 	}
 	if err := r.refreshBedrockAWSCredentials(ctx); err == nil && r.bedrockAuthRecoveryAttempted {
 		if messages != nil {
@@ -225,8 +247,20 @@ func (r *ResponsesAgentRunner) reloadStoredChatGPTAuth(ctx context.Context) (boo
 		return false, permanentRefreshFailure(auth.RefreshTokenAccountMismatchMessage)
 	}
 	stored, err := auth.NewStoreWithOptions(r.CodexHome, r.StoreOptions).Load()
-	if err != nil || stored == nil {
+	if err != nil {
+		// Rust #58324: a storage read failure (interrupted write, malformed
+		// auth.json) is transient. Treating it as an account mismatch made the
+		// failure permanent, discarded the cached credential, and stopped
+		// unauthorized recovery from ever retrying.
+		return false, err
+	}
+	if stored == nil {
 		return false, permanentRefreshFailure(auth.RefreshTokenAccountMismatchMessage)
+	}
+	if err := auth.ValidateStoredAuthCredential(stored); err != nil {
+		// Rust rejects broken agent identity JWT material while building live
+		// auth, which surfaces here as a transient reload failure.
+		return false, err
 	}
 	if strings.TrimSpace(accountIDFromMap(stored.Tokens)) != strings.TrimSpace(expectedAccountID) {
 		return false, permanentRefreshFailure(auth.RefreshTokenAccountMismatchMessage)

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -19,7 +20,10 @@ const (
 	windowsSandboxSetupFlag = "--codex-run-as-windows-sandbox-setup"
 	setupModeFull           = "full"
 	setupModeProvisionOnly  = "provision-only"
-	createNoWindow          = 0x08000000
+	// setupModeInteractiveProvision provisions sandbox identities without the
+	// full ACL setup path (Rust #42309 SetupMode::InteractiveProvision).
+	setupModeInteractiveProvision = "interactive-provision"
+	createNoWindow                = 0x08000000
 
 	errorCancelled        windows.Errno = 1223
 	seeMaskNoCloseProcess               = 0x00000040
@@ -48,8 +52,42 @@ type setupElevationPayload struct {
 	AllowLocalBinding bool     `json:"allow_local_binding,omitempty"`
 	Otel              any      `json:"otel,omitempty"`
 	RealUser          string   `json:"real_user"`
+	UserProfile       string   `json:"user_profile,omitempty"`
 	Mode              string   `json:"mode"`
 	RefreshOnly       bool     `json:"refresh_only,omitempty"`
+	Runtime           string   `json:"runtime,omitempty"`
+}
+
+// setupUserProfile forwards the invoking user's profile to the elevated helper.
+// The helper only uses it to keep PowerShell's working directory and relative
+// path resolution alive when the command runs beneath that profile
+// (Rust #49690).
+func setupUserProfile() string {
+	return strings.TrimSpace(os.Getenv("USERPROFILE"))
+}
+
+// setupPayloadRuntime serializes the selected setup runtime. Legacy stays
+// omitted so payloads remain wire-compatible (Rust skips serializing Legacy).
+func setupPayloadRuntime() string {
+	return setupRuntimeValue(CurrentSetupRuntime())
+}
+
+// setupRuntimeValue serializes the selected setup runtime for a payload.
+func setupRuntimeValue(runtime SetupRuntime) string {
+	if runtime.IsLegacy() {
+		return ""
+	}
+	return string(SetupRuntimeRegistered)
+}
+
+// requireLegacySetupRuntime rejects helper-owned account provisioning for a
+// registered Core, which must be provisioned by the packaged service
+// (Rust "registered Core requires service-owned provisioning").
+func requireLegacySetupRuntime() error {
+	if CurrentSetupRuntime().IsLegacy() {
+		return nil
+	}
+	return setupFailuref(SetupErrorHelperRequestArgsFailed, "registered Core requires service-owned provisioning")
 }
 
 func setupExecutableArgs(payloadB64 string, useDispatchFlag bool) []string {
@@ -86,6 +124,9 @@ type shellExecuteInfoW struct {
 }
 
 func runElevatedSetup(req *SandboxSetupRequest) error {
+	if err := requireLegacySetupRuntime(); err != nil {
+		return err
+	}
 	if req.Permissions == nil || !req.Permissions.IsEnforceableByWindowsSandbox() {
 		return fmt.Errorf("unsupported filesystem permissions for Windows sandbox setup")
 	}
@@ -99,32 +140,44 @@ func runElevatedSetup(req *SandboxSetupRequest) error {
 			"failed to create sandbox dir %s: %v", sbxDir, err,
 		)
 	}
-	readRoots, writeRoots := BuildPayloadRoots(req, req.Overrides)
-	networkIdentity := SandboxNetworkIdentityFromPermissions(req.Permissions, req.ProxyEnforced)
-	offlineProxySettings := offlineProxySettingsForRequest(req, networkIdentity)
-	payload := &setupElevationPayload{
-		Version:           SetupVersion,
-		OfflineUsername:   OfflineUsername,
-		OnlineUsername:    OnlineUsername,
-		CodexHome:         req.CodexHome,
-		CommandCWD:        req.CommandCWD,
-		ReadRoots:         readRoots,
-		WriteRoots:        writeRoots,
-		DenyReadPaths:     BuildPayloadDenyReadPaths(req.Overrides.DenyReadPaths),
-		DenyWritePaths:    BuildPayloadDenyWritePaths(req, req.Overrides.DenyWritePaths),
-		ProxyPorts:        offlineProxySettings.ProxyPorts,
-		AllowLocalBinding: offlineProxySettings.AllowLocalBinding,
-		RealUser:          setupRealUser(req.RealUser),
-		Mode:              setupModeFull,
-	}
+	payload := elevatedProvisioningPayload(req)
 	elevated, err := isElevated()
 	if err != nil {
 		return setupFailuref(SetupErrorOrchestratorElevationCheckFailed, "failed to determine elevation state: %v", err)
 	}
-	return runSetupExe(payload, !elevated, req.CodexHome, true)
+	return runSetupExe(payload, !elevated, req.CodexHome, true, nil)
+}
+
+// elevatedProvisioningPayload keeps privileged interactive setup limited to
+// sandbox identities and proxy settings. Caller workspace and ACL roots are
+// applied afterwards by the non-elevated setup refresh
+// (Rust #42309 elevated_provisioning_payload).
+func elevatedProvisioningPayload(req *SandboxSetupRequest) *setupElevationPayload {
+	networkIdentity := SandboxNetworkIdentityFromPermissions(req.Permissions, req.ProxyEnforced)
+	offlineProxySettings := offlineProxySettingsForRequest(req, networkIdentity)
+	return &setupElevationPayload{
+		Version:           SetupVersion,
+		OfflineUsername:   OfflineUsername,
+		OnlineUsername:    OnlineUsername,
+		CodexHome:         req.CodexHome,
+		CommandCWD:        req.CodexHome,
+		ReadRoots:         []string{},
+		WriteRoots:        []string{},
+		DenyReadPaths:     []string{},
+		DenyWritePaths:    []string{},
+		ProxyPorts:        offlineProxySettings.ProxyPorts,
+		AllowLocalBinding: offlineProxySettings.AllowLocalBinding,
+		RealUser:          setupRealUser(req.RealUser),
+		UserProfile:       setupUserProfile(),
+		Mode:              setupModeInteractiveProvision,
+		Runtime:           setupPayloadRuntime(),
+	}
 }
 
 func runElevatedProvisioningSetup(req *SandboxSetupRequest) error {
+	if err := requireLegacySetupRuntime(); err != nil {
+		return err
+	}
 	if req.CodexHome == "" {
 		return ErrInvalidRequest
 	}
@@ -160,9 +213,68 @@ func runElevatedProvisioningSetup(req *SandboxSetupRequest) error {
 		WriteRoots:      []string{},
 		ProxyPorts:      []uint16{},
 		RealUser:        setupRealUser(req.RealUser),
+		UserProfile:     setupUserProfile(),
 		Mode:            setupModeProvisionOnly,
+		Runtime:         setupPayloadRuntime(),
 	}
-	return runSetupExe(payload, false, req.CodexHome, true)
+	return runSetupExe(payload, false, req.CodexHome, true, nil)
+}
+
+// RunElevatedProvisioningSetupWithRetainedHandles ports the service-side
+// provisioning launch (Rust run_elevated_provisioning_setup_with_retained_handles):
+// the service is already elevated, so the helper starts without elevation while
+// every retained home/ancestor handle is duplicated into it for the duration of
+// the run.
+func RunElevatedProvisioningSetupWithRetainedHandles(codexHome, realUser string, settings OfflineProxySettings, runtime SetupRuntime, retained []windows.Handle) error {
+	if !isLocalDiskPath(codexHome) {
+		return setupFailuref(
+			SetupErrorOrchestratorSandboxDirCreateFailed,
+			"sandbox provisioning CODEX_HOME must be an absolute local disk path: %s", codexHome,
+		)
+	}
+	sbxDir := SandboxDir(codexHome)
+	if err := os.MkdirAll(sbxDir, 0o700); err != nil {
+		return setupFailuref(
+			SetupErrorOrchestratorSandboxDirCreateFailed,
+			"failed to create sandbox dir %s: %v", sbxDir, err,
+		)
+	}
+	elevated, err := isElevated()
+	if err != nil {
+		return setupFailuref(SetupErrorOrchestratorElevationCheckFailed, "failed to determine elevation state: %v", err)
+	}
+	if !elevated {
+		return setupFailuref(
+			SetupErrorOrchestratorElevationRequired,
+			"sandbox provisioning setup must be run from an elevated process",
+		)
+	}
+	payload := &setupElevationPayload{
+		Version:           SetupVersion,
+		OfflineUsername:   OfflineUsername,
+		OnlineUsername:    OnlineUsername,
+		CodexHome:         codexHome,
+		CommandCWD:        codexHome,
+		ReadRoots:         []string{},
+		WriteRoots:        []string{},
+		ProxyPorts:        append([]uint16(nil), settings.ProxyPorts...),
+		AllowLocalBinding: settings.AllowLocalBinding,
+		RealUser:          setupRealUser(realUser),
+		UserProfile:       setupUserProfile(),
+		Mode:              setupModeProvisionOnly,
+		Runtime:           setupRuntimeValue(runtime),
+	}
+	return runSetupExe(payload, false, codexHome, true, retained)
+}
+
+// isLocalDiskPath mirrors Rust's absolute local disk prefix check: no UNC or
+// device paths, only a drive-letter root.
+func isLocalDiskPath(path string) bool {
+	if !filepath.IsAbs(path) {
+		return false
+	}
+	volume := strings.TrimPrefix(filepath.VolumeName(path), `\\?\`)
+	return len(volume) == 2 && volume[1] == ':'
 }
 
 func runSetupRefresh(codexHome string) error {
@@ -190,10 +302,12 @@ func runSetupRefresh(codexHome string) error {
 		ProxyPorts:        proxySettings.ProxyPorts,
 		AllowLocalBinding: proxySettings.AllowLocalBinding,
 		RealUser:          setupRealUser(""),
+		UserProfile:       setupUserProfile(),
 		Mode:              setupModeFull,
 		RefreshOnly:       true,
+		Runtime:           setupPayloadRuntime(),
 	}
-	return runSetupExe(payload, false, codexHome, true)
+	return runSetupExe(payload, false, codexHome, true, nil)
 }
 
 func runSetupRefreshForRequest(req *SandboxSetupRequest) error {
@@ -226,13 +340,15 @@ func runSetupRefreshForRequest(req *SandboxSetupRequest) error {
 		ProxyPorts:        offlineProxySettings.ProxyPorts,
 		AllowLocalBinding: offlineProxySettings.AllowLocalBinding,
 		RealUser:          setupRealUser(req.RealUser),
+		UserProfile:       setupUserProfile(),
 		Mode:              setupModeFull,
 		RefreshOnly:       true,
+		Runtime:           setupPayloadRuntime(),
 	}
-	return runSetupExe(payload, false, req.CodexHome, true)
+	return runSetupExe(payload, false, req.CodexHome, true, nil)
 }
 
-func runSetupExe(payload *setupElevationPayload, needsElevation bool, codexHome string, verifyComplete bool) error {
+func runSetupExe(payload *setupElevationPayload, needsElevation bool, codexHome string, verifyComplete bool, retained []windows.Handle) error {
 	payloadJSON, err := json.Marshal(payload)
 	if err != nil {
 		return setupFailuref(SetupErrorOrchestratorPayloadSerializeFailed, "failed to serialize elevation payload: %v", err)
@@ -244,6 +360,9 @@ func runSetupExe(payload *setupElevationPayload, needsElevation bool, codexHome 
 		if err := EncodeSandboxLaunchPayload(payloadB64, launchEnv); err != nil {
 			return setupFailuref(SetupErrorOrchestratorPayloadSerializeFailed, "failed to encode elevation payload environment: %v", err)
 		}
+		// The helper is a separate process; carry the parent's runtime selection
+		// explicitly instead of inheriting a shell override.
+		ApplyWrapperRuntimeEnv(launchEnv)
 	}
 	clearedReport := true
 	if err := ClearSetupErrorReport(codexHome); err != nil {
@@ -260,7 +379,7 @@ func runSetupExe(payload *setupElevationPayload, needsElevation bool, codexHome 
 		useDispatchFlag = false
 	}
 	if !needsElevation {
-		status, err := runSetupExeNonElevated(exe, payloadB64, useDispatchFlag, launchEnv)
+		status, err := runSetupExeNonElevated(exe, payloadB64, useDispatchFlag, launchEnv, retained)
 		if err != nil {
 			return setupFailuref(SetupErrorOrchestratorHelperLaunchFailed, "failed to launch setup helper (non-elevated): %v", err)
 		}
@@ -295,7 +414,7 @@ func runSetupExe(payload *setupElevationPayload, needsElevation bool, codexHome 
 	return nil
 }
 
-func runSetupExeNonElevated(exe string, payloadB64 string, useDispatchFlag bool, launchEnv map[string]string) (*os.ProcessState, error) {
+func runSetupExeNonElevated(exe string, payloadB64 string, useDispatchFlag bool, launchEnv map[string]string, retained []windows.Handle) (*os.ProcessState, error) {
 	args := setupExecutableArgs(payloadB64, useDispatchFlag)
 	if launchEnv != nil {
 		args = []string{launchPayloadEnvFlag}
@@ -308,6 +427,13 @@ func runSetupExeNonElevated(exe string, payloadB64 string, useDispatchFlag bool,
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	if len(retained) > 0 {
+		// The helper keeps the pinned directories open until it exits.
+		if err := StartWithRetainedHandles(cmd, retained); err != nil {
+			return nil, err
+		}
+		return cmd.Process.Wait()
+	}
 	return nilIfNoState(cmd)
 }
 
@@ -404,6 +530,9 @@ func setupRealUser(value string) string {
 	if value != "" {
 		return value
 	}
+	if user, err := currentSetupUser(); err == nil && user != "" {
+		return user
+	}
 	if user := os.Getenv("USERNAME"); user != "" {
 		return user
 	}
@@ -411,6 +540,32 @@ func setupRealUser(value string) string {
 		return user
 	}
 	return "Administrators"
+}
+
+// currentSetupUser resolves the requesting process identity from its token
+// rather than USERNAME, which elevation cannot change (Rust
+// `runtime_ownership::current_setup_user`).
+func currentSetupUser() (string, error) {
+	var token windows.Token
+	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token); err != nil {
+		return "", err
+	}
+	defer token.Close()
+	user, err := token.GetTokenUser()
+	if err != nil {
+		return "", err
+	}
+	if user == nil || user.User.Sid == nil || !user.User.Sid.IsValid() {
+		return "", fmt.Errorf("token user SID not present")
+	}
+	account, domain, _, err := user.User.Sid.LookupAccount("")
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(domain) != "" {
+		return domain + `\` + account, nil
+	}
+	return account, nil
 }
 
 func offlineProxySettingsForRequest(req *SandboxSetupRequest, networkIdentity SandboxNetworkIdentity) OfflineProxySettings {

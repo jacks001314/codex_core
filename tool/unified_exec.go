@@ -19,9 +19,11 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"codex_core/envutil"
 	"codex_core/execpolicy"
 	"codex_core/execserver"
 	"codex_core/network"
+	"codex_core/protocol"
 	"codex_core/sandbox"
 	"codex_core/utils"
 
@@ -113,6 +115,9 @@ type WriteStdinApprovalRequest struct {
 	AdditionalPermissions *sandbox.AdditionalPermissionProfile
 	InternalPermissions   *sandbox.AdditionalPermissionProfile
 	PermissionProfile     *sandbox.PermissionProfile
+	// OriginalCommand is the command that launched the terminal (Rust #57758);
+	// the review names it so the reviewer sees what the input reaches.
+	OriginalCommand string
 	// Escalated reports that the launch bypassed the sandbox.
 	Escalated bool
 	// ManagedNetwork reports that the launch enforced an environment-owned
@@ -270,6 +275,10 @@ type UnifiedExecEvent struct {
 	Duration  time.Duration
 	StartedAt time.Time
 	TimedOut  bool
+	// SandboxType is the executor-observed backend for a terminal event
+	// (Rust #47568). Start events leave it nil because the backend is only
+	// known once the process has launched.
+	SandboxType *sandbox.SandboxType
 }
 
 type UnifiedExecEventSink func(UnifiedExecEvent)
@@ -335,19 +344,22 @@ type unifiedExecProcess struct {
 	mu            sync.Mutex
 	interactionMu sync.Mutex
 	interactions  atomic.Int32
-	eventMu       sync.Mutex
-	output        *unifiedExecHeadTailBuffer
-	transcript    *unifiedExecHeadTailBuffer
-	eventPending  []byte
-	emittedDeltas int
-	exited        bool
-	exitCode      int
-	waitErr       error
-	timedOut      bool
-	sandboxDenied bool
-	eventsStarted bool
-	pendingEvents []UnifiedExecEvent
-	endOnce       sync.Once
+	// initialExecActive keeps a session private until its initial exec_command
+	// call returns the first result (Rust #59633 initial_exec_command_active).
+	initialExecActive atomic.Bool
+	eventMu           sync.Mutex
+	output            *unifiedExecHeadTailBuffer
+	transcript        *unifiedExecHeadTailBuffer
+	eventPending      []byte
+	emittedDeltas     int
+	exited            bool
+	exitCode          int
+	waitErr           error
+	timedOut          bool
+	sandboxDenied     bool
+	eventsStarted     bool
+	pendingEvents     []UnifiedExecEvent
+	endOnce           sync.Once
 }
 
 type unifiedExecSandboxProcess interface {
@@ -437,9 +449,37 @@ func (m *UnifiedExecManager) Exec(ctx context.Context, req *ShellRequest, callID
 	if runtime.GOOS == "windows" && req.PermissionProfile != nil && !req.PermissionProfile.Disabled {
 		return m.execWindowsSandbox(ctx, req, callID, processID)
 	}
-	cmd := osexec.Command(req.Command[0], req.Command[1:]...)
+	command := req.Command
+	launchEnv := shellRequestEnv(req)
+	var snapshotReader *os.File
+	if req.LocalShellSnapshot != nil {
+		prepared, reader, prepareErr := prepareLocalShellSnapshot(ctx, &execserver.ExecParams{
+			ProcessID:     fmt.Sprintf("unified-exec-%d", processID),
+			Argv:          append([]string(nil), req.Command...),
+			CWD:           req.CWD,
+			Env:           launchEnv,
+			ShellSnapshot: req.LocalShellSnapshot,
+		}, launchEnv)
+		if prepareErr != nil {
+			m.releaseProcessID(processID)
+			emitUnifiedExecLaunchFailure(req, callID, prepareErr)
+			return nil, prepareErr
+		}
+		if prepared != nil {
+			command = prepared.Argv
+			launchEnv = prepared.Env
+		}
+		snapshotReader = reader
+	}
+	cmd := osexec.Command(command[0], command[1:]...)
 	cmd.Dir = req.CWD
-	cmd.Env = envSlice(shellRequestEnv(req))
+	cmd.Env = envSlice(launchEnv)
+	// Rust #48078: source the snapshot through an inherited descriptor and
+	// release this process's copy once the child owns one.
+	if snapshotReader != nil {
+		cmd.ExtraFiles = append(cmd.ExtraFiles, snapshotReader)
+		defer func() { _ = snapshotReader.Close() }()
+	}
 	openSession := startUnifiedExecSessionTrace(m, req.UnifiedExecThreadID, req.UnifiedExecTurnID, callID)
 	started, err := startUnifiedExecCommand(cmd, req.TTY)
 	openSession.finish(err, ctx)
@@ -474,6 +514,7 @@ func (m *UnifiedExecManager) Exec(ctx context.Context, req *ShellRequest, callID
 	m.mu.Lock()
 	m.processes[processID] = process
 	m.mu.Unlock()
+	process.initialExecActive.Store(true)
 	process.emitEvent(UnifiedExecEvent{
 		Kind:        UnifiedExecEventBegin,
 		CallID:      process.callID,
@@ -511,7 +552,9 @@ func (m *UnifiedExecManager) Exec(ctx context.Context, req *ShellRequest, callID
 	}
 
 	yield := clampUnifiedExecInitialYield(req.YieldTimeMS)
-	return m.collect(ctx, process, yield, req.MaxOutputTokens)
+	result, err := m.collect(ctx, process, yield, req.MaxOutputTokens)
+	process.initialExecActive.Store(false)
+	return result, err
 }
 
 func (m *UnifiedExecManager) execWindowsSandbox(ctx context.Context, req *ShellRequest, callID string, processID int) (*ShellResult, error) {
@@ -566,6 +609,7 @@ func (m *UnifiedExecManager) execWindowsSandbox(ctx context.Context, req *ShellR
 	m.mu.Lock()
 	m.processes[processID] = process
 	m.mu.Unlock()
+	process.initialExecActive.Store(true)
 	process.emitEvent(UnifiedExecEvent{
 		Kind:        UnifiedExecEventBegin,
 		CallID:      process.callID,
@@ -599,7 +643,9 @@ func (m *UnifiedExecManager) execWindowsSandbox(ctx context.Context, req *ShellR
 		go process.enforceTimeout(time.Duration(req.TimeoutMS) * time.Millisecond)
 	}
 	yield := clampUnifiedExecInitialYield(req.YieldTimeMS)
-	return m.collect(ctx, process, yield, req.MaxOutputTokens)
+	result, err := m.collect(ctx, process, yield, req.MaxOutputTokens)
+	process.initialExecActive.Store(false)
+	return result, err
 }
 
 var localUnifiedExecOutputDrainGrace = 5 * time.Second
@@ -642,6 +688,48 @@ func waitForUnifiedExecOutputDrain(readers *sync.WaitGroup, closers []io.ReadClo
 // report is the in-process one (Rust #49467 uses `Environment::info()` for the
 // local environment). It is a variable so tests can substitute the report.
 var localLaunchPrependPathDirs = execserver.LocalPrependPathDirs
+
+// prepareLocalShellSnapshot applies the local executor's shell snapshot to a
+// launch the tool runs in this process (Rust #39957). It is a variable so a
+// test can stand in for the executor's capture.
+var prepareLocalShellSnapshot = func(ctx context.Context, params *execserver.ExecParams, captureEnv map[string]string) (*execserver.ExecParams, *os.File, error) {
+	return execserver.LocalShellSnapshots().Prepare(ctx, params, captureEnv)
+}
+
+// prewarmLocalShellSnapshot captures a speculative local snapshot. It is a
+// variable so a test can stand in for the executor's capture.
+var prewarmLocalShellSnapshot = func(ctx context.Context, params *execserver.ExecParams, captureEnv map[string]string) error {
+	return execserver.LocalShellSnapshots().Prewarm(ctx, params, captureEnv)
+}
+
+// PrewarmLocalShellSnapshot warms the local executor's snapshot for one launch
+// shape without starting the model's command, mirroring Rust
+// `Session::prewarm_shell_snapshots` (#42137). The capture uses the same shell,
+// directory and environment policy a later launch uses, so that launch finds a
+// cached entry instead of paying for the first capture.
+func PrewarmLocalShellSnapshot(ctx context.Context, req *ShellRequest) error {
+	if req == nil || req.LocalShellSnapshot == nil || req.Shell.Shell == nil {
+		return nil
+	}
+	// Rust's prewarm runs the shell's login invocation with an empty script.
+	argv := req.Shell.Shell.DeriveExecArgs("", true)
+	if len(argv) < 3 {
+		return nil
+	}
+	env := shellRequestEnv(req)
+	// Rust's prewarm inserts CODEX_THREAD_ID explicitly, so an inherited value
+	// from the parent process cannot leak into the captured state.
+	if threadID := strings.TrimSpace(req.ThreadID); threadID != "" {
+		envutil.SetThreadIDEnv(env, &threadID)
+	}
+	return prewarmLocalShellSnapshot(ctx, &execserver.ExecParams{
+		ProcessID:     "shell-snapshot-warmup-" + uuid.NewString(),
+		Argv:          argv,
+		CWD:           req.CWD,
+		Env:           env,
+		ShellSnapshot: req.LocalShellSnapshot,
+	}, env)
+}
 
 // unifiedExecExplicitPathOverride reports whether the launch's shell environment
 // policy sets PATH itself; Rust keeps that value instead of restoring the
@@ -692,12 +780,22 @@ func (m *UnifiedExecManager) execRemote(ctx context.Context, req *ShellRequest, 
 			m.releaseProcessID(processID)
 			return nil, fmt.Errorf("failed to query exec-server capabilities: %w", capabilityErr)
 		}
-		if !environmentInfo.Capabilities.NetworkProxyLaunch {
+		networkProxy := environmentInfo.Capabilities.NetworkProxy()
+		if !networkProxy.Launch {
 			_ = client.Close()
 			m.releaseProcessID(processID)
 			return nil, errors.New("selected exec-server does not support executor-local network proxy launches")
 		}
-		warnRemoteCredentialMaskingUnavailable(req, req.RemoteNetworkProxy.Proxy.CredentialMasking, environmentInfo.Capabilities.CredentialMasking)
+		// Rust #56049: an executor that masks only built-in providers cannot
+		// resolve configured provider rules, so fall back to unmasked execution
+		// before the process starts.
+		requestedMasking := req.RemoteNetworkProxy.Proxy.CredentialMasking
+		if len(req.RemoteNetworkProxy.Proxy.CredentialProviders) > 0 &&
+			networkProxy.CredentialMasking != execserver.RemoteCredentialMaskingWithConfiguredProviders {
+			req.RemoteNetworkProxy.Proxy.CredentialMasking = false
+			req.RemoteNetworkProxy.Proxy.CredentialProviders = nil
+		}
+		warnRemoteCredentialMaskingUnavailable(req, requestedMasking, networkProxy.CredentialMasking)
 	}
 	// Rust #49467 (`Feature::LoginShellPackagePath`): login startup can reset
 	// PATH, so a POSIX login shell re-derives its argv with the directories the
@@ -741,7 +839,7 @@ func (m *UnifiedExecManager) execRemote(ctx context.Context, req *ShellRequest, 
 			return nil, err
 		}
 	}
-	startCtx, startCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	startCtx, startCancel := unifiedExecLaunchContext(ctx)
 	remoteCWD, err := unifiedExecPathURI(req.CWD)
 	if err != nil {
 		startCancel()
@@ -838,6 +936,7 @@ func (m *UnifiedExecManager) execRemote(ctx context.Context, req *ShellRequest, 
 	m.mu.Lock()
 	m.processes[processID] = process
 	m.mu.Unlock()
+	process.initialExecActive.Store(true)
 	go process.pollRemote()
 	startupTimer := time.NewTimer(unifiedExecEarlyExitGrace)
 	select {
@@ -865,11 +964,13 @@ func (m *UnifiedExecManager) execRemote(ctx context.Context, req *ShellRequest, 
 		go process.enforceTimeout(time.Duration(req.TimeoutMS) * time.Millisecond)
 	}
 	yield := clampUnifiedExecInitialYield(req.YieldTimeMS)
-	return m.collect(ctx, process, yield, req.MaxOutputTokens)
+	result, err := m.collect(ctx, process, yield, req.MaxOutputTokens)
+	process.initialExecActive.Store(false)
+	return result, err
 }
 
-func warnRemoteCredentialMaskingUnavailable(req *ShellRequest, requested bool, executorSupports bool) {
-	if req == nil || req.WarningSink == nil || !requested {
+func warnRemoteCredentialMaskingUnavailable(req *ShellRequest, requested bool, executorMasking execserver.RemoteCredentialMasking) {
+	if req == nil || req.WarningSink == nil || req.RemoteNetworkProxy == nil || !req.RemoteNetworkProxy.Proxy.Enabled || !requested {
 		return
 	}
 	environmentID := strings.TrimSpace(req.UnifiedExecEnvironmentID)
@@ -878,8 +979,10 @@ func warnRemoteCredentialMaskingUnavailable(req *ShellRequest, requested bool, e
 	}
 	var message string
 	switch {
-	case !executorSupports:
+	case executorMasking == execserver.RemoteCredentialMaskingDisabled:
 		message = fmt.Sprintf("Credential masking is unavailable on environment `%s` because its exec-server does not support it. This command will run with unmasked credentials.", environmentID)
+	case !req.RemoteNetworkProxy.Proxy.CredentialMasking:
+		message = fmt.Sprintf("Credential masking is unavailable for this network proxy configuration on environment `%s`. This command will run with unmasked credentials.", environmentID)
 	case req.Shell.Shell == nil:
 		shellName := ""
 		message = fmt.Sprintf("Credential masking is unavailable for shell `%s` on environment `%s`. This command will run with unmasked credentials.", shellName, environmentID)
@@ -907,6 +1010,20 @@ func unifiedExecWireMetadata(req *ShellRequest, callID string) *execserver.ExecM
 		metadata.ThreadID = &threadID
 	}
 	return metadata
+}
+
+// unifiedExecLaunchContext bounds process creation while carrying the launch
+// trace across the exec-server boundary. The timeout intentionally starts from
+// Background, matching the existing launch budget when the tool call itself is
+// cancelled after the process has been handed off.
+func unifiedExecLaunchContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	startCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if trace, ok := protocol.TraceContextFromContext(ctx); ok {
+		if parsed, ok := execserver.TraceContextFromW3C(trace.Traceparent); ok {
+			startCtx = execserver.WithTraceContext(startCtx, parsed)
+		}
+	}
+	return startCtx, cancel
 }
 
 // emitUnifiedExecLaunchFailure publishes the attempt and terminal failure when
@@ -940,8 +1057,10 @@ func unifiedExecManagedNetworkContext(value *network.ProxyManagedNetworkSandboxC
 		return nil
 	}
 	return &execserver.ManagedNetworkSandboxContext{
-		LoopbackPorts:     append([]uint16(nil), value.LoopbackPorts...),
-		AllowLocalBinding: value.AllowLocalBinding,
+		LoopbackPorts:                  append([]uint16(nil), value.LoopbackPorts...),
+		AllowLocalBinding:              value.AllowLocalBinding,
+		AllowUnixSockets:               append([]string(nil), value.AllowUnixSockets...),
+		DangerouslyAllowAllUnixSockets: value.DangerouslyAllowAllUnixSockets,
 	}
 }
 
@@ -950,9 +1069,9 @@ func unifiedExecSandboxContext(req *ShellRequest) (*execserver.FileSystemSandbox
 		PermissionProfile:               req.PermissionProfile,
 		PermissionProfileJSON:           req.PermissionProfileJSON,
 		CWD:                             req.CWD,
+		WorkspaceRoots:                  req.WorkspaceRoots,
 		UserHomeDir:                     req.UnifiedExecUserHomeDir,
 		WindowsSandboxLevel:             req.WindowsSandboxLevel,
-		WindowsSandboxPrivateDesktop:    req.WindowsSandboxPrivateDesktop,
 		WindowsSandboxProxySettingsMode: req.WindowsSandboxProxySettingsMode,
 		SandboxOverride:                 sandboxOverrideForFirstAttempt(req),
 		AllowedSymlinkedCodexHome:       req.AllowedSymlinkedCodexHome,
@@ -994,7 +1113,6 @@ type FileSystemSandboxContextOptions struct {
 	TemporaryDirectories            []string
 	UserHomeDir                     string
 	WindowsSandboxLevel             sandbox.WindowsSandboxLevel
-	WindowsSandboxPrivateDesktop    bool
 	WindowsSandboxProxySettingsMode execserver.WindowsSandboxProxySettingsMode
 	UseLegacyLandlock               bool
 	// SandboxOverride is the controller's selection carried for observation
@@ -1075,7 +1193,6 @@ func NewFileSystemSandboxContext(options FileSystemSandboxContextOptions) (*exec
 		TemporaryDirectories:            temporaryDirectories,
 		UserHomeDir:                     userHomeDir,
 		WindowsSandboxLevel:             string(windowsSandboxLevel),
-		WindowsSandboxPrivateDesktop:    options.WindowsSandboxPrivateDesktop,
 		WindowsSandboxProxySettingsMode: options.WindowsSandboxProxySettingsMode,
 		UseLegacyLandlock:               options.UseLegacyLandlock,
 		SandboxOverride:                 options.SandboxOverride,
@@ -1227,6 +1344,7 @@ func (m *UnifiedExecManager) WriteStdin(ctx context.Context, args *WriteStdinArg
 					TurnID:                process.turnID,
 					EnvironmentID:         process.environmentID,
 					Chars:                 args.Chars,
+					OriginalCommand:       process.hookCommand,
 					CWD:                   process.cwd,
 					TTY:                   process.tty,
 					SandboxPermissions:    process.launchSandboxPermissions,
@@ -1338,6 +1456,48 @@ func (m *UnifiedExecManager) ListProcesses(threadID string) []UnifiedExecProcess
 	return out
 }
 
+// CommandSessionInfo is one retained unified-exec session visible through the
+// command_sessions world-state section (Rust #59633). A handle stays private
+// until the initial exec_command call has returned.
+type CommandSessionInfo struct {
+	SessionID int
+	Exited    bool
+	InUse     bool
+}
+
+// CommandSessions snapshots the retained sessions of one thread. It includes
+// exited sessions whose results have not been collected yet and excludes the
+// process still serving its initial exec_command call, mirroring Rust's
+// initial_exec_command_active filter.
+func (m *UnifiedExecManager) CommandSessions(threadID string) []CommandSessionInfo {
+	if m == nil {
+		return nil
+	}
+	threadID = strings.TrimSpace(threadID)
+	m.mu.Lock()
+	processes := make([]*unifiedExecProcess, 0, len(m.processes))
+	for _, process := range m.processes {
+		if process == nil || process.initialExecActive.Load() {
+			continue
+		}
+		if threadID != "" && process.threadID != threadID {
+			continue
+		}
+		processes = append(processes, process)
+	}
+	m.mu.Unlock()
+	out := make([]CommandSessionInfo, 0, len(processes))
+	for _, process := range processes {
+		out = append(out, CommandSessionInfo{
+			SessionID: process.id,
+			Exited:    process.hasExited(),
+			InUse:     process.interactions.Load() > 0,
+		})
+	}
+	sort.Slice(out, func(i int, j int) bool { return out[i].SessionID < out[j].SessionID })
+	return out
+}
+
 func (m *UnifiedExecManager) TerminateProcess(threadID string, processID int) bool {
 	if m == nil {
 		return false
@@ -1419,12 +1579,15 @@ func (m *UnifiedExecManager) collect(ctx context.Context, process *unifiedExecPr
 	if err := m.waitForThreadElicitation(ctx, process.threadID); err != nil {
 		return nil, err
 	}
-	output, exited, exitCode, waitErr, timedOut := process.snapshotAndDrain()
+	output, omittedBytes, exited, exitCode, waitErr, timedOut := process.snapshotAndDrain()
 	if exited {
 		stopReason = UnifiedExecStopReasonOutputClosed
 	}
 	result := &ShellResult{
 		Stdout:              output,
+		OmittedBytes:        omittedBytes,
+		SandboxType:         cloneSandboxTypePtr(process.sandboxType),
+		SandboxDenied:       process.wasSandboxDenied(),
 		Duration:            time.Since(started),
 		TimedOut:            timedOut,
 		ChunkID:             generateShellChunkID(),
@@ -1643,7 +1806,7 @@ func (p *unifiedExecProcess) finishWithExit(err error, exitCode *int) {
 			time.Sleep(unifiedExecTrailingOutputGrace)
 			p.mu.Lock()
 			deltas := p.outputDeltasLocked(nil, true)
-			transcript, _ := p.transcript.Snapshot()
+			transcript := p.transcript.SnapshotWithOmissionMarker()
 			event := UnifiedExecEvent{
 				Kind:        UnifiedExecEventEnd,
 				CallID:      p.callID,
@@ -1656,6 +1819,7 @@ func (p *unifiedExecProcess) finishWithExit(err error, exitCode *int) {
 				Duration:    time.Since(p.startedAt),
 				StartedAt:   p.startedAt,
 				TimedOut:    p.timedOut,
+				SandboxType: cloneSandboxTypePtr(p.sandboxType),
 			}
 			p.mu.Unlock()
 			p.emitOutputDeltas(deltas)
@@ -1830,9 +1994,20 @@ func (p *unifiedExecProcess) recoverRemote(lastSeq *uint64, exitCode **int, disc
 	sessionID := p.remoteSessionID
 	processID := p.remoteID
 	exited := p.exited
+	oldClient := p.remote
+	oldEvents := p.remoteEvents
 	p.mu.Unlock()
 	if exited || (strings.TrimSpace(remoteURL) == "" && remoteProvider == nil) || strings.TrimSpace(sessionID) == "" {
 		return false, disconnectErr
+	}
+	// Stop the disconnected client's own reconnect loop before opening the
+	// replacement. Otherwise both the client and this process can attach the
+	// same session, consuming an extra exec-server connection.
+	if oldEvents != nil {
+		oldEvents.Close()
+	}
+	if oldClient != nil {
+		_ = oldClient.Close()
 	}
 	deadline := time.Now().Add(unifiedExecRemoteRecoveryTimeout)
 	lastErr := disconnectErr
@@ -1885,17 +2060,9 @@ func (p *unifiedExecProcess) recoverRemote(lastSeq *uint64, exitCode **int, disc
 						_ = client.Close()
 						return true, nil
 					}
-					oldClient := p.remote
-					oldEvents := p.remoteEvents
 					p.remote = client
 					p.remoteEvents = events
 					p.mu.Unlock()
-					if oldEvents != nil {
-						oldEvents.Close()
-					}
-					if oldClient != nil {
-						_ = oldClient.Close()
-					}
 					return p.applyRemoteReadResponse(response, lastSeq, exitCode)
 				}
 				events.Close()
@@ -1997,7 +2164,7 @@ func (p *unifiedExecProcess) terminate() error {
 	if process == nil {
 		return nil
 	}
-	return process.Kill()
+	return terminateUnifiedExecProcess(process)
 }
 
 func (p *unifiedExecProcess) enforceTimeout(timeout time.Duration) {
@@ -2178,14 +2345,24 @@ func (p *unifiedExecProcess) markSandboxDenied() {
 	p.mu.Unlock()
 }
 
-func (p *unifiedExecProcess) snapshotAndDrain() (string, bool, int, error, bool) {
+func (p *unifiedExecProcess) wasSandboxDenied() bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.sandboxDenied
+}
+
+func (p *unifiedExecProcess) snapshotAndDrain() (string, int, bool, int, error, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	var output []byte
+	omittedBytes := 0
 	if p.output != nil {
-		output, _ = p.output.Drain()
+		output, omittedBytes = p.output.DrainWithOmissionMarker()
 	}
-	return string(output), p.exited, p.exitCode, p.waitErr, p.timedOut
+	return string(output), omittedBytes, p.exited, p.exitCode, p.waitErr, p.timedOut
 }
 
 type unifiedExecOutputWriter struct {

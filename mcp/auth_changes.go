@@ -38,6 +38,17 @@ type MCPAuthChangeSource interface {
 	AuthChanged() <-chan struct{}
 }
 
+// MCPConnectionAuthScoper is implemented by auth-change sources that can name
+// the credential scope a pooled stdio connection belongs to (Rust #57211
+// ConnectionKey::auth_state compares owner, source and login generations).
+// Sources that do not implement it stay a single opaque scope.
+type MCPConnectionAuthScoper interface {
+	// MCPConnectionAuthScope returns one string per credential source. Equal
+	// strings may share a pooled connection; a credential refresh that keeps
+	// the same login continuity must keep the same string.
+	MCPConnectionAuthScope() string
+}
+
 // MCPAuthChangeSourceFunc adapts functions to MCPAuthChangeSource.
 type MCPAuthChangeSourceFunc struct {
 	State   func() MCPAuthChangeState
@@ -61,7 +72,13 @@ func (f MCPAuthChangeSourceFunc) AuthChanged() <-chan struct{} {
 // mcpServerSupportsAuthChange reports whether the initialized server opted in
 // to auth-change notifications via its experimental capabilities.
 func mcpServerSupportsAuthChange(capabilities json.RawMessage) bool {
-	if len(capabilities) == 0 {
+	return mcpServerExperimentalCapability(capabilities, MCPAuthChangeCapability)
+}
+
+// mcpServerExperimentalCapability reports whether the initialized server
+// advertised the named experimental capability.
+func mcpServerExperimentalCapability(capabilities json.RawMessage, capability string) bool {
+	if len(capabilities) == 0 || capability == "" {
 		return false
 	}
 	var payload struct {
@@ -70,14 +87,20 @@ func mcpServerSupportsAuthChange(capabilities json.RawMessage) bool {
 	if err := json.Unmarshal(capabilities, &payload); err != nil {
 		return false
 	}
-	_, ok := payload.Experimental[MCPAuthChangeCapability]
+	_, ok := payload.Experimental[capability]
 	return ok
 }
 
 // mcpAdvertiseAuthChangeCapability inserts the client-side experimental
 // capability that asks the server to opt in.
 func mcpAdvertiseAuthChangeCapability(capabilities map[string]any) {
-	if capabilities == nil {
+	mcpAdvertiseExperimentalCapability(capabilities, MCPAuthChangeCapability)
+}
+
+// mcpAdvertiseExperimentalCapability inserts one empty experimental client
+// capability.
+func mcpAdvertiseExperimentalCapability(capabilities map[string]any, capability string) {
+	if capabilities == nil || capability == "" {
 		return
 	}
 	experimental, _ := capabilities["experimental"].(map[string]any)
@@ -85,7 +108,7 @@ func mcpAdvertiseAuthChangeCapability(capabilities map[string]any) {
 		experimental = map[string]any{}
 		capabilities["experimental"] = experimental
 	}
-	experimental[MCPAuthChangeCapability] = map[string]any{}
+	experimental[capability] = map[string]any{}
 }
 
 // startMCPAuthChangeWatcher sends the initial auth-change notification and

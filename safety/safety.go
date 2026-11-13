@@ -3,6 +3,9 @@ package safety
 import (
 	"path/filepath"
 	"strings"
+
+	shellutil "codex_core/shell"
+	"codex_core/utils"
 )
 
 const (
@@ -32,17 +35,19 @@ type ApprovalPolicy struct {
 type Decision string
 
 const (
-	DecisionAllow     Decision = "allow"
-	DecisionPrompt    Decision = "prompt"
-	DecisionForbidden Decision = "forbidden"
+	DecisionAllow      Decision = "allow"
+	DecisionPrompt     Decision = "prompt"
+	DecisionPromptUser Decision = "prompt-user"
+	DecisionForbidden  Decision = "forbidden"
 )
 
 type ExecRequirementKind string
 
 const (
-	ExecSkip          ExecRequirementKind = "skip"
-	ExecNeedsApproval ExecRequirementKind = "needs_approval"
-	ExecForbidden     ExecRequirementKind = "forbidden"
+	ExecSkip               ExecRequirementKind = "skip"
+	ExecNeedsApproval      ExecRequirementKind = "needs_approval"
+	ExecNeedsHumanApproval ExecRequirementKind = "needs_human_approval"
+	ExecForbidden          ExecRequirementKind = "forbidden"
 )
 
 type ExecRequirement struct {
@@ -87,11 +92,13 @@ func PromptRejectedByPolicy(policy ApprovalPolicy, promptIsRule bool) (string, b
 func RequirementFromEvaluation(command []string, policy ApprovalPolicy, evaluation Evaluation, prefixRule []string, autoAmendmentAllowed bool) ExecRequirement {
 	switch evaluation.Decision {
 	case DecisionForbidden:
-		return ExecRequirement{Kind: ExecForbidden, Reason: reasonForDecision(command, &evaluation, "forbidden by policy")}
-	case DecisionPrompt:
+		return ExecRequirement{Kind: ExecForbidden, Reason: forbiddenReason(command, &evaluation)}
+	case DecisionPrompt, DecisionPromptUser:
+		// Rust #58045 derives the rule-ness from the evaluation's own decision so
+		// a prompt-user checkpoint is treated as a policy rule.
 		promptIsRule := false
 		for _, match := range evaluation.MatchedRules {
-			if match.IsPolicy && match.Decision == DecisionPrompt {
+			if match.IsPolicy && match.Decision == evaluation.Decision {
 				promptIsRule = true
 				break
 			}
@@ -99,27 +106,112 @@ func RequirementFromEvaluation(command []string, policy ApprovalPolicy, evaluati
 		if reason, rejected := PromptRejectedByPolicy(policy, promptIsRule); rejected {
 			return ExecRequirement{Kind: ExecForbidden, Reason: reason}
 		}
+		if evaluation.Decision == DecisionPromptUser {
+			// A managed checkpoint needs a fresh human decision, so it never
+			// proposes a reusable exec-policy amendment.
+			return ExecRequirement{
+				Kind:   ExecNeedsHumanApproval,
+				Reason: humanApprovalReason(command, &evaluation),
+			}
+		}
 		return ExecRequirement{
 			Kind:      ExecNeedsApproval,
-			Reason:    reasonForDecision(command, &evaluation, "approval required by policy"),
+			Reason:    promptReason(command, &evaluation, DecisionPrompt, "approval"),
 			Amendment: requestedAmendment(prefixRule, autoAmendmentAllowed, evaluation.MatchedRules),
 		}
 	case DecisionAllow:
-		return ExecRequirement{Kind: ExecSkip, BypassSandbox: allMatchesArePolicyAllows(evaluation.MatchedRules)}
+		requirement := ExecRequirement{
+			Kind:          ExecSkip,
+			BypassSandbox: allMatchesArePolicyAllows(evaluation.MatchedRules),
+		}
+		if autoAmendmentAllowed {
+			// Rust keeps an amendment on the skip requirement for the case where
+			// the sandboxed attempt is denied and the user is asked to retry
+			// unsandboxed: it offers to remember this command then.
+			requirement.Amendment = allowAmendment(evaluation.MatchedRules)
+		}
+		return requirement
 	default:
 		return ExecRequirement{Kind: ExecForbidden, Reason: "unknown exec policy decision"}
 	}
 }
 
+// StrictestDecision returns the most restrictive decision among matches;
+// the zero value means no match. It mirrors Rust's
+// Evaluation::from_matches ordering (allow < prompt < prompt-user < forbidden).
+func StrictestDecision(matches []RuleMatch) Decision {
+	decision := Decision("")
+	for _, match := range matches {
+		if decisionRank(match.Decision) > decisionRank(decision) {
+			decision = match.Decision
+		}
+	}
+	return decision
+}
+
+func decisionRank(decision Decision) int {
+	switch decision {
+	case DecisionAllow:
+		return 1
+	case DecisionPrompt:
+		return 2
+	case DecisionPromptUser:
+		return 3
+	case DecisionForbidden:
+		return 4
+	default:
+		return 0
+	}
+}
+
+// allowAmendment mirrors Rust's
+// try_derive_execpolicy_amendment_for_allow_rules: a heuristically allowed
+// command proposes itself, and any policy match suppresses the proposal because
+// the policy already decides the sandbox behavior.
+func allowAmendment(matches []RuleMatch) *ExecPolicyAmendment {
+	for _, match := range matches {
+		if match.IsPolicy {
+			return nil
+		}
+	}
+	for _, match := range matches {
+		if match.Decision == DecisionAllow && len(match.Prefix) > 0 && !BannedPrefixSuggestion(match.Prefix) {
+			return &ExecPolicyAmendment{PrefixRule: append([]string(nil), match.Prefix...), Decision: DecisionAllow}
+		}
+	}
+	return nil
+}
+
+// requestedAmendment mirrors Rust's
+// try_derive_execpolicy_amendment_for_prompt_rules. A matching policy prompt
+// rule means the operator already expressed an intent for this command, so no
+// amendment is proposed; otherwise the heuristics prompt match's command (the
+// full token list) becomes the reusable prefix.
 func requestedAmendment(prefixRule []string, allowed bool, matches []RuleMatch) *ExecPolicyAmendment {
 	if !allowed {
 		return nil
 	}
-	if len(prefixRule) > 0 && !BannedPrefixSuggestion(prefixRule) {
+	if len(prefixRule) > 0 {
+		if BannedPrefixSuggestion(prefixRule) {
+			return nil
+		}
+		for _, match := range matches {
+			if match.IsPolicy {
+				return nil
+			}
+		}
 		return &ExecPolicyAmendment{PrefixRule: append([]string(nil), prefixRule...), Decision: DecisionAllow}
 	}
+	// Only a policy prompt rule expresses an equivalent reusable decision; an
+	// allow rule on a different segment must not suppress the prompt
+	// command's proposal.
 	for _, match := range matches {
-		if match.IsPolicy && match.Decision == DecisionPrompt && len(match.Prefix) > 0 && !BannedPrefixSuggestion(match.Prefix) {
+		if match.IsPolicy && match.Decision == DecisionPrompt {
+			return nil
+		}
+	}
+	for _, match := range matches {
+		if !match.IsPolicy && match.Decision == DecisionPrompt && len(match.Prefix) > 0 && !BannedPrefixSuggestion(match.Prefix) {
 			return &ExecPolicyAmendment{PrefixRule: append([]string(nil), match.Prefix...), Decision: DecisionAllow}
 		}
 	}
@@ -161,16 +253,74 @@ func bannedPrefixes() [][]string {
 	}
 }
 
-func reasonForDecision(command []string, evaluation *Evaluation, fallback string) string {
+// humanApprovalReason mirrors Rust derive_prompt_reason for a prompt-user
+// checkpoint: "`cmd` requires human approval: <justification>" or
+// "`cmd` requires human approval by policy", and no reason at all when no
+// policy rule drove the decision (the caller then keeps the justification).
+func humanApprovalReason(command []string, evaluation *Evaluation) string {
+	return promptReason(command, evaluation, DecisionPromptUser, "human approval")
+}
+
+// promptReason mirrors Rust derive_prompt_reason: only a policy rule with the
+// evaluation's decision produces a reason, and the most specific (longest)
+// matching prefix wins.
+func promptReason(command []string, evaluation *Evaluation, decision Decision, label string) string {
+	if evaluation == nil {
+		return ""
+	}
+	found := false
+	bestPrefixLen := -1
+	bestReason := ""
 	for _, match := range evaluation.MatchedRules {
-		if match.Reason != "" {
-			return match.Reason
+		if !match.IsPolicy || match.Decision != decision {
+			continue
+		}
+		if found && len(match.Prefix) <= bestPrefixLen {
+			continue
+		}
+		found = true
+		bestPrefixLen = len(match.Prefix)
+		bestReason = strings.TrimSpace(match.Reason)
+	}
+	if !found {
+		return ""
+	}
+	rendered := shellutil.ShlexJoin(command)
+	if bestReason != "" {
+		return "`" + rendered + "` requires " + label + ": " + bestReason
+	}
+	return "`" + rendered + "` requires " + label + " by policy"
+}
+
+// forbiddenReason mirrors Rust derive_forbidden_reason for the policy-rule
+// case; a command with no forbidden rule match reads as blocked by policy.
+func forbiddenReason(command []string, evaluation *Evaluation) string {
+	rendered := shellutil.ShlexJoin(command)
+	found := false
+	bestPrefixLen := -1
+	bestPrefix := []string(nil)
+	bestReason := ""
+	if evaluation != nil {
+		for _, match := range evaluation.MatchedRules {
+			if !match.IsPolicy || match.Decision != DecisionForbidden {
+				continue
+			}
+			if found && len(match.Prefix) <= bestPrefixLen {
+				continue
+			}
+			found = true
+			bestPrefixLen = len(match.Prefix)
+			bestPrefix = match.Prefix
+			bestReason = strings.TrimSpace(match.Reason)
 		}
 	}
-	if len(command) == 0 {
-		return fallback
+	if !found {
+		return "`" + rendered + "` rejected: blocked by policy"
 	}
-	return fallback + ": " + strings.Join(command, " ")
+	if bestReason != "" {
+		return "`" + rendered + "` rejected: " + bestReason
+	}
+	return "`" + rendered + "` rejected: policy forbids commands starting with `" + shellutil.ShlexJoin(bestPrefix) + "`"
 }
 
 func allMatchesArePolicyAllows(matches []RuleMatch) bool {
@@ -290,6 +440,221 @@ func CanWritePath(policy *FileSystemPolicy, cwd string, path string) bool {
 		}
 	}
 	return false
+}
+
+// FileSystemPolicyContext is the executor-side view of a filesystem policy.
+// Rust #42391 (`FileSystemSandboxPolicyContext`) evaluates patch targets
+// against the selected executor's path convention, so a target spelled with a
+// foreign convention is no longer misclassified by host-native path conversion.
+type FileSystemPolicyContext struct {
+	// CWD is the executor working directory. Its path convention decides how
+	// relative and absolute policy roots are resolved.
+	CWD *utils.PathURI
+	// ExtraWritableRoots are roots the caller resolved for the executor, such
+	// as the executor's cwd and temporary directory.
+	ExtraWritableRoots []*utils.PathURI
+	// ProtectedMetadataNames stay read-only inside every writable root unless a
+	// root grants them explicitly.
+	ProtectedMetadataNames []string
+}
+
+// ResolvePath resolves a patch path (absolute in the executor convention or
+// relative to the executor cwd) to a path URI without touching the filesystem.
+func (c FileSystemPolicyContext) ResolvePath(path string) (*utils.PathURI, bool) {
+	if c.CWD == nil {
+		return nil, false
+	}
+	resolved, err := c.CWD.Join(path)
+	if err != nil || resolved == nil {
+		return nil, false
+	}
+	return resolved, true
+}
+
+// CanWritePath reports whether policy grants write access to target when its
+// writable roots are interpreted under the executor path convention. Mirrors
+// Rust #42391 `FileSystemSandboxPolicy::can_write_path(path, context)`.
+func (c FileSystemPolicyContext) CanWritePath(policy *FileSystemPolicy, target *utils.PathURI) bool {
+	if policy == nil || target == nil || c.CWD == nil {
+		return false
+	}
+	if policy.FullDiskWrite {
+		return true
+	}
+	for _, root := range policy.WritableRoots {
+		rootURI, err := c.CWD.Join(root)
+		if err != nil || rootURI == nil {
+			continue
+		}
+		if c.permitsWrite(rootURI, target) {
+			return true
+		}
+	}
+	for _, rootURI := range c.ExtraWritableRoots {
+		if c.permitsWrite(rootURI, target) {
+			return true
+		}
+	}
+	return false
+}
+
+// HasConfiguredWritableRoots mirrors Rust #42391
+// `has_configured_writable_roots(context)`: the policy configures a writable
+// root that resolves under the executor convention. Full-disk policies report
+// false because they carry no narrowing roots.
+func (c FileSystemPolicyContext) HasConfiguredWritableRoots(policy *FileSystemPolicy) bool {
+	if policy == nil || policy.FullDiskWrite {
+		return false
+	}
+	for _, root := range policy.WritableRoots {
+		rootURI, err := c.CWD.Join(root)
+		if err != nil || rootURI == nil {
+			continue
+		}
+		if c.CanWritePath(policy, rootURI) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c FileSystemPolicyContext) permitsWrite(root, target *utils.PathURI) bool {
+	if !target.StartsWith(root) {
+		return false
+	}
+	return !c.introducesProtectedMetadata(root, target)
+}
+
+func (c FileSystemPolicyContext) introducesProtectedMetadata(root, target *utils.PathURI) bool {
+	if len(c.ProtectedMetadataNames) == 0 {
+		return false
+	}
+	relative, ok := lexicalRelativeNativePath(root, target)
+	if !ok || relative == "" {
+		return false
+	}
+	first := relative
+	if index := strings.IndexAny(relative, `/\`); index >= 0 {
+		first = relative[:index]
+	}
+	convention, _ := target.InferConvention()
+	for _, name := range c.ProtectedMetadataNames {
+		if name == "" {
+			continue
+		}
+		if first == name || (convention == utils.ConventionWindows && strings.EqualFold(first, name)) {
+			return true
+		}
+	}
+	return false
+}
+
+// CanWritePathInContext mirrors Rust #42391's context-aware can_write_path.
+func CanWritePathInContext(policy *FileSystemPolicy, context FileSystemPolicyContext, target *utils.PathURI) bool {
+	return context.CanWritePath(policy, target)
+}
+
+// WritePatchConstrainedToWritablePathsInContext mirrors Rust #42391: patch
+// containment is decided with the executor's path convention instead of the
+// host's.
+func WritePatchConstrainedToWritablePathsInContext(action *PatchAction, policy *FileSystemPolicy, context FileSystemPolicyContext) bool {
+	if action == nil || policy == nil {
+		return false
+	}
+	if policy.FullDiskWrite {
+		return true
+	}
+	for _, change := range action.Changes {
+		target, ok := context.ResolvePath(change.Path)
+		if !ok || !context.CanWritePath(policy, target) {
+			return false
+		}
+		if change.Kind == FileUpdate && change.MovePath != "" {
+			moveTarget, ok := context.ResolvePath(change.MovePath)
+			if !ok || !context.CanWritePath(policy, moveTarget) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// AssessPatchSafetyWithContext mirrors Rust #42391's context-aware
+// `assess_patch_safety`: writable-root containment and read-only rejection
+// reasons follow the executor's path convention. The platform sandbox string
+// reports the sandbox the caller can enforce, if any.
+func AssessPatchSafetyWithContext(action *PatchAction, policy ApprovalPolicy, permissionKind PermissionProfileKind, filePolicy FileSystemPolicy, context FileSystemPolicyContext, platformSandbox string) PatchSafetyCheck {
+	if action == nil || len(action.Changes) == 0 {
+		return PatchSafetyCheck{Kind: SafetyReject, Reason: "empty patch"}
+	}
+	if policy.Mode == ApprovalUnlessTrusted {
+		return PatchSafetyCheck{Kind: SafetyAskUser}
+	}
+	rejectsSandboxApproval := policy.Mode == ApprovalNever || (policy.Mode == ApprovalGranular && !policy.SandboxApproval)
+	if WritePatchConstrainedToWritablePathsInContext(action, &filePolicy, context) {
+		if permissionKind == PermissionDisabled || permissionKind == PermissionExternal {
+			return PatchSafetyCheck{Kind: SafetyAutoApprove, SandboxType: "none"}
+		}
+		if platformSandbox != "" {
+			return PatchSafetyCheck{Kind: SafetyAutoApprove, SandboxType: platformSandbox}
+		}
+		if rejectsSandboxApproval {
+			return PatchSafetyCheck{Kind: SafetyReject, Reason: patchRejectionReasonInContext(permissionKind, &filePolicy, context)}
+		}
+		return PatchSafetyCheck{Kind: SafetyAskUser}
+	}
+	if rejectsSandboxApproval {
+		return PatchSafetyCheck{Kind: SafetyReject, Reason: patchRejectionReasonInContext(permissionKind, &filePolicy, context)}
+	}
+	return PatchSafetyCheck{Kind: SafetyAskUser}
+}
+
+func patchRejectionReasonInContext(permissionKind PermissionProfileKind, policy *FileSystemPolicy, context FileSystemPolicyContext) string {
+	if permissionKind == PermissionManaged && policy != nil && !policy.FullDiskWrite && !context.HasConfiguredWritableRoots(policy) {
+		return PatchRejectedReadOnlyReason
+	}
+	return PatchRejectedOutsideProjectReason
+}
+
+// lexicalRelativeNativePath returns the path of target below root using the
+// shared path convention, without touching the filesystem.
+func lexicalRelativeNativePath(root, target *utils.PathURI) (string, bool) {
+	if root == nil || target == nil {
+		return "", false
+	}
+	convention, ok := target.InferConvention()
+	if !ok {
+		return "", false
+	}
+	rootSegments := nonEmptyNativeSegments(convention, root.NativePathString())
+	targetSegments := nonEmptyNativeSegments(convention, target.NativePathString())
+	if len(rootSegments) > len(targetSegments) {
+		return "", false
+	}
+	for index := range rootSegments {
+		if convention == utils.ConventionWindows {
+			if !strings.EqualFold(rootSegments[index], targetSegments[index]) {
+				return "", false
+			}
+			continue
+		}
+		if rootSegments[index] != targetSegments[index] {
+			return "", false
+		}
+	}
+	return strings.Join(targetSegments[len(rootSegments):], "/"), true
+}
+
+func nonEmptyNativeSegments(convention utils.PathConvention, native string) []string {
+	segments := utils.PathSegments(convention, native)
+	out := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		if segment == "" || segment == "." {
+			continue
+		}
+		out = append(out, segment)
+	}
+	return out
 }
 
 func patchRejectionReason(permissionKind PermissionProfileKind, policy *FileSystemPolicy, cwd string) string {

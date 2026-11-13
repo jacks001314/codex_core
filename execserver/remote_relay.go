@@ -2,6 +2,7 @@ package execserver
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -11,12 +12,17 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
+	"codex_core/network"
+
 	"github.com/coder/websocket"
+	"github.com/google/uuid"
 	clatter "github.com/shurlinet/go-clatter"
 )
 
@@ -32,14 +38,44 @@ const (
 	maxNoiseJSONRPCMessageLen              = 64 * 1024 * 1024
 	maxNoiseRelayReorderDistance    uint32 = 64
 	maxNoiseRelayPendingBytes              = 1024 * 1024
+	// maxHandshakeDiagnosticsPerMinute mirrors Rust's
+	// MAX_HANDSHAKE_DIAGNOSTICS_PER_MINUTE (#55498): one relay connection may
+	// emit this many correlated handshake diagnostics per window, followed by a
+	// single suppression marker.
+	maxHandshakeDiagnosticsPerMinute = 100
 )
+
+// atomicDuration is a duration that relay goroutines read while tests shorten
+// it; the Rust build keeps these as constants, the Go tests need settable ones.
+type atomicDuration struct{ nanos atomic.Int64 }
+
+func newAtomicDuration(value time.Duration) *atomicDuration {
+	duration := &atomicDuration{}
+	duration.Store(value)
+	return duration
+}
+
+func (d *atomicDuration) Load() time.Duration {
+	if d == nil {
+		return 0
+	}
+	return time.Duration(d.nanos.Load())
+}
+
+func (d *atomicDuration) Store(value time.Duration) {
+	d.nanos.Store(int64(value))
+}
 
 // noiseHandshakeFailureCooldown mirrors Rust's
 // NOISE_HANDSHAKE_FAILURE_COOLDOWN (#46031): once the handshake failure budget is
 // exhausted the relay pauses new handshake admission for this window instead of
 // closing, so authenticated streams stay connected. It is a variable so tests
 // can shorten the window instead of waiting it out.
-var noiseHandshakeFailureCooldown = 10 * time.Second
+var noiseHandshakeFailureCooldown = newAtomicDuration(10 * time.Second)
+
+// handshakeDiagnosticWindow mirrors Rust's HANDSHAKE_DIAGNOSTIC_WINDOW. It is a
+// variable so tests can advance the window without waiting a minute.
+var handshakeDiagnosticWindow = newAtomicDuration(60 * time.Second)
 
 // recordFailedHandshake mirrors Rust's `record_failed_handshake`: exhausting the
 // failure budget starts the cooldown, and failures recorded during the cooldown
@@ -50,9 +86,132 @@ func recordFailedHandshake(failedHandshakes *int, cooldownUntil *time.Time) {
 	}
 	*failedHandshakes++
 	if *failedHandshakes >= maxFailedNoiseHandshakes {
-		*cooldownUntil = time.Now().Add(noiseHandshakeFailureCooldown)
+		*cooldownUntil = time.Now().Add(noiseHandshakeFailureCooldown.Load())
 		slog.Warn("pausing Noise relay handshakes after repeated failures")
 	}
+}
+
+// handshakeDiagnosticSlot returns the next slot in this window. The limit slot
+// records a suppression marker; all later slots suppress diagnostics until the
+// window resets (Rust #55498 `handshake_diagnostic_slot`).
+func handshakeDiagnosticSlot(windowStart *time.Time, count *int, now time.Time) int {
+	if windowStart == nil || count == nil {
+		return maxHandshakeDiagnosticsPerMinute + 1
+	}
+	if now.Sub(*windowStart) >= handshakeDiagnosticWindow.Load() {
+		*windowStart = now
+		*count = 0
+	}
+	slot := *count
+	*count = min(slot+1, maxHandshakeDiagnosticsPerMinute+1)
+	return slot
+}
+
+// handshakeDiagnostics rate limits correlated diagnostics for one physical
+// relay connection (Rust #55498).
+type handshakeDiagnostics struct {
+	environmentID          string
+	executorRegistrationID string
+	windowStart            time.Time
+	count                  int
+}
+
+func newHandshakeDiagnostics(environmentID, executorRegistrationID string) *handshakeDiagnostics {
+	return &handshakeDiagnostics{
+		environmentID:          environmentID,
+		executorRegistrationID: executorRegistrationID,
+		windowStart:            time.Now(),
+	}
+}
+
+// record emits one handshake diagnostic unless this connection's window is
+// exhausted, in which case the first suppressed call reports a rate-limit
+// marker and every later call stays silent.
+func (d *handshakeDiagnostics) record(streamID, reason string, registryStatus *int) {
+	if d == nil {
+		return
+	}
+	switch slot := handshakeDiagnosticSlot(&d.windowStart, &d.count, time.Now()); {
+	case slot < maxHandshakeDiagnosticsPerMinute:
+		recordHandshakeDiagnostic(d.environmentID, d.executorRegistrationID, streamID, reason, registryStatus)
+	case slot == maxHandshakeDiagnosticsPerMinute:
+		slog.Warn("Noise executor handshake diagnostics rate limited",
+			"noise_event", "handshake_diagnostics",
+			"noise_outcome", "rate_limited",
+			"noise_side", "executor",
+			"environment_id", d.environmentID,
+			"executor_registration_id", d.executorRegistrationID,
+		)
+	}
+}
+
+// recordHandshakeDiagnostic mirrors Rust #55498's
+// `record_handshake_diagnostic`: bounded, non-secret context for an unfinished
+// handshake. The peer controls stream_id, so unvalidated wire data is never
+// exported and non-UUID values collapse to "invalid".
+func recordHandshakeDiagnostic(environmentID, executorRegistrationID, streamID, reason string, registryStatus *int) {
+	normalizedStreamID := "invalid"
+	if parsed, err := uuid.Parse(streamID); err == nil {
+		normalizedStreamID = parsed.String()
+	}
+	outcome := "rejected"
+	if reason == "reset_pending_validation" {
+		outcome = "reset_received"
+	}
+	attributes := []any{
+		"noise_event", "handshake",
+		"noise_outcome", outcome,
+		"noise_side", "executor",
+		"noise_reason", reason,
+		"environment_id", environmentID,
+		"executor_registration_id", executorRegistrationID,
+		"stream_id", normalizedStreamID,
+	}
+	if registryStatus != nil {
+		attributes = append(attributes, "registry_status", *registryStatus)
+	}
+	slog.Warn("Noise executor handshake diagnostic", attributes...)
+}
+
+// classifyHarnessKeyValidationError maps a harness key validation failure onto
+// Rust's closed set of diagnostic reasons (#55498). Error text is never
+// exported: only the category and, when available, the registry HTTP status.
+func classifyHarnessKeyValidationError(err error) (string, *int) {
+	if err == nil {
+		return "", nil
+	}
+	if network.IsPolicyError(err) {
+		return "network_policy", nil
+	}
+	var registryErr *remoteRegistryHTTPError
+	if errors.As(err, &registryErr) {
+		status := registryErr.StatusCode
+		return "registry_http", &status
+	}
+	message := err.Error()
+	switch {
+	case strings.Contains(message, "environment registry authentication error"),
+		strings.Contains(message, "environment registry auth resolution failed"):
+		return "registry_auth", nil
+	case strings.Contains(message, "environment registry config error"):
+		return "registry_config", nil
+	case strings.Contains(message, "environment registry request failed"):
+		if isRegistryRequestTimeout(err) {
+			return "registry_request_timeout", nil
+		}
+		return "registry_request", nil
+	case strings.Contains(message, "exec-server protocol error"):
+		return "validation_protocol", nil
+	}
+	return "validation_error", nil
+}
+
+func isRegistryRequestTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 type remoteHarnessValidationRequest struct {
@@ -71,9 +230,11 @@ type remoteRelayIncoming struct {
 }
 
 type remoteRelayValidationResult struct {
-	streamID     string
-	validationID uint64
-	err          error
+	streamID       string
+	validationID   uint64
+	err            error
+	reason         string
+	registryStatus *int
 }
 
 type pendingRemoteRelayHandshake struct {
@@ -106,9 +267,11 @@ func (s *Server) serveNoiseRelayConnection(
 	writerDone := make(chan error, 1)
 	validationDone := make(chan remoteRelayValidationResult, maxPendingHandshakeValidations)
 	closedStreams := make(chan remoteRelayClosedStream, maxActiveNoiseRelayStreams)
+	transportDiag := newRelayTransportDiagnostics(outgoing, incoming)
+	defer transportDiag.logClosure()
 
-	go runRemoteRelayWriter(connectionCtx, conn, outgoing, writerDone)
-	go runRemoteRelayReader(connectionCtx, conn, incoming)
+	go runRemoteRelayWriter(connectionCtx, conn, outgoing, writerDone, transportDiag)
+	go runRemoteRelayReader(connectionCtx, conn, incoming, transportDiag)
 
 	streams := map[string]*remoteNoiseVirtualStream{}
 	pending := map[string]pendingRemoteRelayHandshake{}
@@ -124,13 +287,18 @@ func (s *Server) serveNoiseRelayConnection(
 	failedHandshakes := 0
 	var handshakeCooldownUntil time.Time
 	var nextValidationID uint64
+	diagnostics := newHandshakeDiagnostics(registration.EnvironmentID, registration.ExecutorRegistrationID)
 	for {
 		select {
 		case <-connectionCtx.Done():
+			transportDiag.setExitReason(relayExitWebsocketClose)
 			return nil
 		case err := <-writerDone:
 			if err == nil || ctx.Err() != nil {
 				return nil
+			}
+			if transportDiag.exitReasonValue() == "" {
+				transportDiag.setExitReason(relayExitWebsocketWrite)
 			}
 			return err
 		case closed := <-closedStreams:
@@ -146,22 +314,26 @@ func (s *Server) serveNoiseRelayConnection(
 			delete(pending, result.streamID)
 			if result.err != nil {
 				item.handshake.Destroy()
+				diagnostics.record(result.streamID, result.reason, result.registryStatus)
 				queueRelayReset(outgoing, result.streamID)
 				recordFailedHandshake(&failedHandshakes, &handshakeCooldownUntil)
 				continue
 			}
 			if len(streams) >= maxActiveNoiseRelayStreams {
 				item.handshake.Destroy()
+				diagnostics.record(result.streamID, "active_stream_limit", nil)
 				queueRelayReset(outgoing, result.streamID)
 				continue
 			}
 			transport, response, err := item.handshake.Complete()
 			if err != nil {
+				diagnostics.record(result.streamID, "handshake_completion", nil)
 				queueRelayReset(outgoing, result.streamID)
 				recordFailedHandshake(&failedHandshakes, &handshakeCooldownUntil)
 				continue
 			}
 			if err := queueRelayFrame(outgoing, newRelayHandshakeFrame(result.streamID, response)); err != nil {
+				diagnostics.record(result.streamID, "response_queue_full", nil)
 				transport.Destroy()
 				return err
 			}
@@ -177,8 +349,10 @@ func (s *Server) serveNoiseRelayConnection(
 		case event := <-incoming:
 			if event.err != nil {
 				if ctx.Err() != nil || websocket.CloseStatus(event.err) != -1 {
+					transportDiag.setExitReason(relayExitWebsocketClose)
 					return nil
 				}
+				transportDiag.setExitReason(relayExitWebsocketRead)
 				return event.err
 			}
 			frame := event.frame
@@ -189,6 +363,7 @@ func (s *Server) serveNoiseRelayConnection(
 				// running, and the failure budget resets once admission resumes.
 				if !handshakeCooldownUntil.IsZero() {
 					if time.Now().Before(handshakeCooldownUntil) {
+						diagnostics.record(frame.StreamID, "cooldown", nil)
 						queueRelayReset(outgoing, frame.StreamID)
 						continue
 					}
@@ -196,28 +371,49 @@ func (s *Server) serveNoiseRelayConnection(
 					handshakeCooldownUntil = time.Time{}
 				}
 				if _, exists := streams[frame.StreamID]; exists {
+					diagnostics.record(frame.StreamID, "duplicate_active_stream", nil)
 					queueRelayReset(outgoing, frame.StreamID)
 					continue
 				}
 				if previous, exists := pending[frame.StreamID]; exists {
 					delete(pending, frame.StreamID)
 					previous.handshake.Destroy()
+					diagnostics.record(frame.StreamID, "duplicate_pending_stream", nil)
 					queueRelayReset(outgoing, frame.StreamID)
 					recordFailedHandshake(&failedHandshakes, &handshakeCooldownUntil)
 					continue
 				}
-				if len(streams) >= maxActiveNoiseRelayStreams || len(pending) >= maxPendingHandshakeValidations {
+				if len(streams) >= maxActiveNoiseRelayStreams {
+					diagnostics.record(frame.StreamID, "active_stream_limit", nil)
+					queueRelayReset(outgoing, frame.StreamID)
+					continue
+				}
+				if len(pending) >= maxPendingHandshakeValidations {
+					diagnostics.record(frame.StreamID, "pending_validation_limit", nil)
 					queueRelayReset(outgoing, frame.StreamID)
 					continue
 				}
 				prologue := noiseChannelPrologue(registration.EnvironmentID, registration.ExecutorRegistrationID, frame.StreamID)
 				handshake, authorization, err := readRemoteNoiseHandshake(identity, prologue, frame.HandshakeBytes)
-				if err != nil || len(authorization) > maxHarnessKeyAuthorizationBytes || !utf8.ValidString(authorization) {
+				if err != nil {
 					if handshake != nil {
 						handshake.Destroy()
 					}
+					diagnostics.record(frame.StreamID, "handshake_request", nil)
 					queueRelayReset(outgoing, frame.StreamID)
 					recordFailedHandshake(&failedHandshakes, &handshakeCooldownUntil)
+					continue
+				}
+				if len(authorization) > maxHarnessKeyAuthorizationBytes {
+					handshake.Destroy()
+					diagnostics.record(frame.StreamID, "authorization_too_long", nil)
+					queueRelayReset(outgoing, frame.StreamID)
+					continue
+				}
+				if !utf8.ValidString(authorization) {
+					handshake.Destroy()
+					diagnostics.record(frame.StreamID, "authorization_not_utf8", nil)
+					queueRelayReset(outgoing, frame.StreamID)
 					continue
 				}
 				validationID := nextValidationID
@@ -226,9 +422,17 @@ func (s *Server) serveNoiseRelayConnection(
 				go func(streamID string, publicKey RemotePublicKey, authorization string, validationID uint64) {
 					validationCtx, validationCancel := context.WithTimeout(connectionCtx, harnessKeyValidationTimeout)
 					defer validationCancel()
-					err := validateRemoteHarnessKey(validationCtx, cfg, registration, publicKey, authorization)
+					err := validateRemoteHarnessKey(validationCtx, cfg, registration, publicKey, authorization, streamID)
+					result := remoteRelayValidationResult{streamID: streamID, validationID: validationID, err: err}
+					if err != nil {
+						if validationCtx.Err() != nil {
+							result.reason = "validation_timeout"
+						} else {
+							result.reason, result.registryStatus = classifyHarnessKeyValidationError(err)
+						}
+					}
 					select {
-					case validationDone <- remoteRelayValidationResult{streamID: streamID, validationID: validationID, err: err}:
+					case validationDone <- result:
 					case <-connectionCtx.Done():
 					}
 				}(frame.StreamID, handshake.publicKey, authorization, validationID)
@@ -238,6 +442,7 @@ func (s *Server) serveNoiseRelayConnection(
 					if item, exists := pending[frame.StreamID]; exists {
 						delete(pending, frame.StreamID)
 						item.handshake.Destroy()
+						diagnostics.record(frame.StreamID, "data_before_handshake", nil)
 						recordFailedHandshake(&failedHandshakes, &handshakeCooldownUntil)
 					}
 					queueRelayReset(outgoing, frame.StreamID)
@@ -252,6 +457,9 @@ func (s *Server) serveNoiseRelayConnection(
 				if item, exists := pending[frame.StreamID]; exists {
 					delete(pending, frame.StreamID)
 					item.handshake.Destroy()
+					// A reset may come from the harness or the relay; its reason is
+					// untrusted, so only the correlated stream id is reported.
+					diagnostics.record(frame.StreamID, "reset_pending_validation", nil)
 				}
 				if stream := streams[frame.StreamID]; stream != nil {
 					delete(streams, frame.StreamID)
@@ -269,7 +477,7 @@ func (s *Server) serveNoiseRelayConnection(
 // pin the relay writer forever.
 const remoteRelayWriteTimeout = 60 * time.Second
 
-func runRemoteRelayWriter(ctx context.Context, conn *websocket.Conn, outgoing <-chan []byte, done chan<- error) {
+func runRemoteRelayWriter(ctx context.Context, conn *websocket.Conn, outgoing <-chan []byte, done chan<- error, diagnostics *relayTransportDiagnostics) {
 	ticker := time.NewTicker(remoteRelayKeepaliveInterval)
 	defer ticker.Stop()
 	for {
@@ -278,12 +486,15 @@ func runRemoteRelayWriter(ctx context.Context, conn *websocket.Conn, outgoing <-
 			done <- nil
 			return
 		case payload := <-outgoing:
+			diagnostics.recordMessageDequeued()
+			diagnostics.recordWriteStart("data")
 			// The write budget is independent of pong deadlines: a pong may clear
 			// its own deadline, never the in-flight write.
 			writeCtx, cancelWrite := context.WithTimeout(ctx, remoteRelayWriteTimeout)
 			err := conn.Write(writeCtx, websocket.MessageBinary, payload)
 			cancelWrite()
 			if err != nil {
+				diagnostics.setExitReason(relayWriteExitReason(err))
 				if errors.Is(err, context.DeadlineExceeded) {
 					done <- errors.New("Noise multiplexed environment websocket write timed out")
 					return
@@ -291,22 +502,35 @@ func runRemoteRelayWriter(ctx context.Context, conn *websocket.Conn, outgoing <-
 				done <- fmt.Errorf("Noise multiplexed environment websocket write failed: %w", err)
 				return
 			}
+			diagnostics.recordWriteComplete("data", 1)
 		case <-ticker.C:
+			// A ping only proves the relay peer is reachable; it says nothing about
+			// executor receipt. Record both the write and the pong separately.
+			diagnostics.recordWriteStart("keepalive")
 			pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			err := conn.Ping(pingCtx)
 			cancel()
 			if err != nil {
+				diagnostics.setExitReason(relayWriteExitReason(err))
 				done <- fmt.Errorf("Noise multiplexed environment websocket keepalive failed: %w", err)
 				return
 			}
+			diagnostics.recordWriteComplete("keepalive", 0)
+			diagnostics.recordPongReceived()
 		}
 	}
 }
 
-func runRemoteRelayReader(ctx context.Context, conn *websocket.Conn, incoming chan<- remoteRelayIncoming) {
+// remoteRelayApplicationDeliveryTimeout bounds a delivery into the executor
+// application queue so a stalled consumer is reported as application
+// backpressure rather than looking like a missing transport read (#58025).
+const remoteRelayApplicationDeliveryTimeout = 60 * time.Second
+
+func runRemoteRelayReader(ctx context.Context, conn *websocket.Conn, incoming chan<- remoteRelayIncoming, diagnostics *relayTransportDiagnostics) {
 	for {
 		messageType, payload, err := conn.Read(ctx)
 		if err != nil {
+			diagnostics.recordReadError(err)
 			select {
 			case incoming <- remoteRelayIncoming{err: err}:
 			case <-ctx.Done():
@@ -316,13 +540,22 @@ func runRemoteRelayReader(ctx context.Context, conn *websocket.Conn, incoming ch
 		if messageType != websocket.MessageBinary {
 			continue
 		}
+		diagnostics.recordFrameRead()
 		frame, err := decodeRelayMessageFrame(payload)
 		if err != nil {
 			continue
 		}
+		startedAt := time.Now()
+		timer := time.NewTimer(remoteRelayApplicationDeliveryTimeout)
 		select {
 		case incoming <- remoteRelayIncoming{frame: frame}:
+			timer.Stop()
+		case <-timer.C:
+			logRelayApplicationBackpressure(time.Since(startedAt), len(incoming), cap(incoming))
+			diagnostics.setExitReason(relayExitApplicationDelivery)
+			return
 		case <-ctx.Done():
+			timer.Stop()
 			return
 		}
 	}
@@ -334,6 +567,7 @@ func validateRemoteHarnessKey(
 	registration *remoteRegistrationResponse,
 	publicKey RemotePublicKey,
 	authorization string,
+	streamID string,
 ) error {
 	body, err := json.Marshal(remoteHarnessValidationRequest{
 		ExecutorRegistrationID:  registration.ExecutorRegistrationID,
@@ -343,35 +577,36 @@ func validateRemoteHarnessKey(
 	if err != nil {
 		return err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, remoteEndpointURL(cfg.BaseURL, "/cloud/environment/"+cfg.EnvironmentID+"/validate"), strings.NewReader(string(body)))
-	if err != nil {
-		return errors.New("environment registry harness key validation failed")
-	}
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Accept", "application/json")
 	// Rust #54346 routes this through `resolve_auth` + `http_for_auth`, so the
 	// scoped mode validates its single bearer here too and uses the
-	// proxy-bypassing client for a loopback HTTP registry.
-	headers, executorCredential, err := resolveRemoteEnvironmentAuth(ctx, cfg)
-	if err != nil {
-		return err
-	}
-	for key, values := range headers {
-		for _, value := range values {
-			request.Header.Add(key, value)
+	// proxy-bypassing client for a loopback HTTP registry. Rust #55987 also
+	// replays the validation once after a 401 with replacement credentials.
+	build := func() (*http.Request, error) {
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, remoteEndpointURL(cfg.BaseURL, "/cloud/environment/"+cfg.EnvironmentID+"/validate"), bytes.NewReader(body))
+		if err != nil {
+			return nil, errors.New("environment registry harness key validation failed")
 		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Accept", "application/json")
+		// Rust #55498 forwards only a valid stream UUID so the registry can
+		// correlate its validation with the relay's handshake diagnostics.
+		if parsed, parseErr := uuid.Parse(streamID); parseErr == nil {
+			request.Header.Set("x-codex-noise-stream-id", parsed.String())
+		}
+		return request, nil
 	}
-	client, err := remoteRegistryHTTPClientForAuth(cfg)
+	response, executorCredential, err := sendRegistryAuthenticated(ctx, cfg, build, false)
 	if err != nil {
 		return err
-	}
-	response, err := client.Do(request)
-	if err != nil {
-		return errors.New("environment registry harness key validation failed")
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("environment registry harness key validation failed (%s)", response.Status)
+		// The request carries the short-lived authorization, so the body is
+		// never read. The typed status still classifies the diagnostic.
+		return &remoteRegistryHTTPError{
+			StatusCode: response.StatusCode,
+			message:    fmt.Sprintf("environment registry harness key validation failed (%s)", response.Status),
+		}
 	}
 	var decoded remoteHarnessValidationResponse
 	if err := json.NewDecoder(io.LimitReader(response.Body, 64*1024)).Decode(&decoded); err != nil {
@@ -456,12 +691,19 @@ func newRemoteNoiseVirtualStream(
 		streamID: streamID, instanceID: instanceID, transport: transport,
 		conn: clientConn, incoming: make(chan []byte, remoteRelayChannelCapacity), cancel: cancel,
 	}
+	forwarding := server != nil && server.forwardDestinationURL() != ""
 	go func() {
 		defer serverConn.Close()
-		// Rust #39235: when the JSON-RPC processor exits before the writer
-		// task, the physical relay still resets the corresponding harness
-		// stream so the peer does not wait on a dead connection.
-		_ = server.serveConnectionStream(streamCtx, serverConn, serverConn)
+		if forwarding {
+			// Rust's Forwarder bridges each accepted stream to the configured
+			// exec-server WebSocket instead of serving it here.
+			_ = server.serveForwardedStream(streamCtx, serverConn)
+		} else {
+			// Rust #39235: when the JSON-RPC processor exits before the writer
+			// task, the physical relay still resets the corresponding harness
+			// stream so the peer does not wait on a dead connection.
+			_ = server.serveConnectionStream(streamCtx, serverConn, serverConn)
+		}
 		queueRelayReset(outgoing, streamID)
 	}()
 	go stream.runInboundWriter(streamCtx)
@@ -506,6 +748,7 @@ func (s *remoteNoiseVirtualStream) runInboundWriter(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case message := <-s.incoming:
+			logNoiseRequestReceipt(message)
 			message = append(message, '\n')
 			if _, err := s.conn.Write(message); err != nil {
 				s.Close()

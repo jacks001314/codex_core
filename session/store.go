@@ -14,6 +14,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"codex_core/protocol"
+	"codex_core/utils"
 )
 
 const (
@@ -82,22 +85,25 @@ type ThreadSectionAppearance struct {
 }
 
 type Item struct {
-	ID               string          `json:"id"`
-	Type             string          `json:"type"`
-	Role             string          `json:"role,omitempty"`
-	Text             string          `json:"text,omitempty"`
-	Name             string          `json:"name,omitempty"`
-	Namespace        string          `json:"namespace,omitempty"`
-	CallID           string          `json:"call_id,omitempty"`
-	Status           string          `json:"status,omitempty"`
-	Content          []ContentPart   `json:"content,omitempty"`
-	Data             map[string]any  `json:"data,omitempty"`
-	Raw              json.RawMessage `json:"raw,omitempty"`
-	CreatedAt        time.Time       `json:"created_at"`
-	ResponseID       string          `json:"response_id,omitempty"`
-	Metadata         map[string]any  `json:"metadata,omitempty"`
-	CreatedAtOrdinal uint64          `json:"created_at_ordinal,omitempty"`
-	UpdatedAtOrdinal uint64          `json:"updated_at_ordinal,omitempty"`
+	ID         string          `json:"id"`
+	Type       string          `json:"type"`
+	Role       string          `json:"role,omitempty"`
+	Text       string          `json:"text,omitempty"`
+	Name       string          `json:"name,omitempty"`
+	Namespace  string          `json:"namespace,omitempty"`
+	CallID     string          `json:"call_id,omitempty"`
+	Status     string          `json:"status,omitempty"`
+	Content    []ContentPart   `json:"content,omitempty"`
+	Data       map[string]any  `json:"data,omitempty"`
+	Raw        json.RawMessage `json:"raw,omitempty"`
+	CreatedAt  time.Time       `json:"created_at"`
+	ResponseID string          `json:"response_id,omitempty"`
+	// ResponseItemID is the Responses API item identity when it differs from
+	// the thread-item id (Rust #57538 keeps the two separate for user messages).
+	ResponseItemID   string         `json:"response_item_id,omitempty"`
+	Metadata         map[string]any `json:"metadata,omitempty"`
+	CreatedAtOrdinal uint64         `json:"created_at_ordinal,omitempty"`
+	UpdatedAtOrdinal uint64         `json:"updated_at_ordinal,omitempty"`
 }
 
 func (s *Store) ListItems(threadID ThreadID, options ListItemsOptions) (*ItemPage, error) {
@@ -105,15 +111,17 @@ func (s *Store) ListItems(threadID ThreadID, options ListItemsOptions) (*ItemPag
 	if err != nil {
 		return nil, err
 	}
-	if options.AfterUpdatedAtOrdinal != nil && record.ForkedFromID != "" {
-		return nil, fmt.Errorf("%w: incremental item replay is not supported for forked threads", ErrInvalidThreadID)
+	// Rust #59793: forked histories page like any other thread because the child
+	// record materializes the inherited prefix and applies the same segment bounds.
+	if options.AfterUpdatedAtOrdinal != nil && options.BeforeUpdatedAtOrdinal != nil {
+		return nil, fmt.Errorf("%w: update-ordinal boundaries are mutually exclusive", ErrInvalidThreadID)
 	}
 	sortKey := options.SortKey
 	if sortKey == "" {
 		sortKey = ItemSortCreatedAtOrdinal
 	}
-	if sortKey == ItemSortUpdatedAtOrdinal && options.AfterUpdatedAtOrdinal == nil {
-		return nil, fmt.Errorf("%w: update-ordinal item sorting requires an update watermark", ErrInvalidThreadID)
+	if sortKey == ItemSortUpdatedAtOrdinal && options.AfterUpdatedAtOrdinal == nil && options.BeforeUpdatedAtOrdinal == nil {
+		return nil, fmt.Errorf("%w: update-ordinal item sorting requires an update boundary", ErrInvalidThreadID)
 	}
 	if sortKey != ItemSortCreatedAtOrdinal && sortKey != ItemSortUpdatedAtOrdinal {
 		return nil, fmt.Errorf("%w: unsupported item sort key %q", ErrInvalidThreadID, sortKey)
@@ -141,6 +149,9 @@ func (s *Store) ListItems(threadID ThreadID, options ListItemsOptions) (*ItemPag
 			continue
 		}
 		if options.AfterUpdatedAtOrdinal != nil && item.UpdatedAtOrdinal <= *options.AfterUpdatedAtOrdinal {
+			continue
+		}
+		if options.BeforeUpdatedAtOrdinal != nil && item.UpdatedAtOrdinal >= *options.BeforeUpdatedAtOrdinal {
 			continue
 		}
 		ordinal := item.CreatedAtOrdinal
@@ -214,6 +225,9 @@ type ListItemsOptions struct {
 	SortDirection         SortDirection
 	SortKey               ItemSortKey
 	AfterUpdatedAtOrdinal *uint64
+	// BeforeUpdatedAtOrdinal is the exclusive upper bound for an update-window
+	// read (Rust #59793). It is mutually exclusive with AfterUpdatedAtOrdinal.
+	BeforeUpdatedAtOrdinal *uint64
 }
 
 type ItemPage struct {
@@ -225,8 +239,9 @@ type ContentPart struct {
 	Type     string `json:"type"`
 	Text     string `json:"text,omitempty"`
 	ImageURL string `json:"image_url,omitempty"`
-	// FileID is the durable uploaded-file reference for an image part, stored
-	// instead of an inline URL (Rust #45794/#45543).
+	// FileID is the durable uploaded-file reference for an image or audio part,
+	// stored instead of an inline URL (Rust #45794/#45543 and AudioReference::File
+	// from #58430).
 	FileID   string  `json:"file_id,omitempty"`
 	AudioURL string  `json:"audio_url,omitempty"`
 	Detail   *string `json:"detail,omitempty"`
@@ -315,27 +330,31 @@ type QueuedSubmission struct {
 }
 
 type Record struct {
-	ID               ThreadID         `json:"id"`
-	SessionID        string           `json:"session_id,omitempty"`
-	ForkedFromID     ThreadID         `json:"forked_from_id,omitempty"`
-	ParentThreadID   ThreadID         `json:"parent_thread_id,omitempty"`
-	Title            string           `json:"title,omitempty"`
-	Preview          string           `json:"preview,omitempty"`
-	Archived         bool             `json:"archived"`
-	Section          *ThreadSection   `json:"section,omitempty"`
-	SectionPosition  *int64           `json:"section_position,omitempty"`
-	SectionEnteredAt *time.Time       `json:"section_entered_at,omitempty"`
-	IsPinned         bool             `json:"is_pinned,omitempty"` // Legacy on-disk migration field.
-	CreatedAt        time.Time        `json:"created_at"`
-	UpdatedAt        time.Time        `json:"updated_at"`
-	RecencyAt        time.Time        `json:"recency_at"`
-	Metadata         Metadata         `json:"metadata"`
-	HistoryBase      *HistoryPosition `json:"history_base,omitempty"`
-	Items            []Item           `json:"items,omitempty"`
-	FromRollout      bool             `json:"-"`
-	ItemCount        int              `json:"-"`
-	InheritedItems   int              `json:"-"`
-	InheritedTurns   int              `json:"-"`
+	ID           ThreadID `json:"id"`
+	SessionID    string   `json:"session_id,omitempty"`
+	ForkedFromID ThreadID `json:"forked_from_id,omitempty"`
+	// AttachedThreadParentID marks a persisted fork attached to the named
+	// source thread (Rust #56351). It is independent of the spawned-agent
+	// ParentThreadID graph.
+	AttachedThreadParentID ThreadID         `json:"attached_thread_parent_id,omitempty"`
+	ParentThreadID         ThreadID         `json:"parent_thread_id,omitempty"`
+	Title                  string           `json:"title,omitempty"`
+	Preview                string           `json:"preview,omitempty"`
+	Archived               bool             `json:"archived"`
+	Section                *ThreadSection   `json:"section,omitempty"`
+	SectionPosition        *int64           `json:"section_position,omitempty"`
+	SectionEnteredAt       *time.Time       `json:"section_entered_at,omitempty"`
+	IsPinned               bool             `json:"is_pinned,omitempty"` // Legacy on-disk migration field.
+	CreatedAt              time.Time        `json:"created_at"`
+	UpdatedAt              time.Time        `json:"updated_at"`
+	RecencyAt              time.Time        `json:"recency_at"`
+	Metadata               Metadata         `json:"metadata"`
+	HistoryBase            *HistoryPosition `json:"history_base,omitempty"`
+	Items                  []Item           `json:"items,omitempty"`
+	FromRollout            bool             `json:"-"`
+	ItemCount              int              `json:"-"`
+	InheritedItems         int              `json:"-"`
+	InheritedTurns         int              `json:"-"`
 }
 
 // HistoryPosition freezes the materialized prefix inherited by a paginated
@@ -411,15 +430,30 @@ type ListOptions struct {
 	SourceKinds    []string
 	Relation       *RelationFilter
 	IncludeHistory bool
+	// IncludeAttachedThreads includes persisted attached threads in a
+	// search listing without changing provider or source filters (Rust #60574).
+	IncludeAttachedThreads bool
 	// ExcludedThreadIDs drops threads before the page size is applied, mirroring
 	// Rust's ThreadListParams::excluded_thread_ids (#51595). Empty means no
 	// exclusions.
 	ExcludedThreadIDs []ThreadID
+	// HistoryAccount limits local discovery to threads visible to the current
+	// ChatGPT login (Rust #58918). Nil leaves the listing unscoped.
+	HistoryAccount *HistoryAccount
+}
+
+// HistoryAccount is the current ChatGPT identity used to scope local history.
+// Untagged threads remain visible to every login.
+type HistoryAccount struct {
+	UserID    string
+	AccountID string
 }
 
 type RelationFilter struct {
 	DirectChildrenOf ThreadID
 	DescendantsOf    ThreadID
+	// AttachedThreadsOf returns only saved forks attached to this thread.
+	AttachedThreadsOf ThreadID
 }
 
 type Page struct {
@@ -468,20 +502,14 @@ func (s *Store) SearchMessageOccurrences(threadID ThreadID, searchTerm string) (
 			}
 			text = strings.Join(parts, "\n")
 		}
-		lower := strings.ToLower(text)
-		for from := 0; from <= len(lower); {
-			rel := strings.Index(lower[from:], needle)
-			if rel < 0 {
-				break
-			}
-			start := from + rel
-			end := start + len(needle)
-			turnID, _ := item.Data["turn_id"].(string)
-			if turnID == "" {
-				turnID, _ = item.Data["turnId"].(string)
-			}
-			out = append(out, MessageOccurrence{TurnID: turnID, ItemID: item.ID, Text: text, Start: start, End: end})
-			from = end
+		turnID, _ := item.Data["turn_id"].(string)
+		if turnID == "" {
+			turnID, _ = item.Data["turnId"].(string)
+		}
+		// Rust #60759: thread search matches under Unicode default case
+		// folding, so final sigma, sigma and the "ss" fold of "ß" all hit.
+		for _, match := range utils.FoldedRanges(text, needle, 0) {
+			out = append(out, MessageOccurrence{TurnID: turnID, ItemID: item.ID, Text: text, Start: match[0], End: match[1]})
 		}
 	}
 	return out, nil
@@ -521,11 +549,58 @@ type PrepareForkParams struct {
 	Boundary ForkBoundary
 }
 
+// ForkSourceReservation keeps a source thread alive until a prepared fork is
+// finalized. Release is called after the child's record is durable.
+type ForkSourceReservation interface {
+	Release()
+}
+
+// heldForkSourceReservation marks a preparation whose source cannot be deleted
+// because the store mutation lock remains held through child creation.
+type heldForkSourceReservation struct{}
+
+func (heldForkSourceReservation) Release() {}
+
 type PreparedFork struct {
 	SourceID     ThreadID
 	HistoryBase  *HistoryPosition
 	Items        []Item
 	RolloutTurns []TurnSnapshot
+
+	sourceReservation ForkSourceReservation
+	revalidateSource  bool
+}
+
+// WithSourceReservation marks this snapshot as protected by a backend-owned
+// source reservation. Revalidation is skipped while the reservation is held.
+func (p *PreparedFork) WithSourceReservation(reservation ForkSourceReservation) *PreparedFork {
+	if p == nil {
+		return nil
+	}
+	p.sourceReservation = reservation
+	p.revalidateSource = reservation == nil
+	return p
+}
+
+// WithSourceRevalidation marks this snapshot for source revalidation when the
+// child's history reference becomes durable. It is used when the backend does
+// not hold a source reservation.
+func (p *PreparedFork) WithSourceRevalidation() *PreparedFork {
+	if p == nil {
+		return nil
+	}
+	p.sourceReservation = nil
+	p.revalidateSource = true
+	return p
+}
+
+func (p *PreparedFork) releaseSourceReservation() {
+	if p == nil || p.sourceReservation == nil {
+		return
+	}
+	reservation := p.sourceReservation
+	p.sourceReservation = nil
+	reservation.Release()
 }
 
 type ResolvedPhysicalHistory struct {
@@ -554,6 +629,12 @@ func NewStore(root string) *Store {
 }
 
 func storeRootLock(root string) *sync.RWMutex {
+	key := storeRootKey(root)
+	lock, _ := storeRootLocks.LoadOrStore(key, &sync.RWMutex{})
+	return lock.(*sync.RWMutex)
+}
+
+func storeRootKey(root string) string {
 	key := filepath.Clean(root)
 	if absolute, err := filepath.Abs(key); err == nil {
 		key = absolute
@@ -561,8 +642,7 @@ func storeRootLock(root string) *sync.RWMutex {
 	if runtime.GOOS == "windows" {
 		key = strings.ToLower(key)
 	}
-	lock, _ := storeRootLocks.LoadOrStore(key, &sync.RWMutex{})
-	return lock.(*sync.RWMutex)
+	return key
 }
 
 func (s *Store) Root() string {
@@ -696,6 +776,16 @@ func (s *Store) Revert(threadID ThreadID, beforeTurnID string) (*Record, error) 
 	}
 	if strings.TrimSpace(beforeTurnID) == "" {
 		return nil, fmt.Errorf("%w: beforeTurnId is required", ErrInvalidThreadID)
+	}
+	// Rust #57256: an attached fork's visible history starts at its parent
+	// bookmark, so a turn inherited from the parent cannot be a revert
+	// boundary even though it is materialized for model context.
+	if record.InheritedTurns > 0 {
+		for i := 0; i < record.InheritedTurns && i < len(record.Metadata.RolloutTurns); i++ {
+			if record.Metadata.RolloutTurns[i].ID == strings.TrimSpace(beforeTurnID) {
+				return nil, fmt.Errorf("%w: beforeTurnId '%s' was not found in the source thread", ErrInvalidThreadID, strings.TrimSpace(beforeTurnID))
+			}
+		}
 	}
 	items, err := itemsBeforeTurn(record.Items, beforeTurnID)
 	if err != nil {
@@ -997,7 +1087,10 @@ func (s *Store) AppendItem(threadID ThreadID, item Item) (*Record, error) {
 	if item.CreatedAt.IsZero() {
 		item.CreatedAt = now
 	}
+	EnsureHistorySequences(record.Items)
 	record.Items = append(record.Items, item)
+	EnsureAppendedHistorySequences(record.Items, len(record.Items)-1)
+	item = record.Items[len(record.Items)-1]
 	record.UpdatedAt = item.CreatedAt
 	record.RecencyAt = item.CreatedAt
 	if record.Preview == "" {
@@ -1021,7 +1114,13 @@ func (s *Store) AppendItems(threadID ThreadID, items []Item) (*Record, error) {
 		if items[i].CreatedAt.IsZero() {
 			items[i].CreatedAt = now
 		}
-		record.Items = append(record.Items, items[i])
+	}
+	EnsureHistorySequences(record.Items)
+	appendedStart := len(record.Items)
+	record.Items = append(record.Items, items...)
+	EnsureAppendedHistorySequences(record.Items, appendedStart)
+	copy(items, record.Items[appendedStart:])
+	for i := range items {
 		record.UpdatedAt = items[i].CreatedAt
 		record.RecencyAt = items[i].CreatedAt
 		if record.Preview == "" {
@@ -1631,23 +1730,83 @@ func ListRecords(records []Record, options ListOptions) (*Page, error) {
 
 func (s *Store) Fork(sourceID ThreadID, options ForkOptions) (*Record, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	source, err := s.readLocked(sourceID, true, true)
 	if err != nil {
+		s.mu.Unlock()
 		return nil, err
 	}
-	return s.forkRecordLocked(source, options)
+	prepared, err := s.PrepareFork(source, prepareForkParamsFromOptions(options))
+	if err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
+	prepared.WithSourceReservation(heldForkSourceReservation{})
+	record, err := s.finalizePreparedForkLocked(source, prepared, options)
+	s.mu.Unlock()
+	prepared.releaseSourceReservation()
+	return record, err
 }
 
 func (s *Store) ForkRecord(source *Record, options ForkOptions) (*Record, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.forkRecordLocked(source, options)
+	prepared, err := s.PrepareFork(source, prepareForkParamsFromOptions(options))
+	if err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
+	prepared.WithSourceReservation(heldForkSourceReservation{})
+	record, err := s.finalizePreparedForkLocked(source, prepared, options)
+	s.mu.Unlock()
+	prepared.releaseSourceReservation()
+	return record, err
 }
 
-func (s *Store) forkRecordLocked(source *Record, options ForkOptions) (*Record, error) {
+// FinalizePreparedFork validates a prepared snapshot and durably creates the
+// child. It lets alternative backends prepare history outside the store lock
+// while still revalidating the source at the commit boundary.
+func (s *Store) FinalizePreparedFork(source *Record, prepared *PreparedFork, options ForkOptions) (*Record, error) {
+	if s == nil {
+		return nil, fmt.Errorf("%w: store is nil", ErrInvalidThreadID)
+	}
+	s.mu.Lock()
+	record, err := s.finalizePreparedForkLocked(source, prepared, options)
+	s.mu.Unlock()
+	prepared.releaseSourceReservation()
+	return record, err
+}
+
+func (s *Store) finalizePreparedForkLocked(source *Record, prepared *PreparedFork, options ForkOptions) (*Record, error) {
 	if source == nil {
 		return nil, fmt.Errorf("%w: source record is nil", ErrInvalidThreadID)
+	}
+	if prepared == nil {
+		return nil, fmt.Errorf("%w: prepared fork is nil", ErrInvalidThreadID)
+	}
+	if prepared.SourceID != source.ID {
+		return nil, fmt.Errorf("%w: prepared fork source %s does not match %s", ErrInvalidThreadID, prepared.SourceID, source.ID)
+	}
+	if options.HistoryBaseSet {
+		prepared.HistoryBase = cloneHistoryPosition(options.HistoryBase)
+	}
+	if prepared.sourceReservation == nil && prepared.HistoryBase != nil {
+		if !prepared.revalidateSource {
+			return nil, fmt.Errorf("%w: prepared fork has neither a source reservation nor revalidation", ErrInvalidThreadID)
+		}
+		current, err := s.readLocked(prepared.SourceID, true, true)
+		if err == nil {
+			if !current.CreatedAt.Equal(source.CreatedAt) || current.SessionID != source.SessionID {
+				return nil, fmt.Errorf("%w: fork source %s changed while the child was being prepared", ErrConflict, prepared.SourceID)
+			}
+		} else if errors.Is(err, ErrThreadNotFound) && (prepared.HistoryBase.EndOrdinalExclusive != 0 || prepared.HistoryBase.EndByteOffset != 0) {
+			// Some paginated sources live only in the app-server's physical
+			// rollout database. Their absence from the JSON store is valid when
+			// the prepared physical-history reference still resolves.
+			if _, resolveErr := s.resolvePhysicalHistory(*prepared.HistoryBase); resolveErr != nil {
+				return nil, fmt.Errorf("revalidate fork source %s: %w", prepared.SourceID, resolveErr)
+			}
+		} else {
+			return nil, fmt.Errorf("revalidate fork source %s: %w", prepared.SourceID, err)
+		}
 	}
 	newID := options.NewID
 	if newID == "" {
@@ -1670,14 +1829,10 @@ func (s *Store) forkRecordLocked(source *Record, options ForkOptions) (*Record, 
 	if strings.TrimSpace(options.LastTurnID) != "" && strings.TrimSpace(options.BeforeTurnID) != "" {
 		return nil, fmt.Errorf("%w: `beforeTurnId` cannot be combined with `lastTurnId`", ErrInvalidThreadID)
 	}
-	prepared, err := s.PrepareFork(source, prepareForkParamsFromOptions(options))
-	if err != nil {
-		return nil, err
-	}
-	if options.HistoryBaseSet {
-		prepared.HistoryBase = cloneHistoryPosition(options.HistoryBase)
-	}
 	items := prepared.Items
+	// Rust #59312: forked history backfills missing response item ids through
+	// the shared UUIDv7 generator before the child persists or replays them.
+	BackfillMissingItemIDs(items, protocol.NewUUIDv7ItemIDGenerator())
 	title := options.Title
 	if title == "" && source.Title != "" {
 		title = source.Title
@@ -1912,6 +2067,14 @@ func matchesListOptions(record *Record, options *ListOptions, all []Record) bool
 	if len(options.ModelProviders) > 0 && !containsString(options.ModelProviders, record.Metadata.ModelProvider) {
 		return false
 	}
+	if options.HistoryAccount != nil {
+		if creator := strings.TrimSpace(record.Metadata.CreatorUserID); creator != "" && creator != strings.TrimSpace(options.HistoryAccount.UserID) {
+			return false
+		}
+		if creator := strings.TrimSpace(record.Metadata.CreatorAccountID); creator != "" && creator != strings.TrimSpace(options.HistoryAccount.AccountID) {
+			return false
+		}
+	}
 	if options.CWDSet && len(options.CWDs) == 0 {
 		// Rust #51602: `cwd_filters.is_some_and(is_empty)` returns an empty page
 		// on the scan path, so an explicitly empty cwd array matches nothing.
@@ -1930,6 +2093,12 @@ func matchesListOptions(record *Record, options *ListOptions, all []Record) bool
 		return false
 	}
 	if options.Relation != nil && !recordMatchesRelation(record, options.Relation, all) {
+		return false
+	}
+	// Attached forks are hidden from ordinary listings and from every other
+	// relationship listing (Rust #56351).
+	if record.AttachedThreadParentID != "" && !options.IncludeAttachedThreads &&
+		(options.Relation == nil || options.Relation.AttachedThreadsOf == "") {
 		return false
 	}
 	if len(options.ExcludedThreadIDs) > 0 && containsThreadID(options.ExcludedThreadIDs, record.ID) {
@@ -2062,6 +2231,9 @@ func recordMatchesSearch(record *Record, search string) bool {
 }
 
 func recordMatchesRelation(record *Record, relation *RelationFilter, all []Record) bool {
+	if relation.AttachedThreadsOf != "" {
+		return record.AttachedThreadParentID == relation.AttachedThreadsOf
+	}
 	if relation.DirectChildrenOf != "" {
 		return record.ParentThreadID == relation.DirectChildrenOf
 	}
@@ -2258,6 +2430,12 @@ func itemTurnID(item *Item, index int) string {
 		return turnID
 	}
 	return turnID
+}
+
+// ItemTurnID exposes the turn attribution ListItems uses, including the
+// legacy positional fallback for records written before items carried turn ids.
+func ItemTurnID(item *Item, index int) string {
+	return itemTurnID(item, index)
 }
 
 func itemTurnIDWithExplicit(item *Item, index int) (string, bool) {
@@ -2775,6 +2953,7 @@ func cloneTurnSnapshot(snapshot TurnSnapshot) TurnSnapshot {
 	return TurnSnapshot{
 		ID:           snapshot.ID,
 		Status:       snapshot.Status,
+		RootTurnID:   snapshot.RootTurnID,
 		StartedAt:    cloneInt64Ptr(snapshot.StartedAt),
 		CompletedAt:  cloneInt64Ptr(snapshot.CompletedAt),
 		DurationMS:   cloneInt64Ptr(snapshot.DurationMS),

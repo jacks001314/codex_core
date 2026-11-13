@@ -4,6 +4,9 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	"sort"
+
+	"codex_core/sandbox/windowssandbox/provisionservice"
 
 	json "github.com/goccy/go-json"
 )
@@ -15,10 +18,49 @@ type SandboxCredentials struct {
 }
 
 var (
-	runElevatedSetupForCredentials         = RunElevatedSetup
+	runElevatedSetupForCredentials         = runAutomaticSetupForCredentials
+	runElevatedSetupFallbackForCredentials = RunElevatedSetup
 	runSetupRefreshForCredentials          = RunSetupRefreshForRequest
 	selectSandboxCredentialsForCredentials = SelectSandboxCredentials
+	sandboxAccountFlagsForCredentials      = readSandboxAccountFlags
+	provisionViaServiceForCredentials      = provisionWindowsSandboxViaService
+	loadInstallationForReadiness           = LoadInstallation
+	currentProcessPackageName              = CurrentProcessPackageFullName
 )
+
+// runAutomaticSetupForCredentials prefers an installed provisioning service at
+// launch time and falls back to the elevated helper only when the service is
+// unavailable (Rust run_automatic_setup). Service errors propagate.
+func runAutomaticSetupForCredentials(request *SandboxSetupRequest) error {
+	if request == nil {
+		return ErrInvalidRequest
+	}
+	settings := provisionservice.Settings{}
+	if request.OfflineProxySettings != nil {
+		settings.ProxyPorts = append([]uint16{}, request.OfflineProxySettings.ProxyPorts...)
+		settings.AllowLocalBinding = request.OfflineProxySettings.AllowLocalBinding
+	}
+	listeners := FilterProvisioningListeners(
+		ProvisioningListenersFromProxyEnvironment(request.Env),
+		settings.ProxyPorts,
+	)
+	outcome, err := provisionViaServiceForCredentials(request.CodexHome, settings, listeners)
+	if err != nil {
+		return err
+	}
+	if outcome == provisionservice.Provisioned {
+		return nil
+	}
+	return runElevatedSetupFallbackForCredentials(request)
+}
+
+// provisionWindowsSandboxViaService provisions through the authenticated
+// packaged service. Registered Core never falls back (Client refuses it).
+func provisionWindowsSandboxViaService(codexHome string, settings provisionservice.Settings, listeners provisionservice.Listeners) (provisionservice.Outcome, error) {
+	client := provisionservice.NewClient()
+	client.RegisteredCore = RegisteredCoreRequested
+	return client.ProvisionWindowsSandbox(codexHome, settings, listeners)
+}
 
 func RequireLogonSandboxCreds(codexHome string) (*SandboxCredentials, error) {
 	return selectSandboxCredentialsForCredentials(codexHome, SandboxNetworkIdentityOffline)
@@ -122,6 +164,29 @@ func requireLogonSandboxCredsForPermissions(
 		}
 	} else {
 		setupReason = "sandbox setup marker missing or incompatible"
+	}
+
+	if identity != nil {
+		// Cleanup may also have removed the group, so repair missing or disabled
+		// accounts before the ACL refresh can fail. Expired passwords also need a
+		// full setup because a refresh cannot rotate them or update the stored
+		// credentials (Rust #46239).
+		for _, username := range []string{OfflineUsername, OnlineUsername} {
+			flags, found, err := sandboxAccountFlagsForCredentials(username)
+			if err != nil {
+				continue
+			}
+			if !sandboxAccountNeedsRepair(flags, found) {
+				continue
+			}
+			const reason = "sandbox account is missing, disabled, or password expired"
+			if err := removeStaleSandboxUsersFile(codexHome, reason); err != nil {
+				return nil, err
+			}
+			setupReason = reason
+			identity = nil
+			break
+		}
 	}
 
 	request := &SandboxSetupRequest{
@@ -283,6 +348,33 @@ func DecodeSandboxUserPassword(record SandboxUserRecord) (string, error) {
 	return string(decrypted), nil
 }
 
+// sandboxAccountNeedsRepair reports whether a managed account must be repaired
+// before setup can be considered complete (Rust #46239 read_local_user_flags
+// gate). A missing account and a disabled or password-expired account all
+// require full setup.
+func sandboxAccountNeedsRepair(flags uint32, found bool) bool {
+	if !found {
+		return true
+	}
+	const (
+		userFlagAccountDisable  = 0x0002
+		userFlagPasswordExpired = 0x800000
+	)
+	return flags&(userFlagAccountDisable|userFlagPasswordExpired) != 0
+}
+
+// removeStaleSandboxUsersFile drops credentials that an older setup (or
+// service) could mistake for proof of completed setup once an account needs
+// repair (Rust #46239 remove_sandbox_users_file).
+func removeStaleSandboxUsersFile(codexHome string, reason string) error {
+	path := SandboxUsersPath(codexHome)
+	_ = LogNoteInDir(SandboxDir(codexHome), reason+"; deleting "+path)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("delete %s: %w", path, err)
+	}
+	return nil
+}
+
 func SandboxSetupIsComplete(codexHome string) (bool, error) {
 	marker, err := ReadSetupMarker(codexHome)
 	if err != nil {
@@ -295,10 +387,92 @@ func SandboxSetupIsComplete(codexHome string) (bool, error) {
 	if err != nil {
 		return false, nil
 	}
-	return users.VersionMatches(), nil
+	if !users.VersionMatches() {
+		return false, nil
+	}
+	if !CurrentSetupRuntime().IsLegacy() {
+		ready, err := registeredSetupIsReady(codexHome)
+		if err != nil || !ready {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// SandboxSetupIsCompleteWithSettings reports whether the recorded setup matches
+// the requested offline proxy settings (Rust
+// sandbox_setup_is_complete_with_settings): a version-matching marker whose
+// sorted proxy ports and local-binding mode match, plus a version-matching
+// credentials file.
+func SandboxSetupIsCompleteWithSettings(codexHome string, settings OfflineProxySettings) bool {
+	marker, err := ReadSetupMarker(codexHome)
+	if err != nil || !marker.VersionMatches() {
+		return false
+	}
+	recorded := append([]uint16(nil), marker.ProxyPorts...)
+	sort.Slice(recorded, func(left, right int) bool { return recorded[left] < recorded[right] })
+	desired := append([]uint16(nil), settings.ProxyPorts...)
+	sort.Slice(desired, func(left, right int) bool { return desired[left] < desired[right] })
+	if !equalUint16s(recorded, desired) || marker.AllowLocalBinding != settings.AllowLocalBinding {
+		return false
+	}
+	users, err := ReadSandboxUsersFile(codexHome)
+	return err == nil && users.VersionMatches()
+}
+
+// registeredSetupIsReady checks the service receipt for an opt-in registered
+// Core (Rust `registered_setup_is_ready`): both managed accounts must exist and
+// be enabled, the process must run from an installed package, and the committed
+// receipt must name that package and this Codex home.
+func registeredSetupIsReady(codexHome string) (bool, error) {
+	for _, username := range []string{OfflineUsername, OnlineUsername} {
+		flags, found, err := sandboxAccountFlagsForCredentials(username)
+		if err != nil {
+			return false, err
+		}
+		if sandboxAccountDisabled(flags, found) {
+			return false, nil
+		}
+	}
+	fullName, hasPackage, err := currentProcessPackageName()
+	if err != nil || !hasPackage {
+		return false, err
+	}
+	record, err := loadInstallationForReadiness()
+	if err != nil || record == nil {
+		return false, err
+	}
+	if !installationHomeMatches(record.CodexHome, codexHome) {
+		return false, nil
+	}
+	registration, err := record.RuntimeRegistration()
+	if err != nil {
+		return false, err
+	}
+	return registration.ReadyForPackage(fullName), nil
+}
+
+// sandboxAccountDisabled reports an account the service receipt cannot rely on
+// (Rust `local_user_flags(account)` with UF_ACCOUNTDISABLE).
+func sandboxAccountDisabled(flags uint32, found bool) bool {
+	const userFlagAccountDisable = 0x0002
+	return !found || flags&userFlagAccountDisable != 0
 }
 
 func WriteSandboxUsersFile(codexHome string, users *SandboxUsersFile) error {
+	return writeSandboxUsersFile(codexHome, users, func(path string, data []byte) error {
+		return os.WriteFile(path, data, 0o600)
+	})
+}
+
+// WriteSandboxUsersFileForProvisioning replaces the credentials file through a
+// fresh handle relative to the pinned secrets directory instead of writing
+// through a caller-controlled destination entry (Rust #42342).
+func WriteSandboxUsersFileForProvisioning(codexHome string, users *SandboxUsersFile) error {
+	return writeSandboxUsersFile(codexHome, users, WriteFileAtomically)
+}
+
+func writeSandboxUsersFile(codexHome string, users *SandboxUsersFile, write func(string, []byte) error) error {
 	if users == nil {
 		return ErrInvalidRequest
 	}
@@ -309,7 +483,7 @@ func WriteSandboxUsersFile(codexHome string, users *SandboxUsersFile) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(SandboxUsersPath(codexHome), data, 0o600)
+	return write(SandboxUsersPath(codexHome), data)
 }
 
 func ReadSandboxUsersFile(codexHome string) (*SandboxUsersFile, error) {

@@ -132,6 +132,10 @@ type CodexCommandExecutionEventRequest struct {
 
 type CodexCommandExecutionEventParams struct {
 	CodexToolItemEventBase
+	// SandboxBackend is the observed process backend for the command (Rust
+	// #47568). It is serialized as null when no launch was observed, which keeps
+	// "unknown" distinguishable from an explicit unsandboxed run ("none").
+	SandboxBackend *string `json:"sandbox_backend"`
 	// ModelSlug and ReasoningEffort attribute the command to the model that
 	// invoked it (Rust #45445): they are captured from the resolved step settings
 	// when the command starts and carried to completion, so a model switch during
@@ -178,6 +182,9 @@ type CodexMCPToolCallEventParams struct {
 	// ConnectorID is the trusted Codex Apps connector the call resolved to (Rust
 	// #32867).
 	ConnectorID *string `json:"connector_id"`
+	// VoiceSessionID is the realtime voice session that started or steered the
+	// calling turn (Rust #46058).
+	VoiceSessionID *string `json:"voice_session_id"`
 	// ElicitationType classifies the call when it ended in an authentication or
 	// account-linking block (`auth_or_link`) or in a denied, aborted or timed-out
 	// approval (`approval`); ordinary calls report null (Rust #45649/#45716).
@@ -243,6 +250,9 @@ type CodexImageGenerationEventParams struct {
 	// TransparentBackground mirrors Rust #40544: the optional image-generation
 	// transparent-background value is carried in the Analytics event params.
 	TransparentBackground *bool `json:"transparent_background,omitempty"`
+	// GenerationID mirrors Rust #43953: the selected image's backend generation
+	// id is analytics-only and omitted when the response carried none.
+	GenerationID *string `json:"generation_id,omitempty"`
 }
 
 func NewCodexCommandExecutionEvent(params CodexCommandExecutionEventParams) CodexCommandExecutionEventRequest {

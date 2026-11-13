@@ -29,8 +29,12 @@ const (
 	RefreshTokenURLEnvOverride = "CODEX_REFRESH_TOKEN_URL_OVERRIDE"
 	RevokeTokenURLEnvOverride  = "CODEX_REVOKE_TOKEN_URL_OVERRIDE"
 	LoginClientIDEnvOverride   = "CODEX_APP_SERVER_LOGIN_CLIENT_ID"
-	legacyLoginClientIDEnvVar  = "CODEX_APP_SERVER_LOGIN_CLIENT_ID"
-	chatGPTAuthClaimNamespace  = "https://api.openai.com/auth"
+	// LoginIssuerEnvOverride lets packaged clients point the app-server login
+	// flow at a staging issuer (Rust #42811). The matching open-app redirect
+	// override stays debug-only upstream and is not carried here.
+	LoginIssuerEnvOverride    = "CODEX_APP_SERVER_LOGIN_ISSUER"
+	legacyLoginClientIDEnvVar = "CODEX_APP_SERVER_LOGIN_CLIENT_ID"
+	chatGPTAuthClaimNamespace = "https://api.openai.com/auth"
 )
 
 type OAuthOptions struct {
@@ -49,7 +53,10 @@ type OAuthOptions struct {
 	CallbackPort       uint16
 	ForceState         string
 	ForcedWorkspaces   []string
-	StoreOptions       *StoreOptions
+	// WorkspaceLogin, when set, binds the browser callback to the managed login
+	// that requested a workspace switch (Rust #57514 WorkspaceLogin).
+	WorkspaceLogin *WorkspaceLogin
+	StoreOptions   *StoreOptions
 }
 
 type PKCECodes struct {
@@ -80,6 +87,11 @@ type ExchangedTokens struct {
 	IDToken      string `json:"id_token"`
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
+	// Issuer and ClientID record the OAuth authority that issued the refresh
+	// token. They are persisted as oauth_provenance and are not part of the
+	// token endpoint response.
+	Issuer   string `json:"-"`
+	ClientID string `json:"-"`
 }
 
 // RefreshReason is the caller-reported diagnostic Rust attaches to a ChatGPT
@@ -190,6 +202,15 @@ func BuildAuthorizeURL(opts *OAuthOptions, redirectURI string, pkce *PKCECodes, 
 	if workspaces := normalizedWorkspaceList(opts.ForcedWorkspaces); len(workspaces) > 0 {
 		query.Set("allowed_workspace_id", strings.Join(workspaces, ","))
 	}
+	if login := opts.WorkspaceLogin; login != nil {
+		query.Set("current_workspace_id", login.WorkspaceID)
+		if login.Email != "" {
+			query.Set("login_hint", login.Email)
+		}
+		if login.Connection != "" {
+			query.Set("connection", login.Connection)
+		}
+	}
 	base.RawQuery = query.Encode()
 	return base.String(), nil
 }
@@ -279,7 +300,9 @@ func StartBrowserLogin(ctx context.Context, opts *OAuthOptions) (*BrowserLoginSe
 		return nil, err
 	}
 	port := uint16(listener.Addr().(*net.TCPAddr).Port)
-	redirectURI := fmt.Sprintf("http://localhost:%d/auth/callback", port)
+	// Rust #47927: loopback redirects use 127.0.0.1 so the OAuth callback and
+	// success page do not depend on the localhost hostname resolving.
+	redirectURI := fmt.Sprintf("http://127.0.0.1:%d/auth/callback", port)
 	authURL, err := BuildAuthorizeURL(opts, redirectURI, pkce, state)
 	if err != nil {
 		_ = listener.Close()
@@ -306,7 +329,7 @@ func StartBrowserLogin(ctx context.Context, opts *OAuthOptions) (*BrowserLoginSe
 			http.Redirect(w, request, outcome.successURL, http.StatusFound)
 			return
 		}
-		http.Redirect(w, request, fmt.Sprintf("http://localhost:%d/success", port), http.StatusFound)
+		http.Redirect(w, request, fmt.Sprintf("http://127.0.0.1:%d/success", port), http.StatusFound)
 	})
 	mux.HandleFunc("/success", func(w http.ResponseWriter, request *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -441,6 +464,8 @@ func ExchangeCodeForTokens(ctx context.Context, opts *OAuthOptions, redirectURI 
 	if strings.TrimSpace(tokens.AccessToken) == "" || strings.TrimSpace(tokens.RefreshToken) == "" {
 		return nil, errors.New("token response omitted access_token or refresh_token")
 	}
+	tokens.Issuer = opts.Issuer
+	tokens.ClientID = opts.ClientID
 	return &tokens, nil
 }
 
@@ -535,6 +560,13 @@ func PersistChatGPTTokensWithOptions(codexHome string, tokens *ExchangedTokens, 
 	if tokens == nil {
 		return errors.New("tokens are required")
 	}
+	auth := authDotJSONFromExchangedTokens(tokens)
+	return NewStoreWithOptions(codexHome, storeOptions).Save(auth)
+}
+
+// authDotJSONFromExchangedTokens renders a completed OAuth exchange the way a
+// fresh ChatGPT login stores it.
+func authDotJSONFromExchangedTokens(tokens *ExchangedTokens) AuthDotJSON {
 	auth := AuthDotJSON{
 		AuthMode: "chatgpt",
 		Tokens: map[string]any{
@@ -544,23 +576,43 @@ func PersistChatGPTTokensWithOptions(codexHome string, tokens *ExchangedTokens, 
 		},
 		LastRefresh: time.Now().UTC().Format(time.RFC3339),
 	}
+	if issuer := strings.TrimSpace(tokens.Issuer); issuer != "" {
+		clientID := strings.TrimSpace(tokens.ClientID)
+		auth.Tokens["oauth_provenance"] = map[string]any{
+			"issuer": issuer, "client_id": clientID,
+		}
+		auth.Tokens["login_owner_id"] = newOAuthLoginOwnerID()
+	}
 	if accountID := ChatGPTAccountIDFromJWT(tokens.IDToken); accountID != "" {
 		auth.Tokens["account_id"] = accountID
 	}
-	return NewStoreWithOptions(codexHome, storeOptions).Save(auth)
+	return auth
 }
 
 func RefreshChatGPTTokens(ctx context.Context, opts *RefreshChatGPTTokenOptions) (*AuthDotJSON, error) {
 	if opts == nil {
 		opts = &RefreshChatGPTTokenOptions{}
 	}
+	codexHome := strings.TrimSpace(opts.CodexHome)
+	if codexHome == "" {
+		codexHome = DefaultCodexHome()
+	}
+	// Ordinary refresh holds the same gate as AccountOAuthGrantLease, so an
+	// identity-provider exchange and a refresh cannot rotate the grant
+	// concurrently (Rust #55546 refresh_lock).
+	gate := accountRefreshGateFor(codexHome)
+	if err := gate.acquire(ctx); err != nil {
+		return nil, errors.New("Account refresh coordination is unavailable.")
+	}
+	defer gate.release()
+	attempted := refreshAttemptSnapshot(codexHome, opts.AuthSnapshot, opts.StoreOptions)
+	provenance := oauthProvenanceFromTokens(nilSafeTokens(attempted))
 	normalized := NormalizeOAuthOptions(&OAuthOptions{
 		CodexHome:  opts.CodexHome,
-		Issuer:     opts.Issuer,
-		ClientID:   opts.ClientID,
+		Issuer:     firstNonEmptyAuth(opts.Issuer, provenance.Issuer),
+		ClientID:   firstNonEmptyAuth(opts.ClientID, provenance.ClientID),
 		HTTPClient: opts.HTTPClient,
 	})
-	attempted := refreshAttemptSnapshot(normalized.CodexHome, opts.AuthSnapshot, opts.StoreOptions)
 	if failed := RefreshFailureForAuth(normalized.CodexHome, attempted); failed != nil {
 		return nil, failed
 	}
@@ -586,36 +638,53 @@ func RefreshChatGPTTokens(ctx context.Context, opts *RefreshChatGPTTokenOptions)
 	if value := RefreshReasonValue(reason); value != "" {
 		body["refresh_reason"] = value
 	}
-	var out ExchangedTokens
-	if err := postJSON(ctx, normalized.HTTPClient, refreshTokenURL(normalized.Issuer), body, &out); err != nil {
-		var statusErr *httpStatusError
-		if errors.As(err, &statusErr) {
-			// RFC 6749 reports an unusable refresh token as invalid_grant
-			// without preserving the legacy expired/reused/revoked subtype.
-			// Keep it terminal with the generic reason (#39637).
-			code := extractRefreshTokenErrorCode(statusErr.Body)
-			isInvalidGrantBadRequest := statusErr.StatusCode == http.StatusBadRequest &&
-				strings.EqualFold(code, "invalid_grant")
-			failed := classifyRefreshTokenFailure(statusErr.Body)
-			if statusErr.StatusCode == http.StatusUnauthorized ||
-				failed.Reason != RefreshTokenFailedOther ||
-				isInvalidGrantBadRequest {
-				RecordPermanentRefreshFailureIfUnchangedWithOptions(normalized.CodexHome, attempted, failed, opts.StoreOptions)
-				return nil, failed
+	// Rust #58355: this generation is unsettled from the start of the exchange
+	// until the refreshed credentials are persisted. A cancelled exchange keeps
+	// the record, while a completed failure restores the record it replaced so
+	// it cannot settle an earlier cancelled attempt.
+	previousUnsettled := beginChatGPTRefresh(normalized.CodexHome, nilSafeTokens(attempted))
+	refreshed, refreshErr := func() (*AuthDotJSON, error) {
+		var out ExchangedTokens
+		if err := postJSON(ctx, normalized.HTTPClient, refreshTokenURL(normalized.Issuer), body, &out); err != nil {
+			var statusErr *httpStatusError
+			if errors.As(err, &statusErr) {
+				// RFC 6749 reports an unusable refresh token as invalid_grant
+				// without preserving the legacy expired/reused/revoked subtype.
+				// Keep it terminal with the generic reason (#39637).
+				code := extractRefreshTokenErrorCode(statusErr.Body)
+				isInvalidGrantBadRequest := statusErr.StatusCode == http.StatusBadRequest &&
+					strings.EqualFold(code, "invalid_grant")
+				failed := classifyRefreshTokenFailure(statusErr.Body)
+				if statusErr.StatusCode == http.StatusUnauthorized ||
+					failed.Reason != RefreshTokenFailedOther ||
+					isInvalidGrantBadRequest {
+					RecordPermanentRefreshFailureIfUnchangedWithOptions(normalized.CodexHome, attempted, failed, opts.StoreOptions)
+					return nil, failed
+				}
 			}
+			return nil, err
 		}
-		return nil, err
+		if strings.TrimSpace(out.AccessToken) == "" {
+			return nil, errors.New("refresh response omitted access_token")
+		}
+		if strings.TrimSpace(out.RefreshToken) == "" {
+			out.RefreshToken = refreshToken
+		}
+		if err := persistRefreshedChatGPTTokens(normalized.CodexHome, attempted, &out, opts.StoreOptions); err != nil {
+			return nil, err
+		}
+		return NewStoreWithOptions(normalized.CodexHome, opts.StoreOptions).Load()
+	}()
+	switch {
+	case refreshErr == nil:
+		settleChatGPTRefresh(normalized.CodexHome)
+	case ctx.Err() != nil:
+		// The exchange was interrupted after it started, so the stored token may
+		// already have been rotated even if this call never saw the response.
+	default:
+		restoreChatGPTRefresh(normalized.CodexHome, previousUnsettled)
 	}
-	if strings.TrimSpace(out.AccessToken) == "" {
-		return nil, errors.New("refresh response omitted access_token")
-	}
-	if strings.TrimSpace(out.RefreshToken) == "" {
-		out.RefreshToken = refreshToken
-	}
-	if err := PersistRefreshedChatGPTTokensWithOptions(normalized.CodexHome, &out, opts.StoreOptions); err != nil {
-		return nil, err
-	}
-	return NewStoreWithOptions(normalized.CodexHome, opts.StoreOptions).Load()
+	return refreshed, refreshErr
 }
 
 func refreshAttemptSnapshot(codexHome string, provided *AuthDotJSON, storeOptions *StoreOptions) *AuthDotJSON {
@@ -644,30 +713,94 @@ func PersistRefreshedChatGPTTokensWithOptions(codexHome string, tokens *Exchange
 	if tokens == nil {
 		return errors.New("tokens are required")
 	}
-	store := NewStoreWithOptions(codexHome, storeOptions)
-	current, err := store.Load()
+	expected, err := NewStoreWithOptions(codexHome, storeOptions).Load()
 	if err != nil {
 		return err
 	}
-	next := AuthDotJSON{AuthMode: "chatgpt", Tokens: map[string]any{}}
-	if current != nil {
-		next = *current
-		next.AuthMode = "chatgpt"
-		next.Tokens = cloneAnyMap(current.Tokens)
+	return persistRefreshedChatGPTTokens(codexHome, expected, tokens, storeOptions)
+}
+
+var errAccountCredentialsChangedDuringRefresh = errors.New("Account credentials changed during refresh.")
+
+// persistRefreshedChatGPTTokens writes a refresh response only when the stored
+// credential still belongs to the login that requested it. The read, login
+// check and write are one process-wide commit (Rust #55646 persist_tokens).
+func persistRefreshedChatGPTTokens(codexHome string, expected *AuthDotJSON, tokens *ExchangedTokens, storeOptions *StoreOptions) error {
+	if tokens == nil {
+		return errors.New("tokens are required")
 	}
+	if expected == nil || expected.Tokens == nil {
+		return errors.New("Token data is not available.")
+	}
+	store := NewStoreWithOptions(codexHome, storeOptions)
+	guard, err := store.lockForWrite()
+	if err != nil {
+		return err
+	}
+	defer guard.release()
+	commit, err := store.lockCommit()
+	if err != nil {
+		return err
+	}
+	defer commit.release()
+	current, err := store.loadLocked()
+	if err != nil {
+		return err
+	}
+	if current == nil {
+		return errors.New("Token data is not available.")
+	}
+	if current.Mode() != "chatgpt" || !sameLoginForPersistence(expected.Tokens, current.Tokens) {
+		return errAccountCredentialsChangedDuringRefresh
+	}
+	next := *current
+	next.AuthMode = "chatgpt"
+	next.Tokens = cloneAnyMap(current.Tokens)
 	if next.Tokens == nil {
 		next.Tokens = map[string]any{}
 	}
-	if strings.TrimSpace(tokens.IDToken) != "" {
-		next.Tokens["id_token"] = strings.TrimSpace(tokens.IDToken)
-		if accountID := ChatGPTAccountIDFromJWT(tokens.IDToken); accountID != "" {
-			next.Tokens["account_id"] = accountID
+	refreshToken := strings.TrimSpace(tokens.RefreshToken)
+	// Attach provenance only when this response rotated the refresh token or the
+	// stored grant is still the one the request used. A concurrent writer that
+	// replaced the refresh token has unknown authority (Rust #55546).
+	rotated := refreshToken != "" && refreshToken != tokenRefreshToken(expected.Tokens)
+	provenance := oauthProvenanceFromTokens(expected.Tokens)
+	endpointMatches := provenance.Issuer != "" &&
+		refreshTokenURL(provenance.Issuer) == strings.TrimRight(provenance.Issuer, "/")+"/oauth/token"
+	if endpointMatches && (rotated || tokenRefreshToken(next.Tokens) == tokenRefreshToken(expected.Tokens)) {
+		next.Tokens["oauth_provenance"] = map[string]any{
+			"issuer": provenance.Issuer, "client_id": provenance.ClientID,
+		}
+	} else {
+		delete(next.Tokens, "oauth_provenance")
+	}
+	if idToken := strings.TrimSpace(tokens.IDToken); idToken != "" {
+		next.Tokens["id_token"] = idToken
+		// Rust #57514 persist_tokens keeps the selected workspace: a refresh may
+		// return an ID token for the login's default workspace while
+		// tokens.account_id still names the workspace the user switched to.
+		if existing := strings.TrimSpace(stringFromAny(next.Tokens, "account_id")); existing == "" {
+			if accountID := ChatGPTAccountIDFromJWT(idToken); accountID != "" {
+				next.Tokens["account_id"] = accountID
+			}
 		}
 	}
 	next.Tokens["access_token"] = strings.TrimSpace(tokens.AccessToken)
-	next.Tokens["refresh_token"] = strings.TrimSpace(tokens.RefreshToken)
+	next.Tokens["refresh_token"] = refreshToken
 	next.LastRefresh = time.Now().UTC().Format(time.RFC3339)
-	return store.Save(next)
+	if auto, ok := store.backend().(*autoAuthStorage); ok {
+		keyringAuth, keyringErr := auto.keyring.Load()
+		if keyringErr != nil {
+			// Rust #58343: the keyring generation is unknown, so the rotated
+			// fallback tokens belong in the file store; never overwrite the
+			// unread keyring entry, even if it recovered before this commit.
+			return store.saveRefreshedFallbackLocked(next, keyringErr)
+		}
+		if keyringAuth != nil && !AuthsEqualForRefresh(keyringAuth, expected) {
+			return errAccountCredentialsChangedDuringRefresh
+		}
+	}
+	return store.saveLocked(next)
 }
 
 func ChatGPTAccountIDFromJWT(jwt string) string {
@@ -893,6 +1026,12 @@ func handleOAuthCallback(request *http.Request, opts *OAuthOptions, redirectURI 
 	if err := EnsureWorkspaceAllowed(opts.ForcedWorkspaces, tokens.IDToken); err != nil {
 		return &oauthCallbackOutcome{err: err}
 	}
+	if opts.WorkspaceLogin != nil {
+		if err := opts.WorkspaceLogin.Save(tokens); err != nil {
+			return &oauthCallbackOutcome{err: fmt.Errorf("sign-in completed but credentials could not be saved locally: %w", err)}
+		}
+		return &oauthCallbackOutcome{successURL: composeOAuthSuccessURL(request, tokens)}
+	}
 	if err := PersistChatGPTTokensWithOptions(opts.CodexHome, tokens, opts.StoreOptions); err != nil {
 		return &oauthCallbackOutcome{err: fmt.Errorf("sign-in completed but credentials could not be saved locally: %w", err)}
 	}
@@ -934,7 +1073,7 @@ func composeOAuthSuccessURL(request *http.Request, tokens *ExchangedTokens) stri
 	if strings.TrimSpace(claims.PlanType) != "" {
 		query.Set("plan_type", strings.TrimSpace(claims.PlanType))
 	}
-	return "http://localhost:" + port + "/success?" + query.Encode()
+	return "http://127.0.0.1:" + port + "/success?" + query.Encode()
 }
 
 func writeOAuthErrorPage(w http.ResponseWriter, err error) {
@@ -1026,4 +1165,32 @@ func firstNonEmptyAuth(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// OAuthProvenance records the authority that issued an account refresh token.
+// It is optional for legacy auth records; token claims never infer it.
+type OAuthProvenance struct {
+	Issuer   string
+	ClientID string
+}
+
+func oauthProvenanceFromTokens(tokens map[string]any) OAuthProvenance {
+	raw, _ := tokens["oauth_provenance"].(map[string]any)
+	if raw == nil {
+		if encoded, ok := tokens["oauth_provenance"].(map[string]string); ok {
+			return OAuthProvenance{Issuer: strings.TrimSpace(encoded["issuer"]), ClientID: strings.TrimSpace(encoded["client_id"])}
+		}
+		return OAuthProvenance{}
+	}
+	issuer, _ := raw["issuer"].(string)
+	clientID, _ := raw["client_id"].(string)
+	return OAuthProvenance{Issuer: strings.TrimSpace(issuer), ClientID: strings.TrimSpace(clientID)}
+}
+
+func newOAuthLoginOwnerID() string {
+	var data [16]byte
+	if _, err := rand.Read(data[:]); err != nil {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(data[:])
 }

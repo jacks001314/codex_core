@@ -88,6 +88,18 @@ func ClearSetupErrorReport(codexHome string) error {
 }
 
 func WriteSetupErrorReport(codexHome string, report *SetupErrorReport) error {
+	return writeSetupErrorReport(codexHome, report, func(path string, data []byte) error {
+		return os.WriteFile(path, data, 0o600)
+	})
+}
+
+// WriteSetupErrorReportForProvisioning writes the report through a fresh
+// handle relative to the pinned sandbox directory (Rust #42342).
+func WriteSetupErrorReportForProvisioning(codexHome string, report *SetupErrorReport) error {
+	return writeSetupErrorReport(codexHome, report, WriteFileAtomically)
+}
+
+func writeSetupErrorReport(codexHome string, report *SetupErrorReport, write func(string, []byte) error) error {
 	if report == nil {
 		return ErrInvalidRequest
 	}
@@ -99,7 +111,7 @@ func WriteSetupErrorReport(codexHome string, report *SetupErrorReport) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(SetupErrorPath(codexHome), data, 0o600)
+	return write(SetupErrorPath(codexHome), data)
 }
 
 func ReadSetupErrorReport(codexHome string) (*SetupErrorReport, error) {
@@ -115,6 +127,31 @@ func ReadSetupErrorReport(codexHome string) (*SetupErrorReport, error) {
 		return nil, err
 	}
 	return &report, nil
+}
+
+// SetupErrorChain renders an error together with its wrapped causes as
+// "outer: cause: root", mirroring Rust's alternate anyhow formatting
+// (`{error:#}`, #46237). A cause already present in the rendered parent is
+// skipped, so `%w`-wrapped messages do not repeat themselves; error types that
+// keep their cause out of Error() still surface it here.
+func SetupErrorChain(err error) string {
+	if err == nil {
+		return ""
+	}
+	parts := make([]string, 0, 3)
+	seen := map[string]bool{}
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		message := strings.TrimSpace(current.Error())
+		if message == "" || seen[message] {
+			continue
+		}
+		if len(parts) > 0 && strings.Contains(parts[len(parts)-1], message) {
+			continue
+		}
+		seen[message] = true
+		parts = append(parts, message)
+	}
+	return strings.Join(parts, ": ")
 }
 
 func SanitizeSetupMetricTagValue(value string) string {

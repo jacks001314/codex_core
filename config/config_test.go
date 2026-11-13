@@ -62,10 +62,11 @@ func TestManagedProjectRootMarkersGovernDiscoveryLikeRust(t *testing.T) {
 	if err := os.WriteFile(ConfigPath(home), []byte("model = \"gpt-user\"\n"+trusted), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(managedConfigPath(home, ""), []byte("project_root_markers = [\"MARKER\"]\n"), 0o600); err != nil {
+	managed := filepath.Join(home, "managed_config.toml")
+	if err := os.WriteFile(managed, []byte("project_root_markers = [\"MARKER\"]\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := LoadWithOptions(home, &LoadOptions{CWD: repo, IncludeManagedConfig: true})
+	cfg, err := LoadWithOptions(home, &LoadOptions{CWD: repo, IncludeManagedConfig: true, ManagedConfigPath: managed})
 	if err != nil {
 		t.Fatalf("LoadWithOptions() error = %v", err)
 	}
@@ -718,29 +719,6 @@ func TestCodeModeExperimentalShowCellOverheadLikeRust(t *testing.T) {
 	}
 }
 
-func TestCodeModeToolDescriptionFirstLikeRust(t *testing.T) {
-	enabled := &Config{Values: map[string]any{
-		"features": map[string]any{"code_mode_tool_description_first": true},
-	}}
-	if !enabled.CodeModeToolDescriptionFirst() {
-		t.Fatal("CodeModeToolDescriptionFirst() = false, want true")
-	}
-	for _, test := range []struct {
-		name string
-		cfg  *Config
-	}{
-		{name: "disabled", cfg: &Config{Values: map[string]any{
-			"features": map[string]any{"code_mode_tool_description_first": false},
-		}}},
-		{name: "absent", cfg: &Config{Values: map[string]any{"features": map[string]any{}}}},
-		{name: "nil", cfg: nil},
-	} {
-		if test.cfg.CodeModeToolDescriptionFirst() {
-			t.Errorf("%s config enabled tool-description-first", test.name)
-		}
-	}
-}
-
 func TestCodeModeOnlyStrictThirdPartyToolsLikeRust(t *testing.T) {
 	enabled := &Config{Values: map[string]any{
 		"features": map[string]any{"code_mode_only_strict_3p_tools": true},
@@ -1199,6 +1177,51 @@ sources = ["tool_outputs", "reasoning"]
 	}
 }
 
+// TestGuardianV3FeatureConfigLikeRust mirrors Rust #56459: guardianv3 accepts a
+// boolean or a table with only `enabled`, profile settings override the base
+// value, and unknown table fields are rejected.
+func TestGuardianV3FeatureConfigLikeRust(t *testing.T) {
+	base := `
+[features]
+guardianv3 = true
+
+[profiles.review.features.guardianv3]
+enabled = false
+`
+	dir := t.TempDir()
+	if err := os.WriteFile(ConfigPath(dir), []byte(base), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadEffectiveWithOptions(dir, &EffectiveOptions{Profile: "review", StrictConfig: true})
+	if err != nil {
+		t.Fatalf("guardianv3 profile config rejected: %v", err)
+	}
+	if cfg.FeatureSettings()["guardianv3"] {
+		t.Fatal("guardianv3 = true, want the profile table to override the base boolean")
+	}
+
+	tableDir := t.TempDir()
+	if err := os.WriteFile(ConfigPath(tableDir), []byte("[features.guardianv3]\nenabled = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tableCfg, err := LoadEffectiveWithOptions(tableDir, &EffectiveOptions{StrictConfig: true})
+	if err != nil {
+		t.Fatalf("guardianv3 table rejected: %v", err)
+	}
+	if !tableCfg.FeatureSettings()["guardianv3"] {
+		t.Fatal("guardianv3 = false, want the enabled table to turn it on")
+	}
+
+	unknownDir := t.TempDir()
+	if err := os.WriteFile(ConfigPath(unknownDir), []byte("[features.guardianv3]\nunknown = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadEffectiveWithOptions(unknownDir, &EffectiveOptions{StrictConfig: true}); err == nil ||
+		!strings.Contains(err.Error(), "unknown configuration field `features.guardianv3.unknown`") {
+		t.Fatalf("guardianv3 unknown field error = %v", err)
+	}
+}
+
 // TestGuardianV2MaxToolCallLagDefaultsLikeRust mirrors Rust
 // GuardianV2Config::max_tool_call_lag (#39001): the accessor reports whether the
 // config set the value (the model catalog supplies a lower-priority default and
@@ -1623,6 +1646,7 @@ func TestKnownTuiConfigFieldsCoverHostReadKeysLikeRust(t *testing.T) {
 		"auto_recap":               "app/interactive.go:1899",
 		"right_click_paste":        "app/interactive.go:1914",
 		"mouse_scroll_speed":       "app/interactive.go:1941",
+		"sidebar_width_percent":    "app/tui_sidebar_width.go:32",
 		"terminal_title":           "doctor/doctor.go:4105",
 		"keymap":                   "tui/keymap_config.go:568",
 		"effects":                  "config/tui_effects.go:45",
@@ -2695,6 +2719,9 @@ func TestWindowsIgnoresLegacyManagedConfigLikeRust(t *testing.T) {
 // legacy managed_config.toml alone must not count as local managed
 // configuration.
 func TestHasLocalManagedConfigurationWindowsExcludesLegacyFile(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("default CODEX_HOME/managed_config.toml is Windows-specific")
+	}
 	home := t.TempDir()
 	if err := os.WriteFile(filepath.Join(home, "managed_config.toml"), []byte("model = \"gpt-4.1\"\n"), 0o600); err != nil {
 		t.Fatal(err)

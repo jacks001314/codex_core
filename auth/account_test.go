@@ -128,13 +128,16 @@ func TestPlanTypeClassificationsMatchRust(t *testing.T) {
 	if PlanBusiness.IsTeamLike() || PlanProlite.IsTeamLike() {
 		t.Fatal("enterprise and individual Pro Lite plans are not team-like")
 	}
-	for _, plan := range []PlanType{PlanTeam, PlanSelfServeBusinessProlite, PlanSelfServeBusinessUsageBased, PlanBusiness, PlanEnt26, PlanEnterpriseCBPAutomation, PlanEnterpriseCBPUsageBased, PlanEnterprise, PlanEdu, PlanEduPlus, PlanEduPro} {
+	for _, plan := range []PlanType{PlanTeam, PlanSelfServeBusinessProlite, PlanSelfServeBusinessUsageBased, PlanBusiness, PlanEnt26, PlanEnterpriseCBPAutomation, PlanEnterpriseCBPUsageBased, PlanEnterprise, PlanEdu, PlanEduPlus, PlanEduPro, PlanSci, PlanSciPlus} {
 		if !plan.IsWorkspaceAccount() {
 			t.Fatalf("plan %q should be a workspace account", plan)
 		}
 	}
 	if PlanPlus.IsWorkspaceAccount() || PlanUnknown.IsWorkspaceAccount() {
 		t.Fatal("individual or unknown plans must not be workspace accounts")
+	}
+	if PlanTypeFromString("sci") != PlanSci || PlanTypeFromString("sci_plus") != PlanSciPlus {
+		t.Fatal("academic researcher plans must parse")
 	}
 }
 
@@ -148,6 +151,16 @@ func TestPlanFromStringParsesEducationVariants(t *testing.T) {
 		if got := planFromString(input); got != want {
 			t.Fatalf("planFromString(%q) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+// Rust #47971 adds the `promax` raw plan name to KnownPlan.
+func TestPlanFromStringParsesProMax(t *testing.T) {
+	if got := planFromString("promax"); got != PlanProMax {
+		t.Fatalf("planFromString(promax) = %q, want %q", got, PlanProMax)
+	}
+	if got := PlanTypeFromString(" promax "); got != PlanProMax {
+		t.Fatalf("PlanTypeFromString( promax ) = %q, want %q", got, PlanProMax)
 	}
 }
 
@@ -350,6 +363,7 @@ func TestLoginAccountResponseMarshalRustUnionShape(t *testing.T) {
 
 func TestGetAccountResponseMarshalRustUnionShape(t *testing.T) {
 	email := "user@example.com"
+	workspace := "Acme"
 	cases := []struct {
 		name string
 		in   *GetAccountResponse
@@ -358,37 +372,47 @@ func TestGetAccountResponseMarshalRustUnionShape(t *testing.T) {
 		{
 			name: "none requiring openai auth",
 			in:   &GetAccountResponse{RequiresOpenAIAuth: true},
-			want: `{"account":null,"requiresOpenaiAuth":true,"workspaceRouting":null}`,
+			want: `{"account":null,"requiresOpenaiAuth":true,"userId":null,"workspaceRouting":null}`,
 		},
 		{
 			name: "api key",
 			in:   &GetAccountResponse{Account: &Account{Type: AccountAPIKey}, RequiresOpenAIAuth: true},
-			want: `{"account":{"type":"apiKey"},"requiresOpenaiAuth":true,"workspaceRouting":null}`,
+			want: `{"account":{"type":"apiKey"},"requiresOpenaiAuth":true,"userId":null,"workspaceRouting":null}`,
 		},
 		{
 			name: "chatgpt with email",
 			in:   &GetAccountResponse{Account: &Account{Type: AccountChatGPT, Email: &email, PlanType: PlanPro}, RequiresOpenAIAuth: true},
-			want: `{"account":{"type":"chatgpt","email":"user@example.com","planType":"pro"},"requiresOpenaiAuth":true,"workspaceRouting":null}`,
+			want: `{"account":{"type":"chatgpt","email":"user@example.com","planType":"pro","workspaceName":null},"requiresOpenaiAuth":true,"userId":null,"workspaceRouting":null}`,
 		},
 		{
 			name: "chatgpt without email",
 			in:   &GetAccountResponse{Account: &Account{Type: AccountChatGPT, PlanType: PlanEnterprise}, RequiresOpenAIAuth: true},
-			want: `{"account":{"type":"chatgpt","email":null,"planType":"enterprise"},"requiresOpenaiAuth":true,"workspaceRouting":null}`,
+			want: `{"account":{"type":"chatgpt","email":null,"planType":"enterprise","workspaceName":null},"requiresOpenaiAuth":true,"userId":null,"workspaceRouting":null}`,
 		},
 		{
 			name: "chatgpt ent26",
 			in:   &GetAccountResponse{Account: &Account{Type: AccountChatGPT, PlanType: PlanEnt26}, RequiresOpenAIAuth: true},
-			want: `{"account":{"type":"chatgpt","email":null,"planType":"ent26"},"requiresOpenaiAuth":true,"workspaceRouting":null}`,
+			want: `{"account":{"type":"chatgpt","email":null,"planType":"ent26","workspaceName":null},"requiresOpenaiAuth":true,"userId":null,"workspaceRouting":null}`,
 		},
 		{
 			name: "chatgpt missing plan",
 			in:   &GetAccountResponse{Account: &Account{Type: AccountChatGPT, Email: &email}, RequiresOpenAIAuth: true},
-			want: `{"account":{"type":"chatgpt","email":"user@example.com","planType":"unknown"},"requiresOpenaiAuth":true,"workspaceRouting":null}`,
+			want: `{"account":{"type":"chatgpt","email":"user@example.com","planType":"unknown","workspaceName":null},"requiresOpenaiAuth":true,"userId":null,"workspaceRouting":null}`,
 		},
 		{
 			name: "amazon bedrock",
 			in:   &GetAccountResponse{Account: &Account{Type: AccountAmazonBedrock, UsesCodexManagedCredentials: true}},
-			want: `{"account":{"type":"amazonBedrock","usesCodexManagedCredentials":true},"requiresOpenaiAuth":false,"workspaceRouting":null}`,
+			want: `{"account":{"type":"amazonBedrock","usesCodexManagedCredentials":true},"requiresOpenaiAuth":false,"userId":null,"workspaceRouting":null}`,
+		},
+		{
+			name: "chatgpt with workspace name",
+			in: &GetAccountResponse{Account: &Account{
+				Type:          AccountChatGPT,
+				Email:         &email,
+				PlanType:      PlanBusiness,
+				WorkspaceName: &workspace,
+			}, RequiresOpenAIAuth: true},
+			want: `{"account":{"type":"chatgpt","email":"user@example.com","planType":"business","workspaceName":"Acme"},"requiresOpenaiAuth":true,"userId":null,"workspaceRouting":null}`,
 		},
 	}
 	for _, tc := range cases {
@@ -495,6 +519,38 @@ func TestChatGPTAuthTokensLoginUsesExternalMode(t *testing.T) {
 	}
 	updated := manager.AccountUpdated()
 	if updated.AuthMode == nil || *updated.AuthMode != "chatgptAuthTokens" || updated.PlanType == nil || *updated.PlanType != PlanPro {
+		t.Fatalf("updated = %+v", updated)
+	}
+}
+
+func TestBedrockAPIKeyLoginUsesManagedMode(t *testing.T) {
+	manager := NewAccountManager()
+	response, err := manager.Login(&LoginAccountParams{
+		Type:   AccountAmazonBedrock,
+		APIKey: " bedrock-key ",
+		Region: " us-east-2 ",
+	})
+	if err != nil {
+		t.Fatalf("Login(amazonBedrock) error = %v", err)
+	}
+	if response.Type != AccountAmazonBedrock {
+		t.Fatalf("response = %+v", response)
+	}
+	read := manager.GetAccount(&GetAccountParams{})
+	if read.Account == nil || read.Account.Type != AccountAmazonBedrock ||
+		!read.Account.UsesCodexManagedCredentials || read.RequiresOpenAIAuth {
+		t.Fatalf("account = %+v", read)
+	}
+	snapshot := manager.AuthSnapshot()
+	if snapshot == nil || snapshot.Mode() != "bedrock-api-key" {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
+	keys, ok := snapshot.BedrockAPIKey.(*BedrockAPIKeyAuth)
+	if !ok || keys.APIKey != "bedrock-key" || keys.Region != "us-east-2" {
+		t.Fatalf("bedrock api key = %#v", snapshot.BedrockAPIKey)
+	}
+	updated := manager.AccountUpdated()
+	if updated.AuthMode == nil || *updated.AuthMode != "bedrockApiKey" {
 		t.Fatalf("updated = %+v", updated)
 	}
 }

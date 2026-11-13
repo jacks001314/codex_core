@@ -398,13 +398,11 @@ shows or why it matters>:
 
 ...
 ============================================================
-
 `raw_memory` FORMAT (STRICT)
 ============================================================
 
 The schema is below.
 ---
-
 description: concise but information-dense description of the primary task(s), outcome, and highest-value takeaway
 task: <primary_task_signature>
 task_group: <cwd_or_workflow_bucket>
@@ -422,20 +420,16 @@ task_group: <project/workflow topic>
 task_outcome: <success|partial|fail|uncertain>
 
 Preference signals:
-
 - when <situation>, the user said / asked / corrected: "<short quote or near-verbatim request>" -> <what that suggests for similar future runs>
 - <split distinct defaults into separate bullets; do not collapse multiple concrete requests into one umbrella summary>
 
 Reusable knowledge:
-
 - <validated repo fact, procedural shortcut, or durable takeaway>
 
 Failures and how to do differently:
-
 - <what failed, what pivot worked, and how to avoid repeating it>
 
 References:
-
 - <verbatim strings and artifacts a future agent should be able to reuse directly: full commands with flags, exact ids, file paths, function names, error strings, user wording, or other retrieval handles worth preserving verbatim>
 
 ### Task 2: <short task name> (if needed)
@@ -445,19 +439,15 @@ task_group: ...
 task_outcome: ...
 
 Preference signals:
-
 - ... -> ...
 
 Reusable knowledge:
-
 - ...
 
 Failures and how to do differently:
-
 - ...
 
 References:
-
 - ...
 
 Preferred task-block body shape (strongly recommended):
@@ -522,7 +512,7 @@ Evidence and attribution rules (strict):
   - Override it only when the rollout clearly spent most of its meaningful work in another
     working directory.
   - Mention secondary working directories in bullets if they matter for future retrieval or interpretation.
-    Be more conservative here than in the rollout summary:
+Be more conservative here than in the rollout summary:
 
 - Preserve preference evidence inside the task where it appeared; let Phase 2 decide whether
   repeated signals add up to a stable user preference.
@@ -552,7 +542,6 @@ Evidence and attribution rules (strict):
   prefer putting it in `## User preferences` instead of burying it inside a task block.
 
 For each task block, include enough detail to be useful for future agent reference:
-
 - what the user wanted and expected,
 - what preference signals were revealed in that task,
 - what was attempted and what actually worked,

@@ -31,6 +31,39 @@ eof_line: "*** End of File" LF
 
 var ErrInvalidPatch = errors.New("invalid apply_patch")
 
+// InvalidPatchError mirrors Rust's ParseError::InvalidPatchError. Error()
+// renders thiserror's Display form ("invalid patch: {message}"), which is what
+// the app-server tool reports; the standalone apply_patch entry point renders
+// it through FormatCLIError instead.
+type InvalidPatchError struct {
+	Message string
+}
+
+func (e *InvalidPatchError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return "invalid patch: " + e.Message
+}
+
+func (e *InvalidPatchError) Unwrap() error { return ErrInvalidPatch }
+
+// InvalidHunkError mirrors Rust's ParseError::InvalidHunkError, including the
+// 1-based line number the parser was looking at.
+type InvalidHunkError struct {
+	LineNumber int
+	Message    string
+}
+
+func (e *InvalidHunkError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return fmt.Sprintf("invalid hunk at line %d, %s", e.LineNumber, e.Message)
+}
+
+func (e *InvalidHunkError) Unwrap() error { return ErrInvalidPatch }
+
 type ErrorKind string
 
 const (
@@ -59,9 +92,6 @@ type Action struct {
 	CWD           string
 	Hunks         []Change
 	Changes       map[string]Change
-	// NoFollowSymlinks is set by the runtime when an unsandboxed patch must
-	// not follow symlinks (Rust #39659).
-	NoFollowSymlinks bool
 }
 
 type ApplyOptions struct {
@@ -177,61 +207,338 @@ func CreateFreeformTool(includeEnvironmentID bool) *ToolSpec {
 }
 
 func Parse(input string) (*Action, error) {
-	lines := splitLines(input)
-	// Rust parser.rs: the patch text is trimmed as a whole and each marker
-	// line is matched after trimming, so leading/trailing whitespace around
-	// patch markers is tolerated (see scenarios 017/018/020).
-	if len(lines) < 2 || strings.TrimSpace(lines[0]) != "*** Begin Patch" {
-		return nil, fmt.Errorf("%w: missing begin marker", ErrInvalidPatch)
+	lines, err := checkPatchBoundaries(splitLines(input))
+	if err != nil {
+		return nil, err
 	}
-	action := &Action{Changes: make(map[string]Change)}
-	i := 1
-	if i < len(lines) {
-		if trimmed := strings.TrimSpace(lines[i]); strings.HasPrefix(trimmed, "*** Environment ID:") {
-			value := strings.TrimSpace(strings.TrimPrefix(trimmed, "*** Environment ID:"))
+	parser := &patchParser{action: &Action{Changes: make(map[string]Change)}}
+	for index, line := range lines {
+		parser.lineNumber = index + 1
+		if err := parser.processLine(line, index == len(lines)-1); err != nil {
+			return nil, err
+		}
+	}
+	if parser.mode != patchEnded {
+		return nil, &InvalidPatchError{Message: "The last line of the patch must be '*** End Patch'"}
+	}
+	if len(parser.action.Hunks) == 0 {
+		// Rust parses an empty patch successfully and fails while applying it
+		// ("No files were modified."). Keep the parse-time rejection, but render
+		// it through FormatError so both the CLI and the tool match Rust.
+		return nil, fmt.Errorf("%w: patch contains no hunks", ErrInvalidPatch)
+	}
+	return parser.action, nil
+}
+
+// checkPatchBoundaries mirrors Rust's parser.rs check_patch_boundaries_lenient:
+// the outer lines must be the Begin/End markers (after trimming), or the patch
+// may be wrapped in a heredoc of the form used by gpt-4.1 local_shell calls.
+func checkPatchBoundaries(lines []string) ([]string, error) {
+	if err := checkStrictPatchBoundaries(lines); err == nil {
+		return lines, nil
+	} else if len(lines) >= 4 {
+		first, last := lines[0], lines[len(lines)-1]
+		if (first == "<<EOF" || first == "<<'EOF'" || first == `<<"EOF"`) && strings.HasSuffix(last, "EOF") {
+			inner := lines[1 : len(lines)-1]
+			if err := checkStrictPatchBoundaries(inner); err != nil {
+				return nil, err
+			}
+			return inner, nil
+		}
+		return nil, err
+	} else {
+		return nil, err
+	}
+}
+
+func checkStrictPatchBoundaries(lines []string) error {
+	if len(lines) > 0 {
+		first := strings.TrimSpace(lines[0])
+		last := strings.TrimSpace(lines[len(lines)-1])
+		if first == "*** Begin Patch" && last == "*** End Patch" {
+			return nil
+		}
+		if first != "*** Begin Patch" {
+			return &InvalidPatchError{Message: "The first line of the patch must be '*** Begin Patch'"}
+		}
+	}
+	return &InvalidPatchError{Message: "The last line of the patch must be '*** End Patch'"}
+}
+
+type patchMode int
+
+const (
+	patchNotStarted patchMode = iota
+	patchStarted
+	patchAddFile
+	patchDeleteFile
+	patchUpdateFile
+	patchEnded
+)
+
+type patchChunkState struct {
+	oldLines    int
+	newLines    int
+	isEndOfFile bool
+}
+
+func (c patchChunkState) empty() bool { return c.oldLines == 0 && c.newLines == 0 }
+
+// patchParser ports codex-rs/apply-patch/src/streaming_parser.rs so parse
+// failures carry Rust's messages and 1-based line numbers.
+type patchParser struct {
+	action     *Action
+	mode       patchMode
+	lineNumber int
+
+	pending        Change
+	updateHunkLine int
+	updateMovePath string
+	updateDiff     strings.Builder
+	chunks         []patchChunkState
+
+	addContent strings.Builder
+}
+
+func (p *patchParser) processLine(line string, isLastLine bool) error {
+	trimmed := strings.TrimSpace(line)
+	switch p.mode {
+	case patchNotStarted:
+		if trimmed == "*** Begin Patch" {
+			p.mode = patchStarted
+			return nil
+		}
+		return &InvalidPatchError{Message: "The first line of the patch must be '*** Begin Patch'"}
+	case patchStarted, patchAddFile, patchDeleteFile:
+		if handled, err := p.handleHunkHeaderOrEnd(trimmed); handled || err != nil {
+			return err
+		}
+		if p.mode == patchAddFile {
+			if content, ok := strings.CutPrefix(line, "+"); ok {
+				p.addContent.WriteString(content)
+				p.addContent.WriteByte('\n')
+				return nil
+			}
+		}
+		return invalidHunkHeaderError(trimmed, p.lineNumber)
+	case patchUpdateFile:
+		return p.processUpdateLine(line, isLastLine)
+	case patchEnded:
+		if trimmed == "" {
+			return nil
+		}
+		return &InvalidPatchError{Message: "The last line of the patch must be '*** End Patch'"}
+	}
+	return nil
+}
+
+func (p *patchParser) handleHunkHeaderOrEnd(trimmed string) (bool, error) {
+	if p.mode == patchStarted {
+		if value, ok := strings.CutPrefix(trimmed, "*** Environment ID:"); ok {
+			if p.action.EnvironmentID != "" {
+				return true, &InvalidPatchError{Message: "apply_patch environment_id cannot be specified more than once"}
+			}
+			value = strings.TrimSpace(value)
 			if value == "" {
-				return nil, fmt.Errorf("%w: empty environment id", ErrInvalidPatch)
+				return true, &InvalidPatchError{Message: "apply_patch environment_id cannot be empty"}
 			}
-			action.EnvironmentID = value
-			i++
+			p.action.EnvironmentID = value
+			return true, nil
 		}
 	}
-	for i < len(lines) {
-		line := lines[i]
-		if strings.TrimSpace(line) == "*** End Patch" {
-			if len(action.Changes) == 0 {
-				return nil, fmt.Errorf("%w: patch contains no hunks", ErrInvalidPatch)
-			}
-			return action, nil
+	switch {
+	case trimmed == "*** End Patch":
+		if err := p.ensureUpdateHunkNotEmpty(trimmed); err != nil {
+			return true, err
 		}
-		trimmed := strings.TrimSpace(line)
-		switch {
-		case strings.HasPrefix(trimmed, "*** Add File: "):
-			next, change, err := parseAdd(lines, i)
-			if err != nil {
-				return nil, err
-			}
-			action.addChange(change)
-			i = next
-		case strings.HasPrefix(trimmed, "*** Delete File: "):
-			path := strings.TrimPrefix(trimmed, "*** Delete File: ")
-			if err := validatePath(path); err != nil {
-				return nil, err
-			}
-			action.addChange(Change{Kind: ChangeDelete, Path: path})
-			i++
-		case strings.HasPrefix(trimmed, "*** Update File: "):
-			next, change, err := parseUpdate(lines, i)
-			if err != nil {
-				return nil, err
-			}
-			action.addChange(change)
-			i = next
-		default:
-			return nil, fmt.Errorf("%w: unexpected line %q", ErrInvalidPatch, line)
+		p.finishHunk()
+		p.mode = patchEnded
+		return true, nil
+	case strings.HasPrefix(trimmed, "*** Add File: "):
+		path := strings.TrimPrefix(trimmed, "*** Add File: ")
+		if err := p.startHunk(trimmed, validatePath(path)); err != nil {
+			return true, err
+		}
+		p.pending = Change{Kind: ChangeAdd, Path: path}
+		p.addContent.Reset()
+		p.mode = patchAddFile
+		return true, nil
+	case strings.HasPrefix(trimmed, "*** Delete File: "):
+		path := strings.TrimPrefix(trimmed, "*** Delete File: ")
+		if err := p.startHunk(trimmed, validatePath(path)); err != nil {
+			return true, err
+		}
+		p.action.addChange(Change{Kind: ChangeDelete, Path: path})
+		p.mode = patchDeleteFile
+		return true, nil
+	case strings.HasPrefix(trimmed, "*** Update File: "):
+		path := strings.TrimPrefix(trimmed, "*** Update File: ")
+		if err := p.startHunk(trimmed, validatePath(path)); err != nil {
+			return true, err
+		}
+		p.pending = Change{Kind: ChangeUpdate, Path: path}
+		p.updateHunkLine = p.lineNumber
+		p.updateMovePath = ""
+		p.updateDiff.Reset()
+		p.chunks = nil
+		p.mode = patchUpdateFile
+		return true, nil
+	}
+	return false, nil
+}
+
+// startHunk flushes the hunk that just ended (Rust's
+// ensure_update_hunk_is_not_empty) and reports a path validation failure.
+func (p *patchParser) startHunk(header string, pathErr error) error {
+	if err := p.ensureUpdateHunkNotEmpty(header); err != nil {
+		return err
+	}
+	if pathErr != nil {
+		return pathErr
+	}
+	p.finishHunk()
+	return nil
+}
+
+func (p *patchParser) finishHunk() {
+	switch p.mode {
+	case patchAddFile:
+		p.pending.Content = p.addContent.String()
+		p.action.addChange(p.pending)
+	case patchUpdateFile:
+		p.pending.MovePath = p.updateMovePath
+		p.pending.UnifiedDiff = p.updateDiff.String()
+		p.action.addChange(p.pending)
+	}
+}
+
+func (p *patchParser) lastChunk() *patchChunkState {
+	if len(p.chunks) == 0 {
+		return nil
+	}
+	return &p.chunks[len(p.chunks)-1]
+}
+
+func (p *patchParser) ensureUpdateHunkNotEmpty(line string) error {
+	if p.mode != patchUpdateFile {
+		return nil
+	}
+	if len(p.chunks) == 0 {
+		return &InvalidHunkError{
+			LineNumber: p.updateHunkLine,
+			Message:    fmt.Sprintf("Update file hunk for path '%s' is empty", p.pending.Path),
 		}
 	}
-	return nil, fmt.Errorf("%w: missing end marker", ErrInvalidPatch)
+	if last := p.lastChunk(); last.empty() {
+		if line == "*** End Patch" {
+			return &InvalidHunkError{LineNumber: p.lineNumber, Message: "Update hunk does not contain any lines"}
+		}
+		return &InvalidHunkError{LineNumber: p.lineNumber, Message: unexpectedUpdateLineMessage(line)}
+	}
+	return nil
+}
+
+func unexpectedUpdateLineMessage(line string) string {
+	return fmt.Sprintf("Unexpected line found in update hunk: '%s'. Every line should start with ' ' (context line), '+' (added line), or '-' (removed line)", line)
+}
+
+func expectedChangeContextMessage(line string) string {
+	return fmt.Sprintf("Expected update hunk to start with a @@ context marker, got: '%s'", line)
+}
+
+func invalidHunkHeaderError(line string, lineNumber int) error {
+	return &InvalidHunkError{
+		LineNumber: lineNumber,
+		Message: fmt.Sprintf(
+			"'%s' is not a valid hunk header. Valid hunk headers: '*** Add File: {path}', '*** Delete File: {path}', '*** Update File: {path}'",
+			line,
+		),
+	}
+}
+
+func (p *patchParser) appendUpdateDiffLine(line string) {
+	p.updateDiff.WriteString(line)
+	p.updateDiff.WriteByte('\n')
+}
+
+func (p *patchParser) processUpdateLine(line string, isLastLine bool) error {
+	updateLine := strings.TrimRight(line, " 	")
+	header := updateLine
+	if isLastLine && strings.TrimSpace(line) == "*** End Patch" {
+		header = "*** End Patch"
+	}
+	if handled, err := p.handleHunkHeaderOrEnd(header); handled || err != nil {
+		return err
+	}
+	if last := p.lastChunk(); last != nil && last.isEndOfFile {
+		if updateLine == "" {
+			return nil
+		}
+		if updateLine != "@@" && !strings.HasPrefix(updateLine, "@@ ") {
+			return &InvalidHunkError{LineNumber: p.lineNumber, Message: expectedChangeContextMessage(line)}
+		}
+	}
+	if len(p.chunks) == 0 && p.updateMovePath == "" {
+		if moveTo, ok := strings.CutPrefix(updateLine, "*** Move to: "); ok {
+			if err := validatePath(moveTo); err != nil {
+				return err
+			}
+			p.updateMovePath = moveTo
+			return nil
+		}
+	}
+	if (updateLine == "@@" || strings.HasPrefix(updateLine, "@@ ")) && p.lastChunk() != nil && p.lastChunk().empty() {
+		return &InvalidHunkError{LineNumber: p.lineNumber, Message: unexpectedUpdateLineMessage(line)}
+	}
+	if updateLine == "@@" || strings.HasPrefix(updateLine, "@@ ") {
+		p.chunks = append(p.chunks, patchChunkState{})
+		p.appendUpdateDiffLine(line)
+		return nil
+	}
+	if updateLine == "*** End of File" {
+		if last := p.lastChunk(); last != nil && last.empty() {
+			return &InvalidHunkError{LineNumber: p.lineNumber, Message: "Update hunk does not contain any lines"}
+		}
+		if last := p.lastChunk(); last != nil {
+			last.isEndOfFile = true
+		}
+		p.appendUpdateDiffLine(line)
+		return nil
+	}
+	switch {
+	case line == "":
+		p.ensureChunkForContent()
+		p.lastChunk().oldLines++
+		p.lastChunk().newLines++
+		p.appendUpdateDiffLine(line)
+		return nil
+	case strings.HasPrefix(line, " "):
+		p.ensureChunkForContent()
+		p.lastChunk().oldLines++
+		p.lastChunk().newLines++
+		p.appendUpdateDiffLine(line)
+		return nil
+	case strings.HasPrefix(line, "+"):
+		p.ensureChunkForContent()
+		p.lastChunk().newLines++
+		p.appendUpdateDiffLine(line)
+		return nil
+	case strings.HasPrefix(line, "-"):
+		p.ensureChunkForContent()
+		p.lastChunk().oldLines++
+		p.appendUpdateDiffLine(line)
+		return nil
+	}
+	if last := p.lastChunk(); last != nil && !last.empty() {
+		return &InvalidHunkError{LineNumber: p.lineNumber, Message: expectedChangeContextMessage(line)}
+	}
+	return &InvalidHunkError{LineNumber: p.lineNumber, Message: unexpectedUpdateLineMessage(line)}
+}
+
+func (p *patchParser) ensureChunkForContent() {
+	if len(p.chunks) == 0 {
+		p.chunks = append(p.chunks, patchChunkState{})
+	}
 }
 
 func (a *Action) IsEmpty() bool {
@@ -307,23 +614,20 @@ func (a *Action) Verify(options *ApplyOptions) error {
 	if a == nil || len(a.Hunks) == 0 {
 		return fmt.Errorf("%w: patch contains no hunks", ErrInvalidPatch)
 	}
-	if a != nil && options != nil && options.NoFollowSymlinks {
-		a.NoFollowSymlinks = true
-	}
 	cwd := "."
 	if options != nil && strings.TrimSpace(options.CWD) != "" {
 		cwd = options.CWD
 	}
-	return a.preflight(applyOptionsFileSystem(options), cwd)
+	// The walk is a per-call option: a verification that asked for the
+	// no-follow check must not make a later apply of the same patch follow
+	// its paths through symlinks (Rust #39659).
+	return a.preflight(applyOptionsFileSystem(options), cwd, options != nil && options.NoFollowSymlinks)
 }
 
 // ApplyVerified commits an action after Verify has succeeded.
 func (a *Action) ApplyVerified(options *ApplyOptions) (*ApplyResult, error) {
 	if a == nil || len(a.Hunks) == 0 {
 		return nil, fmt.Errorf("%w: patch contains no hunks", ErrInvalidPatch)
-	}
-	if a != nil && options != nil && options.NoFollowSymlinks {
-		a.NoFollowSymlinks = true
 	}
 	cwd := "."
 	if options != nil && strings.TrimSpace(options.CWD) != "" {
@@ -348,14 +652,19 @@ func (a *Action) applyCommitted(fs FileSystem, cwd string) (*ApplyResult, error)
 	return result, nil
 }
 
-func (a *Action) preflight(fs FileSystem, cwd string) error {
+func (a *Action) preflight(fs FileSystem, cwd string, noFollowSymlinks bool) error {
 	// The symlink walk stays on the host process filesystem: it is a Go
 	// host-path safety check (Rust #39659) for the unsandboxed local case, and
 	// no wire primitive models "is this component a symlink" over the exec
 	// server. Patch targets themselves are read through fs below.
-	if a != nil && a.NoFollowSymlinks {
+	if a != nil && noFollowSymlinks {
+		// The workspace root itself is trusted: hosts such as macOS reach their
+		// temporary directories through a system symlink (/var -> /private/var),
+		// so the walk starts at the resolved root and still rejects every link
+		// inside the workspace. Absolute patch targets keep the strict walk.
+		root := noFollowWorkspaceRoot(cwd)
 		for _, name := range a.FilePaths() {
-			resolved, err := resolveWorkspacePath(cwd, name)
+			resolved, err := resolveWorkspacePath(root, name)
 			if err != nil {
 				return err
 			}
@@ -366,7 +675,7 @@ func (a *Action) preflight(fs FileSystem, cwd string) error {
 			}
 			if strings.TrimSpace(name) != "" {
 				if movePath, ok := a.movePathFor(name); ok {
-					moveResolved, moveErr := resolveWorkspacePath(cwd, movePath)
+					moveResolved, moveErr := resolveWorkspacePath(root, movePath)
 					if moveErr != nil {
 						return moveErr
 					}
@@ -488,6 +797,18 @@ func (a *Action) movePathFor(path string) (string, bool) {
 	return "", false
 }
 
+// noFollowWorkspaceRoot resolves the workspace root once for the no-follow
+// walk. A host may expose the workspace through a system symlink (macOS
+// /var -> /private/var); resolving the root keeps those patches usable while
+// links below the root are still rejected.
+func noFollowWorkspaceRoot(cwd string) string {
+	resolved, err := filepath.EvalSymlinks(cwd)
+	if err != nil || strings.TrimSpace(resolved) == "" {
+		return cwd
+	}
+	return resolved
+}
+
 // noFollowSymlinkPath walks every component of path and returns the first
 // component that is a symlink (or the path itself when the leaf is a link),
 // mirroring Rust #39659 no-follow filesystem operations.
@@ -508,7 +829,9 @@ func noFollowSymlinkPath(path string) (string, error) {
 		current = filepath.Join(current, part)
 		info, err := os.Lstat(current)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
+			// A component that cannot be inspected because an ancestor is a
+			// regular file is simply absent, the same shape Windows reports.
+			if errors.Is(err, os.ErrNotExist) || isNotDirectory(err) {
 				continue
 			}
 			return "", err
@@ -548,6 +871,29 @@ func FormatError(err error) string {
 		return "No files were modified."
 	}
 	return err.Error()
+}
+
+// FormatCLIError renders an error the way codex-rs/apply-patch/src/lib.rs does
+// from the standalone apply_patch entry point: parse failures are prefixed with
+// the parser's own wording, everything else is printed as-is.
+// plainIOMessage is the fallback for errors that carry no OS errno.
+func plainIOMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func FormatCLIError(err error) string {
+	var hunkErr *InvalidHunkError
+	if errors.As(err, &hunkErr) {
+		return fmt.Sprintf("Invalid patch hunk on line %d: %s", hunkErr.LineNumber, hunkErr.Message)
+	}
+	var patchErr *InvalidPatchError
+	if errors.As(err, &patchErr) {
+		return "Invalid patch: " + patchErr.Message
+	}
+	return FormatError(err)
 }
 
 func (r *ApplyResult) Summary() string {
@@ -621,10 +967,12 @@ func applyAdd(fs FileSystem, cwd string, change *Change) (*AppliedFile, error) {
 		return nil, err
 	}
 	if err := fs.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Failed to create parent directories for %s", path)
 	}
+	// anyhow's context hides the write cause, and the CLI prints only that
+	// context line.
 	if err := fs.WriteFile(path, []byte(change.Content), 0o600); err != nil {
-		return nil, fmt.Errorf("failed to write file %s: %w", path, err)
+		return nil, fmt.Errorf("Failed to write file %s", path)
 	}
 	return &AppliedFile{
 		Kind: ChangeAdd,
@@ -642,10 +990,10 @@ func applyDelete(fs FileSystem, cwd string, change *Change) (*AppliedFile, error
 	if err != nil {
 		return nil, err
 	}
-	if info, err := fs.Stat(path); err != nil {
+	// ensure_not_directory reports a directory as an io error that anyhow's
+	// context hides, so the CLI keeps only the context line either way.
+	if info, err := fs.Stat(path); err != nil || !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("Failed to delete file %s", path)
-	} else if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("Failed to delete file %s: not a regular file", path)
 	}
 	data, _ := fs.ReadFile(path)
 	if err := fs.Remove(path); err != nil {
@@ -667,13 +1015,18 @@ func applyUpdate(fs FileSystem, cwd string, change *Change) (*AppliedFile, error
 	if err != nil {
 		return nil, err
 	}
+	if info, statErr := fs.Stat(path); statErr == nil && info.IsDir() {
+		// Rust reads through CreateFileW, which fails on a directory where
+		// Go's os.File opens it and only fails on the first read.
+		return nil, fmt.Errorf("Failed to read file to update %s: %s", path, rustIOMessage(rustDirectoryReadError()))
+	}
 	data, err := fs.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read file to update %s: %w", path, err)
+		return nil, fmt.Errorf("Failed to read file to update %s: %s", path, rustIOMessage(err))
 	}
-	updated, err := applyUpdateDiffToContent(string(data), change)
+	updated, err := applyUpdateDiffToContent(string(data), change, path)
 	if err != nil {
-		return nil, fmt.Errorf("%w in %s", err, path)
+		return nil, err
 	}
 	outPath := path
 	outDisplayPath := change.Path
@@ -685,14 +1038,14 @@ func applyUpdate(fs FileSystem, cwd string, change *Change) (*AppliedFile, error
 		outDisplayPath = change.MovePath
 	}
 	if err := fs.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Failed to create parent directories for %s", outPath)
 	}
 	if err := fs.WriteFile(outPath, []byte(updated), 0o600); err != nil {
-		return nil, fmt.Errorf("failed to write file %s: %w", outPath, err)
+		return nil, fmt.Errorf("Failed to write file %s", outPath)
 	}
 	if change.MovePath != "" && outPath != path {
 		if err := fs.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("failed to remove original file %s: %w", path, err)
+			return nil, fmt.Errorf("Failed to remove original %s", path)
 		}
 	}
 	return &AppliedFile{
@@ -710,15 +1063,15 @@ func applyUpdate(fs FileSystem, cwd string, change *Change) (*AppliedFile, error
 
 // applyUnifiedDiffToContent always preserves the target file's existing line
 // endings (Rust #51203 removed the legacy LF-normalizing mode).
-func applyUnifiedDiffToContent(content string, diff string) (string, error) {
-	return applyUnifiedDiffToContentPreserving(content, diff)
+func applyUnifiedDiffToContent(content string, diff string, pathLabel string) (string, error) {
+	return applyUnifiedDiffToContentPreserving(content, diff, pathLabel)
 }
 
-func applyUpdateDiffToContent(content string, change *Change) (string, error) {
+func applyUpdateDiffToContent(content string, change *Change, pathLabel string) (string, error) {
 	if change != nil && change.MovePath != "" && strings.TrimSpace(change.UnifiedDiff) == "" {
 		return content, nil
 	}
-	return applyUnifiedDiffToContent(content, change.UnifiedDiff)
+	return applyUnifiedDiffToContent(content, change.UnifiedDiff, pathLabel)
 }
 
 type updateChunk struct {
@@ -822,80 +1175,6 @@ func resolveWorkspacePath(cwd string, path string) (string, error) {
 	return absFull, nil
 }
 
-func parseAdd(lines []string, start int) (int, Change, error) {
-	path := strings.TrimPrefix(strings.TrimSpace(lines[start]), "*** Add File: ")
-	if err := validatePath(path); err != nil {
-		return start, Change{}, err
-	}
-	var content strings.Builder
-	i := start + 1
-	for i < len(lines) {
-		line := lines[i]
-		if isHunkOrEnd(line) {
-			break
-		}
-		if !strings.HasPrefix(line, "+") {
-			return start, Change{}, fmt.Errorf("%w: add file lines must start with +", ErrInvalidPatch)
-		}
-		content.WriteString(strings.TrimPrefix(line, "+"))
-		content.WriteByte('\n')
-		i++
-	}
-	if i == start+1 {
-		return start, Change{}, fmt.Errorf("%w: add file hunk requires content", ErrInvalidPatch)
-	}
-	return i, Change{Kind: ChangeAdd, Path: path, Content: content.String()}, nil
-}
-
-func parseUpdate(lines []string, start int) (int, Change, error) {
-	path := strings.TrimPrefix(strings.TrimSpace(lines[start]), "*** Update File: ")
-	if err := validatePath(path); err != nil {
-		return start, Change{}, err
-	}
-	i := start + 1
-	movePath := ""
-	if i < len(lines) {
-		trimEnd := strings.TrimRight(lines[i], " \t")
-		if strings.HasPrefix(trimEnd, "*** Move to: ") {
-			movePath = strings.TrimPrefix(trimEnd, "*** Move to: ")
-		}
-	}
-	if movePath != "" {
-		if err := validatePath(movePath); err != nil {
-			return start, Change{}, err
-		}
-		i++
-	}
-	var diff strings.Builder
-	for i < len(lines) {
-		line := lines[i]
-		// Rust StreamingPatchParser UpdateFile mode matches hunk headers with
-		// trailing whitespace trimmed (update_line) and the final line with a
-		// full trim (finish()), while a leading-space marker mid-hunk is a
-		// context line. updateHunkBoundary mirrors that split.
-		if updateHunkBoundary(line, i == len(lines)-1) {
-			break
-		}
-		if line == "*** End of File" || strings.HasPrefix(line, "@@") || strings.HasPrefix(line, "+") || strings.HasPrefix(line, "-") || strings.HasPrefix(line, " ") {
-			diff.WriteString(line)
-			diff.WriteByte('\n')
-			i++
-			continue
-		}
-		return start, Change{}, fmt.Errorf("%w: invalid update line %q", ErrInvalidPatch, line)
-	}
-	if chunks, err := parseUpdateChunks(diff.String()); err != nil {
-		return start, Change{}, err
-	} else if len(chunks) == 0 {
-		// Rust parser: the spec requires at least one change line per update
-		// hunk (`change+`), so a move without any chunk is rejected even when
-		// `*** Move to:` is present ("Update file hunk for path 'X' is
-		// empty"). Verified against the Rust apply_patch oracle.
-		return start, Change{}, fmt.Errorf("%w: update file hunk for path %q is empty", ErrInvalidPatch, path)
-	}
-	return i, Change{Kind: ChangeUpdate, Path: path, MovePath: movePath, UnifiedDiff: diff.String()}, nil
-}
-
 func splitLines(input string) []string {
 	// Rust parse_patch_text trims the whole patch before splitting lines.
 	input = strings.TrimSpace(input)
@@ -906,34 +1185,6 @@ func splitLines(input string) []string {
 		return nil
 	}
 	return strings.Split(input, "\n")
-}
-
-func isHunkOrEnd(line string) bool {
-	// Rust AddFile/DeleteFile modes match hunk headers and the end marker on
-	// the fully trimmed line.
-	trimmed := strings.TrimSpace(line)
-	return trimmed == "*** End Patch" ||
-		strings.HasPrefix(trimmed, "*** Add File: ") ||
-		strings.HasPrefix(trimmed, "*** Delete File: ") ||
-		strings.HasPrefix(trimmed, "*** Update File: ")
-}
-
-// updateHunkBoundary reports whether line terminates an update hunk, mirroring
-// Rust's UpdateFile mode: headers are matched with trailing whitespace trimmed
-// (update_line), and the final line of the patch may match the end marker with
-// a full trim (StreamingPatchParser::finish). A leading-space marker in the
-// middle of an update hunk is a context line, exactly like Rust.
-func updateHunkBoundary(line string, isLastLine bool) bool {
-	trimEnd := strings.TrimRight(line, " \t")
-	if trimEnd == "*** End Patch" {
-		return true
-	}
-	if isLastLine && strings.TrimSpace(line) == "*** End Patch" {
-		return true
-	}
-	return strings.HasPrefix(trimEnd, "*** Add File: ") ||
-		strings.HasPrefix(trimEnd, "*** Delete File: ") ||
-		strings.HasPrefix(trimEnd, "*** Update File: ")
 }
 
 func validatePath(path string) error {

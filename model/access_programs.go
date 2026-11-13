@@ -50,8 +50,10 @@ const (
 // `ApiKeyCyberAccessPrograms::from_config` (#49714): only the OpenAI provider id
 // and the `api_key_cyber_access_programs` feature decide the policy, so enabling
 // the forwarding feature is enough on its own.
-func ApiKeyCyberAccessProgramsFromConfig(featureSettings map[string]bool, providerID string) ApiKeyCyberAccessPrograms {
-	if strings.TrimSpace(providerID) != OpenAIProviderID {
+func ApiKeyCyberAccessProgramsFromConfig(featureSettings map[string]bool, providerID string, provider ProviderInfo) ApiKeyCyberAccessPrograms {
+	// Rust #58190: the provider definition may opt a non-OpenAI provider into
+	// Cyber access programs through `capabilities.cyber_access_programs`.
+	if !provider.SupportsCyberAccessPrograms(providerID) {
 		return ApiKeyCyberAccessProgramsUnsupportedProvider
 	}
 	if features.Enabled(featureSettings, "api_key_cyber_access_programs") {
@@ -80,7 +82,9 @@ func AccessProgramsForAuth(program string, snapshot *auth.AuthDotJSON, policy Ap
 	if snapshot == nil {
 		return nil, nil
 	}
-	if authHasChatGPTAccountForProgram(snapshot) {
+	// Rust #59743: header-authenticated requests forward an explicit program so
+	// the server can evaluate entitlement, exactly like a ChatGPT account.
+	if authHasChatGPTAccountForProgram(snapshot) || authIsHeaderAuthForProgram(snapshot) {
 		return &AccessPrograms{Cyber: trimmed}, nil
 	}
 	if !authIsAPIKeyForProgram(snapshot) {
@@ -101,11 +105,47 @@ func AccessProgramsForAuth(program string, snapshot *auth.AuthDotJSON, policy Ap
 	}
 }
 
+// authIsHeaderAuthForProgram mirrors the `CodexAuth::Headers` arm of Rust's
+// `for_auth` gate (#59743): host-supplied header credentials forward the
+// explicit program and leave the entitlement decision to the backend.
+func authIsHeaderAuthForProgram(snapshot *auth.AuthDotJSON) bool {
+	return snapshot != nil && snapshot.Mode() == "headers"
+}
+
+// ValidateRequiredCyberAccessPrograms mirrors Rust #59754: a thread whose host
+// requires an explicit allowed program must send one of them, and omitting the
+// program is a request error even though the backend would also reject it.
+func ValidateRequiredCyberAccessPrograms(allowed []string, programs *AccessPrograms) error {
+	if len(allowed) == 0 {
+		return nil
+	}
+	selected := ""
+	if programs != nil {
+		selected = strings.TrimSpace(programs.Cyber)
+	}
+	for _, candidate := range allowed {
+		if selected != "" && strings.EqualFold(strings.TrimSpace(candidate), selected) {
+			return nil
+		}
+	}
+	return &codexapi.APIError{
+		Kind:    codexapi.ErrorInvalidRequest,
+		Message: "this thread requires an allowed explicit access program",
+	}
+}
+
 // authIsAPIKeyForProgram reports whether the credential is an OpenAI API key
 // (Rust `CodexAuth::is_api_key_auth` = `AuthMode::ApiKey`; Bedrock and Agent
 // Identity credentials have their own modes and do not qualify).
 func authIsAPIKeyForProgram(snapshot *auth.AuthDotJSON) bool {
 	return snapshot != nil && snapshot.Mode() == "api-key"
+}
+
+// AuthIsAPIKey mirrors Rust `CodexAuth::is_api_key_auth` for callers that
+// resolve cyber-program eligibility outside this package (exec Daybreak
+// selection, Rust #49856/#53717).
+func AuthIsAPIKey(snapshot *auth.AuthDotJSON) bool {
+	return authIsAPIKeyForProgram(snapshot)
 }
 
 // authHasChatGPTAccountForProgram reports whether the auth snapshot is an
@@ -120,6 +160,12 @@ func authHasChatGPTAccountForProgram(snapshot *auth.AuthDotJSON) bool {
 	default:
 		return false
 	}
+}
+
+// AuthHasChatGPTAccount mirrors Rust `AuthMode::has_chatgpt_account` for
+// callers outside this package.
+func AuthHasChatGPTAccount(snapshot *auth.AuthDotJSON) bool {
+	return authHasChatGPTAccountForProgram(snapshot)
 }
 
 // GuardianCyberAccessProgram mirrors Rust

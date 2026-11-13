@@ -734,7 +734,7 @@ func TestOAuthTokenClientExchangeAuthorizationCode(t *testing.T) {
 			"code":          "auth-code",
 			"redirect_uri":  "http://127.0.0.1:1234/callback",
 			"client_id":     "client-1",
-			"client_secret": "secret-1",
+			"client_secret": " secret-1 ",
 			"code_verifier": "verifier-1",
 		}
 		for key, want := range wants {
@@ -796,7 +796,7 @@ func TestOAuthTokenClientRefreshToken(t *testing.T) {
 			"grant_type":    "refresh_token",
 			"refresh_token": "refresh-old",
 			"client_id":     "client-1",
-			"client_secret": "secret-1",
+			"client_secret": " secret-1 ",
 		}
 		for key, want := range wants {
 			if got := r.Form.Get(key); got != want {
@@ -1456,5 +1456,55 @@ func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(value); err != nil {
 		t.Fatalf("Encode() error = %v", err)
+	}
+}
+
+// TestDiscoverStreamableHTTPOAuthClassifiesProbeStatusLikeRust pins the
+// classification observed from Rust's `codex mcp add --url` (rmcp
+// AuthorizationManager::resolve_metadata): 4xx answers mean the resource has no
+// authorization support, while transient server-side failures must stay
+// discovery errors so `mcp add` prints the "may or may not require login" hint.
+func TestDiscoverStreamableHTTPOAuthClassifiesProbeStatusLikeRust(t *testing.T) {
+	cases := []struct {
+		status      int
+		wantUnknown bool
+	}{
+		{status: http.StatusOK},
+		{status: http.StatusUnauthorized},
+		{status: http.StatusForbidden},
+		{status: http.StatusNotFound},
+		{status: http.StatusMethodNotAllowed},
+		{status: http.StatusRequestTimeout, wantUnknown: true},
+		{status: http.StatusTooEarly, wantUnknown: true},
+		{status: http.StatusTooManyRequests, wantUnknown: true},
+		{status: http.StatusInternalServerError, wantUnknown: true},
+		{status: http.StatusBadGateway, wantUnknown: true},
+		{status: http.StatusServiceUnavailable, wantUnknown: true},
+	}
+	for _, testCase := range cases {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/mcp" {
+				http.NotFound(w, r)
+				return
+			}
+			w.WriteHeader(testCase.status)
+		}))
+		discovery, err := DiscoverStreamableHTTPOAuth(context.Background(), server.URL+"/mcp", server.Client())
+		server.Close()
+		if testCase.wantUnknown {
+			if err == nil {
+				t.Fatalf("status %d: error = nil, want discovery failure", testCase.status)
+			}
+			if discovery != nil {
+				t.Fatalf("status %d: discovery = %#v, want nil", testCase.status, discovery)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("status %d: error = %v, want no support", testCase.status, err)
+		}
+		if discovery != nil {
+			t.Fatalf("status %d: discovery = %#v, want nil", testCase.status, discovery)
+		}
 	}
 }

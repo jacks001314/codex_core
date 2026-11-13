@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"codex_core/network"
 )
 
 const (
@@ -56,8 +58,11 @@ const (
 	// (df30941072) added GPT-6 Sol and Luna, Rust #49339 (a6e9eaa9bd) added
 	// GPT-6.1 Sol.
 	AmazonBedrockGPT61SolModelID = "openai.gpt-6.1-sol"
-	AmazonBedrockGPT6SolModelID  = "openai.gpt-6-sol"
-	AmazonBedrockGPT6LunaModelID = "openai.gpt-6-luna"
+	// AmazonBedrockGPT61TerraModelID is the Bedrock slug for GPT-6.1 Terra
+	// (Rust #57293).
+	AmazonBedrockGPT61TerraModelID = "openai.gpt-6.1-terra"
+	AmazonBedrockGPT6SolModelID    = "openai.gpt-6-sol"
+	AmazonBedrockGPT6LunaModelID   = "openai.gpt-6-luna"
 	// AmazonBedrockGPT6AstraModelID is the Bedrock slug for the bundled
 	// gpt-6-astra model (Rust #42619).
 	AmazonBedrockGPT6AstraModelID = "openai.gpt-6-astra"
@@ -67,14 +72,23 @@ const (
 	// AMAZON_BEDROCK_RUNTIME_GLOBAL_GPT_5_6_TERRA_MODEL_ID
 	// (model-provider-info/src/lib.rs, #38470): the `global.` cross-region
 	// variants the Bedrock Runtime endpoint prefers for background work.
-	AmazonBedrockRuntimeGlobalGPT56LunaModelID         = "global.openai.gpt-5.6-luna"
-	AmazonBedrockRuntimeGlobalGPT56TerraModelID        = "global.openai.gpt-5.6-terra"
-	LegacyOllamaChatProviderID                         = "ollama-chat"
-	OllamaChatProviderRemovedMessage                   = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782"
-	LMStudioOSSProviderID                              = "lmstudio"
-	OllamaOSSProviderID                                = "ollama"
-	DefaultLMStudioPort                         uint16 = 1234
-	DefaultOllamaPort                           uint16 = 11434
+	AmazonBedrockRuntimeGlobalGPT56LunaModelID  = "global.openai.gpt-5.6-luna"
+	AmazonBedrockRuntimeGlobalGPT56TerraModelID = "global.openai.gpt-5.6-terra"
+	// Google Cloud Vertex AI's OpenAI-compatible provider (Rust #56265).
+	GCPProviderID                           = "gcp"
+	GCPProviderName                         = "Google Cloud Vertex AI"
+	GCPDefaultLocation                      = "global"
+	GCPProjectEnvVar                        = "GOOGLE_CLOUD_PROJECT"
+	GCPLocationEnvVar                       = "GOOGLE_CLOUD_LOCATION"
+	GCPCredentialFileEnvVar                 = "GOOGLE_APPLICATION_CREDENTIALS"
+	GCPAuthCommandTimeoutMS                 = 30_000
+	GCPAuthRefreshMS                        = 3_000_000
+	LegacyOllamaChatProviderID              = "ollama-chat"
+	OllamaChatProviderRemovedMessage        = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782"
+	LMStudioOSSProviderID                   = "lmstudio"
+	OllamaOSSProviderID                     = "ollama"
+	DefaultLMStudioPort              uint16 = 1234
+	DefaultOllamaPort                uint16 = 11434
 )
 
 const chatWireAPIRemovedMessage = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782"
@@ -109,6 +123,11 @@ type ProviderAuthInfo struct {
 	TimeoutMS         uint64   `json:"timeout_ms,omitempty"`
 	RefreshIntervalMS uint64   `json:"refresh_interval_ms,omitempty"`
 	CWD               string   `json:"cwd,omitempty"`
+	// Env carries extra environment variables for the auth command. It is
+	// runtime-only: GCP's credential_file is passed as
+	// GOOGLE_APPLICATION_CREDENTIALS here without changing the parent process
+	// environment (Rust #57188).
+	Env map[string]string `json:"-"`
 }
 
 // Format redacts provider authentication command arguments from diagnostic
@@ -176,13 +195,23 @@ func (a ProviderAuthRefreshInfo) Format(f fmt.State, verb rune) {
 // (#46482): secondary OAuth credentials delivered alongside the provider's
 // primary authentication.
 type GatewayOAuthConfig struct {
-	AuthorizationURL string               `json:"authorization_url,omitempty"`
-	TokenURL         string               `json:"token_url,omitempty"`
-	ClientID         string               `json:"client_id,omitempty"`
-	Resource         *string              `json:"resource,omitempty"`
-	Scopes           []string             `json:"scopes,omitempty"`
-	RedirectPort     *uint16              `json:"redirect_port,omitempty"`
-	Delivery         GatewayOAuthDelivery `json:"delivery"`
+	AuthorizationURL string `json:"authorization_url,omitempty"`
+	// DeviceAuthorizationURL enables device-code sign-in for terminals that
+	// cannot open a browser (Rust #59822).
+	DeviceAuthorizationURL string   `json:"device_authorization_url,omitempty"`
+	TokenURL               string   `json:"token_url,omitempty"`
+	ClientID               string   `json:"client_id,omitempty"`
+	Resource               *string  `json:"resource,omitempty"`
+	Scopes                 []string `json:"scopes,omitempty"`
+	RedirectPort           *uint16  `json:"redirect_port,omitempty"`
+	// CredentialsStore selects where this gateway's OAuth grants are stored
+	// (Rust #58219 GatewayOAuthConfig::credentials_store). The empty value is
+	// the keyring-backed default and stays out of the serialized identity.
+	CredentialsStore string `json:"credentials_store,omitempty"`
+	// CredentialExport replaces browser OAuth with a command that prints the
+	// gateway access token (Rust #59787).
+	CredentialExport *GatewayCredentialExportConfig `json:"credential_export,omitempty"`
+	Delivery         GatewayOAuthDelivery           `json:"delivery"`
 }
 
 // GatewayOAuthDelivery is Rust's tagged delivery enum: `{kind: "header", name,
@@ -194,17 +223,42 @@ type GatewayOAuthDelivery struct {
 	Scheme string `json:"scheme,omitempty"`
 }
 
+// Effective returns the delivery Rust's serde default applies when the field
+// is omitted: Authorization: Bearer (Rust #57313).
+func (d GatewayOAuthDelivery) Effective() GatewayOAuthDelivery {
+	if strings.TrimSpace(d.Kind) == "" {
+		return GatewayOAuthDelivery{Kind: "header", Name: "Authorization", Scheme: "Bearer"}
+	}
+	return d
+}
+
+// IsAuthorizationBearer reports whether the gateway token rides in the
+// primary Authorization bearer slot (Rust `is_authorization_bearer`).
+func (d GatewayOAuthDelivery) IsAuthorizationBearer() bool {
+	effective := d.Effective()
+	return effective.Kind == "header" &&
+		strings.EqualFold(strings.TrimSpace(effective.Name), "authorization") &&
+		strings.EqualFold(effective.HeaderScheme(), "bearer")
+}
+
 // EffectiveHeaderName returns the request header the delivery writes, and an
 // empty string for an unknown kind. It mirrors Rust's `header` computation in
 // GatewayOAuthConfig::validate.
 func (d GatewayOAuthDelivery) EffectiveHeaderName() string {
-	switch d.Kind {
+	switch effective := d.Effective(); effective.Kind {
 	case "header":
-		return d.Name
+		return effective.Name
 	case "cookie":
 		return "cookie"
 	}
 	return ""
+}
+
+// RequiresGatewayOrigin reports whether the gateway bearer must only be sent
+// to the configured gateway origin (Rust #57313).
+func (c *GatewayOAuthConfig) RequiresGatewayOrigin() bool {
+	// Rust #59787: an exported gateway token is only sent to the gateway origin.
+	return c != nil && (c.Delivery.IsAuthorizationBearer() || c.UsesCredentialExport())
 }
 
 // HeaderScheme returns the delivery scheme, applying Rust's "Bearer" default.
@@ -246,11 +300,22 @@ func (c *GatewayOAuthConfig) Validate(provider *ProviderInfo) error {
 	if provider.AWS != nil || provider.IsAmazonBedrock() {
 		return errors.New("provider gateway_oauth cannot be combined with AWS authentication")
 	}
-	if err := validateGatewayOAuthURL(c.AuthorizationURL, "gateway_oauth.authorization_url"); err != nil {
-		return err
-	}
-	if err := validateGatewayOAuthURL(c.TokenURL, "gateway_oauth.token_url"); err != nil {
-		return err
+	if c.CredentialExport != nil {
+		// Rust #59787 rejects a mixed configuration instead of guessing which
+		// credential source wins.
+		if strings.TrimSpace(c.AuthorizationURL) != "" || strings.TrimSpace(c.TokenURL) != "" || strings.TrimSpace(c.ClientID) != "" {
+			return errors.New("choose one gateway credential source: credential_export or OAuth settings (authorization_url, token_url, and client_id)")
+		}
+		if !validCredentialExportCommand(strings.TrimSpace(c.CredentialExport.Command)) {
+			return errors.New("gateway_oauth.credential_export command must be an absolute path or a bare executable name")
+		}
+	} else {
+		if err := validateGatewayOAuthURL(c.AuthorizationURL, "gateway_oauth.authorization_url"); err != nil {
+			return err
+		}
+		if err := validateGatewayOAuthURL(c.TokenURL, "gateway_oauth.token_url"); err != nil {
+			return err
+		}
 	}
 	if strings.TrimSpace(provider.BaseURL) == "" {
 		return errors.New("gateway_oauth requires base_url")
@@ -258,41 +323,87 @@ func (c *GatewayOAuthConfig) Validate(provider *ProviderInfo) error {
 	if err := validateGatewayOAuthURL(provider.BaseURL, "base_url"); err != nil {
 		return err
 	}
-	if strings.TrimSpace(c.ClientID) == "" || (c.RedirectPort != nil && *c.RedirectPort == 0) {
+	if c.RequiresGatewayOrigin() && strings.TrimSpace(provider.ModelCatalogURL) != "" {
+		if err := validateGatewayOAuthURL(provider.ModelCatalogURL, "model_catalog_url"); err != nil {
+			return err
+		}
+		if !gatewayOAuthSameOrigin(provider.BaseURL, provider.ModelCatalogURL) {
+			return errors.New("Codex would send gateway credentials to a different model catalog. Set model_catalog_url to a URL with the same scheme, host, and port as base_url, or remove model_catalog_url to use the gateway's catalog.")
+		}
+	}
+	if c.CredentialExport == nil && (strings.TrimSpace(c.ClientID) == "" || (c.RedirectPort != nil && *c.RedirectPort == 0)) {
 		return errors.New("gateway_oauth requires a nonempty client_id and a nonzero redirect_port")
 	}
+	delivery := c.Delivery.Effective()
 	header := ""
-	switch c.Delivery.Kind {
-	case "header":
-		if !isGatewayOAuthHeaderName(c.Delivery.Name) {
-			return errors.New("invalid gateway_oauth header name")
+	if delivery.IsAuthorizationBearer() {
+		// The gateway token would share the Authorization slot with the
+		// provider's own credential (Rust #57313).
+		if provider.RequiresOpenAIAuth || strings.TrimSpace(provider.EnvKey) != "" ||
+			strings.TrimSpace(provider.ExperimentalBearerToken) != "" || provider.HasCommandAuth() {
+			return errors.New("Header conflict. Codex is configured to send both the model provider credential and the gateway token in the Authorization header. Set gateway_oauth.delivery to a different header or cookie that your gateway accepts for its token.")
 		}
-		scheme := c.Delivery.HeaderScheme()
-		lowered := strings.ToLower(c.Delivery.Name)
-		if !isGatewayOAuthToken(scheme) || reservedGatewayOAuthHeaders[lowered] ||
-			hasGatewayOAuthReservedPrefix(lowered) {
-			return errors.New("invalid or reserved gateway_oauth delivery header or scheme")
+		header = "authorization"
+	} else {
+		switch delivery.Kind {
+		case "header":
+			if !isGatewayOAuthHeaderName(delivery.Name) {
+				return errors.New("invalid gateway_oauth header name")
+			}
+			scheme := delivery.HeaderScheme()
+			lowered := strings.ToLower(delivery.Name)
+			if !isGatewayOAuthToken(scheme) || reservedGatewayOAuthHeaders[lowered] ||
+				hasGatewayOAuthReservedPrefix(lowered) {
+				return errors.New("invalid or reserved gateway_oauth delivery header or scheme")
+			}
+			header = lowered
+		case "cookie":
+			if !isGatewayOAuthToken(delivery.Name) {
+				return errors.New("invalid gateway_oauth cookie name")
+			}
+			header = "cookie"
+		default:
+			return errors.New("invalid gateway_oauth delivery kind")
 		}
-		header = lowered
-	case "cookie":
-		if !isGatewayOAuthToken(c.Delivery.Name) {
-			return errors.New("invalid gateway_oauth cookie name")
-		}
-		header = "cookie"
-	default:
-		return errors.New("invalid gateway_oauth delivery kind")
 	}
 	for name := range provider.HTTPHeaders {
 		if strings.EqualFold(name, header) {
-			return errors.New("gateway_oauth delivery conflicts with a configured provider header")
+			return fmt.Errorf("The %s header is set in both gateway_oauth.delivery and the provider's http_headers or env_http_headers. Remove the duplicate header from the provider or choose a different gateway delivery.", header)
 		}
 	}
 	for name := range provider.EnvHTTPHeaders {
 		if strings.EqualFold(name, header) {
-			return errors.New("gateway_oauth delivery conflicts with a configured provider header")
+			return fmt.Errorf("The %s header is set in both gateway_oauth.delivery and the provider's http_headers or env_http_headers. Remove the duplicate header from the provider or choose a different gateway delivery.", header)
 		}
 	}
 	return nil
+}
+
+// gatewayOAuthSameOrigin compares the scheme, host, and effective port of
+// two validated URLs (Rust url::Origin equality).
+func gatewayOAuthSameOrigin(left string, right string) bool {
+	leftScheme, leftHost, leftPort := gatewayOAuthURLOrigin(left)
+	rightScheme, rightHost, rightPort := gatewayOAuthURLOrigin(right)
+	return leftScheme == rightScheme && leftHost == rightHost && leftPort == rightPort
+}
+
+func gatewayOAuthURLOrigin(raw string) (string, string, string) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return "", "", ""
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	host := strings.ToLower(parsed.Hostname())
+	port := parsed.Port()
+	if port == "" {
+		switch scheme {
+		case "https":
+			port = "443"
+		case "http":
+			port = "80"
+		}
+	}
+	return scheme, host, port
 }
 
 func hasGatewayOAuthReservedPrefix(name string) bool {
@@ -384,6 +495,33 @@ type ProviderCapabilitiesOverride struct {
 	ExternalWebAccess *bool `json:"external_web_access,omitempty"`
 	// RemoteCompaction overrides the remote compaction protocol.
 	RemoteCompaction *RemoteCompactionSupport `json:"remote_compaction,omitempty"`
+	// CyberAccessPrograms lets a non-OpenAI provider opt into Cyber access
+	// programs (Rust #58190 ModelProviderCapabilities::cyber_access_programs).
+	CyberAccessPrograms *bool `json:"cyber_access_programs,omitempty"`
+	// CustomToolGrammar turns the grammar encoding for free-form custom tools
+	// off for providers that only accept free-form text custom tools.
+	CustomToolGrammar *bool `json:"custom_tool_grammar,omitempty"`
+}
+
+// SupportsCyberAccessPrograms mirrors Rust
+// ModelProviderInfo::supports_cyber_access_programs: the OpenAI provider always
+// qualifies, and every other provider only with an explicit capability opt-in.
+func (p ProviderInfo) SupportsCyberAccessPrograms(providerID string) bool {
+	if strings.TrimSpace(providerID) == OpenAIProviderID {
+		return true
+	}
+	return p.Capabilities != nil && p.Capabilities.CyberAccessPrograms != nil && *p.Capabilities.CyberAccessPrograms
+}
+
+// SupportsCustomToolGrammar resolves whether the provider accepts Responses
+// custom tools whose format is a constrained grammar. The grammar encoding
+// stays enabled by default; a provider that only implements free-form text
+// custom tools opts out with capabilities.custom_tool_grammar.
+func (p ProviderInfo) SupportsCustomToolGrammar() bool {
+	if p.Capabilities != nil && p.Capabilities.CustomToolGrammar != nil {
+		return *p.Capabilities.CustomToolGrammar
+	}
+	return true
 }
 
 type ProviderInfo struct {
@@ -399,22 +537,36 @@ type ProviderInfo struct {
 	Auth                    *ProviderAuthInfo `json:"auth,omitempty"`
 	// GatewayOAuth carries secondary OAuth credentials required by the
 	// provider's gateway (Rust #46482).
-	GatewayOAuth                *GatewayOAuthConfig  `json:"gateway_oauth,omitempty"`
-	AWS                         *ProviderAWSAuthInfo `json:"aws,omitempty"`
-	WireAPI                     WireAPI              `json:"wire_api,omitempty"`
-	QueryParams                 map[string]string    `json:"query_params,omitempty"`
-	HTTPHeaders                 map[string]string    `json:"http_headers,omitempty"`
-	EnvHTTPHeaders              map[string]string    `json:"env_http_headers,omitempty"`
-	RequestMaxRetries           *uint64              `json:"request_max_retries,omitempty"`
-	StreamMaxRetries            *uint64              `json:"stream_max_retries,omitempty"`
-	StreamIdleTimeoutMS         *uint64              `json:"stream_idle_timeout_ms,omitempty"`
-	WebsocketConnectTimeoutMS   *uint64              `json:"websocket_connect_timeout_ms,omitempty"`
-	RequiresOpenAIAuth          bool                 `json:"requires_openai_auth,omitempty"`
-	SupportsWebsockets          bool                 `json:"supports_websockets,omitempty"`
-	SupportsStandaloneWebSearch bool                 `json:"supports_standalone_web_search,omitempty"`
+	GatewayOAuth              *GatewayOAuthConfig  `json:"gateway_oauth,omitempty"`
+	AWS                       *ProviderAWSAuthInfo `json:"aws,omitempty"`
+	WireAPI                   WireAPI              `json:"wire_api,omitempty"`
+	QueryParams               map[string]string    `json:"query_params,omitempty"`
+	HTTPHeaders               map[string]string    `json:"http_headers,omitempty"`
+	EnvHTTPHeaders            map[string]string    `json:"env_http_headers,omitempty"`
+	RequestMaxRetries         *uint64              `json:"request_max_retries,omitempty"`
+	StreamMaxRetries          *uint64              `json:"stream_max_retries,omitempty"`
+	StreamIdleTimeoutMS       *uint64              `json:"stream_idle_timeout_ms,omitempty"`
+	WebsocketConnectTimeoutMS *uint64              `json:"websocket_connect_timeout_ms,omitempty"`
+	// RequiresOpenAIAuth reports whether the provider requires an OpenAI API
+	// key or ChatGPT login token (Rust #49118). When true, the user sees a
+	// login screen on first run and credentials are stored through the backend
+	// selected by cli_auth_credentials_store. When false (the default), the
+	// login screen is skipped and EnvKey names the environment variable that
+	// supplies the API key.
+	RequiresOpenAIAuth          bool `json:"requires_openai_auth,omitempty"`
+	SupportsWebsockets          bool `json:"supports_websockets,omitempty"`
+	SupportsStandaloneWebSearch bool `json:"supports_standalone_web_search,omitempty"`
 	// Capabilities carries optional API capability overrides for a custom
 	// Responses-compatible provider (Rust ModelProviderCapabilities, #50459).
 	Capabilities *ProviderCapabilitiesOverride `json:"capabilities,omitempty"`
+	// ProjectID, Location, and CredentialFile are the built-in GCP provider's
+	// configurable overrides (Rust model-provider-info fields of the same name).
+	// CredentialFile is an absolute path to an Application Default Credentials
+	// file; it is passed as GOOGLE_APPLICATION_CREDENTIALS only to the provider
+	// auth command.
+	ProjectID      *string `json:"project_id,omitempty"`
+	Location       *string `json:"location,omitempty"`
+	CredentialFile *string `json:"credential_file,omitempty"`
 	// IncludeInternalMetadata is Rust's runtime-only
 	// `ModelProviderInfo::include_internal_metadata` grant: a provider carrying it
 	// may receive internal tool metadata even when its endpoint would fail the
@@ -466,7 +618,26 @@ func (p APIProvider) Format(f fmt.State, verb rune) {
 	)
 }
 
+// IsGCP reports whether this provider is the built-in Google Cloud provider.
+func (p *ProviderInfo) IsGCP() bool {
+	return p != nil && p.Name == GCPProviderName
+}
+
+// ValidateGCPCredentialFile mirrors Rust validate_gcp_credential_file: a GCP
+// credential override must be an absolute path.
+func (p *ProviderInfo) ValidateGCPCredentialFile() error {
+	if p != nil && p.CredentialFile != nil && !filepath.IsAbs(*p.CredentialFile) {
+		return errors.New("provider credential_file must be an absolute path")
+	}
+	return nil
+}
+
 func (p *ProviderInfo) Validate() error {
+	if p.IsGCP() {
+		if err := p.ValidateGCPCredentialFile(); err != nil {
+			return err
+		}
+	}
 	if p.GatewayOAuth != nil {
 		if err := p.GatewayOAuth.Validate(p); err != nil {
 			return err
@@ -780,12 +951,20 @@ func cloneProviderAuthInfo(info *ProviderAuthInfo) *ProviderAuthInfo {
 	if info == nil {
 		return nil
 	}
+	env := make(map[string]string, len(info.Env))
+	for key, value := range info.Env {
+		env[key] = value
+	}
+	if len(env) == 0 {
+		env = nil
+	}
 	return &ProviderAuthInfo{
 		Command:           info.Command,
 		Args:              append([]string(nil), info.Args...),
 		TimeoutMS:         info.TimeoutMS,
 		RefreshIntervalMS: info.RefreshIntervalMS,
 		CWD:               info.CWD,
+		Env:               env,
 	}
 }
 
@@ -833,6 +1012,132 @@ func CreateOpenAIProvider(baseURL string) ProviderInfo {
 	}
 }
 
+// CreateGCPProvider mirrors Rust ModelProviderInfo::create_gcp_provider. Config
+// loading supplies the default command auth after resolving its working
+// directory.
+func CreateGCPProvider() ProviderInfo {
+	return ProviderInfo{
+		Name:               GCPProviderName,
+		WireAPI:            WireAPIResponses,
+		RequiresOpenAIAuth: false,
+		SupportsWebsockets: false,
+	}
+}
+
+// GCPRuntimeBaseURL mirrors Rust model-provider gcp::vertex_base_url: the
+// configured project/location win over GOOGLE_CLOUD_PROJECT /
+// GOOGLE_CLOUD_LOCATION, and the location defaults to `global`.
+func GCPRuntimeBaseURL(info *ProviderInfo, environmentProject string, environmentLocation string) (string, error) {
+	var configuredProject *string
+	var configuredLocation *string
+	if info != nil {
+		configuredProject = info.ProjectID
+		configuredLocation = info.Location
+	}
+	// An explicitly configured (Some) project/location wins even when it trims
+	// to an empty string: Rust must reject that value instead of falling back to
+	// the environment (empty_configured_project_does_not_fall_back_to_environment).
+	project := ""
+	projectName := GCPProjectEnvVar
+	if configuredProject != nil {
+		project = strings.TrimSpace(*configuredProject)
+		projectName = "model_providers.gcp.project_id"
+	} else {
+		project = strings.TrimSpace(environmentProject)
+	}
+	if configuredProject == nil && project == "" {
+		return "", fmt.Errorf(
+			"Missing environment variable: `%s`. Set model_providers.gcp.project_id or %s to your Google Cloud project ID, or configure model_providers.gcp.base_url.",
+			GCPProjectEnvVar, GCPProjectEnvVar,
+		)
+	}
+	location := ""
+	locationName := GCPLocationEnvVar
+	if configuredLocation != nil {
+		location = strings.TrimSpace(*configuredLocation)
+		locationName = "model_providers.gcp.location"
+	} else {
+		location = strings.TrimSpace(environmentLocation)
+		if location == "" {
+			location = GCPDefaultLocation
+		}
+	}
+	for _, field := range []struct {
+		name  string
+		value string
+	}{
+		{projectName, project},
+		{locationName, location},
+	} {
+		if !validGCPResourceName(field.value) {
+			return "", fmt.Errorf("%s must be non-empty and contain only ASCII letters, digits, and hyphens", field.name)
+		}
+	}
+	return fmt.Sprintf("https://aiplatform.googleapis.com/v1/projects/%s/locations/%s/publishers/openai/v1", project, location), nil
+}
+
+func validGCPResourceName(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') || character == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// MergeGCPProviderOverrides mirrors Rust merge_gcp_provider_overrides: only
+// base_url, auth, http_headers, project_id, location, and credential_file may
+// change on the built-in provider.
+func MergeGCPProviderOverrides(builtIn *ProviderInfo, overrides ProviderInfo) error {
+	if err := overrides.ValidateGCPCredentialFile(); err != nil {
+		return fmt.Errorf("model_providers.%s %s", GCPProviderID, err)
+	}
+	if err := overrides.Validate(); err != nil {
+		return fmt.Errorf("model_providers.%s %s", GCPProviderID, err)
+	}
+	baseURL := overrides.BaseURL
+	overrides.BaseURL = ""
+	auth := overrides.Auth
+	overrides.Auth = nil
+	credentialFile := overrides.CredentialFile
+	overrides.CredentialFile = nil
+	httpHeaders := overrides.HTTPHeaders
+	overrides.HTTPHeaders = nil
+	projectID := overrides.ProjectID
+	overrides.ProjectID = nil
+	location := overrides.Location
+	overrides.Location = nil
+	if !(&overrides).isZero() {
+		return fmt.Errorf("model_providers.%s only supports changing `base_url`, `auth`, `http_headers`, `project_id`, `location`, and `credential_file`; other non-default provider fields are not supported", GCPProviderID)
+	}
+	if builtIn == nil {
+		return nil
+	}
+	builtIn.ProjectID = projectID
+	builtIn.Location = location
+	builtIn.CredentialFile = credentialFile
+	if baseURL != "" {
+		builtIn.BaseURL = baseURL
+	}
+	if auth != nil {
+		builtIn.Auth = cloneProviderAuthInfo(auth)
+	}
+	if len(httpHeaders) > 0 {
+		if builtIn.HTTPHeaders == nil {
+			builtIn.HTTPHeaders = map[string]string{}
+		}
+		for name, value := range httpHeaders {
+			builtIn.HTTPHeaders[name] = value
+		}
+	}
+	return nil
+}
+
 func CreateAmazonBedrockProvider(aws *ProviderAWSAuthInfo) ProviderInfo {
 	if aws == nil {
 		aws = &ProviderAWSAuthInfo{}
@@ -855,7 +1160,6 @@ func CreateAmazonBedrockProvider(aws *ProviderAWSAuthInfo) ProviderInfo {
 func CreateAmazonBedrockRuntimeProvider(aws *ProviderAWSAuthInfo) ProviderInfo {
 	provider := CreateAmazonBedrockProvider(aws)
 	provider.Name = AmazonBedrockRuntimeProviderName
-	provider.HTTPHeaders = nil
 	return provider
 }
 
@@ -891,6 +1195,7 @@ func BuiltInProviders(openAIBaseURL string) map[string]ProviderInfo {
 		OpenAIProviderID:               CreateOpenAIProvider(openAIBaseURL),
 		AmazonBedrockProviderID:        CreateAmazonBedrockProvider(nil),
 		AmazonBedrockRuntimeProviderID: CreateAmazonBedrockRuntimeProvider(nil),
+		GCPProviderID:                  CreateGCPProvider(),
 		OllamaOSSProviderID:            CreateOSSProvider(DefaultOllamaPort, WireAPIResponses),
 		LMStudioOSSProviderID:          CreateOSSProvider(DefaultLMStudioPort, WireAPIResponses),
 	}
@@ -899,6 +1204,29 @@ func BuiltInProviders(openAIBaseURL string) map[string]ProviderInfo {
 func MergeConfiguredProviders(providers map[string]ProviderInfo, configured map[string]ProviderInfo) (map[string]ProviderInfo, error) {
 	out := cloneProviderMap(providers)
 	for key, provider := range configured {
+		if key == OpenAIProviderID {
+			// Rust #57567: the built-in provider keeps its identity,
+			// authentication, and inference routing; only catalog routing is
+			// configurable through `[model_providers.openai]`.
+			if catalogURL := provider.ModelCatalogURL; catalogURL != "" {
+				if err := validateBuiltinOpenAICatalogURL(catalogURL); err != nil {
+					return nil, err
+				}
+				if builtIn, ok := out[key]; ok {
+					builtIn.ModelCatalogURL = catalogURL
+					out[key] = builtIn
+				}
+			}
+			continue
+		}
+		if key == GCPProviderID {
+			builtIn := out[key]
+			if err := MergeGCPProviderOverrides(&builtIn, provider); err != nil {
+				return nil, err
+			}
+			out[key] = builtIn
+			continue
+		}
 		if isBedrockProviderID(key) {
 			baseURLOverride := provider.BaseURL
 			provider.BaseURL = ""
@@ -933,6 +1261,24 @@ func MergeConfiguredProviders(providers map[string]ProviderInfo, configured map[
 		}
 	}
 	return out, nil
+}
+
+// validateBuiltinOpenAICatalogURL enforces Rust #57567's catalog destination
+// rules for the built-in OpenAI provider: HTTPS, an allowed ChatGPT host, and
+// no embedded credentials.
+func validateBuiltinOpenAICatalogURL(catalogURL string) error {
+	const message = "model_providers.openai.model_catalog_url must use an allowed ChatGPT host. If you need to use a 3rd party host, configure a custom model_provider"
+	parsed, err := url.Parse(catalogURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return errors.New(message)
+	}
+	if parsed.User != nil {
+		return errors.New(message)
+	}
+	if !network.IsAllowedChatGPTHost(parsed.Hostname()) {
+		return errors.New(message)
+	}
+	return nil
 }
 
 func IsAzureResponsesProvider(name, baseURL string) bool {
@@ -1001,6 +1347,9 @@ func (p *ProviderInfo) isZero() bool {
 		p.StreamIdleTimeoutMS == nil &&
 		p.WebsocketConnectTimeoutMS == nil &&
 		p.Capabilities == nil &&
+		p.ProjectID == nil &&
+		p.Location == nil &&
+		p.CredentialFile == nil &&
 		!p.RequiresOpenAIAuth &&
 		!p.SupportsWebsockets
 }

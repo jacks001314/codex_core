@@ -21,19 +21,29 @@ const gatewayRefreshSkewSeconds int64 = 30
 // provider gateway (Rust GatewayAuthConfig).
 type GatewayAuthConfig struct {
 	AuthorizationURL string
-	TokenURL         string
-	ClientID         string
-	Resource         string
-	Scopes           []string
-	RedirectPort     *uint16
+	// DeviceAuthorizationURL enables device-code sign-in for terminals that
+	// cannot open a browser (Rust #59822).
+	DeviceAuthorizationURL string
+	TokenURL               string
+	ClientID               string
+	Resource               string
+	Scopes                 []string
+	RedirectPort           *uint16
+	// CredentialsStore selects the grant store: "" or "keyring" uses the
+	// encrypted keyring namespace, "file" uses <codex_home>/secrets/gateway_oauth.json
+	// (Rust #58219 OAuthCredentialsStore).
+	CredentialsStore string
 }
 
 // gatewayStoredToken is the persisted credential shape. A missing expiry means
 // the issuer did not report one.
 type gatewayStoredToken struct {
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token,omitempty"`
-	ExpiresAt    *int64 `json:"expires_at,omitempty"`
+	AccessToken string `json:"access_token"`
+	// AuthorizationID is stable across refreshes and replaced by a new
+	// authorization grant (Rust StoredToken.authorization_id).
+	AuthorizationID string `json:"authorization_id,omitempty"`
+	RefreshToken    string `json:"refresh_token,omitempty"`
+	ExpiresAt       *int64 `json:"expires_at,omitempty"`
 }
 
 // gatewayTokenResponse is the standard token-endpoint response.
@@ -45,8 +55,10 @@ type gatewayTokenResponse struct {
 }
 
 // intoStored validates one token response and rotates the refresh token, keeping
-// the previous one when the issuer does not return a new value.
-func (r gatewayTokenResponse) intoStored(previousRefreshToken string) (gatewayStoredToken, error) {
+// the previous one when the issuer does not return a new value. A refresh
+// preserves the previous grant identity; a fresh authorization creates one
+// (Rust TokenResponse::into_stored).
+func (r gatewayTokenResponse) intoStored(previous *gatewayStoredToken) (gatewayStoredToken, error) {
 	if strings.TrimSpace(r.AccessToken) == "" {
 		return gatewayStoredToken{}, errors.New("provider OAuth token response omitted its access token")
 	}
@@ -70,10 +82,26 @@ func (r gatewayTokenResponse) intoStored(previousRefreshToken string) (gatewaySt
 		expiresAt = &value
 	}
 	refreshToken := r.RefreshToken
-	if refreshToken == "" {
-		refreshToken = previousRefreshToken
+	authorizationID := ""
+	if previous != nil {
+		authorizationID = previous.AuthorizationID
+		if refreshToken == "" {
+			refreshToken = previous.RefreshToken
+		}
 	}
-	return gatewayStoredToken{AccessToken: r.AccessToken, RefreshToken: refreshToken, ExpiresAt: expiresAt}, nil
+	if authorizationID == "" {
+		generated, err := generateOAuthState()
+		if err != nil {
+			return gatewayStoredToken{}, errors.New("failed to generate provider OAuth authorization id")
+		}
+		authorizationID = generated
+	}
+	return gatewayStoredToken{
+		AccessToken:     r.AccessToken,
+		AuthorizationID: authorizationID,
+		RefreshToken:    refreshToken,
+		ExpiresAt:       expiresAt,
+	}, nil
 }
 
 // gatewayTokenIsUsable mirrors Rust `token_is_usable`: a token without an expiry
@@ -150,14 +178,22 @@ func diagnosticURL(value string) string {
 // authorization endpoint must not carry OAuth request parameters, and the
 // client id and redirect port must be usable.
 func validateGatewayAuthConfig(config GatewayAuthConfig) error {
-	authorization, err := validateOAuthEndpoint(config.AuthorizationURL, "provider OAuth authorization endpoint")
-	if err != nil {
-		return err
+	// A device-only configuration omits the browser authorization endpoint.
+	if strings.TrimSpace(config.AuthorizationURL) != "" || strings.TrimSpace(config.DeviceAuthorizationURL) == "" {
+		authorization, err := validateOAuthEndpoint(config.AuthorizationURL, "provider OAuth authorization endpoint")
+		if err != nil {
+			return err
+		}
+		for name := range authorization.Query() {
+			switch name {
+			case "response_type", "client_id", "redirect_uri", "state", "scope", "resource", "code_challenge", "code_challenge_method":
+				return errors.New("provider OAuth authorization endpoint cannot include OAuth request parameters")
+			}
+		}
 	}
-	for name := range authorization.Query() {
-		switch name {
-		case "response_type", "client_id", "redirect_uri", "state", "scope", "resource", "code_challenge", "code_challenge_method":
-			return errors.New("provider OAuth authorization endpoint cannot include OAuth request parameters")
+	if strings.TrimSpace(config.DeviceAuthorizationURL) != "" {
+		if _, err := validateOAuthEndpoint(config.DeviceAuthorizationURL, "provider OAuth device authorization endpoint"); err != nil {
+			return err
 		}
 	}
 	if _, err := validateOAuthEndpoint(config.TokenURL, "provider OAuth token endpoint"); err != nil {

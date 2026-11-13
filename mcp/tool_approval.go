@@ -96,11 +96,11 @@ const MCPToolApprovalRejectedMessage = "user rejected MCP tool call"
 // (notify_mcp_tool_call_skip "MCP tool call blocked by app configuration").
 const MCPToolCallBlockedByAppConfigurationMessage = "MCP tool call blocked by app configuration"
 
-// MCPElicitationHandoffMessage is Rust's recovery guidance for a request a
-// non-root agent cannot present to the user (#46066): automatic decisions still
-// apply, but interactive MCP elicitations and approval prompts are denied so the
-// subagent hands the blocker to its parent instead.
-const MCPElicitationHandoffMessage = "MCP server elicitations can only be requested by the root thread. " +
+// MCPToolApprovalUserInputRootThreadMessage is Rust #46877's recovery guidance
+// for the legacy request_user_input approval path, which stays restricted to
+// the root thread even though MCP elicitations may now be surfaced by
+// subagents.
+const MCPToolApprovalUserInputRootThreadMessage = "MCP tool approval via request_user_input requires the root thread. " +
 	"Ask the parent agent to handle this request. " +
 	"Do not retry the blocked action until the parent confirms the blocker is resolved."
 
@@ -178,11 +178,16 @@ func MCPToolApprovalResponseCancels(response *tool.UserInputResponse, questionID
 }
 
 // MCPToolApprovalKey identifies a remembered approval. Rust keys on the server,
-// the tool, and the connector/plugin identity; Go's MCP service configuration is
-// already resolved per server, so the server/tool pair is exact within a thread.
+// the connector, the account link, and the tool.
 type MCPToolApprovalKey struct {
 	Server string
 	Tool   string
+	// ConnectorID scopes a remembered approval to the app connector that served
+	// the call (Rust McpToolApprovalKey::connector_id).
+	ConnectorID string
+	// LinkID scopes a remembered approval to the app account link that was
+	// approved (Rust #42133). Empty means the call used no link selector.
+	LinkID string
 }
 
 // MCPToolApprovalPromptOptions mirrors Rust's McpToolApprovalPromptOptions after
@@ -195,12 +200,21 @@ type MCPToolApprovalPromptOptions struct {
 // MCPToolApprovalRequest is the turn-scoped context an approval handler needs to
 // surface and record a decision.
 type MCPToolApprovalRequest struct {
-	Server        string
-	Tool          string
-	Arguments     any
-	Annotations   *RuntimeToolAnnotations
-	ConnectorID   string
-	ConnectorName string
+	Server      string
+	Tool        string
+	Arguments   any
+	Annotations *RuntimeToolAnnotations
+	// EnvironmentID is the environment that owns the MCP server (Rust
+	// ApprovalAction::McpToolCall's environment_id), used to scope the
+	// PermissionRequest hook to that environment's managed hooks.
+	EnvironmentID string
+	// PreparedPermissionSource is the immutable permission authority captured
+	// when this MCP call was prepared. Guardian reviews use it instead of the
+	// live server owner, whose permissions may have changed since the model step
+	// started (Rust #59028). It is never serialized into the approval action.
+	PreparedPermissionSource *MCPServerPermissionSource
+	ConnectorID              string
+	ConnectorName            string
 	// ConnectorDescription is the connector's own description from the tool
 	// metadata (Rust McpToolApprovalMetadata::connector_description).
 	ConnectorDescription string
@@ -218,6 +232,10 @@ type MCPToolApprovalRequest struct {
 	// mode, and the key both for session-remembered approvals and (when the
 	// elicitation feature is on) for the persistent policy amendment.
 	SessionKey *MCPToolApprovalKey
+	// LinkID is the resolved app account link for a Codex Apps call (Rust
+	// #42056/#42134). It selects link-specific approval settings and scopes the
+	// approval key.
+	LinkID string
 	// AllowSessionRemember / AllowPersistentApproval mirror Rust's
 	// session_mcp_tool_approval_key / persistent_mcp_tool_approval_key (nil for
 	// non-Auto modes).
@@ -292,14 +310,11 @@ func (s *MCPService) ToolApprovalMode(serverName string, toolName string) apps.A
 	return apps.AppToolApprovalAuto
 }
 
-// RequiresMCPToolApproval ports Rust requires_mcp_tool_approval: a destructive
-// hint requires approval, a read-only hint does not, and otherwise the call
-// requires approval unless both hints explicitly say it is safe.
+// RequiresMCPToolApproval ports Rust requires_mcp_tool_approval: a read-only
+// hint takes precedence over destructive and open-world hints, and otherwise
+// the call requires approval unless both hints explicitly say it is safe.
 func RequiresMCPToolApproval(annotations *RuntimeToolAnnotations) bool {
 	if annotations == nil {
-		return true
-	}
-	if annotations.DestructiveHint != nil && *annotations.DestructiveHint {
 		return true
 	}
 	if annotations.ReadOnlyHint != nil && *annotations.ReadOnlyHint {
@@ -357,7 +372,7 @@ func MCPPermissionProfileGrantsFullDiskWrite(profile *sandbox.PermissionProfile)
 
 // MCPSessionToolApprovalKey ports Rust session_mcp_tool_approval_key: only Auto
 // mode offers a session-remembered approval.
-func MCPSessionToolApprovalKey(mode apps.AppToolApproval, serverName string, toolName string) (MCPToolApprovalKey, bool) {
+func MCPSessionToolApprovalKey(mode apps.AppToolApproval, serverName string, toolName string, connectorID string, linkID string) (MCPToolApprovalKey, bool) {
 	if NormalizeAppToolApprovalMode(mode) != apps.AppToolApprovalAuto {
 		return MCPToolApprovalKey{}, false
 	}
@@ -366,7 +381,12 @@ func MCPSessionToolApprovalKey(mode apps.AppToolApproval, serverName string, too
 	if serverName == "" || toolName == "" {
 		return MCPToolApprovalKey{}, false
 	}
-	return MCPToolApprovalKey{Server: serverName, Tool: toolName}, true
+	return MCPToolApprovalKey{
+		Server:      serverName,
+		Tool:        toolName,
+		ConnectorID: strings.TrimSpace(connectorID),
+		LinkID:      strings.TrimSpace(linkID),
+	}, true
 }
 
 // MCPToolApprovalPromptOptionsFor ports Rust mcp_tool_approval_prompt_options:
@@ -575,10 +595,24 @@ func runtimeToolAnnotations(annotations any) *RuntimeToolAnnotations {
 	return &out
 }
 
+// preparedPermissionSource returns the permission authority captured when this
+// call was prepared. A thread-owned server has no environment owner, so it
+// resolves to nil (Rust #59028/#59489 McpPermissionSource::Thread).
+func (e *ToolExecutor) preparedPermissionSource(server string) *MCPServerPermissionSource {
+	if e == nil || e.binding == nil {
+		return nil
+	}
+	source, ok := e.binding.PermissionSourceForServer(server)
+	if !ok {
+		return nil
+	}
+	return &source
+}
+
 // approveToolCallIfNeeded ports the decision half of Rust
 // maybe_request_mcp_tool_approval: it returns a denied tool output when the call
 // must not run, and nil when the call may proceed.
-func (e *ToolExecutor) approveToolCallIfNeeded(ctx context.Context, callID string, arguments any) (*tool.Output, error) {
+func (e *ToolExecutor) approveToolCallIfNeeded(ctx context.Context, callID string, arguments any, linkID string) (*tool.Output, error) {
 	options := e.toolApproval
 	if options == nil || options.Handler == nil {
 		return nil, nil
@@ -586,6 +620,11 @@ func (e *ToolExecutor) approveToolCallIfNeeded(ctx context.Context, callID strin
 	server := e.resolvedServerName()
 	toolName := e.resolvedRemoteToolName()
 	annotations := runtimeToolAnnotations(e.toolInfo.Annotations)
+	var destructiveHint, openWorldHint *bool
+	if annotations != nil {
+		destructiveHint = annotations.DestructiveHint
+		openWorldHint = annotations.OpenWorldHint
+	}
 	mode := NormalizeAppToolApprovalMode(e.mcpService().ToolApprovalMode(server, toolName))
 	if IsCodexAppsMCPServerName(server) {
 		if options.AppPolicy == nil {
@@ -597,10 +636,11 @@ func (e *ToolExecutor) approveToolCallIfNeeded(ctx context.Context, callID strin
 		// runs.
 		policy := options.AppPolicy.Policy(apps.AppToolPolicyInput{
 			ConnectorID:     e.connectorID,
+			LinkID:          strings.TrimSpace(linkID),
 			ToolName:        toolName,
 			ToolTitle:       e.toolInfo.Title,
-			DestructiveHint: annotations.DestructiveHint,
-			OpenWorldHint:   annotations.OpenWorldHint,
+			DestructiveHint: destructiveHint,
+			OpenWorldHint:   openWorldHint,
 		})
 		if !policy.Enabled {
 			body := MCPToolCallBlockedByAppConfigurationMessage
@@ -615,7 +655,11 @@ func (e *ToolExecutor) approveToolCallIfNeeded(ctx context.Context, callID strin
 		mode = NormalizeAppToolApprovalMode(policy.Approval)
 	}
 	var profile *sandbox.PermissionProfile
-	if options.PermissionProfileForServer != nil {
+	preparedPermissionSource := e.preparedPermissionSource(server)
+	if preparedPermissionSource != nil {
+		profile = preparedPermissionSource.Profile
+	}
+	if profile == nil && options.PermissionProfileForServer != nil {
 		profile = options.PermissionProfileForServer(server)
 	}
 	if MCPPermissionPromptAutoApproved(options.ApprovalPolicy, profile, mode) {
@@ -624,30 +668,37 @@ func (e *ToolExecutor) approveToolCallIfNeeded(ctx context.Context, callID strin
 	if !RequiresMCPToolApprovalForMode(annotations, mode) {
 		return nil, nil
 	}
-	sessionKey, allowSessionRemember := MCPSessionToolApprovalKey(mode, server, toolName)
+	sessionKey, allowSessionRemember := MCPSessionToolApprovalKey(mode, server, toolName, e.connectorID, linkID)
 	var sessionKeyPtr *MCPToolApprovalKey
 	if allowSessionRemember {
 		key := sessionKey
 		sessionKeyPtr = &key
 	}
+	environmentID := e.mcpService().serverEnvironmentID(server)
+	if preparedPermissionSource != nil && strings.TrimSpace(preparedPermissionSource.EnvironmentID) != "" {
+		environmentID = strings.TrimSpace(preparedPermissionSource.EnvironmentID)
+	}
 	outcome, err := options.Handler.ApproveMCPToolCall(ctx, &MCPToolApprovalRequest{
-		Server:                  server,
-		Tool:                    toolName,
-		Arguments:               arguments,
-		Annotations:             annotations,
-		ConnectorID:             e.connectorID,
-		ConnectorName:           e.connectorName,
-		ConnectorDescription:    e.connectorDescription,
-		ToolTitle:               e.toolInfo.Title,
-		ToolDescription:         e.toolInfo.Description,
-		ApprovalMode:            mode,
-		ThreadID:                e.threadID,
-		TurnID:                  e.turnID,
-		CallID:                  callID,
-		HookToolName:            e.hookToolName(),
-		SessionKey:              sessionKeyPtr,
-		AllowSessionRemember:    allowSessionRemember,
-		AllowPersistentApproval: allowSessionRemember,
+		Server:                   server,
+		Tool:                     toolName,
+		Arguments:                arguments,
+		Annotations:              annotations,
+		EnvironmentID:            environmentID,
+		PreparedPermissionSource: preparedPermissionSource,
+		ConnectorID:              e.connectorID,
+		ConnectorName:            e.connectorName,
+		ConnectorDescription:     e.connectorDescription,
+		ToolTitle:                e.toolInfo.Title,
+		ToolDescription:          e.toolInfo.Description,
+		ApprovalMode:             mode,
+		ThreadID:                 e.threadID,
+		TurnID:                   e.turnID,
+		CallID:                   callID,
+		HookToolName:             e.hookToolName(),
+		SessionKey:               sessionKeyPtr,
+		LinkID:                   strings.TrimSpace(linkID),
+		AllowSessionRemember:     allowSessionRemember,
+		AllowPersistentApproval:  allowSessionRemember,
 	})
 	if err != nil {
 		return nil, err

@@ -66,12 +66,29 @@ func (m *LazyModelsManager) SetAPIKeyModelDiscoveryEnabled(enabled bool) {
 	}
 }
 
+// ForOriginator forwards catalog partitioning to the resolved manager
+// (Rust #56284). A manager that cannot partition reports false.
+func (m *LazyModelsManager) ForOriginator(originator string) (ModelsManager, bool) {
+	if m == nil {
+		return nil, false
+	}
+	partitioned, ok := m.resolve().(OriginatorModelsManager)
+	if !ok {
+		return nil, false
+	}
+	return partitioned.ForOriginator(originator)
+}
+
 func (m *LazyModelsManager) ListModels(strategy RefreshStrategy) []ModelPreset {
 	return m.resolve().ListModels(strategy)
 }
 
 func (m *LazyModelsManager) RawModelCatalog(strategy RefreshStrategy) ModelsResponse {
 	return m.resolve().RawModelCatalog(strategy)
+}
+
+func (m *LazyModelsManager) ModelCatalogWithOrigins(strategy RefreshStrategy) []CatalogModel {
+	return m.resolve().ModelCatalogWithOrigins(strategy)
 }
 
 func (m *LazyModelsManager) GetRemoteModels() []ModelInfo {
@@ -84,6 +101,10 @@ func (m *LazyModelsManager) GetDefaultModel(model string, allowProviderModelFall
 
 func (m *LazyModelsManager) GetModelInfo(model string, config *ModelsManagerConfig) ModelInfo {
 	return m.resolve().GetModelInfo(model, config)
+}
+
+func (m *LazyModelsManager) GetCatalogModel(model string, config *ModelsManagerConfig) CatalogModel {
+	return m.resolve().GetCatalogModel(model, config)
 }
 
 func (m *LazyModelsManager) RefreshIfNewETag(etag string) {

@@ -9,7 +9,6 @@ import (
 	"sort"
 	"strings"
 
-	"codex_core/jsonschema"
 	"codex_core/tool"
 	"codex_core/utils"
 )
@@ -101,9 +100,30 @@ type ToolExecutorOptions struct {
 	// x-codex-turn-metadata entry). Nil omits the entry; the callback is invoked
 	// per call so live turn state (the user-input flag) is current.
 	TurnMetadata func() map[string]any
+	// AppsMCPProductSKU is the turn's configured `apps_mcp_product_sku`. Only
+	// REPL-backed servers and the browser connector receive it, bounded to the
+	// known attribution values (Rust #60697).
+	AppsMCPProductSKU string
 	// TurnRootTurnID supplies the issuing turn's root turn id for host-owned
 	// Apps calls (Rust #51421). Nil or empty omits the field.
 	TurnRootTurnID func() string
+	// AgentMetadataRecipient is the host-selected plugin registration that
+	// receives private agent attribution in every tool-call `_meta`
+	// (Rust #58378). Nil omits both keys unless the turn installed one.
+	AgentMetadataRecipient *AgentMCPMetadataRecipient
+	ToolRequestMetaHook    *MCPToolRequestMetaHook
+	// ToolAdmission runs after approval and immediately before dispatch. It
+	// lets the host reject a stale prepared call when another provider has since
+	// taken ownership of the thread.
+	ToolAdmission func(serverName string, toolName string, callID string) error
+	// ResolvedServer is this executor's effective MCP registration. Matching the
+	// recipient requires the loaded source, plugin attribution, environment and
+	// transport, not just the server name.
+	ResolvedServer *ResolvedServer
+	// TurnCyberAccessProgram supplies the issuing turn's explicit Cyber program
+	// (Rust turn_context.cyber_access_program). Nil or empty sends JSON null on a
+	// matching agent registration.
+	TurnCyberAccessProgram func() string
 	// ToolInputSchemaMaxBytes bounds best-effort compaction of this server's
 	// model-visible input schema (Rust #47936).
 	ToolInputSchemaMaxBytes int
@@ -175,6 +195,14 @@ type AuthElicitationOptions struct {
 // entry).
 const MCPToolTurnMetadataMetaKey = "x-codex-turn-metadata"
 
+const (
+	// MCPAgentRootTurnIDMetaKey and MCPAgentCyberAccessProgramMetaKey carry the
+	// private agent attribution Rust sends only to a host-selected plugin
+	// registration (#58378). Unset values are explicit JSON nulls.
+	MCPAgentRootTurnIDMetaKey         = "x-codex-root-turn-id"
+	MCPAgentCyberAccessProgramMetaKey = "x-codex-cyber-access-program"
+)
+
 type ToolExecutor struct {
 	service                       *MCPService
 	serverName                    string
@@ -194,7 +222,13 @@ type ToolExecutor struct {
 	windowID                      string
 	requestMeta                   map[string]any
 	turnMetadata                  func() map[string]any
+	appsMCPProductSKU             string
 	turnRootTurnID                func() string
+	agentMetadataRecipient        *AgentMCPMetadataRecipient
+	toolRequestMetaHook           *MCPToolRequestMetaHook
+	toolAdmission                 func(serverName string, toolName string, callID string) error
+	resolvedServer                *ResolvedServer
+	turnCyberAccessProgram        func() string
 	hostOwnedApps                 bool
 	binding                       *Binding
 	openAIFileRewriter            *OpenAIFileRewriter
@@ -237,7 +271,13 @@ func NewToolExecutor(options *ToolExecutorOptions) *ToolExecutor {
 	executor.windowID = strings.TrimSpace(options.WindowID)
 	executor.requestMeta = cloneAnyMap(options.RequestMeta)
 	executor.turnMetadata = options.TurnMetadata
+	executor.appsMCPProductSKU = strings.TrimSpace(options.AppsMCPProductSKU)
 	executor.turnRootTurnID = options.TurnRootTurnID
+	executor.agentMetadataRecipient = options.AgentMetadataRecipient
+	executor.toolRequestMetaHook = options.ToolRequestMetaHook
+	executor.toolAdmission = options.ToolAdmission
+	executor.resolvedServer = options.ResolvedServer
+	executor.turnCyberAccessProgram = options.TurnCyberAccessProgram
 	executor.toolInputSchemaMaxBytes = options.ToolInputSchemaMaxBytes
 	executor.codeModeInputSchemaMaxBytes = options.CodeModeInputSchemaMaxBytes
 	executor.hostOwnedApps = options.HostOwnedApps
@@ -319,16 +359,35 @@ func (e *ToolExecutor) MCPServerName() string {
 	return e.resolvedServerName()
 }
 
+// invocationMetadata describes one live call for the invocation registry.
+// Rust #59489: an environment-owned server also captures its prepared rules, so
+// a follow-up approval raised by the server reviews the same permissions the
+// call was prepared under, even after the owner republishes them.
+func (e *ToolExecutor) invocationMetadata(arguments any) MCPInvocationMetadata {
+	metadata := MCPInvocationMetadata{
+		ServerName:           e.resolvedServerName(),
+		ToolName:             e.resolvedRemoteToolName(),
+		ConnectorID:          e.connectorID,
+		ConnectorName:        e.connectorName,
+		ConnectorDescription: e.connectorDescription,
+		ToolTitle:            e.toolInfo.Title,
+		ToolDescription:      e.toolInfo.Description,
+		Arguments:            cloneMCPInvocationArguments(arguments),
+		ThreadID:             e.threadID,
+		TurnID:               e.turnID,
+	}
+	if source := e.preparedPermissionSource(e.resolvedServerName()); source != nil && !source.Thread {
+		metadata.PermissionSource = source
+	}
+	return metadata
+}
+
 func (e *ToolExecutor) Spec() tool.Spec {
 	name := e.resolvedToolName()
-	parameters := jsonschema.NormalizeWithBudget(cloneAnyMap(e.toolInfo.InputSchema), e.toolInputSchemaMaxBytes)
-	// Mirrors Rust agent_plugin_mcp_tool_to_responses_api_tool: Agent Plugins
-	// v1 tools that still exceed the serialized-size cap after normalization
-	// degrade to an accept-anything object schema instead of reaching the
-	// model oversized.
-	if e.agentPlugin && len(mustMarshalJSON(parameters)) > maxSerializedMCPToolBytes {
-		parameters = map[string]any{"type": "object", "additionalProperties": true}
-	}
+	// The normalized parameters come from this manager shared definition index
+	// (Rust #55724), so schema normalization is not repeated for every session
+	// that sees the same catalog. Cloning keeps the shared definition immutable.
+	parameters := cloneAnyMap(e.resolvedToolDefinition().parameters)
 	return tool.Spec{
 		Name:        name,
 		Description: firstNonEmptyMCP(e.toolInfo.Description, e.toolInfo.Title),
@@ -344,6 +403,15 @@ func (e *ToolExecutor) Spec() tool.Spec {
 	}
 }
 
+// resolvedToolDefinition returns the immutable normalized definition for this
+// executor. Without a manager the executor still normalizes locally.
+func (e *ToolExecutor) resolvedToolDefinition() *mcpToolDefinition {
+	if e.service != nil && e.service.sharedDefinitions != nil {
+		return e.service.sharedDefinitions.getOrCreate(e.toolInfo, e.serverName, e.agentPlugin, e.toolInputSchemaMaxBytes)
+	}
+	return newMCPToolDefinition(e.toolInfo, e.agentPlugin, e.toolInputSchemaMaxBytes)
+}
+
 func maxIntMCP(left, right int) int {
 	if right > left {
 		return right
@@ -356,18 +424,7 @@ func (e *ToolExecutor) Execute(ctx context.Context, invocation *tool.Invocation)
 		return nil, tool.RespondToModel("mcp handler received unsupported payload")
 	}
 	arguments := mcpHookToolInput(invocation.Payload.Arguments)
-	releaseInvocation := e.service.RegisterToolInvocation(e.resolvedServerName(), invocation.CallID, MCPInvocationMetadata{
-		ServerName:           e.resolvedServerName(),
-		ToolName:             e.resolvedRemoteToolName(),
-		ConnectorID:          e.connectorID,
-		ConnectorName:        e.connectorName,
-		ConnectorDescription: e.connectorDescription,
-		ToolTitle:            e.toolInfo.Title,
-		ToolDescription:      e.toolInfo.Description,
-		Arguments:            cloneMCPInvocationArguments(arguments),
-		ThreadID:             e.threadID,
-		TurnID:               e.turnID,
-	})
+	releaseInvocation := e.service.RegisterToolInvocation(e.resolvedServerName(), invocation.CallID, e.invocationMetadata(arguments))
 	defer releaseInvocation()
 	rewrittenArguments := any(nil)
 	if e.openAIFileRewriter != nil && len(e.openAIFileInputOptionalFields) > 0 {
@@ -379,6 +436,10 @@ func (e *ToolExecutor) Execute(ctx context.Context, invocation *tool.Invocation)
 		rewrittenArguments = rewritten
 	}
 	meta := e.requestMetaForCall(invocation.CallID)
+	meta, hookErr := e.applyMCPToolRequestMetaHook(meta, invocation.CallID)
+	if hookErr != nil {
+		return nil, tool.RespondToModel(hookErr.Error())
+	}
 	// Rust #40728: a server whose published permission authority is unavailable
 	// must be rejected instead of running with another owner's authority.
 	if err := e.ensureServerPermissionAuthority(); err != nil {
@@ -388,6 +449,11 @@ func (e *ToolExecutor) Execute(ctx context.Context, invocation *tool.Invocation)
 	// execution so a required link_id cannot be bypassed by omitting it.
 	linkID := ""
 	if IsCodexAppsMCPServerName(e.resolvedServerName()) {
+		// Apps refreshes fetch outside the runtime gate; drain them before
+		// capturing this call's catalog (Rust #60639).
+		if e.service != nil {
+			_ = e.service.WaitForAppsToolRefresh(ctx)
+		}
 		resolved, err := resolveMCPToolAccount(&e.toolInfo, arguments)
 		if err != nil {
 			return nil, tool.RespondToModel(err.Error())
@@ -396,8 +462,13 @@ func (e *ToolExecutor) Execute(ctx context.Context, invocation *tool.Invocation)
 	}
 	// Rust mcp_tool_call.rs maybe_request_mcp_tool_approval: a custom MCP server
 	// can require the user to approve a call before it runs.
-	if denied, err := e.approveToolCallIfNeeded(ctx, invocation.CallID, arguments); err != nil || denied != nil {
+	if denied, err := e.approveToolCallIfNeeded(ctx, invocation.CallID, arguments, linkID); err != nil || denied != nil {
 		return denied, err
+	}
+	if e.toolAdmission != nil {
+		if err := e.toolAdmission(e.resolvedServerName(), e.resolvedRemoteToolName(), invocation.CallID); err != nil {
+			return nil, tool.RespondToModel(err.Error())
+		}
 	}
 	callParams := &MCPToolCallParams{
 		Context:    ctx,
@@ -563,9 +634,8 @@ func (e *ToolExecutor) maybeRequestCodexAppsAuthElicitation(ctx context.Context,
 	}
 	response, err := e.authElicitation.Request(ctx, elicitationRequest)
 	if err != nil {
-		// Rust #46066: a failed request (for example a subagent's handoff) keeps
-		// the connector's diagnostic and adds the recovery guidance instead of
-		// dropping the original result.
+		// A failed delivery keeps the connector's diagnostic and adds the
+		// recovery guidance instead of dropping the original result.
 		return AuthElicitationFailureResult(plan.AuthFailure, result, err)
 	}
 	if response == nil || response.Action != MCPElicitationActionAccept {
@@ -665,6 +735,24 @@ func (e *ToolExecutor) WaitUntilReady(ctx context.Context, invocation *tool.Invo
 	return e.mcpService().WaitForServerStartup(ctx, e.resolvedServerName(), threadID)
 }
 
+// applyMCPToolRequestMetaHook runs the host-scoped metadata hook installed for
+// this executor registration. It only mutates metadata when server, tool,
+// source and transport all match.
+func (e *ToolExecutor) applyMCPToolRequestMetaHook(meta any, callID string) (any, error) {
+	if e == nil || e.toolRequestMetaHook == nil {
+		return meta, nil
+	}
+	return e.toolRequestMetaHook.Apply(
+		meta,
+		e.resolvedServerName(),
+		e.resolvedRemoteToolName(),
+		e.resolvedServer,
+		e.threadID,
+		e.turnID,
+		callID,
+	)
+}
+
 func (e *ToolExecutor) requestMetaForCall(callID ...string) any {
 	if e == nil {
 		return nil
@@ -680,8 +768,24 @@ func (e *ToolExecutor) requestMetaForCall(callID ...string) any {
 	// turn metadata document so the server can attribute the call.
 	if e.turnMetadata != nil {
 		if document := e.turnMetadata(); len(document) > 0 {
-			requestMeta[MCPToolTurnMetadataMetaKey] = document
+			// Rust #60697: a client-supplied product_sku is never forwarded to
+			// unrelated MCP servers. Trusted REPL/browser attribution comes from
+			// the turn configuration instead.
+			trusted := cloneAnyMap(document)
+			delete(trusted, "product_sku")
+			if IsNodeReplBackedConnector(e.resolvedServerName(), e.connectorID) && e.appsMCPProductSKU != "" {
+				trusted["product_sku"] = BoundedProductSKU(e.appsMCPProductSKU)
+			}
+			requestMeta[MCPToolTurnMetadataMetaKey] = trusted
 		}
+	}
+	// Rust #58378: private agent attribution reaches only the exact host-selected
+	// plugin registration, and a matching registration gets JSON null for an
+	// unset value.
+	if e.agentMetadataRecipient != nil && e.resolvedServer != nil &&
+		e.agentMetadataRecipient.Matches(e.resolvedServerName(), *e.resolvedServer) {
+		requestMeta[MCPAgentRootTurnIDMetaKey] = mcpOptionalMetadataValue(e.turnRootTurnID)
+		requestMeta[MCPAgentCyberAccessProgramMetaKey] = mcpOptionalMetadataValue(e.turnCyberAccessProgram)
 	}
 	if IsCodexAppsMCPServerName(e.resolvedServerName()) {
 		appsMeta, _ := requestMeta["_codex_apps"].(map[string]any)
@@ -712,6 +816,16 @@ func (e *ToolExecutor) requestMetaForCall(callID ...string) any {
 	return requestMeta
 }
 
+func mcpOptionalMetadataValue(provider func() string) any {
+	if provider == nil {
+		return nil
+	}
+	if value := strings.TrimSpace(provider()); value != "" {
+		return value
+	}
+	return nil
+}
+
 // actorConfirmationPoliciesMeta builds the openai/confirmation_policies value for
 // an eligible actor call. It is always a (possibly empty) object so runtimes
 // can clear startup defaults; text is forwarded verbatim.
@@ -738,6 +852,21 @@ func (e *ToolExecutor) PreToolUsePayload(invocation *tool.Invocation) (*tool.Pre
 		ToolInput: mcpHookToolInput(invocation.Payload.Arguments),
 		McpTool:   e.mcpToolContext(),
 	}, true
+}
+
+// HookEnvironmentIDs reports the environment that owns the MCP server (Rust
+// `McpHandler::environments_for_input` -> `server_environment_id`). Executor-
+// discovered servers without a runtime config stay unscoped.
+func (e *ToolExecutor) HookEnvironmentIDs(invocation *tool.Invocation) []string {
+	_ = invocation
+	if e == nil {
+		return nil
+	}
+	id := e.mcpService().serverEnvironmentID(e.resolvedServerName())
+	if id == "" {
+		return nil
+	}
+	return []string{id}
 }
 
 // mcpToolContext captures the model-visible MCP tool details and its source
@@ -1245,4 +1374,5 @@ func mcpLogPreview(body string) string {
 var _ tool.Executor = (*ToolExecutor)(nil)
 var _ tool.PreToolUsePayloadProvider = (*ToolExecutor)(nil)
 var _ tool.PostToolUsePayloadProvider = (*ToolExecutor)(nil)
+var _ tool.HookEnvironmentSelector = (*ToolExecutor)(nil)
 var _ tool.HookInputUpdater = (*ToolExecutor)(nil)

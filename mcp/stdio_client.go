@@ -29,6 +29,10 @@ type stdioInventory struct {
 	// that produced Tools (Rust #54686); nil when tool discovery failed, so the
 	// status wire field serializes as null.
 	ToolListMeta json.RawMessage
+	// NegotiatedModern reports that the connection that produced this catalog
+	// finished the modern discovery handshake, so the catalog belongs to the
+	// modern protocol generation (Rust #60037).
+	NegotiatedModern bool
 }
 
 // mcpStdioStderrDrainGrace bounds how long teardown waits for queued stderr
@@ -37,27 +41,50 @@ type stdioInventory struct {
 const mcpStdioStderrDrainGrace = 250 * time.Millisecond
 
 type stdioClient struct {
-	mu                                 sync.Mutex
-	capabilitiesMu                     sync.Mutex
-	writeMu                            sync.Mutex
-	closed                             bool
-	config                             *ServerConfig
-	cmd                                *exec.Cmd
-	process                            *mcpStdioProcess
-	stdin                              io.WriteCloser
-	reader                             *bufio.Reader
-	stderr                             *stdioOutputBuffer
-	nextID                             int64
-	started                            bool
-	initialized                        bool
-	initializing                       bool
-	initDone                           chan struct{}
-	initErr                            error
-	pending                            map[int64]*stdioPendingCall
-	pendingOrder                       []int64
-	openAIForm                         bool
-	userVerification                   bool
-	protocolMode                       MCPProtocolMode
+	mu               sync.Mutex
+	capabilitiesMu   sync.Mutex
+	writeMu          sync.Mutex
+	closed           bool
+	config           *ServerConfig
+	cmd              *exec.Cmd
+	process          *mcpStdioProcess
+	stdin            io.WriteCloser
+	reader           *bufio.Reader
+	stderr           *stdioOutputBuffer
+	nextID           int64
+	started          bool
+	initialized      bool
+	initializing     bool
+	initDone         chan struct{}
+	initErr          error
+	pending          map[int64]*stdioPendingCall
+	pendingOrder     []int64
+	openAIForm       bool
+	userVerification bool
+	// networkPolicy advertises the experimental call-scoped network policy
+	// capability to a trusted ChatGPT origin (Rust #56278).
+	networkPolicy bool
+	protocolMode  MCPProtocolMode
+	// messageLimit is the bounded framing limit selected at launch. Discovery
+	// keeps the modern limit even after falling back to the legacy handshake,
+	// matching Rust's bounded local transport (Rust #57210).
+	messageLimit int64
+	// legacyFallback is a previously working legacy connection for the same
+	// account, kept while this connection attempts a protocol upgrade. Once the
+	// upgrade fails for a non-authentication reason every call is delegated to
+	// it (Rust #57210).
+	legacyFallback *stdioClient
+	// delegate is the retained legacy connection this client hands all traffic
+	// to after a failed upgrade.
+	delegate *stdioClient
+	// startupInputReceived records that the helper asked its chat for input
+	// before it finished starting, which binds it to that chat and keeps it out
+	// of the shared pool (Rust #57211).
+	startupInputReceived bool
+	// catalog is the tool catalog this exact connection has published. Shared
+	// pooled helpers keep one catalog per live connection (Rust #43031).
+	catalogOnce                        sync.Once
+	catalog                            *clientToolCatalog
 	supportsSandboxStateMetaCapability bool
 	// elicitationCancellations remembers server cancellations for this
 	// connection so elicitations return `cancel` instead of hanging
@@ -74,6 +101,35 @@ type stdioClient struct {
 	// toolListChanges counts tools/list_changed notifications received on this
 	// connection, so a catalog captured before one is never reused (Rust #54656).
 	toolListChanges mcpToolListRevision
+	// negotiatedModern records that this connection finished the modern
+	// discovery handshake, so the catalog published on it belongs to the modern
+	// protocol generation (Rust #60037).
+	negotiatedModern bool
+}
+
+// toolCatalog returns the catalog owned by this connection, creating an empty
+// one on first use.
+func (c *stdioClient) toolCatalog() *clientToolCatalog {
+	if c == nil {
+		return nil
+	}
+	c.catalogOnce.Do(func() {
+		c.catalog = newClientToolCatalog(nil)
+	})
+	return c.catalog
+}
+
+// negotiatedModernProtocol reports whether this connection finished the modern
+// discovery handshake. A connection that fell back to the legacy initialize
+// reports false even though it keeps the modern framing limit, and that is the
+// distinction the tool catalog cache needs (Rust #60037).
+func (c *stdioClient) negotiatedModernProtocol() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.negotiatedModern && c.initialized
 }
 
 // os/exec copies a child's output from background goroutines. Keep each
@@ -122,6 +178,10 @@ type stdioCallOptions struct {
 	Roots       []MCPRoot
 	Elicitation MCPElicitationHandler
 	Progress    MCPProgressHandler
+	// Lease is the calling chat's server-side connection lease. It is opened
+	// after initialization and tags the request with the host-owned id, so a
+	// release can cancel exactly this chat's pending requests (Rust #57978).
+	Lease *mcpChatLease
 }
 
 type stdioRPCResponse struct {
@@ -151,10 +211,13 @@ func listMCPStdioInventory(config *ServerConfig) (*stdioInventory, error) {
 }
 
 func listMCPStdioInventoryWithClient(client *stdioClient) (*stdioInventory, error) {
-	return listMCPStdioInventoryWithOptions(client, "", "", nil)
+	return listMCPStdioInventoryWithOptions(client, "", "", nil, false)
 }
 
-func listMCPStdioInventoryWithOptions(client *stdioClient, serverName string, threadID string, roots []MCPRoot) (*stdioInventory, error) {
+// listMCPStdioInventoryWithOptions lists one local server's catalog. When
+// skipResourceTemplates is set the template listing is not requested and the
+// reported template list stays empty (Rust #57861).
+func listMCPStdioInventoryWithOptions(client *stdioClient, serverName string, threadID string, roots []MCPRoot, skipResourceTemplates bool) (*stdioInventory, error) {
 	result := &stdioInventory{}
 	options := &stdioCallOptions{ServerName: serverName, ThreadID: threadID, Roots: roots}
 	tools, toolListMeta, err := listMCPStdioTools(client, options)
@@ -162,6 +225,7 @@ func listMCPStdioInventoryWithOptions(client *stdioClient, serverName string, th
 	// triggers, so read them after the attempt even when discovery failed.
 	if client != nil {
 		result.ServerCapabilities = client.serverCapabilitiesRaw()
+		result.NegotiatedModern = client.negotiatedModernProtocol()
 	}
 	if err != nil {
 		return result, err
@@ -172,8 +236,10 @@ func listMCPStdioInventoryWithOptions(client *stdioClient, serverName string, th
 	if resources, err := listMCPStdioResources(client, options); err == nil {
 		result.Resources = resources
 	}
-	if templates, err := listMCPStdioResourceTemplates(client, options); err == nil {
-		result.ResourceTemplates = templates
+	if !skipResourceTemplates {
+		if templates, err := listMCPStdioResourceTemplates(client, options); err == nil {
+			result.ResourceTemplates = templates
+		}
 	}
 	return result, nil
 }
@@ -225,12 +291,36 @@ func callMCPStdioTool(config *ServerConfig, serverName string, threadID string, 
 }
 
 func callMCPStdioToolWithClient(client *stdioClient, serverName string, threadID string, turnID string, itemID string, roots []MCPRoot, elicitation MCPElicitationHandler, progress MCPProgressHandler, tool string, arguments any, meta any) (*MCPToolCallResponse, error) {
+	return callMCPStdioToolWithLease(client, nil, serverName, threadID, turnID, itemID, roots, elicitation, progress, tool, arguments, meta)
+}
+
+// callMCPStdioToolWithLease tags the call with the chat's server-side lease.
+// The host owns the lease metadata, so any caller-supplied value is replaced
+// (Rust #57978).
+func callMCPStdioToolWithLease(client *stdioClient, lease *mcpChatLease, serverName string, threadID string, turnID string, itemID string, roots []MCPRoot, elicitation MCPElicitationHandler, progress MCPProgressHandler, tool string, arguments any, meta any) (*MCPToolCallResponse, error) {
 	params := mcpToolCallParams(client.config, tool, arguments, meta)
 	var response MCPToolCallResponse
-	if err := client.CallWithOptions(&stdioCallOptions{ServerName: serverName, ThreadID: threadID, TurnID: turnID, ItemID: itemID, Roots: roots, Elicitation: elicitation, Progress: progress}, "tools/call", params, &response); err != nil {
+	if err := client.CallWithOptions(&stdioCallOptions{ServerName: serverName, ThreadID: threadID, TurnID: turnID, ItemID: itemID, Roots: roots, Elicitation: elicitation, Progress: progress, Lease: lease}, "tools/call", params, &response); err != nil {
 		return nil, withMCPRequestErrorCode(err)
 	}
 	return &response, nil
+}
+
+// mcpParamsWithConnectionLease attaches or replaces the host-owned lease id on
+// a request that already carries `_meta`.
+func mcpParamsWithConnectionLease(params any, leaseID string) any {
+	values, ok := params.(map[string]any)
+	if !ok || strings.TrimSpace(leaseID) == "" {
+		return params
+	}
+	meta, _ := values["_meta"].(map[string]any)
+	clone := cloneAnyMap(meta)
+	if clone == nil {
+		clone = map[string]any{}
+	}
+	clone[ConnectionLeaseMetaKey] = leaseID
+	values["_meta"] = clone
+	return values
 }
 
 func readMCPStdioResource(config *ServerConfig, serverName string, elicitation MCPElicitationHandler, progress MCPProgressHandler, params *MCPResourceReadParams) (*MCPResourceReadResponse, error) {
@@ -240,6 +330,12 @@ func readMCPStdioResource(config *ServerConfig, serverName string, elicitation M
 }
 
 func readMCPStdioResourceWithClient(client *stdioClient, serverName string, roots []MCPRoot, elicitation MCPElicitationHandler, progress MCPProgressHandler, params *MCPResourceReadParams) (*MCPResourceReadResponse, error) {
+	return readMCPStdioResourceWithLease(client, nil, serverName, roots, elicitation, progress, params)
+}
+
+// readMCPStdioResourceWithLease carries the chat's server-side lease id, which
+// the host owns, on the resource-read request (Rust #57978).
+func readMCPStdioResourceWithLease(client *stdioClient, lease *mcpChatLease, serverName string, roots []MCPRoot, elicitation MCPElicitationHandler, progress MCPProgressHandler, params *MCPResourceReadParams) (*MCPResourceReadResponse, error) {
 	if params == nil || strings.TrimSpace(params.URI) == "" {
 		return nil, invalidMCPRequest("server and uri are required")
 	}
@@ -248,7 +344,7 @@ func readMCPStdioResourceWithClient(client *stdioClient, serverName string, root
 		threadID = strings.TrimSpace(*params.ThreadID)
 	}
 	var response MCPResourceReadResponse
-	if err := client.CallWithOptions(&stdioCallOptions{ServerName: serverName, ThreadID: threadID, Roots: roots, Elicitation: elicitation, Progress: progress}, "resources/read", mcpResourceReadRequestParams(params), &response); err != nil {
+	if err := client.CallWithOptions(&stdioCallOptions{ServerName: serverName, ThreadID: threadID, Roots: roots, Elicitation: elicitation, Progress: progress, Lease: lease}, "resources/read", mcpResourceReadRequestParams(params), &response); err != nil {
 		return nil, err
 	}
 	return &response, nil
@@ -263,13 +359,36 @@ func newMCPStdioClientWithOpenAIForm(config *ServerConfig, openAIForm bool) *std
 }
 
 func newMCPStdioClientWithFeatures(config *ServerConfig, openAIForm bool, userVerification bool) *stdioClient {
+	return newMCPStdioClientWithCapabilities(config, mcpClientFeatures{
+		OpenAIForm:       openAIForm,
+		UserVerification: userVerification,
+	})
+}
+
+// newMCPStdioClientWithCapabilities builds a client that advertises exactly the
+// capabilities projected for its server.
+func newMCPStdioClientWithCapabilities(config *ServerConfig, features mcpClientFeatures) *stdioClient {
 	cloned := cloneServerConfig(config)
 	return &stdioClient{
 		config:           &cloned,
 		nextID:           1,
-		openAIForm:       openAIForm,
-		userVerification: userVerification,
+		openAIForm:       features.OpenAIForm,
+		userVerification: features.UserVerification,
+		networkPolicy:    features.NetworkPolicy,
 		protocolMode:     cloned.ProtocolMode,
+	}
+}
+
+// clientFeatures describes the capabilities this connection advertised.
+func (c *stdioClient) clientFeatures() mcpClientFeatures {
+	if c == nil {
+		return mcpClientFeatures{}
+	}
+	return mcpClientFeatures{
+		OpenAIForm:       c.openAIForm,
+		AuthChange:       c.authChanges != nil,
+		UserVerification: c.userVerification,
+		NetworkPolicy:    c.networkPolicy,
 	}
 }
 
@@ -291,19 +410,36 @@ func (c *stdioClient) CallWithOptionsContext(ctx context.Context, options *stdio
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ctx, cancel := context.WithTimeout(ctx, c.callTimeout())
-	defer cancel()
 	if options != nil {
 		ctx = contextWithMCPClientContextAndRoots(ctx, options.ThreadID, options.TurnID, options.ItemID, options.Roots)
 	}
-	if err := c.ensureInitialized(ctx, options); err != nil {
+	// Rust #57196: a shared connection must pause only the calling chat's
+	// timeout while it awaits input, so every transport attempt gets the budget
+	// that is left after subtracting time spent waiting on the user.
+	budget := newMCPCallBudget(c.callTimeout())
+	if delegate := c.legacyDelegate(); delegate != nil {
+		return delegate.CallWithOptionsContext(ctx, options, method, params, out)
+	}
+	initCtx, cancelInit := budget.context(ctx)
+	err := c.ensureInitialized(initCtx, options)
+	cancelInit()
+	if err != nil {
+		fallbackCtx, cancelFallback := budget.context(ctx)
+		fallback := c.tryLegacyFallback(fallbackCtx, options, err)
+		cancelFallback()
+		if fallback != nil {
+			return fallback.CallWithOptionsContext(ctx, options, method, params, out)
+		}
 		return err
 	}
 	stderr := c.currentStderr()
 	baseParams := params
 	requestParams := params
+	continuation := &mcpContinuationState{}
 	for round := 0; ; round++ {
-		response, err := c.doRequest(ctx, options, method, requestParams)
+		requestCtx, cancelRequest := budget.context(ctx)
+		response, err := c.doRequest(requestCtx, options, method, requestParams)
+		cancelRequest()
 		if err != nil {
 			return decorateMCPStdioError(err, stderr)
 		}
@@ -311,11 +447,17 @@ func (c *stdioClient) CallWithOptionsContext(ctx context.Context, options *stdio
 			return newMCPRemoteError(method, response.Error)
 		}
 		if c.protocolModeSnapshot() == MCPProtocol20260728 {
-			nextParams, inputRequired, err := nextMCP2026RequestParams(ctx, serverNameFromStdioOptions(options), elicitationFromStdioOptions(options), baseParams, response.Result)
+			// The caller's own timeout is paused while the user answers, so the
+			// waiting time is not charged to the request (Rust #57196).
+			inputStarted := time.Now()
+			nextParams, inputRequired, err := nextMCP2026RequestParams(ctx, serverNameFromStdioOptions(options), elicitationFromStdioOptions(options), c.clientFeatures(), continuation, baseParams, response.Result)
 			if err != nil {
 				return err
 			}
 			if inputRequired {
+				// Awaiting the caller's answer must not consume the request's
+				// own timeout.
+				budget.pause(time.Since(inputStarted))
 				if round >= maxMCPInputRequiredRounds {
 					return fmt.Errorf("MCP %s exceeded %d input-required rounds", method, maxMCPInputRequiredRounds)
 				}
@@ -330,8 +472,47 @@ func (c *stdioClient) CallWithOptionsContext(ctx context.Context, options *stdio
 	}
 }
 
+// mcpCallBudget hands out a per-attempt deadline while excluding time a call
+// spent waiting for the user's input (Rust #57196).
+type mcpCallBudget struct {
+	timeout time.Duration
+	started time.Time
+	paused  time.Duration
+}
+
+func newMCPCallBudget(timeout time.Duration) *mcpCallBudget {
+	return &mcpCallBudget{timeout: timeout, started: time.Now()}
+}
+
+func (b *mcpCallBudget) context(parent context.Context) (context.Context, context.CancelFunc) {
+	if b == nil {
+		return context.WithCancel(parent)
+	}
+	remaining := b.timeout - time.Since(b.started) + b.paused
+	if remaining <= 0 {
+		remaining = time.Nanosecond
+	}
+	return context.WithTimeout(parent, remaining)
+}
+
+func (b *mcpCallBudget) pause(elapsed time.Duration) {
+	if b == nil || elapsed <= 0 {
+		return
+	}
+	b.paused += elapsed
+}
+
 func (c *stdioClient) doRequest(ctx context.Context, options *stdioCallOptions, method string, params any) (*stdioRPCResponse, error) {
-	params = mcpParamsWithProtocolMetadataAndFeatures(params, c.protocolModeSnapshot(), c.openAIForm, c.authChanges != nil, c.userVerification)
+	// Leases cover chat-scoped work only: catalog and lifecycle requests stay
+	// independent of any one chat (Rust #57978).
+	if options != nil && options.Lease != nil && mcpMethodUsesConnectionLease(method) {
+		leaseID, err := options.Lease.ensureOpen(c)
+		if err != nil {
+			return nil, err
+		}
+		params = mcpParamsWithConnectionLease(params, leaseID)
+	}
+	params = mcpParamsWithProtocolMetadataForFeatures(params, c.protocolModeSnapshot(), c.clientFeatures())
 	cmd := c.currentCommand()
 	id := c.nextRequestID()
 	pending := &stdioPendingCall{
@@ -363,10 +544,125 @@ func (c *stdioClient) doRequest(ctx context.Context, options *stdioCallOptions, 
 		return result.Response, nil
 	case <-ctx.Done():
 		c.unregisterPending(id)
+		if c.isInitialized() {
+			// A ready (possibly shared) connection keeps serving other callers;
+			// only this request is cancelled (Rust #57196).
+			c.cancelRemoteRequest(cmd, id, ctx.Err())
+			return nil, ctx.Err()
+		}
 		c.failTransportFor(cmd, ctx.Err())
 		return nil, ctx.Err()
 	}
 }
+
+// cancelRemoteRequest asks the server to stop work for one request without
+// disturbing the connection. A failed write still tears the transport down.
+func (c *stdioClient) cancelRemoteRequest(owner *exec.Cmd, id int64, reason error) {
+	message := "cancelled"
+	if reason != nil {
+		message = reason.Error()
+	}
+	err := c.writeFrame(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "notifications/cancelled",
+		"params": map[string]any{
+			"requestId": id,
+			"reason":    message,
+		},
+	})
+	if err != nil {
+		c.failTransportFor(owner, err)
+	}
+}
+
+// supportsConnectionLease reports whether the helper negotiated the per-chat
+// connection-lease extension (Rust #57978). Catalog requests do not need it.
+func (c *stdioClient) supportsConnectionLease() bool {
+	if c == nil {
+		return false
+	}
+	capabilities := c.serverCapabilitiesRaw()
+	if len(capabilities) == 0 {
+		return false
+	}
+	var parsed struct {
+		Extensions map[string]json.RawMessage `json:"extensions"`
+	}
+	if json.Unmarshal(capabilities, &parsed) != nil {
+		return false
+	}
+	_, ok := parsed.Extensions[ConnectionLeaseCapability]
+	return ok
+}
+
+// openConnectionLease registers this chat as a logical owner of the shared
+// helper. A bounded wait keeps a wedged helper from stalling startup.
+func (c *stdioClient) openConnectionLease(leaseID string) error {
+	if c == nil || strings.TrimSpace(leaseID) == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), connectionLeaseTimeout)
+	defer cancel()
+	if err := c.CallWithOptionsContext(ctx, &stdioCallOptions{}, "codex/connection/open", map[string]any{"leaseId": leaseID}, nil); err != nil {
+		return fmt.Errorf("open MCP connection lease: %w", err)
+	}
+	return nil
+}
+
+// releaseConnectionLease cancels this chat's pending requests before writing
+// the release. MCP cancellation has no acknowledgement: the helper owns any
+// handler still winding down once it receives both writes in this order.
+func (c *stdioClient) releaseConnectionLease(leaseID string) error {
+	if c == nil || strings.TrimSpace(leaseID) == "" {
+		return nil
+	}
+	c.cancelPendingForLease(leaseID)
+	ctx, cancel := context.WithTimeout(context.Background(), connectionLeaseTimeout)
+	defer cancel()
+	if err := c.CallWithOptionsContext(ctx, &stdioCallOptions{}, "codex/connection/release", map[string]any{"leaseId": leaseID}, nil); err != nil {
+		return fmt.Errorf("release MCP connection lease: %w", err)
+	}
+	return nil
+}
+
+// cancelPendingForLease writes cancellations for the chat's in-flight requests
+// only, so releasing one lease never disturbs another chat.
+func (c *stdioClient) cancelPendingForLease(leaseID string) {
+	if c == nil || strings.TrimSpace(leaseID) == "" {
+		return
+	}
+	c.mu.Lock()
+	owner := c.cmd
+	order := append([]int64(nil), c.pendingOrder...)
+	released := make([]*stdioPendingCall, 0, len(order))
+	for _, id := range order {
+		call := c.pending[id]
+		if call != nil && call.Options != nil && call.Options.Lease != nil && call.Options.Lease.ID() == leaseID {
+			released = append(released, c.removePendingLocked(id))
+		}
+	}
+	c.mu.Unlock()
+	for _, call := range released {
+		if call == nil {
+			continue
+		}
+		c.cancelRemoteRequest(owner, call.ID, errMCPConnectionLeaseReleased)
+		select {
+		case call.Result <- stdioCallResult{Error: errMCPConnectionLeaseReleased}:
+		default:
+		}
+	}
+}
+
+// mcpMethodUsesConnectionLease reports whether a request carries chat scope.
+func mcpMethodUsesConnectionLease(method string) bool {
+	return method == "tools/call" || method == "resources/read"
+}
+
+// errMCPConnectionLeaseReleased fails this chat's in-flight requests locally
+// after their cancellations are written, so a release never waits on a helper
+// that has already dropped the lease (Rust's RequestScope::cancel_and_wait).
+var errMCPConnectionLeaseReleased = errors.New("MCP connection lease released")
 
 func isMCPRemoteError(err error) bool {
 	var remoteErr *MCPRemoteError
@@ -414,6 +710,7 @@ func (c *stdioClient) ensureInitialized(ctx context.Context, options *stdioCallO
 func (c *stdioClient) startAndInitialize(ctx context.Context, options *stdioCallOptions) (err error) {
 	started := time.Now()
 	negotiatedModern := false
+	var configuredMode MCPProtocolMode
 	defer func() {
 		outcome := "failure"
 		if err == nil {
@@ -423,7 +720,7 @@ func (c *stdioClient) startAndInitialize(ctx context.Context, options *stdioCall
 				outcome = "legacy"
 			}
 		}
-		recordProtocolDiscoveryMetrics(mcpProtocolDiscoveryModeLabel(c.protocolMode), outcome, time.Since(started))
+		recordProtocolDiscoveryMetrics(mcpProtocolDiscoveryModeLabel(configuredMode), outcome, time.Since(started))
 	}()
 	defer func() {
 		// Start auth-change notifications only after initialization succeeds so
@@ -436,6 +733,58 @@ func (c *stdioClient) startAndInitialize(ctx context.Context, options *stdioCall
 	if err != nil {
 		return err
 	}
+	configuredMode = protocolMode
+	if err := c.startProcess(protocolMode, launchEnv, modernMCPMessageLimit(protocolMode)); err != nil {
+		return err
+	}
+	stderr := c.currentStderr()
+	discoveryFellBack := false
+	if protocolMode.usesModernMCPLifecycle() {
+		response, discoverErr := c.discoverModernProtocol(ctx, options)
+		switch {
+		case discoverErr == nil:
+			c.finishModernInitialization(response)
+			negotiatedModern = true
+			return nil
+		case isMCPAuthenticationFailure(discoverErr):
+			// Authentication failures are reported as such; neither the legacy
+			// handshake nor a fresh helper can recover them (Rust #57210).
+			_ = c.Close()
+			return decorateMCPStdioError(discoverErr, stderr)
+		case isMCPDiscoveryFallbackError(discoverErr):
+			// A well-behaved legacy helper answers the fallback initialize on the
+			// same pipe, so the working helper is kept (Rust #57210).
+			discoveryFellBack = true
+			c.mu.Lock()
+			c.protocolMode = MCPProtocolLegacy
+			c.mu.Unlock()
+		case shouldRestartLegacyHandshake(discoverErr):
+			// Failed or silent discovery leaves the helper unusable; only a fresh
+			// process can run the legacy handshake.
+			return c.restartLegacyHandshake(ctx, options, launchEnv)
+		default:
+			_ = c.Close()
+			return decorateMCPStdioError(discoverErr, stderr)
+		}
+	}
+
+	initErr := c.initializeLegacyHandshake(ctx, options)
+	if initErr != nil && discoveryFellBack && shouldRestartLegacyHandshake(initErr) {
+		// The legacy helper rejected the in-place initialize because discovery
+		// already consumed its first request.
+		return c.restartLegacyHandshake(ctx, options, launchEnv)
+	}
+	if initErr != nil {
+		_ = c.Close()
+		return decorateMCPStdioError(initErr, stderr)
+	}
+	return nil
+}
+
+// startProcess launches the local helper and installs its transport state. The
+// framing limit is chosen by the launch policy, so a restarted legacy handshake
+// keeps the bounded framing of the original discovery attempt.
+func (c *stdioClient) startProcess(protocolMode MCPProtocolMode, launchEnv map[string]string, messageLimit int64) error {
 	// Rust create_env_for_mcp_server: a local stdio server receives only the
 	// default variables, the config's env_vars, the custom CA settings, and the
 	// explicit env overrides - never the whole parent environment.
@@ -445,6 +794,7 @@ func (c *stdioClient) startAndInitialize(ctx context.Context, options *stdioCall
 	}
 	command := resolveMCPStdioCommand(c.config.Command, childEnv)
 	cmd := newMCPStdioCommand(command, c.config.Args...)
+	preserveMCPStdioArgv0(cmd, c.config.Command, command)
 	// Rust #43870: an escaped descendant can keep the stderr pipe open after the
 	// server exits. Drain queued diagnostics briefly, then let Wait close the
 	// pipes so descriptors are released.
@@ -477,54 +827,64 @@ func (c *stdioClient) startAndInitialize(ctx context.Context, options *stdioCall
 	c.stderr = stderr
 	c.started = true
 	c.initialized = false
+	c.negotiatedModern = false
+	c.startupInputReceived = false
 	c.capabilitiesMu.Lock()
 	c.serverCapabilities = nil
 	c.capabilitiesMu.Unlock()
 	c.protocolMode = protocolMode
+	c.messageLimit = messageLimit
 	c.pending = map[int64]*stdioPendingCall{}
 	c.pendingOrder = nil
 	// Cancellation state belongs to one connection attempt (Rust #44238).
 	c.elicitationCancellations.reset()
 	c.mu.Unlock()
 	go c.readLoop(cmd, stdout)
+	return nil
+}
 
-	if protocolMode == MCPProtocol20260728 {
-		response, err := c.doRequest(ctx, options, "server/discover", map[string]any{})
-		if err == nil && response != nil && response.Error != nil {
-			err = newMCPRemoteError("server/discover", response.Error)
-		}
-		if err == nil {
-			err = validateMCPModernDiscovery(response.Result)
-		}
-		if err == nil {
-			c.supportsSandboxStateMetaCapability = checkSandboxStateMetaCapability(response.Result)
-			negotiatedModern = true
-			c.mu.Lock()
-			c.initialized = true
-			c.capabilitiesMu.Lock()
-			c.serverCapabilities = mcpServerCapabilitiesFromInitializeResult(response.Result)
-			c.capabilitiesMu.Unlock()
-			c.mu.Unlock()
-			return nil
-		}
-		if !isMCPDiscoveryFallbackError(err) {
-			_ = c.Close()
-			return decorateMCPStdioError(err, stderr)
-		}
-		c.mu.Lock()
-		c.protocolMode = MCPProtocolLegacy
-		c.mu.Unlock()
-	}
-
-	response, err := c.doRequest(ctx, options, "initialize", mcpClientInitializeParamsWithFeatures(c.openAIForm, c.authChanges != nil, c.userVerification))
+// discoverModernProtocol probes `server/discover` with the probe budget Rust
+// reserves so a fresh handshake can still run afterwards.
+func (c *stdioClient) discoverModernProtocol(ctx context.Context, options *stdioCallOptions) (*stdioRPCResponse, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, mcpDiscoveryProbeTimeout(c.callTimeout()))
+	defer cancel()
+	response, err := c.doRequest(probeCtx, options, "server/discover", map[string]any{})
 	if err != nil {
-		_ = c.Close()
-		return decorateMCPStdioError(err, stderr)
+		return nil, err
 	}
 	if response != nil && response.Error != nil {
-		err := newMCPRemoteError("initialize", response.Error)
-		_ = c.Close()
-		return decorateMCPStdioError(err, stderr)
+		return nil, newMCPRemoteError("server/discover", response.Error)
+	}
+	if err := validateMCPModernDiscovery(response.Result); err != nil {
+		if isMCPLegacyInitializeResult(response.Result) {
+			// A helper that treats its first request as initialize has already
+			// spent its startup budget.
+			return nil, errMCPModernProtocolUnsupported
+		}
+		return nil, err
+	}
+	return response, nil
+}
+
+func (c *stdioClient) finishModernInitialization(response *stdioRPCResponse) {
+	c.supportsSandboxStateMetaCapability = checkSandboxStateMetaCapability(response.Result)
+	c.mu.Lock()
+	c.protocolMode = MCPProtocol20260728
+	c.negotiatedModern = true
+	c.initialized = true
+	c.capabilitiesMu.Lock()
+	c.serverCapabilities = mcpServerCapabilitiesFromInitializeResult(response.Result)
+	c.capabilitiesMu.Unlock()
+	c.mu.Unlock()
+}
+
+func (c *stdioClient) initializeLegacyHandshake(ctx context.Context, options *stdioCallOptions) error {
+	response, err := c.doRequest(ctx, options, "initialize", mcpClientInitializeParamsForFeatures(c.clientFeatures()))
+	if err != nil {
+		return err
+	}
+	if response != nil && response.Error != nil {
+		return newMCPRemoteError("initialize", response.Error)
 	}
 	c.supportsSandboxStateMetaCapability = checkSandboxStateMetaCapability(response.Result)
 	if err := c.writeFrame(map[string]any{
@@ -532,8 +892,7 @@ func (c *stdioClient) startAndInitialize(ctx context.Context, options *stdioCall
 		"method":  "notifications/initialized",
 		"params":  map[string]any{},
 	}); err != nil {
-		c.Close()
-		return decorateMCPStdioError(err, stderr)
+		return err
 	}
 	c.mu.Lock()
 	c.initialized = true
@@ -544,9 +903,124 @@ func (c *stdioClient) startAndInitialize(ctx context.Context, options *stdioCall
 	return nil
 }
 
+// restartLegacyHandshake replaces a helper whose discovery attempt could not be
+// completed, waiting for the previous process to release its resources before
+// starting the legacy handshake (Rust #57210).
+func (c *stdioClient) restartLegacyHandshake(ctx context.Context, options *stdioCallOptions, launchEnv map[string]string) error {
+	c.stopProcessForRestart()
+	if err := c.startProcess(MCPProtocolLegacy, launchEnv, c.messageLimitSnapshot()); err != nil {
+		_ = c.Close()
+		return err
+	}
+	stderr := c.currentStderr()
+	if err := c.initializeLegacyHandshake(ctx, options); err != nil {
+		_ = c.Close()
+		return decorateMCPStdioError(err, stderr)
+	}
+	return nil
+}
+
+// stopProcessForRestart tears down only the current helper so this client can
+// start its replacement.
+func (c *stdioClient) stopProcessForRestart() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.stopAuthChangeWatcherLocked()
+	cmd := c.cmd
+	process := c.process
+	stdin := c.stdin
+	c.cmd = nil
+	c.process = nil
+	c.stdin = nil
+	c.reader = nil
+	c.stderr = nil
+	c.started = false
+	c.initialized = false
+	c.mu.Unlock()
+	if stdin != nil {
+		_ = stdin.Close()
+	}
+	if cmd != nil && cmd.Process != nil {
+		if process != nil {
+			process.terminate(cmd)
+		} else {
+			_ = cmd.Process.Kill()
+		}
+		_ = waitMCPStdioCommand(cmd)
+	}
+	if process != nil {
+		process.release()
+	}
+}
+
+// mcpDiscoveryProbeTimeout mirrors Rust's local stdio discovery budget: three
+// seconds clamped between half and three quarters of the startup timeout, so a
+// fresh legacy handshake still has time to run.
+func mcpDiscoveryProbeTimeout(limit time.Duration) time.Duration {
+	const preferred = 3 * time.Second
+	if limit <= 0 {
+		return preferred
+	}
+	lower := limit / 2
+	upper := limit - limit/4
+	if preferred < lower {
+		return lower
+	}
+	if preferred > upper {
+		return upper
+	}
+	return preferred
+}
+
+// shouldRestartLegacyHandshake reports whether a discovery or fallback failure
+// left the helper unusable. Authentication failures never restart: a second
+// process cannot fix them, and callers must see the auth error (Rust #57210).
+func shouldRestartLegacyHandshake(err error) bool {
+	if err == nil || isMCPAuthenticationFailure(err) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.ErrClosedPipe) {
+		return true
+	}
+	// Rust's LegacyFallbackFailed arm restarts the helper when the fallback
+	// initialize fails with a broken pipe or connection reset (a helper that
+	// already exited while the client was writing). Windows surfaces that as
+	// ERROR_NO_DATA/ERROR_BROKEN_PIPE instead of Go's io.ErrClosedPipe.
+	if isMCPClosedTransportError(err) {
+		return true
+	}
+	if errors.Is(err, errMCPModernProtocolUnsupported) {
+		return false
+	}
+	var remoteErr *MCPRemoteError
+	return errors.As(err, &remoteErr) && remoteErr.Code != 0
+}
+
+// isMCPAuthenticationFailure recognizes failures that must not be retried
+// against a fresh helper.
+func isMCPAuthenticationFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errMCPAuthenticationRequired) || mcpErrAuthenticationRequired(err) {
+		return true
+	}
+	var remoteErr *MCPRemoteError
+	return errors.As(err, &remoteErr) && (remoteErr.Code == 401 || remoteErr.Code == 407)
+}
+
 func resolveMCPStdioCommand(command string, env map[string]string) string {
 	command = strings.TrimSpace(command)
-	if runtime.GOOS != "windows" || command == "" || hasPathSeparator(command) || filepath.Ext(command) != "" {
+	if command == "" || hasPathSeparator(command) {
+		return command
+	}
+	if runtime.GOOS != "windows" {
+		return resolveBareCommandInChildPath(command, env)
+	}
+	if filepath.Ext(command) != "" {
 		return command
 	}
 	pathValue := ""
@@ -571,6 +1045,59 @@ func resolveMCPStdioCommand(command string, env map[string]string) string {
 	return command
 }
 
+// resolveBareCommandInChildPath mirrors Rust #42192's macOS PATH search: a bare
+// command is looked up in the child's configured PATH rather than the parent's,
+// an empty entry means the current directory, and an unset PATH uses Apple's
+// default. A failed search keeps the bare spelling so the regular launcher and
+// its error behavior remain unchanged.
+func resolveBareCommandInChildPath(command string, env map[string]string) string {
+	pathValue := "/usr/bin:/bin"
+	if env != nil {
+		if value := firstNonEmptyMCP(env["PATH"], env["Path"], env["path"]); value != "" {
+			pathValue = value
+		}
+	}
+	for _, dir := range filepath.SplitList(pathValue) {
+		if dir == "" {
+			dir = "."
+		}
+		candidate := filepath.Join(dir, command)
+		info, err := os.Stat(candidate)
+		if err != nil || !isExecutableMCPCandidate(info) {
+			continue
+		}
+		return candidate
+	}
+	return command
+}
+
+// isExecutableMCPCandidate reports whether a PATH candidate can be executed.
+// Windows has no execute bit, so every regular file is a candidate there.
+func isExecutableMCPCandidate(info os.FileInfo) bool {
+	if info == nil || info.IsDir() {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return true
+	}
+	return info.Mode().Perm()&0o111 != 0
+}
+
+// preserveMCPStdioArgv0 keeps the configured spelling as argv[0] when a bare
+// command was resolved to an executor path (Rust #42192 preserves argv[0] and
+// script spelling). Windows builds the command line for a batch shim itself, so
+// only the POSIX launcher rewrites argv[0].
+func preserveMCPStdioArgv0(cmd *exec.Cmd, configured string, resolved string) {
+	if runtime.GOOS == "windows" || cmd == nil || len(cmd.Args) == 0 {
+		return
+	}
+	configured = strings.TrimSpace(configured)
+	if configured == "" || configured == resolved {
+		return
+	}
+	cmd.Args[0] = configured
+}
+
 func hasPathSeparator(value string) bool {
 	return strings.ContainsAny(value, `/\`)
 }
@@ -592,6 +1119,9 @@ func (c *stdioClient) callTimeout() time.Duration {
 func (c *stdioClient) serverCapabilitiesRaw() json.RawMessage {
 	if c == nil {
 		return nil
+	}
+	if delegate := c.legacyDelegate(); delegate != nil {
+		return delegate.serverCapabilitiesRaw()
 	}
 	c.capabilitiesMu.Lock()
 	defer c.capabilitiesMu.Unlock()
@@ -628,7 +1158,7 @@ func (c *stdioClient) isCurrentCommand(cmd *exec.Cmd) bool {
 func (c *stdioClient) readLoop(cmd *exec.Cmd, reader io.Reader) {
 	buffered := bufio.NewReader(reader)
 	for {
-		data, err := readMCPFrameWithLimit(buffered, modernMCPMessageLimit(c.protocolModeSnapshot()))
+		data, err := readMCPFrameWithLimit(buffered, c.messageLimitSnapshot())
 		if err != nil {
 			c.failTransportFor(cmd, err)
 			return
@@ -707,12 +1237,22 @@ func (c *stdioClient) toolsListRevision() uint64 {
 	if c == nil {
 		return 0
 	}
+	if delegate := c.legacyDelegate(); delegate != nil {
+		return delegate.toolsListRevision()
+	}
 	return c.toolListChanges.current()
 }
 
 // dispatchElicitationRequest answers a server elicitation on its own goroutine
 // so the read loop can keep observing cancellation notifications.
 func (c *stdioClient) dispatchElicitationRequest(ctx context.Context, serverName string, elicitation MCPElicitationHandler, method string, id json.RawMessage, params json.RawMessage) {
+	if !c.isInitialized() {
+		// Client input during startup binds this helper to the chat that
+		// answered it, so it must stay private (Rust #57211).
+		c.mu.Lock()
+		c.startupInputReceived = true
+		c.mu.Unlock()
+	}
 	cmd := c.currentCommand()
 	requestID := append(json.RawMessage(nil), id...)
 	go func() {
@@ -782,13 +1322,31 @@ func (c *stdioClient) isClosed() bool {
 // isInitialized reports whether the MCP handshake completed for this
 // connection (Rust #40636 startup_complete). A ready connection can be reused
 // across a startup-timeout config change; a pending startup cannot.
-func (c *stdioClient) isInitialized() bool {
+// isShareable reports whether another chat may join this connection: it must
+// have negotiated MCP 2026-07-28 and must not depend on the chat that started
+// it (Rust #57211).
+func (c *stdioClient) isShareable() bool {
 	if c == nil {
 		return false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.initialized
+	return !c.closed && c.initialized && c.delegate == nil && !c.startupInputReceived &&
+		c.protocolMode == MCPProtocol20260728
+}
+
+func (c *stdioClient) isInitialized() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	delegate := c.delegate
+	initialized := c.initialized
+	c.mu.Unlock()
+	if delegate != nil {
+		return delegate.isInitialized()
+	}
+	return initialized
 }
 
 func (c *stdioClient) closeLocked() error {
@@ -822,6 +1380,7 @@ func (c *stdioClient) closeLocked() error {
 	c.started = false
 	c.initialized = false
 	c.initializing = false
+	c.startupInputReceived = false
 	c.pending = map[int64]*stdioPendingCall{}
 	c.pendingOrder = nil
 	if c.initDone != nil {
@@ -1029,8 +1588,68 @@ func (c *stdioClient) protocolModeSnapshot() MCPProtocolMode {
 		return MCPProtocolLegacy
 	}
 	c.mu.Lock()
+	delegate := c.delegate
+	mode := c.protocolMode
+	c.mu.Unlock()
+	if delegate != nil {
+		return delegate.protocolModeSnapshot()
+	}
+	return mode
+}
+
+func (c *stdioClient) messageLimitSnapshot() int64 {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.protocolMode
+	return c.messageLimit
+}
+
+// legacyDelegate returns the retained legacy connection once an upgrade failed.
+func (c *stdioClient) legacyDelegate() *stdioClient {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.delegate
+}
+
+// tryLegacyFallback keeps a working legacy connection when the upgrade attempt
+// fails for the same account, except on authentication errors (Rust #57210).
+func (c *stdioClient) tryLegacyFallback(ctx context.Context, options *stdioCallOptions, err error) *stdioClient {
+	if c == nil || err == nil || isMCPAuthenticationFailure(err) {
+		return nil
+	}
+	c.mu.Lock()
+	fallback := c.legacyFallback
+	c.mu.Unlock()
+	if fallback == nil || fallback == c || fallback.isClosed() {
+		return nil
+	}
+	if fallbackErr := fallback.ensureInitialized(ctx, options); fallbackErr != nil {
+		return nil
+	}
+	c.mu.Lock()
+	if c.delegate == nil {
+		c.delegate = fallback
+	}
+	delegate := c.delegate
+	c.mu.Unlock()
+	return delegate
+}
+
+// takeLegacyFallback detaches the retained legacy connection for shutdown.
+func (c *stdioClient) takeLegacyFallback() *stdioClient {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	fallback := c.legacyFallback
+	c.legacyFallback = nil
+	return fallback
 }
 
 func mcpClientInitializeParams(openAIForm bool) map[string]any {
@@ -1042,9 +1661,17 @@ func mcpClientInitializeParamsWithAuthChange(openAIForm bool, advertiseAuthChang
 }
 
 func mcpClientInitializeParamsWithFeatures(openAIForm bool, advertiseAuthChange bool, userVerification bool) map[string]any {
+	return mcpClientInitializeParamsForFeatures(mcpClientFeatures{
+		OpenAIForm:       openAIForm,
+		AuthChange:       advertiseAuthChange,
+		UserVerification: userVerification,
+	})
+}
+
+func mcpClientInitializeParamsForFeatures(features mcpClientFeatures) map[string]any {
 	return map[string]any{
 		"protocolVersion": defaultMCPProtocol,
-		"capabilities":    mcpClientCapabilitiesWithFeatures(openAIForm, advertiseAuthChange, userVerification),
+		"capabilities":    mcpClientCapabilitiesForFeatures(features),
 		"clientInfo": map[string]string{
 			"name":    "codex-go",
 			"version": "go-port",
@@ -1202,18 +1829,19 @@ func mcpStdioLaunchConfig(config *ServerConfig) (MCPProtocolMode, map[string]str
 		return MCPProtocolLegacy, nil, false, nil
 	}
 	env := cloneStringMap(config.Env)
-	if config.ProtocolMode != MCPProtocol20260728 {
+	mode := config.ProtocolMode
+	declared, configured := env[mcpProtocolVersionEnvVar]
+	handshake, valid := mcpStdioHandshakeMode(mode, env)
+	if !valid {
+		return MCPProtocolLegacy, nil, true, fmt.Errorf("unsupported %s `%s` for stdio MCP server; expected `%s`", mcpProtocolVersionEnvVar, declared, modernMCPProtocol)
+	}
+	if configured {
+		delete(env, mcpProtocolVersionEnvVar)
+	}
+	if mode != MCPProtocol20260728 && mode != MCPProtocolDiscoverLocalStdio {
 		return MCPProtocolLegacy, env, false, nil
 	}
-	requestedVersion, configured := env[mcpProtocolVersionEnvVar]
-	delete(env, mcpProtocolVersionEnvVar)
-	if !configured {
-		return MCPProtocolLegacy, env, true, nil
-	}
-	if requestedVersion != modernMCPProtocol {
-		return MCPProtocolLegacy, nil, true, fmt.Errorf("unsupported %s `%s` for stdio MCP server; expected `%s`", mcpProtocolVersionEnvVar, requestedVersion, modernMCPProtocol)
-	}
-	return MCPProtocol20260728, env, true, nil
+	return handshake, env, true, nil
 }
 
 // mcpCustomCAEnvKeys mirrors Rust codex_network_proxy::CUSTOM_CA_ENV_KEYS: the

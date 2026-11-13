@@ -17,8 +17,8 @@ import (
 const (
 	DefaultApprovalReviewPreferredModel      = "codex-auto-review"
 	APIKeyApprovalReviewPreferredModel       = "gpt-5.6-luna"
-	DefaultMemoryExtractionPreferredModel    = "gpt-5.4-mini"
-	DefaultMemoryConsolidationPreferredModel = "gpt-5.4"
+	DefaultMemoryExtractionPreferredModel    = "gpt-6-luna"
+	DefaultMemoryConsolidationPreferredModel = "gpt-6.1-terra"
 )
 
 type ProviderCapabilities struct {
@@ -29,6 +29,11 @@ type ProviderCapabilities struct {
 	ExternalWebAccess bool
 	// RemoteCompaction is the provider's remote context-compaction protocol.
 	RemoteCompaction RemoteCompactionSupport
+	// CustomToolGrammar reports whether the provider accepts Responses custom
+	// tools whose format is a constrained grammar. OpenAI hosts that encoding;
+	// other Responses-compatible servers may only accept free-form text
+	// custom tools and reject the grammar form outright.
+	CustomToolGrammar bool
 }
 
 func DefaultProviderCapabilities() ProviderCapabilities {
@@ -37,6 +42,7 @@ func DefaultProviderCapabilities() ProviderCapabilities {
 		WebSearch:         true,
 		ExternalWebAccess: true,
 		RemoteCompaction:  RemoteCompactionUnsupported,
+		CustomToolGrammar: true,
 	}
 }
 
@@ -77,6 +83,10 @@ type RuntimeProvider interface {
 	SupportsAttestation() bool
 	AccountState() (ProviderAccountState, error)
 	APIProvider() (APIProvider, error)
+	// APIProviderAndAuth resolves routing and authentication from the same
+	// credential snapshot so credential-dependent defaults cannot disagree with
+	// the credentials that authenticate the request (Rust #57178).
+	APIProviderAndAuth() (APIProvider, AuthHeaders, error)
 	RuntimeBaseURL() (string, error)
 	APIAuth() (AuthHeaders, error)
 	// GatewayAuthManager returns the provider's gateway credential manager, or
@@ -94,6 +104,9 @@ func CreateRuntimeProviderForID(providerID string, info ProviderInfo, snapshot *
 	if (&info).IsAmazonBedrock() {
 		return &AmazonBedrockProvider{info: info, auth: snapshot}
 	}
+	if (&info).IsGCP() {
+		return &GCPProvider{info: info, auth: snapshot}
+	}
 	configured := &ConfiguredProvider{providerID: providerID, info: info, auth: snapshot}
 	if info.GatewayOAuth != nil {
 		// Rust constructs the gateway credential manager eagerly and reports
@@ -101,6 +114,8 @@ func CreateRuntimeProviderForID(providerID string, info ProviderInfo, snapshot *
 		// infallible.
 		if err := info.Validate(); err != nil {
 			configured.gatewayAuthErr = err
+		} else if info.GatewayOAuth.UsesCredentialExport() {
+			configured.gatewayExport = newGatewayCredentialExport(info.GatewayOAuth.CredentialExport)
 		} else if manager, err := sharedGatewayAuthManager(info.GatewayOAuth, auth.DefaultCodexHome()); err != nil {
 			configured.gatewayAuthErr = errors.New("failed to create provider OAuth HTTP client")
 		} else {
@@ -131,6 +146,9 @@ type ConfiguredProvider struct {
 	// gatewayAuthManager is the shared gateway credential manager, eagerly
 	// constructed when the provider configures `gateway_oauth` (Rust #46490).
 	gatewayAuthManager *auth.GatewayAuthManager
+	// gatewayExport supplies gateway tokens from a configured command instead
+	// of browser OAuth (Rust #59787).
+	gatewayExport *gatewayCredentialExport
 	// gatewayAuthErr reports why the gateway manager could not be built; it is
 	// surfaced when authentication is requested.
 	gatewayAuthErr error
@@ -155,6 +173,7 @@ func (p *ConfiguredProvider) Capabilities() ProviderCapabilities {
 		WebSearch:         true,
 		ExternalWebAccess: p.info.ExternalWebAccess(),
 		RemoteCompaction:  p.info.RemoteCompactionSupport(),
+		CustomToolGrammar: p.info.SupportsCustomToolGrammar(),
 	}
 }
 
@@ -227,16 +246,24 @@ func (p *ConfiguredProvider) AccountState() (ProviderAccountState, error) {
 }
 
 func (p *ConfiguredProvider) APIProvider() (APIProvider, error) {
-	authMode := ""
-	if p.auth != nil {
-		authMode = p.auth.BackendMode()
-	}
-	apiProvider, err := p.info.ToAPIProvider(authMode)
+	apiProvider, err := ResolveAPIProvider(p.info, p.auth)
 	if err != nil {
 		return APIProvider{}, err
 	}
 	apiProvider.ApplyManagedResidency(p.residency)
 	return apiProvider, nil
+}
+
+func (p *ConfiguredProvider) APIProviderAndAuth() (APIProvider, AuthHeaders, error) {
+	apiProvider, err := p.APIProvider()
+	if err != nil {
+		return APIProvider{}, AuthHeaders{}, err
+	}
+	authHeaders, err := p.APIAuth()
+	if err != nil {
+		return APIProvider{}, AuthHeaders{}, err
+	}
+	return apiProvider, authHeaders, nil
 }
 
 func (p *ConfiguredProvider) RuntimeBaseURL() (string, error) {
@@ -261,9 +288,75 @@ func (p *ConfiguredProvider) APIAuth() (AuthHeaders, error) {
 	if p.gatewayAuthErr != nil {
 		return AuthHeaders{}, p.gatewayAuthErr
 	}
+	var provider gatewayAuthTokenProvider = p.gatewayAuthManager
+	if p.gatewayExport != nil {
+		provider = p.gatewayExport
+	}
 	// Model discovery uses this same composed auth, so gateway tokens refresh
 	// once for inference and discovery alike.
-	return composeGatewayAuth(context.Background(), p.info.GatewayOAuth, p.gatewayAuthManager, primary)
+	return composeGatewayAuth(context.Background(), p.info.GatewayOAuth, provider, primary)
+}
+
+// gatewayAuthTokenFunc adapts a bare resolver into the gateway token provider
+// interface so a catalog can reuse the non-interactive resolution.
+type gatewayAuthTokenFunc func(ctx context.Context) (string, error)
+
+func (f gatewayAuthTokenFunc) ResolveAccessToken(ctx context.Context) (string, error) {
+	return f(ctx)
+}
+
+// catalogAuth mirrors Rust's without_interactive_login gateway manager (Rust
+// #60414): a model catalog refresh reuses an existing gateway session and never
+// starts an interactive login.
+func (p *ConfiguredProvider) catalogAuth() (AuthHeaders, error) {
+	primary, err := ResolveProviderAuth(p.auth, p.info)
+	if err != nil {
+		return AuthHeaders{}, err
+	}
+	if p.info.GatewayOAuth == nil {
+		return primary, nil
+	}
+	if err := p.info.Validate(); err != nil {
+		return AuthHeaders{}, err
+	}
+	if p.gatewayAuthErr != nil {
+		return AuthHeaders{}, p.gatewayAuthErr
+	}
+	var provider gatewayAuthTokenProvider = p.gatewayAuthManager
+	if p.gatewayExport != nil {
+		provider = p.gatewayExport
+	} else if p.gatewayAuthManager != nil {
+		provider = gatewayAuthTokenFunc(p.gatewayAuthManager.ResolveAccessTokenWithoutLogin)
+	}
+	return composeGatewayAuth(context.Background(), p.info.GatewayOAuth, provider, primary)
+}
+
+// RecoverFromUnauthorized refreshes provider-owned credentials after a 401
+// (Rust ModelProvider::recover_from_unauthorized, #59816). A gateway credential
+// export drops its cached token so the retry reruns the command; a browser
+// OAuth gateway owns no local retry and reports NotConfigured.
+func (p *ConfiguredProvider) RecoverFromUnauthorized(_ context.Context) (bool, error) {
+	if p == nil || p.gatewayExport == nil {
+		return false, nil
+	}
+	p.gatewayExport.invalidate()
+	return true, nil
+}
+
+// providerUnauthorizedRecoverer is the optional RuntimeProvider hook the
+// responses runner uses for a 401 retry.
+type providerUnauthorizedRecoverer interface {
+	RecoverFromUnauthorized(ctx context.Context) (bool, error)
+}
+
+// runtimeProviderUnauthorizedRecovery adapts a provider that owns credential
+// recovery into the runner's retry hook.
+func runtimeProviderUnauthorizedRecovery(provider RuntimeProvider) ProviderUnauthorizedRecoveryFunc {
+	recoverer, ok := provider.(providerUnauthorizedRecoverer)
+	if !ok {
+		return nil
+	}
+	return recoverer.RecoverFromUnauthorized
 }
 
 func (p *ConfiguredProvider) GatewayAuthManager() (*auth.GatewayAuthManager, error) {
@@ -278,7 +371,9 @@ func (p *ConfiguredProvider) GatewayAuthManager() (*auth.GatewayAuthManager, err
 
 func (p *ConfiguredProvider) ModelsManager(configCatalog *ModelsResponse) ModelsManager {
 	if configCatalog != nil {
-		return NewStaticModelsManager(*configCatalog)
+		// Rust #57770: a configured catalog is explicit configuration, so its
+		// entries may still name a reviewer for a custom gateway.
+		return NewStaticModelsManagerWithOrigin(*configCatalog, ModelOriginExplicitConfig)
 	}
 	if IsOSSProviderID(p.providerID) {
 		return NewStaticModelsManager(OSSModelCatalog(p.providerID))
@@ -287,18 +382,29 @@ func (p *ConfiguredProvider) ModelsManager(configCatalog *ModelsResponse) Models
 	if err != nil {
 		return NewStaticModelsManager(BundledModelsResponse())
 	}
+	// Rust #60414: a gateway-owned catalog reuses the existing session instead
+	// of starting an interactive login; every other provider keeps APIAuth.
 	authHeaders, err := p.APIAuth()
+	if err == nil && SupportsGatewayCatalog(p.info) {
+		authHeaders, err = p.catalogAuth()
+	}
 	if err != nil {
 		return NewStaticModelsManager(BundledModelsResponse())
 	}
 	supportsAPIKeyModels := p.info.SupportsAPIKeyModels()
 	// Rust `uses_api_key_auth`: an explicit provider key also opts the session
 	// into API-key discovery, even when the picker itself uses ChatGPT (#46561).
-	usesAPIKeyAuth := p.info.HasProviderAPIKey() || authUsesAPIKey(p.auth)
+	// Rust #60414 keeps an unrelated saved API key from gating a gateway-owned
+	// model catalog that shares the provider's origin.
+	usesAPIKeyAuth := UsesAPIKeyAuth(p.info, authUsesAPIKey(p.auth))
 	if supportsAPIKeyModels && usesAPIKeyAuth && strings.TrimSpace(p.info.ModelCatalogURL) == "" && strings.TrimSpace(p.info.BaseURL) == "" {
 		// Codex model metadata is served by the Codex backend, not the public
 		// /v1/models API (Rust #44392). Inference keeps its own base URL.
-		apiProvider.BaseURL = ChatGPTCodexBaseURL
+		discoveryURL, err := ModelDiscoveryBaseURL(p.info, p.auth)
+		if err != nil {
+			return NewStaticModelsManager(BundledModelsResponse())
+		}
+		apiProvider.BaseURL = discoveryURL
 	}
 	endpoint := NewHTTPModelsEndpoint(&apiProvider, &authHeaders, nil)
 	endpoint.CatalogURL = strings.TrimSpace(p.info.ModelCatalogURL)
@@ -395,6 +501,7 @@ func (p *AmazonBedrockProvider) Capabilities() ProviderCapabilities {
 		WebSearch:         p.info.Name == AmazonBedrockProviderName,
 		ExternalWebAccess: false,
 		RemoteCompaction:  RemoteCompactionV2,
+		CustomToolGrammar: false,
 	}
 }
 
@@ -456,6 +563,18 @@ func (p *AmazonBedrockProvider) APIProvider() (APIProvider, error) {
 		info.BaseURL = baseURL
 	}
 	return info.ToAPIProvider("")
+}
+
+func (p *AmazonBedrockProvider) APIProviderAndAuth() (APIProvider, AuthHeaders, error) {
+	apiProvider, err := p.APIProvider()
+	if err != nil {
+		return APIProvider{}, AuthHeaders{}, err
+	}
+	authHeaders, err := p.APIAuth()
+	if err != nil {
+		return APIProvider{}, AuthHeaders{}, err
+	}
+	return apiProvider, authHeaders, nil
 }
 
 func (p *AmazonBedrockProvider) RuntimeBaseURL() (string, error) {
@@ -587,21 +706,23 @@ func bedrockAccessKeysValue(value any) *auth.BedrockAccessKeysAuth {
 func (p *AmazonBedrockProvider) ModelsManager(configCatalog *ModelsResponse) ModelsManager {
 	if configCatalog != nil {
 		catalog := WithDefaultOnlyServiceTier(*configCatalog)
-		return NewStaticModelsManager(catalog)
+		// Rust #57770: config_model_catalog is ExplicitConfig, the provider's own
+		// Bedrock catalogs are Provider.
+		return NewStaticModelsManagerWithOrigin(catalog, ModelOriginExplicitConfig)
 	}
 	// Rust AmazonBedrockModelProvider::default_model_catalog (#38470): the
 	// Bedrock Runtime endpoint serves its own cross-region catalog, not the
 	// Mantle slugs.
 	if p.info.IsAmazonBedrockRuntime() {
-		return NewStaticModelsManager(AmazonBedrockRuntimeModelCatalog())
+		return NewStaticModelsManagerWithOrigin(AmazonBedrockRuntimeModelCatalog(), ModelOriginProvider)
 	}
 	// Rust #47657: only a GovCloud Mantle front door is restricted to the
 	// GPT-5.6 Terra/Luna catalog; every other Mantle endpoint keeps the full
 	// shared catalog.
 	if isAmazonBedrockGovCloudMantleEndpoint(p.info.BaseURL) {
-		return NewStaticModelsManager(AmazonBedrockGovCloudModelCatalog())
+		return NewStaticModelsManagerWithOrigin(AmazonBedrockGovCloudModelCatalog(), ModelOriginProvider)
 	}
-	return NewStaticModelsManager(AmazonBedrockModelCatalog())
+	return NewStaticModelsManagerWithOrigin(AmazonBedrockModelCatalog(), ModelOriginProvider)
 }
 
 // isAmazonBedrockGovCloudMantleEndpoint mirrors the GovCloud host test inside
@@ -773,4 +894,106 @@ func authHasChatGPTAccount(snapshot *auth.AuthDotJSON) bool {
 	default:
 		return false
 	}
+}
+
+// GCPProvider is the runtime provider for Google Cloud Vertex AI's
+// OpenAI-compatible endpoint (Rust model-provider gcp::GcpModelProvider).
+type GCPProvider struct {
+	info ProviderInfo
+	auth *auth.AuthDotJSON
+}
+
+func (p *GCPProvider) Info() ProviderInfo { return p.info }
+
+func (p *GCPProvider) Capabilities() ProviderCapabilities {
+	return ProviderCapabilities{
+		ImageGeneration:   false,
+		WebSearch:         false,
+		ExternalWebAccess: false,
+		RemoteCompaction:  RemoteCompactionV2,
+		CustomToolGrammar: false,
+	}
+}
+
+func (p *GCPProvider) ApprovalReviewPreferredModel() string { return "gpt-6-luna" }
+
+func (p *GCPProvider) MemoryExtractionPreferredModel() string { return "gpt-6-luna" }
+
+func (p *GCPProvider) MemoryConsolidationPreferredModel() string { return "gpt-6.1-terra" }
+
+func (p *GCPProvider) SupportsAttestation() bool { return false }
+
+func (p *GCPProvider) AccountState() (ProviderAccountState, error) {
+	return ProviderAccountState{
+		Account:            &ProviderAccount{Type: "gcp"},
+		RequiresOpenAIAuth: false,
+	}, nil
+}
+
+func (p *GCPProvider) RuntimeBaseURL() (string, error) {
+	if baseURL := strings.TrimSpace(p.info.BaseURL); baseURL != "" {
+		return baseURL, nil
+	}
+	return GCPRuntimeBaseURL(&p.info, os.Getenv(GCPProjectEnvVar), os.Getenv(GCPLocationEnvVar))
+}
+
+func (p *GCPProvider) APIProvider() (APIProvider, error) {
+	baseURL, err := p.RuntimeBaseURL()
+	if err != nil {
+		return APIProvider{}, err
+	}
+	info := p.info
+	info.BaseURL = baseURL
+	return info.ToAPIProvider("")
+}
+
+func (p *GCPProvider) APIProviderAndAuth() (APIProvider, AuthHeaders, error) {
+	apiProvider, err := p.APIProvider()
+	if err != nil {
+		return APIProvider{}, AuthHeaders{}, err
+	}
+	authHeaders, err := p.APIAuth()
+	if err != nil {
+		return APIProvider{}, AuthHeaders{}, err
+	}
+	return apiProvider, authHeaders, nil
+}
+
+func (p *GCPProvider) APIAuth() (AuthHeaders, error) {
+	headers, err := ResolveProviderAuth(p.auth, p.info)
+	if err != nil || len(headers.Headers) == 0 {
+		return AuthHeaders{}, errors.New("Google Cloud credentials are unavailable or expired. Run `gcloud auth application-default login` to reauthenticate")
+	}
+	return headers, nil
+}
+
+func (p *GCPProvider) GatewayAuthManager() (*auth.GatewayAuthManager, error) {
+	return nil, nil
+}
+
+func (p *GCPProvider) ModelsManager(configCatalog *ModelsResponse) ModelsManager {
+	catalog := BundledModelsResponse()
+	// Rust GcpModelProvider::models_manager (#57770): a configured catalog is
+	// ExplicitConfig, the provider's own Vertex catalog is Provider.
+	origin := ModelOriginProvider
+	if configCatalog != nil {
+		catalog = *configCatalog
+		origin = ModelOriginExplicitConfig
+	}
+	allowed := map[string]struct{}{
+		"gpt-6-astra": {}, "gpt-6-luna": {}, "gpt-6.1-sol": {}, "gpt-6.1-terra": {},
+	}
+	filtered := ModelsResponse{Models: make([]ModelInfo, 0, len(catalog.Models))}
+	for _, item := range catalog.Models {
+		if _, ok := allowed[item.Slug]; !ok {
+			continue
+		}
+		// Vertex supports function tools, namespaces, and client-side tool
+		// search, but not Responses Lite or custom tools.
+		item.UseResponsesLite = false
+		item.ToolMode = ToolModeDirect
+		item.ApplyPatchToolType = ""
+		filtered.Models = append(filtered.Models, item)
+	}
+	return NewStaticModelsManagerWithOrigin(filtered, origin)
 }

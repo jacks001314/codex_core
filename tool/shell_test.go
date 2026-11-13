@@ -457,17 +457,16 @@ func TestBuildShellRequestRequireEscalatedPreapprovalUsesFullAccessProfile(t *te
 func TestBuildShellRequestCarriesWindowsSandboxRuntimeOptions(t *testing.T) {
 	profile := sandbox.WorkspaceWritePermissionProfile()
 	req, err := BuildShellRequest(&ExecCommandArgs{Cmd: "echo ok"}, &Shell{Type: ShellBash, Path: "/bin/sh"}, ShellValidationOptions{
-		CWD:                          t.TempDir(),
-		PermissionProfileID:          sandbox.BuiltInPermissionProfileWorkspace,
-		PermissionProfile:            &profile,
-		WindowsSandboxLevel:          sandbox.WindowsSandboxElevated,
-		WindowsSandboxPrivateDesktop: true,
+		CWD:                 t.TempDir(),
+		PermissionProfileID: sandbox.BuiltInPermissionProfileWorkspace,
+		PermissionProfile:   &profile,
+		WindowsSandboxLevel: sandbox.WindowsSandboxElevated,
 	})
 	if err != nil {
 		t.Fatalf("BuildShellRequest() error = %v", err)
 	}
-	if req.WindowsSandboxLevel != sandbox.WindowsSandboxElevated || !req.WindowsSandboxPrivateDesktop {
-		t.Fatalf("Windows sandbox options = %q/%t", req.WindowsSandboxLevel, req.WindowsSandboxPrivateDesktop)
+	if req.WindowsSandboxLevel != sandbox.WindowsSandboxElevated {
+		t.Fatalf("Windows sandbox level = %q", req.WindowsSandboxLevel)
 	}
 }
 

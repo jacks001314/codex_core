@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -132,19 +133,26 @@ func TestGatewayTokenResponseLikeRust(t *testing.T) {
 	lifetime := uint64(3600)
 	stored, err := gatewayTokenResponse{
 		AccessToken: "token-1", TokenType: "Bearer", ExpiresIn: &lifetime, RefreshToken: "refresh-2",
-	}.intoStored("refresh-1")
+	}.intoStored(&gatewayStoredToken{RefreshToken: "refresh-1", AuthorizationID: "grant-1"})
 	if err != nil {
 		t.Fatalf("intoStored() error = %v", err)
 	}
 	if stored.AccessToken != "token-1" || stored.RefreshToken != "refresh-2" || stored.ExpiresAt == nil {
 		t.Fatalf("stored = %#v", stored)
 	}
+	if stored.AuthorizationID != "grant-1" {
+		t.Fatalf("refresh must preserve the authorization id, got %q", stored.AuthorizationID)
+	}
 	if !gatewayTokenIsUsable(stored) {
 		t.Fatal("a fresh token must be usable")
 	}
-	kept, err := gatewayTokenResponse{AccessToken: "token-2"}.intoStored("refresh-1")
+	kept, err := gatewayTokenResponse{AccessToken: "token-2"}.intoStored(&gatewayStoredToken{RefreshToken: "refresh-1", AuthorizationID: "grant-1"})
 	if err != nil || kept.RefreshToken != "refresh-1" || kept.ExpiresAt != nil {
 		t.Fatalf("missing rotation = %#v, %v", kept, err)
+	}
+	fresh, err := gatewayTokenResponse{AccessToken: "token-3"}.intoStored(nil)
+	if err != nil || fresh.AuthorizationID == "" {
+		t.Fatalf("a fresh grant must create an authorization id: %#v, %v", fresh, err)
 	}
 	expired := time.Now().Unix() - 1
 	if gatewayTokenIsUsable(gatewayStoredToken{AccessToken: "old", ExpiresAt: &expired}) {
@@ -158,7 +166,7 @@ func TestGatewayTokenResponseLikeRust(t *testing.T) {
 		"wrong type":           {AccessToken: "t", TokenType: "mac"},
 		"zero lifetime":        {AccessToken: "t", ExpiresIn: ptrUint64(0)},
 	} {
-		if _, err := response.intoStored(""); err == nil {
+		if _, err := response.intoStored(nil); err == nil {
 			t.Fatalf("%s must be rejected", name)
 		}
 	}
@@ -329,6 +337,42 @@ func TestGatewayAuthManagerReauthorizesAfterRefreshRejectionLikeRust(t *testing.
 	}
 }
 
+// Mirrors Rust `without_interactive_login`: background resolution reports
+// ErrGatewayLoginRequired instead of opening a browser, while usable stored
+// credentials still resolve normally.
+func TestGatewayAuthManagerWithoutInteractiveLoginLikeRust(t *testing.T) {
+	home := t.TempDir()
+	store := newGatewayTestStore()
+	config := GatewayAuthConfig{
+		AuthorizationURL: "https://issuer.example.com/authorize",
+		TokenURL:         "https://issuer.example.com/token",
+		ClientID:         "client-1",
+	}
+	manager := NewGatewayAuthManager(config, home, nil, store)
+	opened := 0
+	manager.openBrowser = func(string) error {
+		opened++
+		return nil
+	}
+	if _, err := manager.ResolveAccessTokenWithoutLogin(context.Background()); !errors.Is(err, ErrGatewayLoginRequired) {
+		t.Fatalf("ResolveAccessTokenWithoutLogin() error = %v, want ErrGatewayLoginRequired", err)
+	}
+	if opened != 0 {
+		t.Fatalf("background resolution opened %d browsers, want 0", opened)
+	}
+
+	expires := time.Now().Add(time.Hour).Unix()
+	payload, _ := json.Marshal(gatewayStoredToken{AccessToken: "stored-token", RefreshToken: "stored-refresh", ExpiresAt: &expires})
+	if err := manager.storage.save(gatewayCredentialID(home, config), string(payload)); err != nil {
+		t.Fatalf("save() error = %v", err)
+	}
+	fresh := NewGatewayAuthManager(config, home, nil, store)
+	fresh.openBrowser = manager.openBrowser
+	token, err := fresh.ResolveAccessTokenWithoutLogin(context.Background())
+	if err != nil || token != "stored-token" {
+		t.Fatalf("ResolveAccessTokenWithoutLogin(stored) = %q, %v", token, err)
+	}
+}
 func ptrUint16(value uint16) *uint16 { return &value }
 
 func ptrInt64(value int64) *int64    { return &value }

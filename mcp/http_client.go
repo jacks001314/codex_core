@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"codex_core/codexapi"
 	"codex_core/model"
 
 	"golang.org/x/oauth2"
@@ -29,6 +30,11 @@ const (
 )
 
 var mcpStreamableHTTPRetryDelays = []time.Duration{250 * time.Millisecond, time.Second}
+
+// errMCPToolContinuationNotRestarted reports that session recovery refused to
+// replay a tool call whose continuation had already submitted a signed
+// verification proof (Rust #44346).
+var errMCPToolContinuationNotRestarted = errors.New("MCP tool continuation failed; the tool was not restarted")
 
 // tokenHasExpired reports whether a stored access token is past its expiry
 // boundary. Rust #43947 uses the real expiry here (not the refresh-skew buffer)
@@ -155,17 +161,21 @@ type httpClient struct {
 	initialized    bool
 	// startupComplete mirrors `initialized` without the mutex so connection
 	// reuse can distinguish a ready client from a pending startup (Rust #40636).
-	startupComplete                    atomic.Bool
-	sessionID                          string
-	serverName                         string
-	threadID                           string
-	turnID                             string
-	itemID                             string
-	roots                              []MCPRoot
-	elicitation                        MCPElicitationHandler
-	progress                           MCPProgressHandler
-	openAIForm                         bool
-	userVerification                   bool
+	startupComplete  atomic.Bool
+	sessionID        string
+	serverName       string
+	threadID         string
+	turnID           string
+	itemID           string
+	roots            []MCPRoot
+	elicitation      MCPElicitationHandler
+	progress         MCPProgressHandler
+	openAIForm       bool
+	userVerification bool
+	emaAuth          bool
+	// networkPolicy advertises the experimental call-scoped network policy
+	// capability to a trusted ChatGPT origin (Rust #56278).
+	networkPolicy                      bool
 	protocolMode                       MCPProtocolMode
 	negotiatedProtocolVersion          string
 	retrySleep                         func(time.Duration)
@@ -179,6 +189,22 @@ type httpClient struct {
 	// connection, so a catalog captured before one is never reused
 	// (Rust #54656).
 	toolListChanges mcpToolListRevision
+	// catalog is the tool catalog this exact connection has published. It is
+	// created lazily so callers without a catalog keep working (Rust #43031).
+	catalogOnce sync.Once
+	catalog     *clientToolCatalog
+}
+
+// toolCatalog returns the catalog owned by this connection, creating an empty
+// one on first use.
+func (c *httpClient) toolCatalog() *clientToolCatalog {
+	if c == nil {
+		return nil
+	}
+	c.catalogOnce.Do(func() {
+		c.catalog = newClientToolCatalog(nil)
+	})
+	return c.catalog
 }
 
 type httpClientCallOptions struct {
@@ -189,6 +215,10 @@ type httpClientCallOptions struct {
 	Roots       []MCPRoot
 	Elicitation MCPElicitationHandler
 	Progress    MCPProgressHandler
+	// MetaForSession rebuilds the request _meta against the session that sends
+	// each attempt, so a recovery retry resolves policy metadata against the
+	// capabilities it negotiated (Rust #56278).
+	MetaForSession func(capabilities json.RawMessage) (any, error)
 }
 
 type mcpOAuthHeaderTransport struct {
@@ -244,10 +274,14 @@ func listMCPHTTPInventory(config *ServerConfig) (*stdioInventory, error) {
 }
 
 func listMCPHTTPInventoryWithClient(client *httpClient) (*stdioInventory, error) {
-	return listMCPHTTPInventoryWithOptions(client, "", "", nil)
+	return listMCPHTTPInventoryWithOptions(client, "", "", nil, false)
 }
 
-func listMCPHTTPInventoryWithOptions(client *httpClient, serverName string, threadID string, roots []MCPRoot) (*stdioInventory, error) {
+// listMCPHTTPInventoryWithOptions lists one remote server's catalog. When
+// skipResourceTemplates is set the template listing is not requested and the
+// reported template list stays empty (Rust #57861: hosted Apps always answers
+// `resources/templates/list` with an empty list).
+func listMCPHTTPInventoryWithOptions(client *httpClient, serverName string, threadID string, roots []MCPRoot, skipResourceTemplates bool) (*stdioInventory, error) {
 	result := &stdioInventory{}
 	options := &httpClientCallOptions{ServerName: serverName, ThreadID: threadID, Roots: roots}
 	tools, toolListMeta, err := listMCPHTTPTools(client, options)
@@ -255,6 +289,7 @@ func listMCPHTTPInventoryWithOptions(client *httpClient, serverName string, thre
 	// triggers, so read them after the attempt even when discovery failed.
 	if client != nil {
 		result.ServerCapabilities = client.serverCapabilitiesRaw()
+		result.NegotiatedModern = client.effectiveProtocolVersion() == modernMCPProtocol
 	}
 	if err != nil {
 		return result, err
@@ -265,14 +300,20 @@ func listMCPHTTPInventoryWithOptions(client *httpClient, serverName string, thre
 	if resources, err := listMCPHTTPResources(client, options); err == nil {
 		result.Resources = resources
 	}
-	if templates, err := listMCPHTTPResourceTemplates(client, options); err == nil {
-		result.ResourceTemplates = templates
+	if !skipResourceTemplates {
+		if templates, err := listMCPHTTPResourceTemplates(client, options); err == nil {
+			result.ResourceTemplates = templates
+		}
 	}
 	return result, nil
 }
 
 func listMCPHTTPTools(client *httpClient, options *httpClientCallOptions) ([]MCPToolInfo, json.RawMessage, error) {
-	return collectMCPPaginatedWithLimitAndMeta(context.Background(), "tools/list", mcpPaginationTimeout(client.config), mcpCatalogItemLimit(client.config), func(ctx context.Context, cursor *string) ([]MCPToolInfo, json.RawMessage, *string, error) {
+	return listMCPHTTPToolsWithContext(context.Background(), client, options)
+}
+
+func listMCPHTTPToolsWithContext(ctx context.Context, client *httpClient, options *httpClientCallOptions) ([]MCPToolInfo, json.RawMessage, error) {
+	return collectMCPPaginatedWithLimitAndMeta(ctx, "tools/list", mcpPaginationTimeout(client.config), mcpCatalogItemLimit(client.config), func(ctx context.Context, cursor *string) ([]MCPToolInfo, json.RawMessage, *string, error) {
 		var response struct {
 			Tools      []MCPToolInfo   `json:"tools"`
 			NextCursor *string         `json:"nextCursor,omitempty"`
@@ -313,20 +354,21 @@ func listMCPHTTPResourceTemplates(client *httpClient, options *httpClientCallOpt
 
 func callMCPHTTPTool(config *ServerConfig, serverName string, threadID string, elicitation MCPElicitationHandler, progress MCPProgressHandler, tool string, arguments any, meta any) (*MCPToolCallResponse, error) {
 	client := newMCPHTTPClient(config)
-	return callMCPHTTPToolWithClient(context.Background(), client, serverName, threadID, "", "", nil, elicitation, progress, tool, arguments, meta)
+	return callMCPHTTPToolWithClient(context.Background(), client, serverName, threadID, "", "", nil, elicitation, progress, tool, arguments, meta, nil)
 }
 
-func callMCPHTTPToolWithClient(ctx context.Context, client *httpClient, serverName string, threadID string, turnID string, itemID string, roots []MCPRoot, elicitation MCPElicitationHandler, progress MCPProgressHandler, tool string, arguments any, meta any) (*MCPToolCallResponse, error) {
+func callMCPHTTPToolWithClient(ctx context.Context, client *httpClient, serverName string, threadID string, turnID string, itemID string, roots []MCPRoot, elicitation MCPElicitationHandler, progress MCPProgressHandler, tool string, arguments any, meta any, metaForSession func(json.RawMessage) (any, error)) (*MCPToolCallResponse, error) {
 	params := mcpToolCallParams(client.config, tool, arguments, meta)
 	var response MCPToolCallResponse
 	if err := client.CallWithOptionsContext(ctx, &httpClientCallOptions{
-		ServerName:  serverName,
-		ThreadID:    threadID,
-		TurnID:      turnID,
-		ItemID:      itemID,
-		Roots:       roots,
-		Elicitation: elicitation,
-		Progress:    progress,
+		ServerName:     serverName,
+		ThreadID:       threadID,
+		TurnID:         turnID,
+		ItemID:         itemID,
+		Roots:          roots,
+		Elicitation:    elicitation,
+		Progress:       progress,
+		MetaForSession: metaForSession,
 	}, "tools/call", params, &response); err != nil {
 		return nil, withMCPRequestErrorCode(err)
 	}
@@ -335,19 +377,28 @@ func callMCPHTTPToolWithClient(ctx context.Context, client *httpClient, serverNa
 
 func readMCPHTTPResource(config *ServerConfig, serverName string, elicitation MCPElicitationHandler, progress MCPProgressHandler, params *MCPResourceReadParams) (*MCPResourceReadResponse, error) {
 	client := newMCPHTTPClient(config)
-	return readMCPHTTPResourceWithClient(client, serverName, nil, elicitation, progress, params)
+	return readMCPHTTPResourceWithClient(nil, client, serverName, nil, elicitation, progress, params)
 }
 
-func readMCPHTTPResourceWithClient(client *httpClient, serverName string, roots []MCPRoot, elicitation MCPElicitationHandler, progress MCPProgressHandler, params *MCPResourceReadParams) (*MCPResourceReadResponse, error) {
+// readMCPHTTPResourceWithClient performs the resources/read call. ctx carries
+// the caller's request context so the outbound request keeps its W3C trace
+// context even when no tracing layer is installed (Rust #60506).
+func readMCPHTTPResourceWithClient(ctx context.Context, client *httpClient, serverName string, roots []MCPRoot, elicitation MCPElicitationHandler, progress MCPProgressHandler, params *MCPResourceReadParams) (*MCPResourceReadResponse, error) {
 	if params == nil || strings.TrimSpace(params.URI) == "" {
 		return nil, invalidMCPRequest("server and uri are required")
+	}
+	if ctx == nil {
+		ctx = params.Context
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	threadID := ""
 	if params != nil && params.ThreadID != nil {
 		threadID = strings.TrimSpace(*params.ThreadID)
 	}
 	var response MCPResourceReadResponse
-	if err := client.CallWithOptions(&httpClientCallOptions{
+	if err := client.CallWithOptionsContext(ctx, &httpClientCallOptions{
 		ServerName:  serverName,
 		ThreadID:    threadID,
 		Roots:       roots,
@@ -372,6 +423,16 @@ func newMCPHTTPClientWithShared(config *ServerConfig, openAIForm bool, shared HT
 }
 
 func newMCPHTTPClientWithFeatures(config *ServerConfig, openAIForm bool, userVerification bool, shared HTTPDoer) *httpClient {
+	features := mcpClientFeatures{OpenAIForm: openAIForm, UserVerification: userVerification}
+	if config != nil && config.EMAAuthExtension {
+		features.EMAAuth = true
+	}
+	return newMCPHTTPClientWithCapabilities(config, features, shared)
+}
+
+// newMCPHTTPClientWithCapabilities builds a client that advertises exactly the
+// capabilities projected for its server.
+func newMCPHTTPClientWithCapabilities(config *ServerConfig, features mcpClientFeatures, shared HTTPDoer) *httpClient {
 	client := mcpHTTPClientFromShared(shared, mcpClientTimeout(config))
 	if config != nil {
 		if policy := mcpRedirectPolicy(config.URL); policy != nil {
@@ -389,14 +450,32 @@ func newMCPHTTPClientWithFeatures(config *ServerConfig, openAIForm bool, userVer
 	protocolMode := MCPProtocolLegacy
 	if config != nil {
 		protocolMode = config.ProtocolMode
+		if config.EMAAuthExtension {
+			protocolMode = MCPProtocol20260728
+		}
 	}
 	return &httpClient{
 		config:           config,
 		client:           mcpHTTPClientWithDefaultHeaders(client, config),
-		openAIForm:       openAIForm,
-		userVerification: userVerification,
+		openAIForm:       features.OpenAIForm,
+		userVerification: features.UserVerification,
+		emaAuth:          features.EMAAuth,
+		networkPolicy:    features.NetworkPolicy,
 		protocolMode:     protocolMode,
 		retrySleep:       time.Sleep,
+	}
+}
+
+// clientFeatures describes the capabilities this connection advertised.
+func (c *httpClient) clientFeatures() mcpClientFeatures {
+	if c == nil {
+		return mcpClientFeatures{}
+	}
+	return mcpClientFeatures{
+		OpenAIForm:       c.openAIForm,
+		UserVerification: c.userVerification,
+		EMAAuth:          c.emaAuth,
+		NetworkPolicy:    c.networkPolicy,
 	}
 }
 
@@ -618,14 +697,22 @@ func (c *httpClient) CallWithOptionsContext(ctx context.Context, options *httpCl
 			return err
 		}
 	}
-	err := c.callWithTransientRetries(ctx, method, params, out)
+	submittedProof, err := c.callWithTransientRetries(ctx, options, method, params, out)
 	if err == nil || !isMCPHTTPSessionInvalidError(err) || strings.TrimSpace(c.sessionID) == "" {
 		return err
+	}
+	if submittedProof {
+		// Session recovery must not replay the original operation after a
+		// continuation already consumed a signed verification proof
+		// (Rust #44346). Authentication challenges never reach this branch:
+		// a 401 is not a session-invalid status.
+		return errMCPToolContinuationNotRestarted
 	}
 	if resetErr := c.reinitialize(ctx); resetErr != nil {
 		return resetErr
 	}
-	return c.callWithTransientRetries(ctx, method, params, out)
+	_, err = c.callWithTransientRetries(ctx, options, method, params, out)
+	return err
 }
 
 // CallStream performs a long-lived streamable HTTP request (Rust
@@ -699,7 +786,7 @@ func (c *httpClient) initialize(ctx context.Context) (string, error) {
 	c.capabilitiesMu.Lock()
 	c.serverCapabilities = nil
 	c.capabilitiesMu.Unlock()
-	response, requestID, err := c.doRPC(ctx, "initialize", mcpClientInitializeParamsWithFeatures(c.openAIForm, false, c.userVerification), "", true)
+	response, requestID, err := c.doRPC(ctx, "initialize", mcpClientInitializeParamsForFeatures(c.clientFeatures()), "", true)
 	if err != nil {
 		recordProtocolDiscoveryMetrics(mcpProtocolDiscoveryModeLabel(c.protocolMode), "failure", time.Since(started))
 		return "", err
@@ -872,19 +959,40 @@ func (c *httpClient) handshakeRequestTimeout(method string) time.Duration {
 	return remaining
 }
 
-func (c *httpClient) callWithTransientRetries(ctx context.Context, method string, params any, out any) error {
+func (c *httpClient) callWithTransientRetries(ctx context.Context, options *httpClientCallOptions, method string, params any, out any) (bool, error) {
+	submittedProof := false
 	for attempt := 0; ; attempt++ {
-		err := c.callWithSession(ctx, method, params, out, c.sessionID)
+		attemptParams, err := c.paramsWithSessionMeta(options, params)
+		if err != nil {
+			return submittedProof, err
+		}
+		var proof bool
+		proof, err = c.callWithSession(ctx, method, attemptParams, out, c.sessionID)
+		submittedProof = submittedProof || proof
 		if err == nil {
-			return nil
+			return submittedProof, nil
 		}
 		if method != "tools/list" || attempt >= len(mcpStreamableHTTPRetryDelays) || !isRetryableMCPStreamableHTTPError(err) {
-			return err
+			return submittedProof, err
 		}
 		if err := c.sleepBeforeRetryContext(ctx, mcpStreamableHTTPRetryDelays[attempt]); err != nil {
-			return err
+			return submittedProof, err
 		}
 	}
+}
+
+// paramsWithSessionMeta replaces the request _meta with the value resolved for
+// the session that sends this attempt. Resolution failures surface before the
+// request is sent, so a local policy failure never reaches the server.
+func (c *httpClient) paramsWithSessionMeta(options *httpClientCallOptions, params any) (any, error) {
+	if options == nil || options.MetaForSession == nil {
+		return params, nil
+	}
+	meta, err := options.MetaForSession(c.serverCapabilitiesRaw())
+	if err != nil {
+		return nil, err
+	}
+	return mcpParamsWithReplacedMeta(params, meta), nil
 }
 
 func (c *httpClient) sleepBeforeRetry(delay time.Duration) {
@@ -906,40 +1014,41 @@ func (c *httpClient) sleepBeforeRetryContext(ctx context.Context, delay time.Dur
 	}
 }
 
-func (c *httpClient) callWithSession(ctx context.Context, method string, params any, out any, sessionID string) error {
+func (c *httpClient) callWithSession(ctx context.Context, method string, params any, out any, sessionID string) (bool, error) {
 	baseParams := params
 	requestParams := params
+	continuation := &mcpContinuationState{}
 	for round := 0; ; round++ {
 		response, requestID, err := c.doRPC(ctx, method, requestParams, sessionID, true)
 		if err != nil {
-			return err
+			return continuation.submittedVerificationProof, err
 		}
 		rpc, readErr := c.readRPCResponse(ctx, response, requestID, sessionID)
 		_ = response.Body.Close()
 		if readErr != nil {
-			return readErr
+			return continuation.submittedVerificationProof, readErr
 		}
 		if rpc.Error != nil {
-			return newMCPRemoteError(method, rpc.Error)
+			return continuation.submittedVerificationProof, newMCPRemoteError(method, rpc.Error)
 		}
 		if c.protocolMode == MCPProtocol20260728 {
 			requestCtx := contextWithMCPClientContextAndRoots(ctx, c.threadID, c.turnID, c.itemID, c.roots)
-			nextParams, inputRequired, err := nextMCP2026RequestParams(requestCtx, c.serverName, c.elicitation, baseParams, rpc.Result)
+			nextParams, inputRequired, err := nextMCP2026RequestParams(requestCtx, c.serverName, c.elicitation, c.clientFeatures(), continuation, baseParams, rpc.Result)
 			if err != nil {
-				return err
+				return continuation.submittedVerificationProof, err
 			}
 			if inputRequired {
 				if round >= maxMCPInputRequiredRounds {
-					return fmt.Errorf("MCP %s exceeded %d input-required rounds", method, maxMCPInputRequiredRounds)
+					return continuation.submittedVerificationProof, fmt.Errorf("MCP %s exceeded %d input-required rounds", method, maxMCPInputRequiredRounds)
 				}
 				requestParams = nextParams
 				continue
 			}
 		}
 		if out == nil || rpc.Result == nil {
-			return nil
+			return continuation.submittedVerificationProof, nil
 		}
-		return json.Unmarshal(*rpc.Result, out)
+		return continuation.submittedVerificationProof, json.Unmarshal(*rpc.Result, out)
 	}
 }
 
@@ -951,7 +1060,7 @@ func (c *httpClient) doRPC(ctx context.Context, method string, params any, sessi
 	if endpoint == "" {
 		return nil, 0, errors.New("HTTP MCP URL is required")
 	}
-	params = mcpParamsWithProtocolMetadataAndFeatures(params, c.protocolMode, c.openAIForm, false, c.userVerification)
+	params = mcpParamsWithProtocolMetadataForFeatures(params, c.protocolMode, c.clientFeatures())
 	payload := map[string]any{
 		"jsonrpc": "2.0",
 		"method":  method,
@@ -1047,6 +1156,22 @@ func isMCPHTTPSessionInvalidError(err error) bool {
 func isRetryableMCPStreamableHTTPError(err error) bool {
 	if err == nil {
 		return false
+	}
+	// Rust #55691: a request held before dispatch (enterprise policy updating or
+	// unavailable) is never replayed by the transport; the caller retries after
+	// the policy is applied.
+	var notSent *MCPEMARequestNotSentError
+	if errors.As(err, &notSent) {
+		return false
+	}
+	// Rust #55607: transient auth failures (for example a temporarily
+	// unavailable managed credential) are retryable, while auth build errors and
+	// network policy denials are terminal.
+	if errors.Is(err, codexapi.ErrAuthBuild) {
+		return false
+	}
+	if errors.Is(err, codexapi.ErrAuthTransient) {
+		return true
 	}
 	var statusErr *mcpHTTPStatusError
 	if errors.As(err, &statusErr) {

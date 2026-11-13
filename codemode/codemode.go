@@ -121,27 +121,9 @@ type CallToolResult<TStructured = { [key: string]: unknown }> = {
   [key: string]: unknown;
 };`
 
-const execDescriptionTemplate = `Run JavaScript code to orchestrate/compose tool calls
-- Evaluates the provided JavaScript code in a fresh V8 isolate as an async module.
-- All nested tools are available on the global tools object. Tool names are exposed as normalized JavaScript identifiers.
-- Nested tool methods take either a string or an object as their input argument.
-- Nested tools return either an object or a string, based on the description.
-- Runs raw JavaScript -- no Node, no file system, no network access, no console.
-- Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences.
-- You may optionally start the tool input with a first-line pragma like // @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}.
-- yield_time_ms asks exec to yield early if the script is still running. Defaults to 10000 ms.
-- max_output_tokens sets the token budget for direct exec results. Defaults to 10000 tokens.
-- When the JS code is fully evaluated, the isolate's lifetime ends and unawaited promises are silently discarded.
-
-Global helpers:
-- exit(): Immediately ends the current script successfully.
-- text(value): Appends a text item. Non-string values are stringified when possible.
-- image(value), audio(value), generatedImage(value): Append supported media results.
-- store(key, value) and load(key): Persist serializable values within the code-mode session.
-- notify(value): Immediately injects an extra custom_tool_call_output.
-- setTimeout(callback, delayMs) and clearTimeout(id): Schedule or cancel timers.
-- ALL_TOOLS: Metadata for enabled nested tools as { name, description } entries.
-- yield_control(): Yields accumulated output while the script keeps running.`
+// execDescriptionTemplate is Rust's EXEC_DESCRIPTION_TEMPLATE verbatim; the
+// bundled text is model-visible whenever the catalog carries no override.
+const execDescriptionTemplate = tool.CodeModeExecDescriptionTemplate
 
 var (
 	ErrCellNotFound = errors.New("code mode cell not found")
@@ -245,24 +227,10 @@ func BuildWaitTool() WaitSpec {
 // BuildWaitToolWithMessages applies the catalog's wait description and
 // parameter schema. Invalid or unsupported schemas retain the bundled shape.
 func BuildWaitToolWithMessages(messages *model.CodeModeToolMessages) WaitSpec {
-	parameters := map[string]any{
-		"required": []string{"cell_id"},
-		"properties": map[string]any{
-			"cell_id":       "Identifier of the running exec cell.",
-			"yield_time_ms": "Wait before yielding more output. Defaults to 10000 ms.",
-			"max_tokens":    "Output token budget for this wait call. Defaults to 10000 tokens.",
-			"terminate":     "True stops the running exec cell; false or omitted waits for output.",
-		},
-	}
-	if messages != nil && messages.Wait != nil && messages.Wait.Parameters != nil {
-		if parsed, err := tool.ParseCatalogParameters(*messages.Wait.Parameters); err == nil {
-			parameters = parsed
-		}
-	}
 	return WaitSpec{
 		Name:        WaitToolName,
 		Description: WaitToolDescription(messages),
-		Parameters:  parameters,
+		Parameters:  WaitToolInputSchema(messages),
 	}
 }
 
@@ -322,6 +290,12 @@ func BuildExecToolDescriptionWithOptions(definitions []ToolDefinition, deferredD
 	if messages != nil && messages.DeferredNestedToolsGuidance != nil {
 		guidance = *messages.DeferredNestedToolsGuidance
 	}
+	// Rust's DeferredToolDiscovery::RankedSearch appends the tool-search guidance
+	// outside code_mode_only, where the enabled search tool's own description is
+	// not rendered below.
+	if !codeModeOnly && containsToolSearchDefinition(definitions) {
+		guidance += "\n\n" + tool.CodeModeToolSearchGuidance
+	}
 	sections := make([]string, 0, 4)
 	if template != "" {
 		sections = append(sections, template)
@@ -376,8 +350,28 @@ func BuildExecToolDescriptionWithOptions(definitions []ToolDefinition, deferredD
 	return strings.Join(sections, "\n\n")
 }
 
+// BuildExecToolDescriptionWithVisibility renders the bundled description with
+// Rust's image-helper variant: image detail values stay documented unless the
+// unified image budget hides them (codex-rs ImageDetailVisibility).
+func BuildExecToolDescriptionWithVisibility(definitions []ToolDefinition, deferredDefinitions []ToolDefinition, namespaces map[string]NamespaceDescription, codeModeOnly bool, deferredToolsAvailable bool, messages *model.CodeModeToolMessages, defaultExecYieldTimeMS int, imageDetailHidden bool) string {
+	imageHelper := tool.CodeModeLegacyImageHelperDescription
+	if imageDetailHidden {
+		imageHelper = tool.CodeModeUnifiedImageHelperDescription
+	}
+	return BuildExecToolDescriptionWithOptions(definitions, deferredDefinitions, namespaces, codeModeOnly, deferredToolsAvailable, messages, defaultExecYieldTimeMS, imageHelper)
+}
+
+func containsToolSearchDefinition(definitions []ToolDefinition) bool {
+	for _, definition := range definitions {
+		if definition.Name == tool.ToolSearchName {
+			return true
+		}
+	}
+	return false
+}
+
 func BuildWaitToolDescription() string {
-	return "Use it after an exec call yields a cell id. Set terminate to stop a still-running cell."
+	return tool.CodeModeWaitDescriptionTemplate
 }
 
 // BuildWaitToolDescriptionWithMessages applies the model catalog's wait
@@ -396,10 +390,10 @@ func WaitToolInputSchema(messages *model.CodeModeToolMessages) map[string]any {
 		"type":     "object",
 		"required": []string{"cell_id"},
 		"properties": map[string]any{
-			"cell_id":       map[string]any{"type": "string"},
-			"yield_time_ms": map[string]any{"type": "integer"},
-			"max_tokens":    map[string]any{"type": "integer"},
-			"terminate":     map[string]any{"type": "boolean"},
+			"cell_id":       map[string]any{"type": "string", "description": "Identifier of the running exec cell."},
+			"yield_time_ms": map[string]any{"type": "number", "description": "Wait before yielding more output. Defaults to 10000 ms."},
+			"max_tokens":    map[string]any{"type": "number", "description": "Output token budget for this wait call. Defaults to 10000 tokens."},
+			"terminate":     map[string]any{"type": "boolean", "description": "True stops the running exec cell; false or omitted waits for output."},
 		},
 	}
 	if messages != nil && messages.Wait != nil && messages.Wait.Parameters != nil {
@@ -455,6 +449,10 @@ func AugmentToolSpec(spec tool.Spec) tool.Spec {
 	if spec.Name.Key() == tool.ToolSearchName {
 		return spec
 	}
+	outputSchema := spec.OutputSchema
+	if len(spec.CodeModeOutputSchema) != 0 {
+		outputSchema = spec.CodeModeOutputSchema
+	}
 	definition := ToolDefinition{
 		Name:                NameForToolName(spec.Name),
 		ToolName:            spec.Name,
@@ -462,7 +460,7 @@ func AugmentToolSpec(spec tool.Spec) tool.Spec {
 		Kind:                ToolKindFunction,
 		InputSchema:         spec.InputSchema,
 		InputSchemaMaxBytes: spec.InputSchemaMaxBytes,
-		OutputSchema:        spec.OutputSchema,
+		OutputSchema:        outputSchema,
 	}
 	if spec.Freeform != nil {
 		definition.Kind = ToolKindFreeform
@@ -1221,13 +1219,21 @@ const (
 )
 
 type Cell struct {
-	ID        string
-	Source    string
-	Output    string
-	Status    CellStatus
-	Error     string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID     string
+	Source string
+	Output string
+	// OutputItems retains the typed content items the cell produced. A
+	// server-truncated observation renders them through the bounded collector
+	// instead of flattening media into text (Rust #57848).
+	OutputItems []ContentItem
+	Status      CellStatus
+	Error       string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+	// CompletedAt records when the cell produced its terminal Result, so waits
+	// and terminations can report how long that result stayed buffered
+	// (Rust #55653).
+	CompletedAt time.Time
 }
 
 type CellStore struct {
@@ -1248,6 +1254,32 @@ func (s *CellStore) SetClock(clock func() time.Time) {
 		return
 	}
 	s.now = clock
+}
+
+// Now reports the store's clock so callers stamping elapsed buffering use the
+// same time source as the cells (Rust #55653's paused-clock tests).
+func (s *CellStore) Now() time.Time {
+	if s == nil {
+		return time.Now()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.now()
+}
+
+// ResultBufferedFor reports how long this cell's terminal result waited for
+// retrieval (Rust #55653). ok is false unless the cell produced a Result.
+func (c *Cell) ResultBufferedFor(now time.Time) (time.Duration, bool) {
+	if c == nil || c.CompletedAt.IsZero() {
+		return 0, false
+	}
+	if c.Status != CellCompleted && c.Status != CellFailed {
+		return 0, false
+	}
+	if now.Before(c.CompletedAt) {
+		return 0, true
+	}
+	return now.Sub(c.CompletedAt), true
 }
 
 func (s *CellStore) Start(id string, source string) (*Cell, error) {
@@ -1278,23 +1310,50 @@ func (s *CellStore) AppendOutput(id string, output string) (*Cell, error) {
 }
 
 func (s *CellStore) Complete(id string, output string, err error) (*Cell, error) {
+	cell, _, err := s.completeIfRunning(id, output, err)
+	return cell, err
+}
+
+// CompleteIfRunning records a finished script only while the cell is still
+// running. A cell that was terminated or already completed keeps its status,
+// which is the Go equivalent of Rust #55653 completion commit rejecting a cell
+// whose phase is no longer Running.
+func (s *CellStore) CompleteIfRunning(id string, output string, err error) (*Cell, bool, error) {
+	return s.completeIfRunning(id, output, err)
+}
+
+func (s *CellStore) completeIfRunning(id string, output string, err error) (*Cell, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cell := s.cells[id]
 	if cell == nil {
-		return nil, fmt.Errorf("%w: %s", ErrCellNotFound, id)
+		return nil, false, fmt.Errorf("%w: %s", ErrCellNotFound, id)
+	}
+	now := s.now().UTC()
+	if cell.Status == CellTerminated {
+		// A termination that already claimed the cell keeps its status; output
+		// the script had produced still belongs to the terminated event.
+		if output != "" {
+			cell.Output += output
+			cell.UpdatedAt = now
+		}
+		return cloneCell(cell), false, nil
+	}
+	if cell.Status != CellRunning {
+		return cloneCell(cell), false, nil
 	}
 	if output != "" {
 		cell.Output += output
 	}
-	cell.UpdatedAt = s.now().UTC()
+	cell.UpdatedAt = now
+	cell.CompletedAt = now
 	if err != nil {
 		cell.Status = CellFailed
 		cell.Error = err.Error()
 	} else {
 		cell.Status = CellCompleted
 	}
-	return cloneCell(cell), nil
+	return cloneCell(cell), true, nil
 }
 
 func (s *CellStore) Terminate(id string) (*Cell, error) {
@@ -1303,6 +1362,11 @@ func (s *CellStore) Terminate(id string) (*Cell, error) {
 	cell := s.cells[id]
 	if cell == nil {
 		return nil, fmt.Errorf("%w: %s", ErrCellNotFound, id)
+	}
+	// A termination that claims an already-completed result keeps it as a
+	// Result so its buffering measurement survives (Rust #55653).
+	if cell.Status == CellCompleted || cell.Status == CellFailed {
+		return cloneCell(cell), nil
 	}
 	cell.Status = CellTerminated
 	cell.UpdatedAt = s.now().UTC()
@@ -1313,6 +1377,36 @@ func (s *CellStore) Terminate(id string) (*Cell, error) {
 // cell was terminated, so observers receive it in the terminated event instead
 // of losing it with the detached observation (Rust #48207). It never changes the
 // cell's status.
+// AppendOutputItems records typed output on the cell and keeps the flattened
+// text view in sync for callers that still read Output.
+func (s *CellStore) AppendOutputItems(id string, items []ContentItem) (*Cell, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cell, ok := s.cells[id]
+	if !ok {
+		return nil, ErrCellNotFound
+	}
+	cell.OutputItems = append(cell.OutputItems, cloneContentItems(items)...)
+	cell.Output += contentItemsOutput(items)
+	cell.UpdatedAt = s.now()
+	return cell, nil
+}
+
+// AppendTerminatedOutputItems records typed output that arrived after the cell
+// was terminated.
+func (s *CellStore) AppendTerminatedOutputItems(id string, items []ContentItem) (*Cell, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cell, ok := s.cells[id]
+	if !ok {
+		return nil, ErrCellNotFound
+	}
+	cell.OutputItems = append(cell.OutputItems, cloneContentItems(items)...)
+	cell.Output += contentItemsOutput(items)
+	cell.UpdatedAt = s.now()
+	return cell, nil
+}
+
 func (s *CellStore) AppendTerminatedOutput(id string, output string) (*Cell, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

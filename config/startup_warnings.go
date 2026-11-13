@@ -81,6 +81,7 @@ func (s *ConfigService) ConfigWarningsForCWD(cwd string) []string {
 // warnings last).
 func StartupWarnings(values map[string]any, requirements *ConfigRequirements) []string {
 	warnings := requirementStartupWarnings(values, requirements)
+	warnings = append(warnings, runtimeAuthModeStartupWarnings(values, requirements)...)
 	return append(warnings, OtelStartupWarnings(values)...)
 }
 
@@ -135,6 +136,13 @@ func requirementStartupWarnings(values map[string]any, requirements *ConfigRequi
 				"Configured values under `feedback` are overridden by requirements from %s.",
 				managedRequirementSource))
 		}
+	}
+	// Rust apply_otel_requirements reports one structured warning when a
+	// managed OTEL value replaces a conflicting configured value.
+	if otelRequirementsConflict(values, requirements.Otel) {
+		warnings = append(warnings, fmt.Sprintf(
+			"Configured values under `otel` are overridden by requirements from %s.",
+			managedRequirementSource))
 	}
 	// Rust managed_features::parse_feature_requirements: a legacy alias warns in
 	// favor of the canonical key, and an unknown key is ignored with a warning.

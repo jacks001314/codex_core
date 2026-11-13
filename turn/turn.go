@@ -8,11 +8,14 @@ import (
 	"time"
 
 	"codex_core/codexapi"
+	"codex_core/criticalpath"
+	"codex_core/tooltiming"
 )
 
 type Profile struct {
 	BeforeFirstSamplingMS      uint64
 	SamplingMS                 uint64
+	CompactionMS               uint64
 	BetweenSamplingOverheadMS  uint64
 	ToolBlockingMS             uint64
 	PendingIdleAfterSamplingMS uint64
@@ -23,12 +26,51 @@ type Profile struct {
 	// `TurnProfile::tools_change_count`).
 	ToolsChangeCount uint32
 	TotalMS          uint64
+	// CriticalPath reports the frozen dependency-path capture for this turn
+	// (Rust #57201). Disabled is the default when the feature is off.
+	CriticalPath CriticalPathReport
+}
+
+// CriticalPathStatus mirrors Rust's TurnCriticalPath capture status.
+type CriticalPathStatus string
+
+const (
+	CriticalPathStatusDisabled   CriticalPathStatus = "disabled"
+	CriticalPathStatusIncomplete CriticalPathStatus = "incomplete"
+	CriticalPathStatusComplete   CriticalPathStatus = "complete"
+)
+
+// CriticalPathDurations is the exclusive category totals over the turn interval,
+// truncated to milliseconds. Sampling and compaction both contribute to
+// inference. Independent truncation can leave the category sum up to five
+// milliseconds below DurationMS.
+type CriticalPathDurations struct {
+	DurationMS   uint64
+	InferenceMS  uint64
+	SamplingMS   uint64
+	CompactionMS uint64
+	AutoReviewMS uint64
+	// AutoReviewOverheadMS is the part of auto-review time outside observed
+	// reviewer turn execution. Nil means attribution was incomplete.
+	AutoReviewOverheadMS *uint64
+	UserWaitMS           uint64
+	ToolsMS              uint64
+	OverheadMS           uint64
+	UnknownMS            uint64
+}
+
+// CriticalPathReport is one finalized turn's capture coverage. Missing capture
+// never becomes a zero-duration measurement.
+type CriticalPathReport struct {
+	Status    CriticalPathStatus
+	Durations *CriticalPathDurations
 }
 
 type profilePhase string
 
 const (
 	phaseSampling     profilePhase = "sampling"
+	phaseCompaction   profilePhase = "compaction"
 	phaseToolBlocking profilePhase = "tool_blocking"
 )
 
@@ -39,15 +81,20 @@ type TimingState struct {
 	firstTokenAt   time.Time
 	firstMessageAt time.Time
 	profile        profileState
+	directTools    *tooltiming.Timings
 }
 
 type profileState struct {
+	captureEnabled           bool
+	path                     *criticalpath.Path
+	toolDependency           *criticalpath.Path
 	startedAt                time.Time
 	lastTransitionAt         time.Time
 	activePhase              profilePhase
 	seenSampling             bool
 	beforeFirstSampling      time.Duration
 	sampling                 time.Duration
+	compaction               time.Duration
 	betweenSamplingOverhead  time.Duration
 	toolBlocking             time.Duration
 	pendingIdleAfterSampling time.Duration
@@ -61,10 +108,108 @@ type TimingGuard struct {
 	timing *TimingState
 	phase  profilePhase
 	active bool
+	batch  *tooltiming.Batch
 }
 
 func NewTimingState() *TimingState {
-	return &TimingState{}
+	return &TimingState{directTools: tooltiming.NewTimings()}
+}
+
+// DirectToolTimings returns the turn's direct-tool invocation registry. It is
+// safe to call on a zero-value TimingState.
+func (t *TimingState) DirectToolTimings() *tooltiming.Timings {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.directTools == nil {
+		t.directTools = tooltiming.NewTimings()
+	}
+	return t.directTools
+}
+
+// EnableCriticalPath turns on dependency-path capture before the turn completes.
+func (t *TimingState) EnableCriticalPath() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.profile.completed == nil {
+		t.profile.captureEnabled = true
+		empty := criticalpath.Path{}
+		t.profile.path = &empty
+	}
+}
+
+// CriticalPathCaptureEnabled reports whether this turn opted into critical-path
+// capture and has not yet frozen its profile.
+func (t *TimingState) CriticalPathCaptureEnabled() bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.profile.captureEnabled && t.profile.completed == nil
+}
+
+// InvalidateCriticalPath drops the captured path without disabling the capture
+// policy, so the completed turn reports incomplete coverage instead of measured
+// zeroes.
+func (t *TimingState) InvalidateCriticalPath() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.profile.completed == nil {
+		t.profile.path = nil
+	}
+}
+
+// CriticalPathReportSnapshot reports capture coverage without freezing an
+// in-flight profile. A frozen profile returns its captured report; an enabled
+// but unfinished capture reports incomplete, so a terminal analytics event
+// never publishes totals for a dependency graph that has not settled.
+func (t *TimingState) CriticalPathReportSnapshot() CriticalPathReport {
+	if t == nil {
+		return CriticalPathReport{Status: CriticalPathStatusDisabled}
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.profile.completed != nil {
+		return t.profile.completed.CriticalPath
+	}
+	if !t.profile.captureEnabled {
+		return CriticalPathReport{Status: CriticalPathStatusDisabled}
+	}
+	return CriticalPathReport{Status: CriticalPathStatusIncomplete}
+}
+
+// SnapshotPath reports the path observed through now. It returns nil when the
+// capture is unavailable, and the frozen path once the turn has completed.
+func (t *TimingState) SnapshotPath(now time.Time) *criticalpath.Path {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.profile.path == nil {
+		return nil
+	}
+	if t.profile.completed != nil {
+		path := *t.profile.path
+		return &path
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	path := t.profile.pathAt(now)
+	if path == nil {
+		return nil
+	}
+	return path
 }
 
 func (t *TimingState) MarkTurnStarted(now time.Time) int64 {
@@ -77,7 +222,12 @@ func (t *TimingState) MarkTurnStarted(now time.Time) int64 {
 	t.startedUnixMS = now.UnixMilli()
 	t.firstTokenAt = time.Time{}
 	t.firstMessageAt = time.Time{}
-	t.profile = profileState{startedAt: now, lastTransitionAt: now}
+	t.profile = profileState{
+		captureEnabled:   t.profile.captureEnabled,
+		path:             t.profile.path,
+		startedAt:        now,
+		lastTransitionAt: now,
+	}
 	return t.startedUnixMS
 }
 
@@ -141,8 +291,18 @@ func (t *TimingState) BeginSampling(now time.Time) *TimingGuard {
 	return t.beginPhase(phaseSampling, now)
 }
 
-func (t *TimingState) BeginToolBlocking(now time.Time) *TimingGuard {
-	return t.beginPhase(phaseToolBlocking, now)
+// BeginCompaction captures local and remote compaction bookkeeping separately
+// from model sampling (Rust #59245).
+func (t *TimingState) BeginCompaction(now time.Time) *TimingGuard {
+	return t.beginPhase(phaseCompaction, now)
+}
+
+func (t *TimingState) BeginToolBlocking(now time.Time, batch *tooltiming.Batch) *TimingGuard {
+	guard := t.beginPhase(phaseToolBlocking, now)
+	if guard != nil {
+		guard.batch = batch
+	}
+	return guard
 }
 
 func (t *TimingState) RecordSamplingRetry() {
@@ -196,7 +356,14 @@ func (g *TimingGuard) CloseAt(now time.Time) {
 	}
 	g.timing.mu.Lock()
 	defer g.timing.mu.Unlock()
-	g.timing.profile.endPhase(now, g.phase)
+	if g.timing.profile.completed == nil {
+		if g.batch != nil {
+			if completed := g.batch.Completed(); completed != nil {
+				g.timing.profile.toolDependency = completed.Path
+			}
+		}
+		g.timing.profile.endPhase(now, g.phase)
+	}
 	g.active = false
 }
 
@@ -230,13 +397,20 @@ func (p *profileState) advance(now time.Time) {
 		p.lastTransitionAt = now
 		return
 	}
-	elapsed := now.Sub(p.lastTransitionAt)
-	if elapsed < 0 {
-		elapsed = 0
+	if now.Before(p.lastTransitionAt) {
+		now = p.lastTransitionAt
 	}
+	elapsed := now.Sub(p.lastTransitionAt)
+	if p.path != nil {
+		extended := p.extendPath(*p.path, p.lastTransitionAt, now)
+		p.path = &extended
+	}
+	p.toolDependency = nil
 	switch p.activePhase {
 	case phaseSampling:
 		p.sampling += elapsed
+	case phaseCompaction:
+		p.compaction += elapsed
 	case phaseToolBlocking:
 		p.toolBlocking += elapsed
 	default:
@@ -253,10 +427,14 @@ func (p *profileState) complete(now time.Time) Profile {
 	if p.completed != nil {
 		return *p.completed
 	}
+	if now.Before(p.lastTransitionAt) {
+		now = p.lastTransitionAt
+	}
 	p.advance(now)
 	profile := Profile{
 		BeforeFirstSamplingMS:      durationMS(p.beforeFirstSampling),
 		SamplingMS:                 durationMS(p.sampling),
+		CompactionMS:               durationMS(p.compaction),
 		BetweenSamplingOverheadMS:  durationMS(p.betweenSamplingOverhead),
 		ToolBlockingMS:             durationMS(p.toolBlocking),
 		PendingIdleAfterSamplingMS: durationMS(p.pendingIdleAfterSampling),
@@ -264,9 +442,69 @@ func (p *profileState) complete(now time.Time) Profile {
 		SamplingRetryCount:         p.samplingRetryCount,
 		ToolsChangeCount:           p.toolsChangeCount,
 		TotalMS:                    durationMS(now.Sub(p.startedAt)),
+		CriticalPath:               p.criticalPathReport(now),
 	}
 	p.completed = &profile
 	return profile
+}
+
+func (p *profileState) pathAt(now time.Time) *criticalpath.Path {
+	if p.path == nil {
+		return nil
+	}
+	if p.lastTransitionAt.IsZero() {
+		path := *p.path
+		return &path
+	}
+	path := p.extendPath(*p.path, p.lastTransitionAt, now)
+	return &path
+}
+
+func (p *profileState) extendPath(path criticalpath.Path, previous time.Time, now time.Time) criticalpath.Path {
+	switch p.activePhase {
+	case phaseSampling:
+		return path.Work(previous, now, criticalpath.WorkSampling)
+	case phaseCompaction:
+		return path.Work(previous, now, criticalpath.WorkCompaction)
+	case phaseToolBlocking:
+		dependency := path.Work(previous, now, criticalpath.WorkUnknown)
+		if p.toolDependency != nil {
+			dependency = *p.toolDependency
+		}
+		return path.Join(previous, now, dependency)
+	default:
+		return path.Work(previous, now, criticalpath.WorkOverhead)
+	}
+}
+
+func (p *profileState) criticalPathReport(end time.Time) CriticalPathReport {
+	if !p.captureEnabled {
+		return CriticalPathReport{Status: CriticalPathStatusDisabled}
+	}
+	if p.path == nil || p.startedAt.IsZero() {
+		return CriticalPathReport{Status: CriticalPathStatusIncomplete}
+	}
+	totals := p.path.Durations(p.startedAt, end)
+	var autoReviewOverhead *uint64
+	if !totals.AutoReviewOverheadUnknown {
+		value := criticalpath.DurationMS(totals.AutoReviewOverhead)
+		autoReviewOverhead = &value
+	}
+	return CriticalPathReport{
+		Status: CriticalPathStatusComplete,
+		Durations: &CriticalPathDurations{
+			DurationMS:           durationMS(end.Sub(p.startedAt)),
+			InferenceMS:          criticalpath.DurationMS(totals.Sampling) + criticalpath.DurationMS(totals.Compaction),
+			SamplingMS:           criticalpath.DurationMS(totals.Sampling),
+			CompactionMS:         criticalpath.DurationMS(totals.Compaction),
+			AutoReviewMS:         criticalpath.DurationMS(totals.AutoReview),
+			AutoReviewOverheadMS: autoReviewOverhead,
+			UserWaitMS:           criticalpath.DurationMS(totals.UserWait),
+			ToolsMS:              criticalpath.DurationMS(totals.Tools),
+			OverheadMS:           criticalpath.DurationMS(totals.Overhead),
+			UnknownMS:            criticalpath.DurationMS(totals.Unknown),
+		},
+	}
 }
 
 func durationMS(duration time.Duration) uint64 {

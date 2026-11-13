@@ -26,6 +26,7 @@ import (
 	"codex_core/envutil"
 	"codex_core/install"
 	"codex_core/network"
+	"codex_core/processgroup"
 	"codex_core/sandbox"
 	"codex_core/shell"
 	"codex_core/utils"
@@ -55,6 +56,8 @@ const (
 	MethodFSWriteFile             = "fs/writeFile"
 	MethodFSCreateDirectory       = "fs/createDirectory"
 	MethodFSGetMetadata           = "fs/getMetadata"
+	MethodFSWatchMissing          = "fs/watchMissing"
+	MethodFSMissingChanged        = "fs/missingChanged"
 	MethodFSCanonicalize          = "fs/canonicalize"
 	MethodFSReadDirectory         = "fs/readDirectory"
 	MethodFSWalk                  = "fs/walk"
@@ -229,6 +232,11 @@ type Server struct {
 	sessions           map[string]*serverSessionEntry
 	detachedSessionTTL time.Duration
 
+	// forwardDestination mirrors Rust's exec-server Forwarder destination: when
+	// set, every accepted Noise relay stream is bridged to that WebSocket
+	// instead of being served by this executor (codex-rs/exec-server/src/forward.rs).
+	forwardDestination string
+
 	// preferMXC mirrors Rust ExecServerRuntimeOptions::prefer_mxc: only the
 	// sandbox preference from startup `features.prefer_mxc` flags, never other
 	// startup configuration or secrets. It is surfaced to
@@ -251,11 +259,40 @@ type Server struct {
 	v2Discovery               *v2DiscoveryManager
 	shellSnapshots            *shellSnapshotManager
 	credentialBrokers         network.RemoteCredentialBrokerCache
+	// missingWatch holds the newest missing-path observation for this
+	// connection (Rust #57598 missing_watch.rs).
+	missingWatch missingWatchState
+	// registrationMu guards the registry-issued executor identity used only
+	// for telemetry attribution (Rust #42373).
+	registrationMu       sync.Mutex
+	executorRegistration *executorRegistrationIdentity
 }
 
 // SetPreferMXC records the startup CLI sandbox preference
 // (`-c features.prefer_mxc=<bool>`), mirroring Rust
 // exec_server_command.rs: only this value is retained from startup overrides.
+// SetForwardDestination mirrors Rust exec-server forwarding: a non-empty URL
+// bridges every Noise relay stream to that exec-server WebSocket instead of
+// serving it locally.
+func (s *Server) SetForwardDestination(url string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.forwardDestination = strings.TrimSpace(url)
+}
+
+// forwardDestinationURL reports the configured forwarding destination.
+func (s *Server) forwardDestinationURL() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.forwardDestination
+}
+
 func (s *Server) SetPreferMXC(value *bool) {
 	if s == nil {
 		return
@@ -340,6 +377,11 @@ func (c *FileSystemSandboxContext) SetAllowedSymlinkedCodexHome(path string) {
 
 type fileHandleEntry struct {
 	file *os.File
+	// refs counts in-flight reads and writes that still hold the descriptor.
+	// Closing a handle releases its slot immediately, but the descriptor stays
+	// open until the last operation drops its pin (Rust #50162 Arc<File>).
+	refs    int
+	retired bool
 }
 
 type serverSessionEntry struct {
@@ -351,37 +393,40 @@ type serverSessionEntry struct {
 }
 
 type processState struct {
-	id               string
-	cmd              *exec.Cmd
-	stdin            io.WriteCloser
-	starting         bool
-	terminateFn      func() error
-	signalFn         func() error
-	pipeStdin        bool
-	tty              bool
-	mu               sync.Mutex
-	cond             *sync.Cond
-	chunks           []outputChunk
-	retainedBytes    int
-	nextSeq          uint64
-	exited           bool
-	exitSequenced    bool
-	exitCode         *int
-	sandboxType      sandbox.SandboxType
-	sandboxDenied    bool
-	failure          string
-	closed           bool
-	closedSequenced  bool
-	openStreams      int
-	seenWriteIDs     map[string]bool
-	seenWriteOrder   []string
-	notify           processNotifier
-	onClosed         func()
-	retention        time.Duration
-	retentionOnce    sync.Once
-	networkProxy     *network.PreparedProxyManagedNetwork
-	policyCancel     context.CancelFunc
-	networkCloseOnce sync.Once
+	id                   string
+	cmd                  *exec.Cmd
+	stdin                io.WriteCloser
+	starting             bool
+	terminateFn          func() error
+	signalFn             func() error
+	pipeStdin            bool
+	tty                  bool
+	mu                   sync.Mutex
+	cond                 *sync.Cond
+	chunks               []outputChunk
+	retainedBytes        int
+	nextSeq              uint64
+	exited               bool
+	exitSequenced        bool
+	exitCode             *int
+	sandboxType          sandbox.SandboxType
+	sandboxDenied        bool
+	failure              string
+	closed               bool
+	closedSequenced      bool
+	openStreams          int
+	seenWriteIDs         map[string]bool
+	seenWriteOrder       []string
+	notifyMu             sync.Mutex
+	notify               processNotifier
+	onClosed             func()
+	retention            time.Duration
+	retentionOnce        sync.Once
+	networkProxy         *network.PreparedProxyManagedNetwork
+	policyCancel         context.CancelFunc
+	networkCloseOnce     sync.Once
+	telemetry            processTelemetry
+	terminationRequested bool
 }
 
 type processNotifier func(method string, params any)
@@ -533,10 +578,19 @@ type EnvironmentInfo struct {
 }
 
 type EnvironmentCapabilities struct {
-	NetworkProxyLaunch         bool `json:"networkProxyLaunch"`
-	CredentialMasking          bool `json:"credentialMasking,omitempty"`
-	CapabilityDiscoverySandbox bool `json:"capabilityDiscoverySandbox"`
-	CapabilityDiscoveryV2      bool `json:"capabilityDiscoveryV2"`
+	NetworkProxyLaunch bool `json:"networkProxyLaunch"`
+	// NetworkProxyReviewDomains advertises that executor proxies enforce
+	// managed review domains before ordinary allows (Rust #56154).
+	NetworkProxyReviewDomains bool `json:"networkProxyReviewDomains,omitempty"`
+	CredentialMasking         bool `json:"credentialMasking,omitempty"`
+	// CredentialMaskingCustomProviders advertises that masking also accepts
+	// configured provider rules (Rust #56049).
+	CredentialMaskingCustomProviders bool `json:"credentialMaskingCustomProviders,omitempty"`
+	CapabilityDiscoverySandbox       bool `json:"capabilityDiscoverySandbox"`
+	CapabilityDiscoveryV2            bool `json:"capabilityDiscoveryV2"`
+	// FSWatchMissing advertises `fs/watchMissing` on this physical connection
+	// (Rust #57598). Only Linux executors can observe missing paths.
+	FSWatchMissing bool `json:"fsWatchMissing,omitempty"`
 	// ShellSnapshotV2 advertises process/start.shellSnapshot support.
 	ShellSnapshotV2 bool `json:"shellSnapshotV2"`
 	// Rust 646f7c0a91: whether this executor supports environmentConfig/read;
@@ -548,6 +602,10 @@ type EnvironmentCapabilities struct {
 	// Rust #50177: whether `fs/open` supports replacement mode and
 	// `fs/writeBlock` is supported.
 	FileWriteStreaming bool `json:"fileWriteStreaming"`
+	// Rust 60e35765 (#45524): whether requests may explicitly select the MXC
+	// Windows sandbox backend. Go never has a native MXC runner, so this stays
+	// false; the field is always serialized to match the Rust wire shape.
+	WindowsMxc bool `json:"windowsMxc"`
 }
 
 type EnvironmentStatus struct {
@@ -600,6 +658,12 @@ type ShellSnapshotRequest struct {
 type ManagedNetworkSandboxContext struct {
 	LoopbackPorts     []uint16 `json:"loopbackPorts"`
 	AllowLocalBinding bool     `json:"allowLocalBinding"`
+	// AllowUnixSockets and DangerouslyAllowAllUnixSockets carry the effective
+	// Unix socket policy from the proxy preparation (Rust #45534). The Linux
+	// sandbox helper allows standalone `AF_UNIX` sockets only for the explicit
+	// allow-all grant. Missing fields deserialize to the restrictive values.
+	AllowUnixSockets               []string `json:"allowUnixSockets"`
+	DangerouslyAllowAllUnixSockets bool     `json:"dangerouslyAllowAllUnixSockets"`
 }
 
 type FileSystemSandboxContext struct {
@@ -614,7 +678,6 @@ type FileSystemSandboxContext struct {
 	TemporaryDirectories            []string                        `json:"temporaryDirectories,omitempty"`
 	UserHomeDir                     string                          `json:"userHomeDir,omitempty"`
 	WindowsSandboxLevel             string                          `json:"windowsSandboxLevel"`
-	WindowsSandboxPrivateDesktop    bool                            `json:"windowsSandboxPrivateDesktop,omitempty"`
 	WindowsSandboxProxySettingsMode WindowsSandboxProxySettingsMode `json:"windowsSandboxProxySettingsMode,omitempty"`
 	UseLegacyLandlock               bool                            `json:"useLegacyLandlock,omitempty"`
 	// allowedSymlinkedCodexHome is trusted executor startup state, never a
@@ -790,6 +853,25 @@ type FSGetMetadataResponse struct {
 	Size         int64 `json:"size"`
 	CreatedAtMS  int64 `json:"createdAtMs"`
 	ModifiedAtMS int64 `json:"modifiedAtMs"`
+}
+
+// FSWatchMissingParams registers one unsandboxed metadata observation per
+// connection (Rust #57598 FsWatchMissingParams). A newer watchId supersedes the
+// prior watch.
+type FSWatchMissingParams struct {
+	WatchID uint64   `json:"watchId"`
+	Missing []string `json:"missing"`
+	Present *string  `json:"present,omitempty"`
+}
+
+type FSWatchMissingResponse struct {
+	Watching bool `json:"watching"`
+}
+
+// FSMissingChangedNotification invalidates the observation identified by
+// watchId (Rust #57598 FsMissingChangedNotification).
+type FSMissingChangedNotification struct {
+	WatchID uint64 `json:"watchId"`
 }
 
 type FSCanonicalizeParams struct {
@@ -1017,7 +1099,7 @@ func NewServerWithHTTPClient(httpClient *http.Client) *Server {
 	if httpClient == nil {
 		httpClient = &http.Client{}
 	}
-	return &Server{
+	server := &Server{
 		processes:          map[string]*processState{},
 		handles:            map[string]*fileHandleEntry{},
 		fileSlots:          make(chan struct{}, maxOpenFiles),
@@ -1027,6 +1109,8 @@ func NewServerWithHTTPClient(httpClient *http.Client) *Server {
 		v2Discovery:        newV2DiscoveryManager(),
 		shellSnapshots:     newShellSnapshotManager(),
 	}
+	server.shellSnapshots.captureCommand = server.prepareShellSnapshotCaptureCommand
+	return server
 }
 
 func newSessionServer(httpClient *http.Client) *Server {
@@ -1050,8 +1134,27 @@ func newSessionServerWithRuntimeOptions(httpClient *http.Client, parent *Server)
 		server.SetProxyPrivateIPsViaUpstream(parent.proxyPrivateIPsViaUpstreamValue())
 		server.SetEnvironmentConfigReader(parent.environmentConfigReaderForRead())
 		server.SetAllowedSymlinkedCodexHome(parent.allowedSymlinkedCodexHomeValue())
+		if identity := parent.executorRegistrationIdentityValue(); identity != nil {
+			server.SetExecutorRegistrationIdentity(identity.environmentID, identity.registrationID)
+		}
 	}
+	server.shellSnapshots.captureCommand = server.prepareShellSnapshotCaptureCommand
 	return server
+}
+
+func (s *Server) prepareShellSnapshotCaptureCommand(params *ExecParams, command []string) ([]string, string, error) {
+	if params == nil || !hasJSONValue(params.Sandbox) {
+		cwd := ""
+		if params != nil {
+			cwd = shellSnapshotNativeCWD(params.CWD)
+		}
+		return append([]string(nil), command...), cwd, nil
+	}
+	captureParams := *params
+	captureParams.Argv = append([]string(nil), command...)
+	captureParams.TTY = false
+	prepared, cwd, _, err := prepareExecProcess(&captureParams, s.allowedSymlinkedCodexHomeValue())
+	return prepared, cwd, err
 }
 
 // localEnvironmentInfoForConnection reports the local environment with the
@@ -1197,6 +1300,9 @@ func (s *Server) setConnectionState(notify processNotifier, requests *serverRequ
 	if previousRequests != nil && previousRequests != requests {
 		previousRequests.close()
 	}
+	// A missing-path observation is scoped to one physical connection, so a
+	// new connection or another session attachment invalidates it (Rust #57598).
+	s.invalidateMissingWatch()
 	for _, process := range processes {
 		process.mu.Lock()
 		process.notify = notify
@@ -1223,7 +1329,10 @@ func (s *Server) shutdown() {
 	}
 	handles := make([]*os.File, 0, len(s.handles))
 	for _, handle := range s.handles {
-		handles = append(handles, handle.file)
+		handle.retired = true
+		if handle.refs == 0 {
+			handles = append(handles, handle.file)
+		}
 	}
 	s.processes = map[string]*processState{}
 	s.handles = map[string]*fileHandleEntry{}
@@ -1237,6 +1346,7 @@ func (s *Server) shutdown() {
 		break
 	}
 	s.mu.Unlock()
+	s.invalidateMissingWatch()
 	if s.shellSnapshots != nil {
 		s.shellSnapshots.close()
 	}
@@ -1347,13 +1457,14 @@ func (s *Server) serveStream(ctx context.Context, stdin io.Reader, stdout io.Wri
 		}
 		_ = json.Unmarshal(requestData, &envelope)
 		if idErr != nil || !hasID || envelope.Method == MethodInitialize || !concurrentRequests {
-			out, ok := s.handleLineWithLabel(notifyCtx, requestData, "exec-server stdio")
+			out, ok, timing := s.dispatchLine(notifyCtx, requestData, "exec-server stdio")
 			if !ok {
 				continue
 			}
 			writeMu.Lock()
 			err := encoder.Encode(out)
 			writeMu.Unlock()
+			timing.record(execServerWriteResult(err), time.Now())
 			if err != nil {
 				detach()
 				requests.Wait()
@@ -1365,13 +1476,14 @@ func (s *Server) serveStream(ctx context.Context, stdin io.Reader, stdout io.Wri
 		go func() {
 			defer requests.Done()
 			requestCtx, afterResponse := withAfterResponseActions(notifyCtx)
-			out, ok := s.handleLineWithLabel(requestCtx, requestData, "exec-server stdio")
+			out, ok, timing := s.dispatchLine(requestCtx, requestData, "exec-server stdio")
 			if !ok {
 				return
 			}
 			writeMu.Lock()
 			err := encoder.Encode(out)
 			writeMu.Unlock()
+			timing.record(execServerWriteResult(err), time.Now())
 			afterResponse.run()
 			if err != nil {
 				writeMu.Lock()
@@ -1429,18 +1541,26 @@ func (s *Server) handleLine(ctx context.Context, line []byte) (any, bool) {
 }
 
 func (s *Server) handleLineWithLabel(ctx context.Context, line []byte, connectionLabel string) (any, bool) {
+	out, ok, _ := s.dispatchLine(ctx, line, connectionLabel)
+	return out, ok
+}
+
+// dispatchLine handles one decoded line. For JSON-RPC requests it also returns
+// the dispatcher timings so the caller can record request metrics after the
+// response is enqueued (Rust #44207).
+func (s *Server) dispatchLine(ctx context.Context, line []byte, connectionLabel string) (any, bool, *execServerRequestTiming) {
 	receivedAt := time.Now()
 	hasID, err := lineHasTopLevelID(line)
 	if err != nil {
-		return malformedRPCResponse(connectionLabel, err), true
+		return malformedRPCResponse(connectionLabel, err), true, nil
 	}
 	if hasID {
 		var req request
 		if err := json.Unmarshal(line, &req); err != nil {
-			return malformedRPCResponse(connectionLabel, err), true
+			return malformedRPCResponse(connectionLabel, err), true, nil
 		}
 		if req.Method == "" {
-			return malformedRPCResponse(connectionLabel, errors.New("JSON-RPC request is missing method")), true
+			return malformedRPCResponse(connectionLabel, errors.New("JSON-RPC request is missing method")), true, nil
 		}
 		trace := TraceContext{}
 		if req.TraceContext != nil {
@@ -1451,27 +1571,34 @@ func (s *Server) handleLineWithLabel(ctx context.Context, line []byte, connectio
 		}
 		requestCtx := withTraceContext(ctx, trace)
 		setExecServerSpanAttribute(requestCtx, "rpc.dispatch_offset_ns", execServerOffsetNanos(receivedAt))
+		startedAt := time.Now()
 		result, err := s.handleRequest(requestCtx, &req)
 		setExecServerSpanAttribute(requestCtx, "rpc.response_enqueue_offset_ns", execServerOffsetNanos(receivedAt))
 		outcome := "success"
 		if err != nil {
 			outcome = "error"
 		}
+		timing := &execServerRequestTiming{
+			method:     execServerRequestMethodLabel(req.Method),
+			result:     outcome,
+			receivedAt: receivedAt,
+			startedAt:  startedAt,
+		}
 		emitExecServerTraceEvent(requestCtx, execServerResponseEnqueuedEvent, map[string]string{
 			"rpc.method": req.Method,
 			"outcome":    outcome,
 		})
 		if err != nil {
-			return errorResponseForRequest(req.ID, err), true
+			return errorResponseForRequest(req.ID, err), true, timing
 		}
-		return response{ID: req.ID, Result: result, TraceContext: &trace}, true
+		return response{ID: req.ID, Result: result, TraceContext: &trace}, true, timing
 	}
 	var note notification
 	if err := json.Unmarshal(line, &note); err != nil {
-		return malformedRPCResponse(connectionLabel, err), true
+		return malformedRPCResponse(connectionLabel, err), true, nil
 	}
 	if note.Method == "" {
-		return malformedRPCResponse(connectionLabel, errors.New("JSON-RPC notification is missing method")), true
+		return malformedRPCResponse(connectionLabel, errors.New("JSON-RPC notification is missing method")), true, nil
 	}
 	if note.Method == MethodInitialized {
 		state := protocolStateFromContext(ctx)
@@ -1483,7 +1610,7 @@ func (s *Server) handleLineWithLabel(ctx context.Context, line []byte, connectio
 			state.mu.Unlock()
 		}
 	}
-	return nil, false
+	return nil, false, nil
 }
 
 func malformedRPCResponse(connectionLabel string, err error) response {
@@ -1674,6 +1801,22 @@ func (s *Server) handleRequest(ctx context.Context, req *request) (any, error) {
 		s.applyFSSandboxRuntimeOptions(params.Sandbox)
 		result, err := getMetadata(&params)
 		return result, mapFSRequestError(err)
+	case MethodFSWatchMissing:
+		var params FSWatchMissingParams
+		if err := decodeParams(req.Params, &params); err != nil {
+			return nil, err
+		}
+		for _, missing := range params.Missing {
+			if err := validateWirePathURI(missing); err != nil {
+				return nil, requestError(-32602, "invalid params: missing must be an absolute file URI: "+err.Error())
+			}
+		}
+		if params.Present != nil {
+			if err := validateWirePathURI(*params.Present); err != nil {
+				return nil, requestError(-32602, "invalid params: present must be an absolute file URI: "+err.Error())
+			}
+		}
+		return s.serverForConnection(ctx).watchMissing(&params, processNotifierFromContext(ctx)), nil
 	case MethodFSCanonicalize:
 		var params FSCanonicalizeParams
 		if err := decodeParams(req.Params, &params); err != nil {
@@ -1758,7 +1901,7 @@ func execServerMethodFamily(method string) string {
 	case MethodHTTPRequest:
 		return "http"
 	case MethodFSReadFile, MethodFSOpen, MethodFSReadBlock, MethodFSWriteBlock, MethodFSClose, MethodFSWriteFile, MethodFSCreateDirectory,
-		MethodFSGetMetadata, MethodFSCanonicalize, MethodFSReadDirectory, MethodFSWalk, MethodFSRemove, MethodFSCopy:
+		MethodFSGetMetadata, MethodFSWatchMissing, MethodFSCanonicalize, MethodFSReadDirectory, MethodFSWalk, MethodFSRemove, MethodFSCopy:
 		return "filesystem"
 	default:
 		return ""
@@ -1788,6 +1931,9 @@ func (s *Server) startProcess(ctx context.Context, params *ExecParams) (*ExecRes
 		}
 	}
 	originalEnv := cloneShellSnapshotEnv(params.Env)
+	// snapshotReader carries the unnamed shell snapshot file whenever the
+	// executor prepared descriptor replay (Rust #48078).
+	var snapshotReader *os.File
 	preparedParams, preparedProxy, policyCancel, err := s.prepareExecutorNetworkProxy(ctx, params)
 	if err != nil {
 		return nil, err
@@ -1816,7 +1962,15 @@ func (s *Server) startProcess(ctx context.Context, params *ExecParams) (*ExecRes
 				"snapshot_requested": strconv.FormatBool(params.ShellSnapshot != nil),
 			}),
 		)
-		rewritten, rewriteErr := s.shellSnapshots.rewrite(snapshotCtx, params, captureEnv, credentialPairs)
+		var credentialTextUnsafe func(string) bool
+		if preparedProxy != nil {
+			credentialTextUnsafe = preparedProxy.SnapshotTextContainsCredential
+		}
+		var restoreFallback func(map[string]string)
+		if preparedProxy != nil {
+			restoreFallback = preparedProxy.RestoreUnbrokeredEnvironment
+		}
+		rewritten, reader, rewriteErr := s.shellSnapshots.rewrite(snapshotCtx, params, captureEnv, credentialPairs, credentialTextUnsafe, restoreFallback)
 		if snapshotSpan != nil {
 			snapshotSpan.End()
 		}
@@ -1830,6 +1984,7 @@ func (s *Server) startProcess(ctx context.Context, params *ExecParams) (*ExecRes
 			return nil, rewriteErr
 		}
 		params = rewritten
+		snapshotReader = reader
 	}
 	preparedNetworkOwned := false
 	defer func() {
@@ -1858,6 +2013,7 @@ func (s *Server) startProcess(ctx context.Context, params *ExecParams) (*ExecRes
 			sandboxSpawnSpan.End()
 		}
 		if startErr != nil {
+			state.telemetry.spawnFailed(sandbox.SandboxTypeWindowsRestrictedToken)
 			s.releaseStartingProcess(params.ProcessID, state)
 			return nil, startErr
 		}
@@ -1889,6 +2045,7 @@ func (s *Server) startProcess(ctx context.Context, params *ExecParams) (*ExecRes
 				}
 			}
 			state.mu.Unlock()
+			state.telemetry.start(sandbox.SandboxTypeWindowsRestrictedToken)
 			var readers sync.WaitGroup
 			for index, reader := range started.readers {
 				if reader == nil {
@@ -1941,6 +2098,12 @@ func (s *Server) startProcess(ctx context.Context, params *ExecParams) (*ExecRes
 	}
 	cmd.Dir = cwd
 	cmd.Env = envPairs(childEnv(params))
+	// Rust #48078: the shell snapshot reader rides along as an inherited
+	// descriptor and is closed here once the child owns its own copy.
+	if snapshotReader != nil {
+		cmd.ExtraFiles = append(cmd.ExtraFiles, snapshotReader)
+		defer func() { _ = snapshotReader.Close() }()
+	}
 	if params.TTY {
 		state, err := s.reserveProcessState(ctx, params)
 		if err != nil {
@@ -1951,18 +2114,40 @@ func (s *Server) startProcess(ctx context.Context, params *ExecParams) (*ExecRes
 			execServerProcessSpawnSpan,
 			execServerProcessSpanAttributes(params.ProcessID, nil),
 		)
-		startedTTY, supported, startErr := startExecServerTTY(cmd)
+		var queryReader *terminalQueryReader
+		var captureDone chan struct{}
+		startCapture := func(master io.ReadWriteCloser) {
+			queryReader = newTerminalQueryReader(master, master)
+			captureDone = make(chan struct{})
+			go func() {
+				defer close(captureDone)
+				state.capture("pty", queryReader)
+				_ = queryReader.Close()
+			}()
+		}
+		startedTTY, supported, startErr := startExecServerTTY(cmd, startCapture)
 		if ttySpawnSpan != nil {
 			ttySpawnSpan.End()
 		}
 		if startErr != nil {
+			state.telemetry.spawnFailed(sandboxType)
 			s.releaseStartingProcess(params.ProcessID, state)
 			return nil, startErr
 		}
 		if supported {
 			// Rust #41436: answer blocking terminal queries from the PTY and
-			// remove them from the output the client sees.
-			queryReader := newTerminalQueryReader(startedTTY.reader, startedTTY.stdin)
+			// remove them from the output the client sees. Unix parks the
+			// reader on the master before the child can start; platforms that
+			// only expose a reader after the spawn attach it here.
+			if queryReader == nil {
+				queryReader = newTerminalQueryReader(startedTTY.reader, startedTTY.stdin)
+				captureDone = make(chan struct{})
+				go func() {
+					defer close(captureDone)
+					state.capture("pty", queryReader)
+					_ = queryReader.Close()
+				}()
+			}
 			state.mu.Lock()
 			state.sandboxType = sandboxType
 			state.mu.Unlock()
@@ -1983,6 +2168,9 @@ func (s *Server) startProcess(ctx context.Context, params *ExecParams) (*ExecRes
 					_ = startedTTY.closePTY()
 				}
 				_ = queryReader.Close()
+				if captureDone != nil {
+					<-captureDone
+				}
 				if startedTTY.cleanup != nil {
 					_ = startedTTY.cleanup()
 				}
@@ -1995,22 +2183,20 @@ func (s *Server) startProcess(ctx context.Context, params *ExecParams) (*ExecRes
 				return err
 			}
 			state.mu.Unlock()
-			captureDone := make(chan struct{})
-			go func() {
-				defer close(captureDone)
-				state.capture("pty", queryReader)
-				_ = queryReader.Close()
-			}()
+			state.telemetry.start(sandboxType)
 			go func() {
 				code, waitErr := startedTTY.wait()
-				if startedTTY.closePTY != nil {
-					_ = startedTTY.closePTY()
-				}
 				select {
 				case <-captureDone:
 				case <-time.After(2 * time.Second):
+					if startedTTY.closePTY != nil {
+						_ = startedTTY.closePTY()
+					}
 					_ = queryReader.Close()
 					<-captureDone
+				}
+				if startedTTY.closePTY != nil {
+					_ = startedTTY.closePTY()
 				}
 				if startedTTY.cleanup != nil {
 					_ = startedTTY.cleanup()
@@ -2025,18 +2211,35 @@ func (s *Server) startProcess(ctx context.Context, params *ExecParams) (*ExecRes
 	// exec server itself has no console. The supported-TTY branch above returned
 	// already and owns a pseudoconsole, so it is untouched.
 	envutil.SuppressConsoleWindow(cmd)
-	stdoutPipe, err := cmd.StdoutPipe()
+	// Rust #47605: piped exec-server children use the shared child launcher's
+	// NewSession mode (with Linux parent-death termination) rather than
+	// inheriting the exec server's session.
+	processgroup.PrepareChildSession(cmd)
+	// Own the output pipes instead of using cmd.StdoutPipe: os/exec's Wait
+	// closes the pipes it created, so a child that writes and exits quickly
+	// could lose its buffered output before the capture goroutines drained it
+	// (Rust reports every chunk before process/exited). With parent-owned ends,
+	// EOF means the child closed them, which is independent of Wait.
+	stdoutReader, stdoutWriter, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
-	stderrPipe, err := cmd.StderrPipe()
+	stderrReader, stderrWriter, err := os.Pipe()
 	if err != nil {
+		_ = stdoutReader.Close()
+		_ = stdoutWriter.Close()
 		return nil, err
 	}
+	cmd.Stdout = stdoutWriter
+	cmd.Stderr = stderrWriter
 	var stdin io.WriteCloser
 	if params.PipeStdin || params.TTY {
 		stdin, err = cmd.StdinPipe()
 		if err != nil {
+			_ = stdoutReader.Close()
+			_ = stdoutWriter.Close()
+			_ = stderrReader.Close()
+			_ = stderrWriter.Close()
 			return nil, err
 		}
 	}
@@ -2045,6 +2248,10 @@ func (s *Server) startProcess(ctx context.Context, params *ExecParams) (*ExecRes
 		if stdin != nil {
 			_ = stdin.Close()
 		}
+		_ = stdoutReader.Close()
+		_ = stdoutWriter.Close()
+		_ = stderrReader.Close()
+		_ = stderrWriter.Close()
 		return nil, err
 	}
 	state.networkProxy = preparedProxy
@@ -2056,8 +2263,10 @@ func (s *Server) startProcess(ctx context.Context, params *ExecParams) (*ExecRes
 		if stdin != nil {
 			_ = stdin.Close()
 		}
-		_ = stdoutPipe.Close()
-		_ = stderrPipe.Close()
+		_ = stdoutReader.Close()
+		_ = stdoutWriter.Close()
+		_ = stderrReader.Close()
+		_ = stderrWriter.Close()
 		return nil, requestError(-32600, fmt.Sprintf("process %s start was cancelled", params.ProcessID))
 	}
 	_, spawnSpan := startExecServerSpan(
@@ -2070,12 +2279,21 @@ func (s *Server) startProcess(ctx context.Context, params *ExecParams) (*ExecRes
 		spawnSpan.End()
 	}
 	if err != nil {
+		state.telemetry.spawnFailed(sandboxType)
 		s.releaseStartingProcess(params.ProcessID, state)
 		if stdin != nil {
 			_ = stdin.Close()
 		}
+		_ = stdoutReader.Close()
+		_ = stdoutWriter.Close()
+		_ = stderrReader.Close()
+		_ = stderrWriter.Close()
 		return nil, err
 	}
+	// The child owns its duplicated ends now; the parent's copies must close or
+	// the capture goroutines never see EOF.
+	_ = stdoutWriter.Close()
+	_ = stderrWriter.Close()
 	if ctx.Err() != nil {
 		s.releaseStartingProcess(params.ProcessID, state)
 	}
@@ -2083,22 +2301,51 @@ func (s *Server) startProcess(ctx context.Context, params *ExecParams) (*ExecRes
 		if stdin != nil {
 			_ = stdin.Close()
 		}
-		_ = stdoutPipe.Close()
-		_ = stderrPipe.Close()
-		_ = cmd.Process.Kill()
+		_ = stdoutReader.Close()
+		_ = stderrReader.Close()
+		_ = processgroup.TerminateProcessTree(cmd.Process)
 		_ = cmd.Wait()
 		return nil, requestError(-32600, fmt.Sprintf("process %s start was cancelled", params.ProcessID))
 	}
+	state.telemetry.start(sandboxType)
 	stdoutStream := "stdout"
 	stderrStream := "stderr"
 	if params.TTY {
 		stdoutStream = "pty"
 		stderrStream = "pty"
 	}
-	go state.capture(stdoutStream, stdoutPipe)
-	go state.capture(stderrStream, stderrPipe)
+	var capture sync.WaitGroup
+	capture.Add(2)
+	go func() {
+		defer capture.Done()
+		state.capture(stdoutStream, stdoutReader)
+		_ = stdoutReader.Close()
+	}()
+	go func() {
+		defer capture.Done()
+		state.capture(stderrStream, stderrReader)
+		_ = stderrReader.Close()
+	}()
 	go func() {
 		err := cmd.Wait()
+		// Rust keeps forwarding the child's final bytes after the wait
+		// completes, and only then lets the exit event out. Publishing exit
+		// first would let a `process/read` that starts from the previous
+		// sequence observe the exit record with the trailing chunks missing
+		// (the chunk lands right after it). Drain the captures first, with a
+		// bounded fallback for a detached child that keeps a pipe open.
+		drained := make(chan struct{})
+		go func() {
+			capture.Wait()
+			close(drained)
+		}()
+		select {
+		case <-drained:
+		case <-time.After(2 * time.Second):
+			_ = stdoutReader.Close()
+			_ = stderrReader.Close()
+			<-drained
+		}
 		state.finish(err)
 	}()
 	return newExecResponse(params.ProcessID, sandboxType), nil
@@ -2150,6 +2397,7 @@ func (s *Server) reserveProcessState(ctx context.Context, params *ExecParams) (*
 		seenWriteIDs: map[string]bool{},
 		notify:       processNotifierFromContext(ctx),
 		retention:    execServerExitedProcessRetention,
+		telemetry:    newProcessTelemetry(ctx, params, s.executorRegistrationIdentityValue()),
 	}
 	state.onClosed = func() {
 		timer := time.NewTimer(state.retention)
@@ -2236,6 +2484,7 @@ func (s *Server) prepareExecutorNetworkProxy(ctx context.Context, params *ExecPa
 		proxyConfig.Network,
 		preparedParams.Env,
 	)
+	processTelemetry := newProcessTelemetry(ctx, params, s.executorRegistrationIdentityValue())
 	proxyConfig.AuditMetadata = network.ProxyAuditMetadata{
 		ConversationID: launch.AuditMetadata.ConversationID,
 		AppVersion:     launch.AuditMetadata.AppVersion,
@@ -2246,6 +2495,7 @@ func (s *Server) prepareExecutorNetworkProxy(ctx context.Context, params *ExecPa
 		TerminalType:   launch.AuditMetadata.TerminalType,
 		Model:          launch.AuditMetadata.Model,
 		Slug:           launch.AuditMetadata.Slug,
+		ProcessLog:     processTelemetry.networkProcessLogMetadata(),
 	}
 	policyCtx, policyCancel := context.WithCancel(context.Background())
 	if launch.PolicyDecisionTimeoutMS != nil {
@@ -2342,8 +2592,10 @@ func (s *Server) prepareExecutorNetworkProxy(ctx context.Context, params *ExecPa
 	}
 	sandboxContext := prepared.SandboxContextSnapshot()
 	preparedParams.ManagedNetwork = &ManagedNetworkSandboxContext{
-		LoopbackPorts:     append([]uint16(nil), sandboxContext.LoopbackPorts...),
-		AllowLocalBinding: sandboxContext.AllowLocalBinding,
+		LoopbackPorts:                  append([]uint16(nil), sandboxContext.LoopbackPorts...),
+		AllowLocalBinding:              sandboxContext.AllowLocalBinding,
+		AllowUnixSockets:               append([]string(nil), sandboxContext.AllowUnixSockets...),
+		DangerouslyAllowAllUnixSockets: sandboxContext.DangerouslyAllowAllUnixSockets,
 	}
 	preparedParams.EnforceManagedNetwork = true
 	return &preparedParams, prepared, policyCancel, nil
@@ -2447,15 +2699,24 @@ func prepareExecProcess(params *ExecParams, allowedSymlinkedCodexHome string) ([
 	if err != nil {
 		return nil, "", sandbox.SandboxTypeNone, requestError(-32602, fmt.Sprintf("invalid sandbox permission profile: %v", err))
 	}
+	managedNetworkJSON, err := managedNetworkSandboxContextJSON(params)
+	if err != nil {
+		return nil, "", sandbox.SandboxTypeNone, requestError(-32602, fmt.Sprintf("invalid managed network context: %v", err))
+	}
 	plan, err := sandbox.BuildCommandRunPlan(&sandbox.CommandRunRequest{
 		ResolvedPermissionProfile:     profile,
 		ResolvedPermissionProfileID:   "exec-server",
 		ResolvedPermissionProfileJSON: profileJSON,
 		CWD:                           cwd,
-		UseLegacyLandlock:             sandboxContext.UseLegacyLandlock,
-		AllowNetworkForProxy:          params.EnforceManagedNetwork,
-		AllowedSymlinkedCodexHome:     allowedSymlinkedCodexHome,
-		Command:                       command,
+		WorkspaceRoots:                sandboxContext.WorkspaceRoots,
+		// Rust #60663: the execution host supplies the helper binaries and the
+		// validated managed-network CA bundle the sandboxed child must read.
+		SandboxReadableRoots:      execServerRuntimeReadablePaths(params),
+		UseLegacyLandlock:         sandboxContext.UseLegacyLandlock,
+		AllowNetworkForProxy:      params.EnforceManagedNetwork,
+		ManagedNetworkJSON:        managedNetworkJSON,
+		AllowedSymlinkedCodexHome: allowedSymlinkedCodexHome,
+		Command:                   command,
 	})
 	if err != nil {
 		return nil, "", sandbox.SandboxTypeNone, requestError(-32602, fmt.Sprintf("failed to prepare process sandbox: %v", err))
@@ -2470,13 +2731,15 @@ func prepareExecProcess(params *ExecParams, allowedSymlinkedCodexHome string) ([
 	plan.CWD = cwd
 	_ = sandboxCWD
 	if runtime.GOOS == "linux" && sandboxCWD != cwd {
-		wrapped, wrapErr := sandbox.CreateLinuxSandboxCommandArgsForPermissionProfileJSON(
+		wrapped, wrapErr := sandbox.CreateLinuxSandboxCommandArgsForPermissionProfileJSONWithSandboxExeAndManagedNetwork(
+			"",
 			command,
 			cwd,
 			profileJSON,
 			sandboxCWD,
 			sandboxContext.UseLegacyLandlock,
 			params.EnforceManagedNetwork,
+			managedNetworkJSON,
 		)
 		if wrapErr != nil {
 			return nil, "", sandbox.SandboxTypeNone, requestError(-32602, fmt.Sprintf("failed to prepare process sandbox: %v", wrapErr))
@@ -2484,6 +2747,61 @@ func prepareExecProcess(params *ExecParams, allowedSymlinkedCodexHome string) ([
 		plan.Command = wrapped
 	}
 	return plan.Command, plan.CWD, plan.SandboxType, nil
+}
+
+// execServerRuntimeReadablePaths lists executor-owned files that restricted
+// reads must expose to a sandboxed child (Rust #60663): the helper executable
+// that re-enters the sandbox to apply seccomp, and the CA bundle selected by
+// the child environment for a managed network. Paths are validated on this
+// host and deduplicated; a relative or missing path is ignored.
+func execServerRuntimeReadablePaths(params *ExecParams) []string {
+	var paths []string
+	if runtime.GOOS == "linux" {
+		if executable, err := os.Executable(); err == nil {
+			if absolute, absErr := filepath.Abs(executable); absErr == nil {
+				paths = append(paths, filepath.Clean(absolute))
+			}
+		}
+		if helper, err := exec.LookPath("codex-linux-sandbox"); err == nil {
+			if absolute, absErr := filepath.Abs(helper); absErr == nil {
+				paths = append(paths, filepath.Clean(absolute))
+			}
+		}
+	}
+	if params != nil {
+		for _, key := range []string{"CODEX_CA_CERTIFICATE", "SSL_CERT_FILE"} {
+			path := strings.TrimSpace(params.Env[key])
+			if path == "" || !filepath.IsAbs(path) {
+				continue
+			}
+			paths = append(paths, filepath.Clean(path))
+		}
+	}
+	seen := map[string]bool{}
+	out := paths[:0]
+	for _, path := range paths {
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		out = append(out, path)
+	}
+	return out
+}
+
+// managedNetworkSandboxContextJSON serializes the prepared managed-network
+// context for the Linux sandbox helper. Rust #45534 hands the context to the
+// helper on proxy-routed launches, and the helper treats its presence as the
+// proxy-mode switch and reads `dangerouslyAllowAllUnixSockets` from it.
+func managedNetworkSandboxContextJSON(params *ExecParams) (string, error) {
+	if params == nil || !params.EnforceManagedNetwork || params.ManagedNetwork == nil {
+		return "", nil
+	}
+	encoded, err := json.Marshal(params.ManagedNetwork)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
 }
 
 func nativeExecServerPath(raw string, label string) (string, error) {
@@ -2807,6 +3125,85 @@ func (s *Server) releaseFileSlot() {
 	}
 }
 
+// acquireFileHandle pins a handle for one read or write. A concurrent close
+// retires the entry but leaves the descriptor open until every pin is
+// released, matching Rust #50162's Arc<File> lifetime.
+func (s *Server) acquireFileHandle(handleID string) (*fileHandleEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry := s.handles[handleID]
+	if entry == nil {
+		return nil, requestError(-32004, fmt.Sprintf("unknown file handle `%s`", handleID))
+	}
+	entry.refs++
+	return entry, nil
+}
+
+// releaseFileHandle drops one pin and closes the descriptor once a retired
+// handle has no operation left using it.
+func (s *Server) releaseFileHandle(entry *fileHandleEntry) {
+	var closeFile *os.File
+	s.mu.Lock()
+	entry.refs--
+	if entry.retired && entry.refs == 0 {
+		closeFile = entry.file
+	}
+	s.mu.Unlock()
+	if closeFile != nil {
+		_ = closeFile.Close()
+	}
+}
+
+// retireFileHandleLocked removes one entry and reports the descriptor to close
+// when no operation still holds it. The caller must hold s.mu.
+func (s *Server) retireFileHandleLocked(handleID string, entry *fileHandleEntry) *os.File {
+	delete(s.handles, handleID)
+	entry.retired = true
+	if entry.refs == 0 {
+		return entry.file
+	}
+	return nil
+}
+
+// retireFileHandle removes a handle and frees its capacity immediately.
+func (s *Server) retireFileHandle(handleID string) bool {
+	var closeFile *os.File
+	s.mu.Lock()
+	entry := s.handles[handleID]
+	if entry != nil {
+		closeFile = s.retireFileHandleLocked(handleID, entry)
+	}
+	s.mu.Unlock()
+	if entry == nil {
+		return false
+	}
+	s.releaseFileSlot()
+	if closeFile != nil {
+		_ = closeFile.Close()
+	}
+	return true
+}
+
+// retireFileHandleIfCurrent retires entry only while it is still the handle's
+// current entry, so a stale read error cannot close a newer handle.
+func (s *Server) retireFileHandleIfCurrent(handleID string, entry *fileHandleEntry) bool {
+	var closeFile *os.File
+	s.mu.Lock()
+	removed := entry != nil && s.handles[handleID] == entry
+	if removed {
+		closeFile = s.retireFileHandleLocked(handleID, entry)
+	}
+	s.mu.Unlock()
+	if !removed {
+		return false
+	}
+	s.releaseFileSlot()
+	if closeFile != nil {
+		_ = closeFile.Close()
+	}
+	return true
+}
+
 func (s *Server) readBlock(params *FSReadBlockParams) (*FSReadBlockResponse, error) {
 	if params == nil {
 		return nil, errors.New("fs/readBlock params are required")
@@ -2820,19 +3217,18 @@ func (s *Server) readBlock(params *FSReadBlockParams) (*FSReadBlockResponse, err
 	if params.Offset > uint64(^uint64(0)>>1) {
 		return nil, requestError(-32600, "file read offset overflowed")
 	}
-	s.mu.Lock()
-	entry := s.handles[params.HandleID]
-	s.mu.Unlock()
-	if entry == nil {
-		return nil, requestError(-32004, fmt.Sprintf("unknown file handle `%s`", params.HandleID))
+	entry, err := s.acquireFileHandle(params.HandleID)
+	if err != nil {
+		return nil, err
 	}
+	defer s.releaseFileHandle(entry)
 	file := entry.file
 	buffer := make([]byte, params.Len)
 	bytesRead := 0
 	for bytesRead < params.Len {
 		readOffset := params.Offset + uint64(bytesRead)
 		if readOffset > uint64(^uint64(0)>>1) {
-			s.closeHandleAfterReadError(params.HandleID, file)
+			s.closeHandleAfterReadError(params.HandleID, entry)
 			return nil, requestError(-32600, "file read offset overflowed")
 		}
 		n, err := file.ReadAt(buffer[bytesRead:], int64(readOffset))
@@ -2841,7 +3237,7 @@ func (s *Server) readBlock(params *FSReadBlockParams) (*FSReadBlockResponse, err
 			break
 		}
 		if err != nil {
-			s.closeHandleAfterReadError(params.HandleID, file)
+			s.closeHandleAfterReadError(params.HandleID, entry)
 			return nil, err
 		}
 	}
@@ -2873,12 +3269,11 @@ func (s *Server) writeBlock(params *FSWriteBlockParams) (*FSWriteBlockResponse, 
 	if end < params.Offset || end > uint64(math.MaxInt64) {
 		return nil, requestError(-32600, "file write range exceeds the signed 64-bit file offset limit")
 	}
-	s.mu.Lock()
-	entry := s.handles[params.HandleID]
-	s.mu.Unlock()
-	if entry == nil {
-		return nil, requestError(-32004, fmt.Sprintf("unknown file handle `%s`", params.HandleID))
+	entry, err := s.acquireFileHandle(params.HandleID)
+	if err != nil {
+		return nil, err
 	}
+	defer s.releaseFileHandle(entry)
 	file := entry.file
 	position := 0
 	for position < len(chunk) {
@@ -2903,31 +3298,12 @@ func (s *Server) closeFile(params *FSCloseParams) (*FSCloseResponse, error) {
 	if err := validateFileHandleID(params.HandleID); err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
-	entry := s.handles[params.HandleID]
-	delete(s.handles, params.HandleID)
-	s.mu.Unlock()
-	if entry != nil {
-		s.releaseFileSlot()
-		if err := entry.file.Close(); err != nil {
-			return nil, err
-		}
-	}
+	s.retireFileHandle(params.HandleID)
 	return &FSCloseResponse{}, nil
 }
 
-func (s *Server) closeHandleAfterReadError(handleID string, file *os.File) {
-	s.mu.Lock()
-	removed := false
-	if entry := s.handles[handleID]; entry != nil && entry.file == file {
-		delete(s.handles, handleID)
-		removed = true
-	}
-	s.mu.Unlock()
-	if removed {
-		s.releaseFileSlot()
-	}
-	_ = file.Close()
+func (s *Server) closeHandleAfterReadError(handleID string, entry *fileHandleEntry) {
+	s.retireFileHandleIfCurrent(handleID, entry)
 }
 
 func validateFileHandleID(handleID string) error {
@@ -3471,6 +3847,7 @@ func (p *processState) capture(stream string, reader io.Reader) {
 		n, err := reader.Read(buffer)
 		if n > 0 {
 			data := append([]byte(nil), buffer[:n]...)
+			p.notifyMu.Lock()
 			p.mu.Lock()
 			chunk := p.appendLocked(stream, data)
 			notify := p.notify
@@ -3478,6 +3855,7 @@ func (p *processState) capture(stream string, reader io.Reader) {
 			if notify != nil {
 				notify(MethodProcessOutput, ProcessOutputNotification{ProcessID: p.id, Seq: chunk.Seq, Stream: chunk.Stream, Chunk: base64.StdEncoding.EncodeToString(chunk.Chunk)})
 			}
+			p.notifyMu.Unlock()
 		}
 		if err != nil {
 			p.finishStream()
@@ -3491,7 +3869,9 @@ func (p *processState) finish(waitErr error) {
 }
 
 func (p *processState) finishWithCode(waitErr error, explicitCode *int) {
+	p.notifyMu.Lock()
 	p.mu.Lock()
+	alreadyExited := p.exited
 	var exitErr *exec.ExitError
 	if waitErr != nil && !errors.As(waitErr, &exitErr) {
 		p.failure = waitErr.Error()
@@ -3507,6 +3887,14 @@ func (p *processState) finishWithCode(waitErr error, explicitCode *int) {
 		p.sandboxDenied = sandbox.IsLikelySandboxDenied(p.sandboxType, p.sandboxExecOutputLocked(*p.exitCode))
 	}
 	p.exited = true
+	telemetry := p.telemetry
+	sandboxType := p.sandboxType
+	sandboxDenied := p.sandboxDenied
+	terminationRequested := p.terminationRequested
+	exitCodeValue := -1
+	if p.exitCode != nil {
+		exitCodeValue = *p.exitCode
+	}
 	var exited *ProcessExitedNotification
 	if !p.exitSequenced {
 		seq := p.nextSeq
@@ -3540,6 +3928,13 @@ func (p *processState) finishWithCode(waitErr error, explicitCode *int) {
 			notify(MethodProcessClosed, *closed)
 		}
 	}
+	p.notifyMu.Unlock()
+	if !alreadyExited {
+		if sandboxDenied {
+			telemetry.sandboxDenied(sandboxType)
+		}
+		telemetry.exit(sandboxType, exitCodeValue, terminationRequested)
+	}
 	if closed != nil {
 		p.closeNetworkResources()
 		p.scheduleRetention()
@@ -3547,6 +3942,7 @@ func (p *processState) finishWithCode(waitErr error, explicitCode *int) {
 }
 
 func (p *processState) finishStream() {
+	p.notifyMu.Lock()
 	p.mu.Lock()
 	if p.openStreams > 0 {
 		p.openStreams--
@@ -3567,6 +3963,7 @@ func (p *processState) finishStream() {
 	if notify != nil && closed != nil {
 		notify(MethodProcessClosed, *closed)
 	}
+	p.notifyMu.Unlock()
 	if closed != nil {
 		p.closeNetworkResources()
 		p.scheduleRetention()
@@ -3752,12 +4149,15 @@ func (p *processState) terminate() *TerminateResponse {
 	cmd := p.cmd
 	terminateFn := p.terminateFn
 	running := !p.exited && (terminateFn != nil || (cmd != nil && cmd.Process != nil))
+	if running {
+		p.terminationRequested = true
+	}
 	p.mu.Unlock()
 	if running {
 		if terminateFn != nil {
 			_ = terminateFn()
 		} else {
-			_ = cmd.Process.Kill()
+			_ = processgroup.TerminateProcessTree(cmd.Process)
 		}
 	}
 	return &TerminateResponse{Running: running}
@@ -3811,7 +4211,7 @@ func (p *processState) signal(params *SignalParams) (*SignalResponse, error) {
 		}
 		return &SignalResponse{}, nil
 	}
-	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+	if err := processgroup.InterruptProcessTree(cmd.Process); err != nil {
 		return nil, fmt.Errorf("failed to signal process: %w", err)
 	}
 	return &SignalResponse{}, nil
@@ -3864,6 +4264,9 @@ func localEnvironmentInfo() *EnvironmentInfo {
 	if home, err := os.UserHomeDir(); err == nil {
 		userHomeDir = home
 	}
+	// Configured provider rules travel with the launch, so masking support
+	// covers custom providers too (Rust #56049).
+	credentialMasking := (runtime.GOOS == "linux" || runtime.GOOS == "darwin") && detected.ShellType == shell.ShellBash
 	return &EnvironmentInfo{
 		Shell:                ShellInfo{Name: detected.Name(), Path: detected.ShellPath},
 		ExecutorVersion:      ExecServerExecutorVersion(),
@@ -3874,13 +4277,17 @@ func localEnvironmentInfo() *EnvironmentInfo {
 		UserHomeDir:          userHomeDir,
 		TemporaryDirectories: localTemporaryDirectories(cwdPath),
 		Capabilities: EnvironmentCapabilities{
-			NetworkProxyLaunch:         true,
-			CredentialMasking:          (runtime.GOOS == "linux" || runtime.GOOS == "darwin") && detected.ShellType == shell.ShellBash,
-			CapabilityDiscoverySandbox: true,
-			CapabilityDiscoveryV2:      true,
-			// Local exec-servers do not own the unified-exec launch path, so they
-			// must not advertise executor-managed shell snapshots (Rust #39958).
-			ShellSnapshotV2: false,
+			NetworkProxyLaunch:               true,
+			NetworkProxyReviewDomains:        true,
+			CredentialMasking:                credentialMasking,
+			CredentialMaskingCustomProviders: credentialMasking,
+			CapabilityDiscoverySandbox:       true,
+			CapabilityDiscoveryV2:            true,
+			FSWatchMissing:                   runtime.GOOS == "linux",
+			// Rust #40376: the local exec server advertises executor-managed
+			// shell snapshots on Unix and keeps reporting them unsupported
+			// elsewhere (EnvironmentInfo::local uses cfg!(unix)).
+			ShellSnapshotV2: runtime.GOOS != "windows",
 			// Rust 646f7c0a91: local executors advertise environmentConfig/read.
 			// Go now implements the request (execserver/environment_config_read.go,
 			// mirroring exec-server/src/server/registry.rs -> environment_config_read),
@@ -3891,6 +4298,11 @@ func localEnvironmentInfo() *EnvironmentInfo {
 			// Rust #50177: the executor supports replacement opens and
 			// positional `fs/writeBlock`.
 			FileWriteStreaming: true,
+			// Rust #45524 reports native MXC availability on Windows. The bit
+			// follows the launcher's own probe (sandbox.WindowsMXCAvailable),
+			// which `sandbox/mxc` registers at init from the PSEC capability, so
+			// the advertised capability and what launch() can do cannot diverge.
+			WindowsMxc: sandbox.WindowsMXCAvailable(),
 		},
 	}
 }
@@ -3950,7 +4362,7 @@ func localTemporaryDirectories(cwd string) []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, name := range names {
-		value := strings.TrimSpace(os.Getenv(name))
+		value := os.Getenv(name)
 		if value == "" {
 			continue
 		}

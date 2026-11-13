@@ -17,9 +17,7 @@ const (
 	ContentOutputText ContentKind = "output_text"
 	ContentInputImage ContentKind = "input_image"
 	// ContentInputAudio classifies an audio content item (Rust
-	// `ContentItem::InputAudio`). Go's content items carry no audio URL field
-	// yet, so nothing in the pipeline produces this kind today; the audio
-	// wrapper labels below still mirror Rust's `user_input_parts` filter.
+	// `ContentItem::InputAudio`).
 	ContentInputAudio ContentKind = "input_audio"
 )
 
@@ -27,11 +25,12 @@ type ContentItem struct {
 	Kind     ContentKind
 	Text     string
 	ImageURL string
-	// FileID is the uploaded-file form of an image reference (Rust
-	// `ImageReference::File`); when set it replaces ImageURL on the wire.
+	// FileID is the uploaded-file form of an image or audio reference (Rust
+	// `ImageReference::File` / `AudioReference::File`); when set it replaces
+	// ImageURL or AudioURL on the wire.
 	FileID string
 	// AudioURL carries an inline audio data URL (Rust
-	// `ContentItem::InputAudio`).
+	// `AudioReference::Inline`).
 	AudioURL string
 	Detail   string
 }
@@ -54,7 +53,13 @@ func (item ContentItem) Wire() map[string]any {
 		}
 		return out
 	case ContentInputAudio:
-		return map[string]any{"type": string(ContentInputAudio), "audio_url": item.AudioURL}
+		out := map[string]any{"type": string(ContentInputAudio)}
+		if item.FileID != "" {
+			out["file_id"] = item.FileID
+		} else if item.AudioURL != "" {
+			out["audio_url"] = item.AudioURL
+		}
+		return out
 	case ContentOutputText:
 		return map[string]any{"type": string(ContentOutputText), "text": item.Text}
 	default:
@@ -78,7 +83,8 @@ func (item ContentItem) RustJSON() ([]byte, error) {
 	}
 	type audioItem struct {
 		Type     string `json:"type"`
-		AudioURL string `json:"audio_url"`
+		AudioURL string `json:"audio_url,omitempty"`
+		FileID   string `json:"file_id,omitempty"`
 	}
 	switch item.Kind {
 	case ContentInputImage:
@@ -90,7 +96,13 @@ func (item ContentItem) RustJSON() ([]byte, error) {
 		}
 		return json.Marshal(imageItem{Type: string(ContentInputImage), ImageURL: imageURL, FileID: fileID, Detail: item.Detail})
 	case ContentInputAudio:
-		return json.Marshal(audioItem{Type: string(ContentInputAudio), AudioURL: item.AudioURL})
+		audioURL, fileID := item.AudioURL, item.FileID
+		// Rust's AudioReference is an untagged either/or; keep the file form
+		// authoritative when both are set, matching Wire().
+		if fileID != "" {
+			audioURL = ""
+		}
+		return json.Marshal(audioItem{Type: string(ContentInputAudio), AudioURL: audioURL, FileID: fileID})
 	case ContentOutputText:
 		return json.Marshal(textItem{Type: string(ContentOutputText), Text: item.Text})
 	default:
@@ -449,15 +461,31 @@ func RawAssistantOutputTextFromItem(item *ResponseItem) (string, bool) {
 }
 
 func ImageGenerationArtifactPath(codexHome string, sessionID string, callID string) string {
-	return filepath.Join(codexHome, "generated_images", sanitizePathPart(sessionID), sanitizePathPart(callID)+".png")
+	return ImageGenerationArtifactPathForFormat(codexHome, sessionID, callID, false)
+}
+
+// ImageGenerationArtifactPathForFormat keeps the encoded format in the file
+// name so an animated result is saved as `.gif` (Rust #59073).
+func ImageGenerationArtifactPathForFormat(codexHome string, sessionID string, callID string, gif bool) string {
+	extension := ".png"
+	if gif {
+		extension = ".gif"
+	}
+	return filepath.Join(codexHome, "generated_images", sanitizePathPart(sessionID), sanitizePathPart(callID)+extension)
 }
 
 func SaveImageGenerationResult(codexHome string, sessionID string, callID string, result string) (string, error) {
+	return SaveImageGenerationResultForFormat(codexHome, sessionID, callID, result, false)
+}
+
+// SaveImageGenerationResultForFormat writes the decoded result as PNG or GIF
+// bytes (Rust #59073 saves the animation bytes unchanged).
+func SaveImageGenerationResultForFormat(codexHome string, sessionID string, callID string, result string, gif bool) (string, error) {
 	bytes, err := base64.StdEncoding.DecodeString(strings.TrimSpace(result))
 	if err != nil {
 		return "", err
 	}
-	path := ImageGenerationArtifactPath(codexHome, sessionID, callID)
+	path := ImageGenerationArtifactPathForFormat(codexHome, sessionID, callID, gif)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", err
 	}

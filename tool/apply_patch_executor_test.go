@@ -12,6 +12,19 @@ import (
 	"codex_core/sandbox"
 )
 
+// canonicalTempDir resolves every symlinked ancestor of a temporary directory.
+// No-follow patches (Rust #39659) reject any symlinked component, and macOS
+// reports its temporary directory through the /var symlink, so Rust's fixtures
+// canonicalize for the same reason.
+func canonicalTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks() error = %v", err)
+	}
+	return dir
+}
+
 func TestApplyPatchExecutorRunsPatchAndFormatsOutput(t *testing.T) {
 	dir := t.TempDir()
 	executor := NewApplyPatchExecutor(&ApplyPatchExecutorOptions{CWD: dir})
@@ -142,6 +155,105 @@ func TestApplyPatchExecutorUsesGrantedPermissionsLikeRust(t *testing.T) {
 		t.Fatalf("granted patch output = %#v, %v", output, err)
 	}
 	assertApplyPatchFile(t, outside, "granted\n")
+}
+
+func TestApplyPatchExecutorApprovesOutsideWorkspaceWithParentGrantLikeRust(t *testing.T) {
+	cwd := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "approved.txt")
+	policy := sandbox.NewWorkspaceWritePolicy()
+	policy.ExcludeTmpdirEnvVar = true
+	policy.ExcludeSlashTmp = true
+	approvals := 0
+	executor := NewApplyPatchExecutor(&ApplyPatchExecutorOptions{
+		CWD:           cwd,
+		SandboxPolicy: policy,
+		Approval: func(_ context.Context, request *ApplyPatchApprovalRequest) (ApplyPatchApprovalDecision, error) {
+			approvals++
+			if request == nil || request.CWD != cwd {
+				t.Fatalf("approval request = %#v, want cwd %q", request, cwd)
+			}
+			return ApplyPatchApprovalDecision{Approved: true}, nil
+		},
+	})
+	patch := "*** Begin Patch\n*** Add File: " + filepath.ToSlash(outside) + "\n+approved\n*** End Patch"
+	output, err := executor.Execute(context.Background(), &Invocation{
+		CallID:   "outside-approved",
+		ToolName: PlainName(DefaultApplyPatchToolName),
+		Payload:  Payload{Kind: PayloadCustom, Input: patch},
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if output == nil || !output.Success {
+		t.Fatalf("approved outside patch = %#v, want success", output)
+	}
+	if approvals != 1 {
+		t.Fatalf("approvals = %d, want one", approvals)
+	}
+	assertApplyPatchFile(t, outside, "approved\n")
+}
+
+func TestApplyPatchExecutorApprovesReadOnlyWorkspaceWriteLikeRust(t *testing.T) {
+	cwd := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "read-only-approved.txt")
+	profile := sandbox.ReadOnlyPermissionProfile()
+	approvals := 0
+	executor := NewApplyPatchExecutor(&ApplyPatchExecutorOptions{
+		CWD:               cwd,
+		PermissionProfile: &profile,
+		Approval: func(context.Context, *ApplyPatchApprovalRequest) (ApplyPatchApprovalDecision, error) {
+			approvals++
+			return ApplyPatchApprovalDecision{Approved: true}, nil
+		},
+	})
+	patch := "*** Begin Patch\n*** Add File: " + filepath.ToSlash(outside) + "\n+approved\n*** End Patch"
+	output, err := executor.Execute(context.Background(), &Invocation{
+		CallID:   "read-only-approved",
+		ToolName: PlainName(DefaultApplyPatchToolName),
+		Payload:  Payload{Kind: PayloadCustom, Input: patch},
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if output == nil || !output.Success {
+		t.Fatalf("approved read-only patch = %#v, want success", output)
+	}
+	if approvals != 1 {
+		t.Fatalf("approvals = %d, want one", approvals)
+	}
+	assertApplyPatchFile(t, outside, "approved\n")
+}
+
+func TestApplyPatchExecutorAutoApprovesFullAccessLikeRust(t *testing.T) {
+	cwd := canonicalTempDir(t)
+	outside := filepath.Join(canonicalTempDir(t), "full-access.txt")
+	profile := sandbox.FullAccessPermissionProfile()
+	sink := &recordingDecisionSink{}
+	executor := NewApplyPatchExecutor(&ApplyPatchExecutorOptions{
+		CWD:               cwd,
+		PermissionProfile: &profile,
+		DecisionSink:      sink,
+		Approval: func(context.Context, *ApplyPatchApprovalRequest) (ApplyPatchApprovalDecision, error) {
+			t.Fatal("a full-access profile should not request approval for a constrained patch")
+			return ApplyPatchApprovalDecision{}, nil
+		},
+	})
+	patch := "*** Begin Patch\n*** Add File: " + filepath.ToSlash(outside) + "\n+full\n*** End Patch"
+	output, err := executor.Execute(context.Background(), &Invocation{
+		CallID:   "full-access-auto-approved",
+		ToolName: PlainName(DefaultApplyPatchToolName),
+		Payload:  Payload{Kind: PayloadCustom, Input: patch},
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if output == nil || !output.Success {
+		t.Fatalf("full-access patch = %#v, want success", output)
+	}
+	if len(sink.autoApproved) != 1 || sink.autoApproved[0].callID != "full-access-auto-approved" {
+		t.Fatalf("auto-approved decisions = %#v", sink.autoApproved)
+	}
+	assertApplyPatchFile(t, outside, "full\n")
 }
 
 func TestApplyPatchExecutorCanonicalProfileWinsOverLegacyPolicyLikeRust(t *testing.T) {
@@ -469,7 +581,7 @@ func TestApplyPatchExecutorInvalidMatrixDoesNotMutateWorkspace(t *testing.T) {
 			if err == nil {
 				t.Fatalf("Execute() = %#v, nil; want verification error", output)
 			}
-			if test.verificationError && !strings.Contains(err.Error(), "failed to find expected lines") {
+			if test.verificationError && !strings.Contains(err.Error(), "Failed to find expected lines in ") {
 				t.Fatalf("Execute() error = %v; want missing-context verification error", err)
 			}
 			assertApplyPatchFile(t, filepath.Join(cwd, "keep.txt"), "keep\n")

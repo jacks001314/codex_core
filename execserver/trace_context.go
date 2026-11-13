@@ -6,6 +6,8 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+
+	"codex_core/protocol"
 )
 
 // TraceContext carries a request trace identifier from receipt through
@@ -44,6 +46,34 @@ func ParseTraceContext(raw string) TraceContext {
 	return TraceContext{TraceID: strings.TrimSpace(parts[0]), SpanID: strings.TrimSpace(parts[1])}
 }
 
+// TraceContextFromW3C extracts the trace and parent span identifiers from a
+// W3C traceparent carrier. Malformed or all-zero identifiers are rejected so a
+// launch never inherits an unrelated active span.
+func TraceContextFromW3C(traceparent string) (TraceContext, bool) {
+	parts := strings.Split(strings.TrimSpace(traceparent), "-")
+	if len(parts) != 4 || len(parts[0]) != 2 || !isHex(parts[0]) || !isHex(parts[1]) || !isHex(parts[2]) || len(parts[3]) != 2 || !isHex(parts[3]) {
+		return TraceContext{}, false
+	}
+	if len(parts[1]) != 32 || len(parts[2]) != 16 {
+		return TraceContext{}, false
+	}
+	if strings.Trim(parts[1], "0") == "" || strings.Trim(parts[2], "0") == "" {
+		return TraceContext{}, false
+	}
+	return TraceContext{TraceID: parts[1], SpanID: parts[2]}, true
+}
+
+func isHex(value string) bool {
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if character >= '0' && character <= '9' || character >= 'a' && character <= 'f' || character >= 'A' && character <= 'F' {
+			continue
+		}
+		return false
+	}
+	return value != ""
+}
+
 // ChildSpan returns a child span identifier within the same trace.
 func (t TraceContext) ChildSpan() TraceContext {
 	return TraceContext{TraceID: strings.TrimSpace(t.TraceID), SpanID: uuid.NewString()}
@@ -60,8 +90,17 @@ func traceContextFromContext(ctx context.Context) TraceContext {
 	if ctx == nil {
 		return TraceContext{}
 	}
-	trace, _ := ctx.Value(traceContextKey{}).(TraceContext)
-	return trace
+	if trace, _ := ctx.Value(traceContextKey{}).(TraceContext); !trace.IsZero() {
+		return trace
+	}
+	// Rust #60506: fall back to the W3C carrier stored on the request context
+	// when no active span trace was installed for this call.
+	if w3c, ok := protocol.TraceContextFromContext(ctx); ok && w3c != nil {
+		if trace, ok := TraceContextFromW3C(w3c.Traceparent); ok {
+			return trace
+		}
+	}
+	return TraceContext{}
 }
 
 // logEnvironmentTrace exposes the active request trace on environment

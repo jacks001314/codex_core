@@ -50,10 +50,17 @@ func (s *PluginService) ReloadConfig() error {
 	installRoot := s.marketplaceInstallRoot
 	manifests := s.manifests
 	now := s.now
+	codexHome := s.codexHome
+	marketplacePolicy := s.marketplacePolicy
 	s.mu.Unlock()
 	values, err := readMarketplaceConfig(configPath)
 	if err != nil {
 		return err
+	}
+	if marketplacePolicy != nil {
+		if filtered, ok := marketplacePolicy.FilterPluginConfig(codexHome, values); ok {
+			values = filtered
+		}
 	}
 	marketplaces := configuredMarketplacesFromConfig(values, installRoot, now)
 	plugins := configuredPluginsFromConfig(values, manifests)
@@ -90,7 +97,14 @@ func (s *PluginService) ResolveConfigMarketplaces(values map[string]any) ([]Plug
 	installRoot := s.marketplaceInstallRoot
 	manifests := s.manifests
 	now := s.now
+	codexHome := s.codexHome
+	marketplacePolicy := s.marketplacePolicy
 	s.mu.Unlock()
+	if marketplacePolicy != nil {
+		if filtered, ok := marketplacePolicy.FilterPluginConfig(codexHome, values); ok {
+			values = filtered
+		}
+	}
 	marketplaces := configuredMarketplacesFromConfig(values, installRoot, now)
 	if len(marketplaces) == 0 {
 		return nil, nil
@@ -131,25 +145,34 @@ func recordMarketplaceConfig(configPath string, marketplace *Marketplace) error 
 	return writeMarketplaceConfig(configPath, values)
 }
 
-func removeMarketplaceConfig(configPath string, marketplaceName string) error {
+// removeMarketplaceConfig drops a user marketplace entry and reports whether
+// the entry existed, mirroring Rust's RemoveMarketplaceConfigOutcome::Removed
+// versus NotFound distinction.
+func removeMarketplaceConfig(configPath string, marketplaceName string) (bool, error) {
 	configPath = strings.TrimSpace(configPath)
 	marketplaceName = strings.TrimSpace(marketplaceName)
 	if configPath == "" || marketplaceName == "" {
-		return nil
+		return false, nil
 	}
 	values, err := readMarketplaceConfig(configPath)
 	if err != nil {
-		return err
+		return false, err
 	}
 	marketplaces, ok := values["marketplaces"].(map[string]any)
 	if !ok {
-		return nil
+		return false, nil
+	}
+	if _, ok := marketplaces[marketplaceName]; !ok {
+		return false, nil
 	}
 	delete(marketplaces, marketplaceName)
 	if len(marketplaces) == 0 {
 		delete(values, "marketplaces")
 	}
-	return writeMarketplaceConfig(configPath, values)
+	if err := writeMarketplaceConfig(configPath, values); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func recordInstalledPluginConfig(configPath string, detail *PluginDetail) error {

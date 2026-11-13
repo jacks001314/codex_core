@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"syscall"
 
 	"codex_core/install"
 	"codex_core/sandbox/sandboxpath"
@@ -43,6 +46,9 @@ const BwrapUnavailableMessage = "bubblewrap is unavailable: no system bwrap was 
 // GlobScanProgram is the external deny-glob scanner inventoried by sandbox
 // integrity checks (Rust #51840).
 const GlobScanProgram = "rg"
+
+// maxUnreadableGlobMatches mirrors Rust MAX_UNREADABLE_GLOB_MATCHES.
+const maxUnreadableGlobMatches = 8192
 
 // bwrapCapabilities are the launcher features probed from `bwrap --help`.
 type bwrapCapabilities struct {
@@ -255,6 +261,99 @@ func FindBundledBwrapForExecutable(executable, commandCWD string) (string, bool)
 		}
 	}
 	return "", false
+}
+
+// ExpandUnreadableGlobsInEnvironment expands deny-read globs in process.
+// Rust #59711 removed the external `rg` scanner: expansion now includes
+// hidden and ignored files, applies the scan depth limit, and fails closed on
+// traversal errors without depending on the command's PATH.
+func ExpandUnreadableGlobsInEnvironment(
+	patterns []string,
+	cwd string,
+	_ sandboxpath.FilesystemPolicy,
+	maxDepth *int,
+	_ map[string]string,
+	_ string,
+) ([]string, error) {
+	return expandUnreadableGlobsInProcess(patterns, cwd, maxDepth)
+}
+
+// inspectUnreadableGlobSearchRoot reports whether a deny-glob search root can
+// be scanned. Following symlink roots is fine, but an inspection failure other
+// than a missing or non-directory root must reject the expansion so a deny is
+// never silently discarded (Rust #57186). Only absent or non-directory roots
+// have no matches.
+func inspectUnreadableGlobSearchRoot(root string) (bool, error) {
+	info, err := os.Stat(root)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to inspect unreadable glob search root %s: %w", root, err)
+	}
+	return info.IsDir(), nil
+}
+
+func splitUnreadableGlobForRipgrep(pattern, cwd string) (string, string, bool) {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return "", "", false
+	}
+	if !filepath.IsAbs(pattern) {
+		pattern = filepath.Join(cwd, pattern)
+	}
+	pattern = filepath.Clean(pattern)
+	firstGlob := -1
+	for index, char := range pattern {
+		if strings.ContainsRune("*?[]", char) {
+			firstGlob = index
+			break
+		}
+	}
+	if firstGlob <= 0 {
+		return "", "", false
+	}
+	staticPrefix := pattern[:firstGlob]
+	rootEnd := strings.LastIndex(staticPrefix, string(filepath.Separator))
+	if strings.HasSuffix(staticPrefix, string(filepath.Separator)) {
+		rootEnd = len(staticPrefix) - 1
+	}
+	if rootEnd <= 0 {
+		return "", "", false
+	}
+	root := pattern[:rootEnd]
+	if !filepath.IsAbs(root) {
+		return "", "", false
+	}
+	glob := escapeUnclosedGlobClasses(pattern[rootEnd+1:])
+	return root, glob, glob != ""
+}
+
+func escapeUnclosedGlobClasses(glob string) string {
+	var out strings.Builder
+	for index := 0; index < len(glob); index++ {
+		if glob[index] != '[' {
+			out.WriteByte(glob[index])
+			continue
+		}
+		end := strings.IndexByte(glob[index+1:], ']')
+		if end < 0 {
+			out.WriteString(`\[`)
+			continue
+		}
+		out.WriteString(glob[index : index+end+2])
+		index += end + 1
+	}
+	return out.String()
+}
+
+func environmentEntries(env map[string]string) []string {
+	entries := make([]string, 0, len(env))
+	for key, value := range env {
+		entries = append(entries, key+"="+value)
+	}
+	sort.Strings(entries)
+	return entries
 }
 
 func isExecutableFile(path string) bool {

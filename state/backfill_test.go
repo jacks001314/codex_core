@@ -221,7 +221,7 @@ FROM threads WHERE id = ?`, id).Scan(
 	if path != wantPath || source != "cli" || historyMode != "paginated" || provider != "openai" || cwd != "/workspace" || cliVersion != "1.2.3" {
 		t.Fatalf("thread identity metadata = path:%q source:%q history:%q provider:%q cwd:%q cli:%q", path, source, historyMode, provider, cwd, cliVersion)
 	}
-	if title != preview || gotPreview != preview || sandboxPolicy != "read-only" || approvalMode != "on-request" || memoryMode != "disabled" || archivedValue != archived || tokens != 42 {
+	if title != preview || gotPreview != preview || sandboxPolicy != defaultThreadSandboxPolicy() || approvalMode != "on-request" || memoryMode != "disabled" || archivedValue != archived || tokens != 42 {
 		t.Fatalf("thread derived metadata = title:%q preview:%q sandbox:%q approval:%q memory:%q archived:%v tokens:%d", title, gotPreview, sandboxPolicy, approvalMode, memoryMode, archivedValue, tokens)
 	}
 }
@@ -336,15 +336,15 @@ func TestRolloutRebuildTimestampOnlyTouchesTimestampsLikeRust(t *testing.T) {
 	if err != nil {
 		t.Fatalf("extractRolloutThreadMetadata() error = %v", err)
 	}
-	metadata.tokensUsed = 99
+	metadata.cwd = "/metadata-workspace"
 	if err := runtime.upsertRolloutThread(ctx, metadata); err != nil {
 		t.Fatalf("upsertRolloutThread() error = %v", err)
 	}
 	if _, fullRows = readTimestampProbeWrites(t, runtime); fullRows != 1 {
 		t.Fatalf("metadata rebuild full-row writes = %d, want 1", fullRows)
 	}
-	if changed := readTimestampProbeRow(t, runtime, threadID); changed.tokensUsed != 99 {
-		t.Fatalf("tokens_used after metadata change = %d, want 99", changed.tokensUsed)
+	if changed := readTimestampProbeRow(t, runtime, threadID); changed.cwd != "/metadata-workspace" {
+		t.Fatalf("cwd after metadata change = %q, want /metadata-workspace", changed.cwd)
 	}
 
 	// Missing rows still need the full repair path.

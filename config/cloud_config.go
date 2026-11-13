@@ -10,6 +10,9 @@ import (
 	"sync"
 
 	"codex_core/apps"
+	"codex_core/plugin"
+
+	"github.com/pelletier/go-toml/v2"
 )
 
 var ErrInvalidCloudConfig = errors.New("invalid cloud config")
@@ -113,7 +116,8 @@ func CloudConfigLayersFromBundle(bundle CloudConfigBundle, baseDir string) (*Clo
 		return nil, err
 	}
 	for _, fragment := range bundle.RequirementsTOML.EnterpriseManaged {
-		values, err := ParseCloudConfigFlatTOML(fragment.Contents)
+		contents := normalizeRequirementsFragmentContents(fragment)
+		values, err := ParseCloudConfigFlatTOML(contents)
 		if err != nil {
 			source := CloudConfigFragmentSource{ID: fragment.ID, Name: fragment.Name}
 			return nil, fmt.Errorf("%w: failed to parse cloud requirements fragment %s: %s", ErrInvalidCloudConfig, source.String(), err)
@@ -121,7 +125,7 @@ func CloudConfigLayersFromBundle(bundle CloudConfigBundle, baseDir string) (*Clo
 		requirements = append(requirements, CloudConfigRequirementsLayer{
 			Source:      CloudConfigLayerSource{Type: CloudConfigLayerEnterpriseManaged, ID: fragment.ID, Name: fragment.Name},
 			Values:      values,
-			RawTOML:     fragment.Contents,
+			RawTOML:     contents,
 			BaseDir:     baseDir,
 			PathContext: pathContext,
 		})
@@ -131,6 +135,35 @@ func CloudConfigLayersFromBundle(bundle CloudConfigBundle, baseDir string) (*Clo
 		EnterpriseManagedConfig:       configLayers,
 		EnterpriseManagedRequirements: requirements,
 	}, nil
+}
+
+// normalizeRequirementsFragmentContents preserves the meaning of the legacy
+// cloud denial fragment. Older backends used `rbac-fast-mode` with
+// `fast_mode = false` to deny every accelerated tier; #51253 keeps that meaning
+// when Ultra Fast became independently policy-controlled, while a fragment from
+// any other source or with `fast_mode = true` is left byte-for-byte unchanged.
+func normalizeRequirementsFragmentContents(fragment CloudConfigFragment) string {
+	if fragment.ID != "rbac-fast-mode" {
+		return fragment.Contents
+	}
+	var parsed map[string]any
+	if err := toml.Unmarshal([]byte(fragment.Contents), &parsed); err != nil {
+		return fragment.Contents
+	}
+	features, ok := parsed["features"].(map[string]any)
+	if !ok {
+		return fragment.Contents
+	}
+	fastMode, ok := features["fast_mode"].(bool)
+	if !ok || fastMode {
+		return fragment.Contents
+	}
+	features["ultrafast_mode"] = false
+	encoded, err := toml.Marshal(parsed)
+	if err != nil {
+		return fragment.Contents
+	}
+	return string(encoded)
 }
 
 type CloudConfigLoadErrorCode string
@@ -263,9 +296,10 @@ func (b *CloudConfigBundleBinding) Status() CloudConfigBundleBindingStatus {
 // CloudConfigBundleSnapshot pairs a loaded bundle with the policy revision
 // binding it was resolved from.
 type CloudConfigBundleSnapshot struct {
-	Bundle  *CloudConfigBundle
-	Err     error
-	Binding *CloudConfigBundleBinding
+	Bundle       *CloudConfigBundle
+	Err          error
+	Binding      *CloudConfigBundleBinding
+	ConfigServer *ConfigServer
 }
 
 // ObserveRemoteBundle suspends enterprise MCP admission before a changed
@@ -385,6 +419,9 @@ type CloudConfigLoader struct {
 	load   func() (*CloudConfigBundle, error)
 	bundle *CloudConfigBundle
 	err    error
+	// configServer is the customer-hosted configuration server this loader
+	// fetches from, if any (Rust CloudConfigBundleLoader::config_server).
+	configServer *ConfigServer
 	// snapshot, when set, returns the published enterprise policy snapshot
 	// instead of fetching through load (Rust #49269
 	// CloudConfigBundleLoader::snapshot_getter).
@@ -432,11 +469,43 @@ func (l *CloudConfigLoader) GetSnapshot() CloudConfigBundleSnapshot {
 	if l == nil {
 		return CloudConfigBundleSnapshot{}
 	}
+	l.mu.Lock()
+	server := cloneConfigServer(l.configServer)
+	l.mu.Unlock()
+	var snapshot CloudConfigBundleSnapshot
 	if l.snapshot != nil {
-		return l.snapshot()
+		snapshot = l.snapshot()
+	} else {
+		bundle, err := l.Get()
+		snapshot = CloudConfigBundleSnapshot{Bundle: bundle, Err: err}
 	}
-	bundle, err := l.Get()
-	return CloudConfigBundleSnapshot{Bundle: bundle, Err: err}
+	if snapshot.Err == nil && server != nil {
+		snapshot.ConfigServer = server
+	}
+	return snapshot
+}
+
+// WithConfigServer records the customer-hosted configuration server this
+// loader fetched from (Rust CloudConfigBundleLoader::with_config_server).
+func (l *CloudConfigLoader) WithConfigServer(server *ConfigServer) *CloudConfigLoader {
+	if l == nil {
+		return l
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.configServer = cloneConfigServer(server)
+	return l
+}
+
+// ConfigServer reports the customer-hosted configuration server behind this
+// loader, if any.
+func (l *CloudConfigLoader) ConfigServer() *ConfigServer {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return cloneConfigServer(l.configServer)
 }
 
 // WithEMAPolicySnapshots attaches the enterprise policy owner and the snapshot
@@ -525,36 +594,56 @@ func MergeCloudConfigLayers(layers []CloudConfigLayer) map[string]any {
 }
 
 func applyCloudConfigBundle(values map[string]any, requirements *ConfigRequirements, bundle CloudConfigBundle, baseDir string) (*ConfigRequirements, error) {
+	merged, _, err := applyCloudConfigBundleWithFilesystemSource(values, requirements, bundle, baseDir)
+	return merged, err
+}
+
+// applyCloudConfigBundleWithFilesystemSource applies the bundle and reports
+// whether any enterprise-managed fragment supplied a [permissions.filesystem]
+// requirement, which doctor uses to name the managed policy source.
+func applyCloudConfigBundleWithFilesystemSource(values map[string]any, requirements *ConfigRequirements, bundle CloudConfigBundle, baseDir string) (*ConfigRequirements, bool, error) {
 	layers, err := CloudConfigLayersFromBundle(bundle, baseDir)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	mergeConfigMaps(values, MergeCloudConfigLayers(layers.EnterpriseManagedConfig))
 
 	managedRequirementValues := map[string]any{}
+	cloudFilesystem := false
 	for _, layer := range layers.EnterpriseManagedRequirements {
 		parsed, err := parseRequirementsTOMLValues([]byte(layer.RawTOML))
 		if err != nil {
-			return nil, fmt.Errorf("%w: failed to parse cloud requirements fragment %s: %s", ErrInvalidCloudConfig, layer.Source.Name, err)
+			return nil, false, fmt.Errorf("%w: failed to parse cloud requirements fragment %s: %s", ErrInvalidCloudConfig, layer.Source.Name, err)
 		}
 		normalizeFeatureRequirementAliases(parsed)
+		if err := normalizeNetworkRequirementAliases(parsed); err != nil {
+			return nil, false, fmt.Errorf("%w: invalid cloud requirements: %s", ErrInvalidCloudConfig, err)
+		}
+		// Rust #56055: config_server selects which server the local machine
+		// trusts, so a fetched policy may never supply it.
+		if _, ok := mapAnyKey(parsed, "config_server", "configServer"); ok {
+			return nil, false, fmt.Errorf("%w: config_server cannot be supplied by fetched policy", ErrInvalidCloudConfig)
+		}
 		if permissions, ok := parsed["permissions"].(map[string]any); ok {
+			if _, ok := permissions["filesystem"]; ok {
+				cloudFilesystem = true
+			}
 			pathContext := layer.PathContext
 			if pathContext == nil {
 				pathContext, err = NewHostConfigPathContext(layer.BaseDir)
 				if err != nil {
-					return nil, fmt.Errorf("%w: invalid cloud requirements: %s", ErrInvalidCloudConfig, err)
+					return nil, false, fmt.Errorf("%w: invalid cloud requirements: %s", ErrInvalidCloudConfig, err)
 				}
 			}
 			if err := resolveFilesystemDenyReadPathsWithContext(permissions, pathContext); err != nil {
-				return nil, fmt.Errorf("%w: invalid cloud requirements: %s", ErrInvalidCloudConfig, err)
+				return nil, false, fmt.Errorf("%w: invalid cloud requirements: %s", ErrInvalidCloudConfig, err)
 			}
 		}
 		mergeConfigMaps(managedRequirementValues, parsed)
 	}
 	managedRequirements, err := configRequirementsFromValidatedMap(managedRequirementValues)
 	if err != nil {
-		return nil, fmt.Errorf("%w: invalid cloud requirements: %s", ErrInvalidCloudConfig, err)
+		return nil, false, fmt.Errorf("%w: invalid cloud requirements: %s", ErrInvalidCloudConfig, err)
 	}
 	// Rust 0f21cb3413 (#39043): cli_auth_credentials_store and chatgpt_base_url
 	// are local-only authentication requirements and are ignored in
@@ -562,6 +651,9 @@ func applyCloudConfigBundle(values map[string]any, requirements *ConfigRequireme
 	if managedRequirements != nil {
 		managedRequirements.CliAuthCredentialsStore = nil
 		managedRequirements.ChatgptBaseURL = nil
+		// Rust ConfigRequirementsToml.config_server is local-only: cloud
+		// requirements may not redirect managed configuration.
+		managedRequirements.ConfigServer = nil
 	}
 
 	// Permission profiles in requirements are executable policy definitions,
@@ -572,7 +664,7 @@ func applyCloudConfigBundle(values map[string]any, requirements *ConfigRequireme
 	if defaultProfile, ok := managedRequirementValues["default_permissions"].(string); ok && strings.TrimSpace(defaultProfile) != "" {
 		values["default_permissions"] = strings.TrimSpace(defaultProfile)
 	}
-	return mergeConfigRequirements(requirements, managedRequirements), nil
+	return mergeConfigRequirements(requirements, managedRequirements), cloudFilesystem, nil
 }
 
 // normalizeFeatureRequirementAliases mirrors Rust #42863: within a single
@@ -606,6 +698,9 @@ func mergeConfigRequirements(base, overlay *ConfigRequirements) *ConfigRequireme
 	if out == nil {
 		return cloneRequirements(overlay)
 	}
+	if out.ConfigServer == nil && overlay.ConfigServer != nil {
+		out.ConfigServer = cloneConfigServer(overlay.ConfigServer)
+	}
 	if overlay.AllowedApprovalPolicies != nil {
 		out.AllowedApprovalPolicies = cloneSlice(overlay.AllowedApprovalPolicies)
 	}
@@ -626,6 +721,9 @@ func mergeConfigRequirements(base, overlay *ConfigRequirements) *ConfigRequireme
 	}
 	if overlay.AllowedWebSearchModes != nil {
 		out.AllowedWebSearchModes = cloneSlice(overlay.AllowedWebSearchModes)
+	}
+	if !otelRequirementsEmpty(overlay.Otel) {
+		out.Otel = mergeOtelRequirements(out.Otel, overlay.Otel)
 	}
 	if overlay.AllowManagedHooksOnly != nil {
 		out.AllowManagedHooksOnly = cloneBoolPtr(overlay.AllowManagedHooksOnly)
@@ -685,6 +783,9 @@ func mergeConfigRequirements(base, overlay *ConfigRequirements) *ConfigRequireme
 	}
 	if overlay.Plugins != nil {
 		out.Plugins = clonePluginRequirements(overlay.Plugins)
+	}
+	if overlay.Marketplaces != nil {
+		out.Marketplaces = plugin.MergeMarketplaceRequirements(out.Marketplaces, overlay.Marketplaces)
 	}
 	if len(overlay.Apps) > 0 {
 		// Rust merge_app_requirements_descending: either layer can disable an

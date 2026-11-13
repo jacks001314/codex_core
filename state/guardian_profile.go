@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	codexctx "codex_core/context"
 	"codex_core/utils"
 )
 
@@ -17,13 +18,35 @@ const (
 	ContextTargetAsync
 )
 
+// GuardianContextMode identifies the conversation-history policy a Guardian
+// review actually selected. It mirrors Rust's GuardianContextMode (#49294)
+// without coupling telemetry to the transcript retention profile.
+type GuardianContextMode string
+
+const (
+	// GuardianContextModeLegacy reviews a compatibility transcript rather than
+	// the parent checkpoint.
+	GuardianContextModeLegacy GuardianContextMode = "legacy"
+	// GuardianContextModeIndependent retains a review transcript independently
+	// of parent compaction.
+	GuardianContextModeIndependent GuardianContextMode = "independent"
+	// GuardianContextModeThreadOwned reviews the thread-owned parent context.
+	GuardianContextModeThreadOwned GuardianContextMode = "thread_owned"
+)
+
+// String returns the stable, bounded label used by Guardian telemetry.
+func (m GuardianContextMode) String() string {
+	return string(m)
+}
+
 // Default transcript entry and retention limits from Rust's
 // guardian-context ContextProfile (#43806). The asynchronous profile lowers the
 // per-entry message cap and total message budget while keeping the same tool
 // limits and recent-entry window.
 const (
-	// MaxMessageEntryTokens caps one user, developer, assistant, or reasoning
-	// entry before transcript retention.
+	// MaxMessageEntryTokens caps one assistant or reasoning entry before transcript
+	// retention. User messages and manual approvals stay complete for request
+	// admission (Rust #44570).
 	MaxMessageEntryTokens = 5_000
 	// MaxToolEntryTokens caps one tool call or tool result entry.
 	MaxToolEntryTokens = 1_000
@@ -32,7 +55,8 @@ const (
 	// MaxToolTranscriptTokens budgets rendered tool evidence separately so it
 	// cannot crowd out the human conversation.
 	MaxToolTranscriptTokens = 10_000
-	// MaxRecentNonUserEntries bounds retained non-user entries.
+	// MaxRecentNonUserEntries bounds retained entries other than user messages
+	// and manual approvals.
 	MaxRecentNonUserEntries = 40
 
 	// AsyncMaxMessageEntryTokens is the asynchronous per-message cap.
@@ -45,9 +69,21 @@ const (
 // retention drops at least one collected entry.
 const GuardianTranscriptOmissionNotice = "Some conversation entries were omitted."
 
+// GuardianBudgetOmissionNotice is Rust's GuardianBudgetOmission fragment
+// (core/src/context/guardian_budget_omission.rs, #44281): the bounded notice the
+// aggregate request budget adds when composed evidence had to be omitted or
+// shortened to fit the reviewer's complete-request limit. It identifies
+// incomplete evidence without implying additional authority.
+const GuardianBudgetOmissionNotice = "<guardian_context_omission>\n" +
+	"Conversation evidence, tool descriptions, or images were omitted or shortened to fit the review input budget. " +
+	"User instructions and prior approvals may be incomplete where marked. " +
+	"Do not infer authorization from missing evidence or treat a partial grant as overriding an omitted restriction.\n" +
+	"</guardian_context_omission>"
+
 // TranscriptEntryLimits holds per-entry caps resolved for the current review.
 type TranscriptEntryLimits struct {
-	// MessageTokens caps user, developer, assistant, and reasoning entries.
+	// MessageTokens caps assistant and reasoning entries. User messages and
+	// manual approvals stay complete until the complete-request budget.
 	MessageTokens int
 	// ToolTokens caps tool calls and ordinary tool outputs.
 	ToolTokens int
@@ -62,7 +98,8 @@ type TranscriptRetentionConfig struct {
 	MaxMessageTranscriptTokens int
 	// MaxToolTranscriptTokens budgets rendered tool entries.
 	MaxToolTranscriptTokens int
-	// MaxRecentNonUserEntries bounds retained entries other than user messages.
+	// MaxRecentNonUserEntries bounds retained entries other than user messages
+	// and manual approvals.
 	MaxRecentNonUserEntries int
 }
 
@@ -75,6 +112,11 @@ type ConversationTranscriptOptions struct {
 	IncludeToolOutputs bool
 	// IncludeReasoning includes plaintext reasoning evidence.
 	IncludeReasoning bool
+	// NativeMultiAgentNamespace preserves calls in this MAv2 namespace as
+	// native transcript items for synchronous backend decryption. Empty keeps
+	// the existing text transcript; "functions" selects the default namespace
+	// (#57448).
+	NativeMultiAgentNamespace string
 }
 
 // DefaultConversationTranscriptOptions mirrors Rust's default: tool calls and
@@ -158,10 +200,12 @@ type GuardianTranscriptKind int
 
 const (
 	// GuardianTranscriptUser is a genuine user message; it is selected before
-	// non-user evidence and always keeps the first entry as an anchor.
+	// other evidence and remains complete through retention.
 	GuardianTranscriptUser GuardianTranscriptKind = iota
-	// GuardianTranscriptProtectedMessage is trusted developer context or a final
-	// assistant answer.
+	// GuardianTranscriptManualApproval is a trusted developer manual approval;
+	// like a user message it remains complete through retention.
+	GuardianTranscriptManualApproval
+	// GuardianTranscriptProtectedMessage is a final assistant answer.
 	GuardianTranscriptProtectedMessage
 	// GuardianTranscriptMessage is ordinary assistant commentary or reasoning.
 	GuardianTranscriptMessage
@@ -173,6 +217,8 @@ func (k GuardianTranscriptKind) defaultRole() string {
 	switch k {
 	case GuardianTranscriptUser:
 		return "user"
+	case GuardianTranscriptManualApproval:
+		return "developer"
 	case GuardianTranscriptProtectedMessage, GuardianTranscriptMessage:
 		return "assistant"
 	case GuardianTranscriptTool:
@@ -197,6 +243,71 @@ type TranscriptEvidenceEntry struct {
 	// Tokens overrides the rendered token cost. Native encrypted evidence uses
 	// this because its payload cannot be rendered as text.
 	Tokens int
+	// Scheduled marks a user entry that came from the scheduler, and Heartbeat
+	// carries its parsed provenance when the envelope is well formed. Repeated
+	// instructions are compressed before retention so delta references keep
+	// their absolute transcript numbers (Rust #57519).
+	Scheduled bool
+	Heartbeat *TranscriptHeartbeat
+}
+
+// TranscriptHeartbeat is the bounded scheduler envelope used to compare
+// repeated instructions; invocation time is excluded from equality.
+type TranscriptHeartbeat struct {
+	AutomationID string
+	Timestamp    string
+	Instructions string
+}
+
+type heartbeatReferenceVersion struct {
+	instructions string
+	number       int
+}
+
+type heartbeatReferences struct {
+	versions map[string]heartbeatReferenceVersion
+}
+
+// prepare replaces repeated scheduler instructions with a reference to the
+// earlier entry. A scheduled envelope that failed to parse clears remembered
+// versions, matching Rust HeartbeatReferences::prepare.
+func (r *heartbeatReferences) prepare(heartbeat *TranscriptHeartbeat, text *string, number int) {
+	if heartbeat == nil {
+		r.versions = nil
+		return
+	}
+	if r.versions == nil {
+		r.versions = map[string]heartbeatReferenceVersion{}
+	}
+	if previous, ok := r.versions[heartbeat.AutomationID]; ok && previous.instructions == heartbeat.Instructions {
+		*text = fmt.Sprintf(
+			"Scheduled automation %s ran at %s. Instructions unchanged from transcript entry [%d]; this is a replay of that earlier instruction, not a new human instruction. If the referenced instructions are unavailable, do not infer authorization from this reference.",
+			heartbeat.AutomationID,
+			heartbeat.Timestamp,
+			previous.number,
+		)
+		return
+	}
+	r.versions[heartbeat.AutomationID] = heartbeatReferenceVersion{
+		instructions: heartbeat.Instructions,
+		number:       number,
+	}
+}
+
+// CompressGuardianTranscriptHeartbeats mirrors Rust prepare_sync_heartbeats
+// (#57519): it runs over the complete collected transcript before any suffix
+// selection, so reference numbers stay absolute in full and delta prompts.
+// Asynchronous consumers apply the same preparation before retention.
+func CompressGuardianTranscriptHeartbeats(entries []TranscriptEvidenceEntry, entryNumberOffset int) {
+	var references heartbeatReferences
+	for index := range entries {
+		entry := &entries[index]
+		if !entry.Scheduled {
+			continue
+		}
+		references.prepare(entry.Heartbeat, &entry.Text, index+entryNumberOffset+1)
+		entry.Heartbeat = nil
+	}
 }
 
 // TranscriptTruncationObservation records evidence lost while rendering.
@@ -218,41 +329,6 @@ type RenderedTranscript struct {
 	Truncations  []TranscriptTruncationObservation
 }
 
-// UserMessageCost is the rendered token cost and original position of a
-// genuine user message.
-type UserMessageCost struct {
-	Index  int
-	Tokens int
-}
-
-// UserMessageSelection contains selected original indices and their total
-// rendered token cost.
-type UserMessageSelection struct {
-	Indices []int
-	Tokens  int
-}
-
-// SelectUserMessages keeps the first and latest user messages, then fills from
-// newest to oldest. The first message remains an anchor even when it exceeds
-// the budget; later messages are included only when they fit.
-func SelectUserMessages(messages []UserMessageCost, maxMessageTokens int) UserMessageSelection {
-	if len(messages) == 0 {
-		return UserMessageSelection{}
-	}
-	selection := UserMessageSelection{
-		Indices: []int{messages[0].Index},
-		Tokens:  messages[0].Tokens,
-	}
-	for i := len(messages) - 1; i >= 1; i-- {
-		message := messages[i]
-		if message.Tokens <= maxMessageTokens-selection.Tokens {
-			selection.Indices = append(selection.Indices, message.Index)
-			selection.Tokens += message.Tokens
-		}
-	}
-	return selection
-}
-
 type transcriptProfileEntry struct {
 	kind          GuardianTranscriptKind
 	tokens        int
@@ -261,27 +337,60 @@ type transcriptProfileEntry struct {
 	retainedBytes int
 }
 
+// renderTranscriptText numbers and attributes one prepared evidence entry.
+// Both budgeting modes share it so a deferred allocation sees the exact text a
+// fixed request would have rendered (Rust guardian-context, #60498).
+func (p ContextProfile) renderTranscriptText(entry TranscriptEvidenceEntry, number int) (string, int) {
+	role := strings.TrimSpace(entry.Role)
+	if role == "" {
+		role = entry.Kind.defaultRole()
+	}
+	suffix := ""
+	if p.Target == ContextTargetAsync {
+		suffix = "\n"
+	}
+	text := fmt.Sprintf("[%d] %s: %s%s", number, role, entry.Text, suffix)
+	tokens := entry.Tokens
+	if tokens <= 0 {
+		tokens = utils.ApproxTokenCount(text)
+	}
+	return text, tokens
+}
+
+// RenderTranscriptForBudgeting applies one profile and budgeting mode to the
+// prepared evidence (Rust guardian-context prepare_transcript_for_budgeting,
+// #60498). Fixed keeps the entry and aggregate selection RenderTranscript
+// applies. Elastic keeps every captured entry so the configured allocation
+// decides which whole entries survive; both reviewer profiles share it and no
+// omission note is reported before that allocation runs.
+func (p ContextProfile) RenderTranscriptForBudgeting(
+	entries []TranscriptEvidenceEntry,
+	entryNumberOffset int,
+	budgeting codexctx.GuardianContextBudgeting,
+) RenderedTranscript {
+	if budgeting != codexctx.GuardianContextBudgetingElastic {
+		return p.RenderTranscript(entries, entryNumberOffset)
+	}
+	rendered := RenderedTranscript{
+		Indices: make([]int, 0, len(entries)),
+		Items:   make([]string, 0, len(entries)),
+	}
+	for index, entry := range entries {
+		text, _ := p.renderTranscriptText(entry, index+entryNumberOffset+1)
+		rendered.Indices = append(rendered.Indices, index)
+		rendered.Items = append(rendered.Items, text)
+	}
+	return rendered
+}
+
 // RenderTranscript applies the profile's sync or async retention policy without
 // advancing the host's full/delta cursor. The host supplies the collected slice
 // and original offset; empty placeholders remain a host concern.
 func (p ContextProfile) RenderTranscript(entries []TranscriptEvidenceEntry, entryNumberOffset int) RenderedTranscript {
 	profileEntries := make([]transcriptProfileEntry, 0, len(entries))
-	userMessages := make([]UserMessageCost, 0, len(entries))
 	for index, entry := range entries {
 		number := index + entryNumberOffset + 1
-		role := strings.TrimSpace(entry.Role)
-		if role == "" {
-			role = entry.Kind.defaultRole()
-		}
-		suffix := ""
-		if p.Target == ContextTargetAsync {
-			suffix = "\n"
-		}
-		text := fmt.Sprintf("[%d] %s: %s%s", number, role, entry.Text, suffix)
-		tokens := entry.Tokens
-		if tokens <= 0 {
-			tokens = utils.ApproxTokenCount(text)
-		}
+		text, tokens := p.renderTranscriptText(entry, number)
 		profileEntries = append(profileEntries, transcriptProfileEntry{
 			kind:          entry.Kind,
 			tokens:        tokens,
@@ -289,21 +398,22 @@ func (p ContextProfile) RenderTranscript(entries []TranscriptEvidenceEntry, entr
 			originalBytes: entry.OriginalBytes,
 			retainedBytes: len(entry.Text),
 		})
-		if entry.Kind == GuardianTranscriptUser {
-			userMessages = append(userMessages, UserMessageCost{Index: index, Tokens: tokens})
-		}
 	}
 
 	included := make([]bool, len(profileEntries))
-	selection := SelectUserMessages(userMessages, p.Retention.MaxMessageTranscriptTokens)
-	for _, index := range selection.Indices {
+	authorizationTokens := 0
+	for index, entry := range profileEntries {
+		if entry.kind != GuardianTranscriptUser && entry.kind != GuardianTranscriptManualApproval {
+			continue
+		}
 		included[index] = true
+		authorizationTokens += entry.tokens
 	}
 	switch p.Target {
 	case ContextTargetSync:
-		p.retainSynchronous(profileEntries, selection.Tokens, included)
+		p.retainSynchronous(profileEntries, authorizationTokens, included)
 	case ContextTargetAsync:
-		available := p.Retention.MaxMessageTranscriptTokens - selection.Tokens
+		available := p.Retention.MaxMessageTranscriptTokens - authorizationTokens
 		if available < 0 {
 			available = 0
 		}
@@ -357,7 +467,7 @@ func (p ContextProfile) retainSynchronous(entries []transcriptProfileEntry, sele
 	retainedNonUser := 0
 	for index := len(entries) - 1; index >= 0; index-- {
 		entry := entries[index]
-		if entry.kind == GuardianTranscriptUser ||
+		if entry.kind == GuardianTranscriptUser || entry.kind == GuardianTranscriptManualApproval ||
 			retainedNonUser >= p.Retention.MaxRecentNonUserEntries {
 			continue
 		}
@@ -459,7 +569,7 @@ func newTranscriptWindow(entries []transcriptProfileEntry, config TranscriptRete
 
 func (w *transcriptWindow) insert(index int) {
 	entry := w.entries[index]
-	if entry.kind == GuardianTranscriptUser ||
+	if entry.kind == GuardianTranscriptUser || entry.kind == GuardianTranscriptManualApproval ||
 		w.maxEntries == 0 ||
 		!w.makeRoomForTokenBudget(entry.kind, entry.tokens) ||
 		!w.makeRoomForEntryLimit(entry.kind) {

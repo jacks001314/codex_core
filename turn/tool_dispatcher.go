@@ -9,8 +9,10 @@ import (
 	"sync"
 	"time"
 
+	"codex_core/agent"
 	"codex_core/model"
 	"codex_core/tool"
+	"codex_core/tooltiming"
 	"codex_core/utils"
 )
 
@@ -27,6 +29,11 @@ type ToolDispatcherOptions struct {
 	TurnID                      string
 	ExecutedToolCalls           *ExecutedToolCallRecorder
 	ToolMode                    string
+	// InjectResponseItems queues a response item as pending input for the
+	// running turn (Rust `Session::inject_if_running`). A yielded Code Mode cell
+	// outlives the exec call that started it, so a later notification is
+	// delivered here instead of the per-call buffer that was already drained.
+	InjectResponseItems func(items []any) bool
 	// InstantInterrupt enables Rust #48135's opt-in code-mode yielding: each
 	// sampling request watches the turn's queued user input and hands the
 	// code-mode calls a shared preemption signal, so a message queued during a
@@ -48,6 +55,14 @@ type ToolDispatcherOptions struct {
 	// Tracer opens Rust #44661's code-mode handler spans and, when it also
 	// implements TraceEventEmitter, receives the call receipt/readiness events.
 	Tracer SpanTracer
+	// CriticalPathTiming enables direct-tool dependency-path capture for this
+	// turn (Rust #57201). TimingState must be the timing state shared with the
+	// turn profile.
+	CriticalPathTiming bool
+	TimingState        *TimingState
+	// InvocationRegistry opts this turn into live tool-call lookup and unique
+	// active call IDs (Rust #57586). A nil registry leaves dispatch unchanged.
+	InvocationRegistry *agent.InvocationRegistry
 }
 
 // Rust #44661 trace-safe milestones. They carry identifiers and tool names
@@ -100,6 +115,21 @@ func (d *ToolDispatcher) completeDirectCall(invocation *tool.Invocation, respons
 	}
 }
 
+// readinessFailureResult reports a readiness failure the model must see as the
+// tool result instead of a turn-level abort (Rust #60038: an MCP call whose
+// server failed to start answers the model with "Could not start MCP server
+// `x`: ..." and the turn continues). Cancellation and other infrastructure
+// failures do not implement tool.ModelVisibleError, so they still fail the turn.
+func (d *ToolDispatcher) readinessFailureResult(invocation *tool.Invocation, err error) (*ToolExecutionResult, bool) {
+	var visible tool.ModelVisibleError
+	if !errors.As(err, &visible) {
+		return nil, false
+	}
+	result := d.rejectedInvocationResult(invocation, err)
+	d.completeDirectCall(invocation, result.Response, nil)
+	return result, true
+}
+
 // releasePreparedDirectCalls frees every pending direct-call slot still reserved
 // for this batch.
 func (d *ToolDispatcher) releasePreparedDirectCalls() {
@@ -126,6 +156,7 @@ type ToolDispatcher struct {
 	onToolCompleted             ToolCompletedCallback
 	emitCodeModeNestedLifecycle bool
 	onCodeModeNotify            CodeModeNotifyCallback
+	injectResponseItems         func(items []any) bool
 	threadID                    string
 	turnID                      string
 	executedToolCalls           *ExecutedToolCallRecorder
@@ -133,6 +164,10 @@ type ToolDispatcher struct {
 	instantInterrupt            bool
 	truncation                  *utils.TruncationPolicy
 	truncationForModel          func(model string) *utils.TruncationPolicy
+	// stepAttribution is the settings captured for the current sampling step
+	// (Rust #45248). The agent loop writes it before that step's tool batch
+	// starts and the batch only reads it, so parallel calls share one value.
+	stepAttribution             *tool.StepAttribution
 	onToolOutputExternalContext func(ctx context.Context, invocation *tool.Invocation, output *tool.Output)
 	tracer                      SpanTracer
 	clockMu                     sync.Mutex
@@ -145,6 +180,14 @@ type ToolDispatcher struct {
 	// directCallsMu guards the prepared-call maps, which the parallel execution
 	// path completes from multiple goroutines.
 	directCallsMu sync.Mutex
+	// criticalPathTiming and timingState gate and own direct-tool path capture.
+	// stepBatch and stepGate belong to the current sampling step's tool batch;
+	// they are written before dispatch starts and only read while it runs.
+	criticalPathTiming bool
+	timingState        *TimingState
+	stepBatch          *tooltiming.Batch
+	stepGate           *tooltiming.Gate
+	invocationRegistry *agent.InvocationRegistry
 }
 
 type ToolExecutionResult struct {
@@ -183,6 +226,12 @@ type ToolResponseItem struct {
 	Execution string                     `json:"execution,omitempty"`
 	Output    *FunctionCallOutputPayload `json:"output,omitempty"`
 	Tools     []any                      `json:"tools,omitempty"`
+
+	// HistoryTruncationTokenLimit is the originating history budget in tokens,
+	// already carrying the serialization allowance (Rust
+	// `CodexHarnessMetadata::history_truncation_token_limit`). It never reaches
+	// the model request: MarshalJSON rebuilds only the response-item fields.
+	HistoryTruncationTokenLimit *uint64 `json:"-"`
 
 	executedToolCalls []model.ExecutedToolCall
 	cellID            string
@@ -383,6 +432,7 @@ func NewToolDispatcher(options *ToolDispatcherOptions) *ToolDispatcher {
 		onToolCompleted:             options.OnToolCompleted,
 		emitCodeModeNestedLifecycle: options.EmitCodeModeNestedLifecycle,
 		onCodeModeNotify:            options.OnCodeModeNotify,
+		injectResponseItems:         options.InjectResponseItems,
 		threadID:                    strings.TrimSpace(options.ThreadID),
 		turnID:                      strings.TrimSpace(options.TurnID),
 		executedToolCalls:           options.ExecutedToolCalls,
@@ -392,6 +442,9 @@ func NewToolDispatcher(options *ToolDispatcherOptions) *ToolDispatcher {
 		truncationForModel:          options.TruncationForModel,
 		onToolOutputExternalContext: options.OnToolOutputExternalContext,
 		tracer:                      options.Tracer,
+		criticalPathTiming:          options.CriticalPathTiming,
+		timingState:                 options.TimingState,
+		invocationRegistry:          options.InvocationRegistry,
 	}
 }
 
@@ -480,6 +533,69 @@ func codeModeCellID(invocation *tool.Invocation, output *tool.Output) string {
 	return ""
 }
 
+// SetStepSettings captures the settings that issued the current sampling step.
+// Tool hooks report these instead of the turn's initial attribution when a
+// turn/settings/update changes the model or approval policy mid-turn
+// (Rust #45248).
+func (d *ToolDispatcher) SetStepSettings(modelID string, reasoningEffort string, permissionMode string) {
+	if d == nil {
+		return
+	}
+	attribution := &tool.StepAttribution{
+		Model:           strings.TrimSpace(modelID),
+		ReasoningEffort: strings.TrimSpace(reasoningEffort),
+		PermissionMode:  strings.TrimSpace(permissionMode),
+	}
+	if attribution.Model == "" && attribution.ReasoningEffort == "" && attribution.PermissionMode == "" {
+		d.stepAttribution = nil
+		return
+	}
+	d.stepAttribution = attribution
+}
+
+// stepTelemetryTags reports the executor tags for an invocation and adds the
+// model captured by the sampling step that issued it. Rust #44242 attributes
+// tool telemetry to the issuing step's model, so a mid-turn model change tags
+// the call's metrics with the step model instead of the turn's first model.
+func (d *ToolDispatcher) stepTelemetryTags(invocation *tool.Invocation) map[string]string {
+	if d == nil || d.router == nil {
+		return nil
+	}
+	tags := d.router.TelemetryTags(invocation)
+	modelID := ""
+	if invocation != nil && invocation.StepAttribution != nil {
+		modelID = strings.TrimSpace(invocation.StepAttribution.Model)
+	}
+	if modelID == "" {
+		return tags
+	}
+	if _, exists := tags["model"]; exists {
+		return tags
+	}
+	attributed := make(map[string]string, len(tags)+1)
+	for key, value := range tags {
+		attributed[key] = value
+	}
+	attributed["model"] = modelID
+	return attributed
+}
+
+// SetRouter replaces the router the following sampling step dispatches through
+// (Rust #44242 rebuilds each step's tool plan from the step's captured model).
+// Callers swap it between steps, after the previous step's tool batch finished;
+// invocations already dispatched keep the executor they were built with. The
+// step's resolved tool mode travels with the plan, so call bookkeeping follows
+// the same surface the model was offered.
+func (d *ToolDispatcher) SetRouter(router *tool.Router) {
+	if d == nil || router == nil {
+		return
+	}
+	d.router = router
+	if mode := strings.TrimSpace(router.ToolMode()); mode != "" {
+		d.toolMode = mode
+	}
+}
+
 // SetStepModel applies the producing model's output-truncation policy to the
 // tools of the current sampling step (Rust #44243). The agent loop drains each
 // step's tools before asking for the next step's settings, so the policy is
@@ -506,9 +622,50 @@ func (d *ToolDispatcher) BeginStepPreempt(mailbox *SteerMailbox) (*tool.YieldSig
 	return signal, mailbox.WatchUserInput(d.threadID, d.turnID, signal)
 }
 
+// BeginStepActivity mirrors Rust's per-sampling-request InputQueue activity
+// subscription (#55644): a tool that waits on wall time (clock.sleep) ends its
+// wait once the turn queues input, including a notifying injection that arrived
+// before the tool call began. It is independent of the instant-interrupt
+// feature, which only arms code-mode yielding for user messages.
+func (d *ToolDispatcher) BeginStepActivity(mailbox *SteerMailbox) (*tool.YieldSignal, func()) {
+	if d == nil || mailbox == nil {
+		return nil, nil
+	}
+	signal := tool.NewYieldSignal()
+	return signal, mailbox.WatchActivity(d.threadID, d.turnID, signal)
+}
+
 func (d *ToolDispatcher) ExecuteToolItems(ctx context.Context, items []model.AgentItem) ([]ToolExecutionResult, error) {
+	return d.ExecuteToolItemsWithBatch(ctx, items, nil)
+}
+
+// BatchTiming returns the critical-path batch for one sampling step, or nil when
+// capture is disabled for this turn.
+func (d *ToolDispatcher) BatchTiming() *tooltiming.Batch {
+	if d == nil || !d.criticalPathTiming || d.timingState == nil {
+		return nil
+	}
+	return tooltiming.NewBatch()
+}
+
+// ExecuteToolItemsWithBatch dispatches one sampling step's direct calls with
+// the supplied critical-path batch. A nil batch creates one when capture is
+// enabled.
+func (d *ToolDispatcher) ExecuteToolItemsWithBatch(ctx context.Context, items []model.AgentItem, batch *tooltiming.Batch) ([]ToolExecutionResult, error) {
 	if d == nil || d.router == nil {
 		return nil, fmt.Errorf("%w: tool router is nil", tool.ErrToolInvalidCall)
+	}
+	if d.criticalPathTiming && d.timingState != nil {
+		if batch == nil {
+			batch = tooltiming.NewBatch()
+		}
+		d.stepBatch = batch
+		d.stepGate = tooltiming.NewGate()
+	} else {
+		// Capture can be disabled between steps; stale step state must not
+		// attribute work to a batch that no longer exists.
+		d.stepBatch = nil
+		d.stepGate = nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -548,11 +705,20 @@ func (d *ToolDispatcher) ExecuteToolItems(ctx context.Context, items []model.Age
 		return nil, nil
 	}
 	if len(invocations) == 1 {
+		startedAt := d.nowUTC()
+		guard := d.beginDirectTiming(invocations[0], startedAt)
 		if err := d.router.WaitUntilReady(ctx, invocations[0]); err != nil {
+			d.finishDirectTiming(guard, nil)
+			if result, ok := d.readinessFailureResult(invocations[0], err); ok {
+				d.releasePreparedDirectCalls()
+				return []ToolExecutionResult{*result}, nil
+			}
 			d.releasePreparedDirectCalls()
 			return nil, err
 		}
+		admitted := d.admitDirectTiming(guard, invocations[0], startedAt)
 		result, err := d.executeToolInvocation(ctx, invocations[0])
+		d.finishDirectTiming(guard, admitted)
 		if err != nil {
 			d.releasePreparedDirectCalls()
 			return nil, err
@@ -585,6 +751,7 @@ func (d *ToolDispatcher) addInvocationContext(invocation *tool.Invocation) {
 		invocation.Context["turnId"] = d.turnID
 	}
 	invocation.Truncation = d.truncation
+	invocation.StepAttribution = d.stepAttribution
 }
 
 func (d *ToolDispatcher) executeToolInvocations(ctx context.Context, invocations []*tool.Invocation) ([]ToolExecutionResult, error) {
@@ -595,7 +762,16 @@ func (d *ToolDispatcher) executeToolInvocations(ctx context.Context, invocations
 	var readinessErr error
 	executeReady := func(index int, invocation *tool.Invocation) {
 		defer readinessWG.Done()
+		startedAt := d.nowUTC()
+		guard := d.beginDirectTiming(invocation, startedAt)
 		if err := d.router.WaitUntilReady(ctx, invocation); err != nil {
+			d.finishDirectTiming(guard, nil)
+			if result, ok := d.readinessFailureResult(invocation, err); ok {
+				readinessErrMu.Lock()
+				results[index] = *result
+				readinessErrMu.Unlock()
+				return
+			}
 			readinessErrMu.Lock()
 			if readinessErr == nil {
 				readinessErr = err
@@ -610,7 +786,9 @@ func (d *ToolDispatcher) executeToolInvocations(ctx context.Context, invocations
 			executionGate.Lock()
 			defer executionGate.Unlock()
 		}
+		admitted := d.admitDirectTiming(guard, invocation, startedAt)
 		result, err := d.executeToolInvocation(ctx, invocation)
+		d.finishDirectTiming(guard, admitted)
 		readinessErrMu.Lock()
 		defer readinessErrMu.Unlock()
 		if err != nil {
@@ -630,8 +808,12 @@ func (d *ToolDispatcher) executeToolInvocations(ctx context.Context, invocations
 			continue
 		}
 		if !d.router.SupportsParallel(invocations[index].ToolName) {
+			startedAt := d.nowUTC()
+			guard := d.beginDirectTiming(invocations[index], startedAt)
 			executionGate.Lock()
+			admitted := d.admitDirectTiming(guard, invocations[index], startedAt)
 			result, err := d.executeToolInvocation(ctx, invocations[index])
+			d.finishDirectTiming(guard, admitted)
 			executionGate.Unlock()
 			if err != nil {
 				readinessWG.Wait()
@@ -645,8 +827,17 @@ func (d *ToolDispatcher) executeToolInvocations(ctx context.Context, invocations
 		for index < len(invocations) && d.router.SupportsParallel(invocations[index].ToolName) && !d.router.HasReadinessWait(invocations[index].ToolName) {
 			index++
 		}
+		timed := make([]timedToolInvocation, index-start)
+		for i := start; i < index; i++ {
+			startedAt := d.nowUTC()
+			timed[i-start] = timedToolInvocation{
+				invocation: invocations[i],
+				startedAt:  startedAt,
+				guard:      d.beginDirectTiming(invocations[i], startedAt),
+			}
+		}
 		executionGate.RLock()
-		groupResults, err := d.executeParallelToolInvocations(ctx, invocations[start:index])
+		groupResults, err := d.executeParallelToolInvocations(ctx, timed)
 		executionGate.RUnlock()
 		if err != nil {
 			readinessWG.Wait()
@@ -661,15 +852,24 @@ func (d *ToolDispatcher) executeToolInvocations(ctx context.Context, invocations
 	return results, nil
 }
 
-func (d *ToolDispatcher) executeParallelToolInvocations(ctx context.Context, invocations []*tool.Invocation) ([]ToolExecutionResult, error) {
-	if len(invocations) == 1 {
-		result, err := d.executeToolInvocation(ctx, invocations[0])
+type timedToolInvocation struct {
+	invocation *tool.Invocation
+	startedAt  time.Time
+	guard      *tooltiming.ToolGuard
+}
+
+func (d *ToolDispatcher) executeParallelToolInvocations(ctx context.Context, timed []timedToolInvocation) ([]ToolExecutionResult, error) {
+	if len(timed) == 1 {
+		item := timed[0]
+		admitted := d.admitDirectTiming(item.guard, item.invocation, item.startedAt)
+		result, err := d.executeToolInvocation(ctx, item.invocation)
+		d.finishDirectTiming(item.guard, admitted)
 		if err != nil {
 			return nil, err
 		}
 		return []ToolExecutionResult{*result}, nil
 	}
-	results := make([]ToolExecutionResult, len(invocations))
+	results := make([]ToolExecutionResult, len(timed))
 	var errorLock sync.Mutex
 	var firstErr error
 	var wg sync.WaitGroup
@@ -683,13 +883,15 @@ func (d *ToolDispatcher) executeParallelToolInvocations(ctx context.Context, inv
 			firstErr = err
 		}
 	}
-	for i := range invocations {
+	for i := range timed {
 		index := i
-		invocation := invocations[i]
+		item := timed[i]
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			result, err := d.executeToolInvocation(ctx, invocation)
+			admitted := d.admitDirectTiming(item.guard, item.invocation, item.startedAt)
+			result, err := d.executeToolInvocation(ctx, item.invocation)
+			d.finishDirectTiming(item.guard, admitted)
 			if err != nil {
 				setError(err)
 				return
@@ -704,7 +906,114 @@ func (d *ToolDispatcher) executeParallelToolInvocations(ctx context.Context, inv
 	return results, nil
 }
 
+// directPathSupported reports whether direct-tool timing can attribute this
+// invocation. Direct spawn and wait calls use this turn tool time; Code Mode and
+// follow-up agent operations still lack runtime capture (Rust #59245).
+func (d *ToolDispatcher) directPathSupported(invocation *tool.Invocation) bool {
+	if invocation == nil {
+		return false
+	}
+	if strings.TrimSpace(invocation.Source) == ToolTraceSourceCodeMode {
+		return false
+	}
+	name := invocation.ToolName
+	if name.Namespace == "" && (name.Name == tool.CodeModeExecToolName || name.Name == tool.CodeModeWaitToolName) {
+		return false
+	}
+	// Multi-agent tool namespaces can be overridden by the tool catalog.
+	switch name.Name {
+	case "send_input", "close_agent", "resume_agent",
+		"list_agents", "followup_task", "interrupt_agent", "send_message":
+		return false
+	}
+	return true
+}
+
+func (d *ToolDispatcher) beginDirectTiming(invocation *tool.Invocation, startedAt time.Time) *tooltiming.ToolGuard {
+	if d == nil || !d.criticalPathTiming || d.timingState == nil {
+		return nil
+	}
+	if !d.directPathSupported(invocation) {
+		d.timingState.InvalidateCriticalPath()
+		return nil
+	}
+	if d.stepBatch == nil {
+		d.stepBatch = tooltiming.NewBatch()
+	}
+	return d.timingState.DirectToolTimings().StartTurnDirectCall(
+		invocation.CallID,
+		d.turnID,
+		d.stepBatch,
+		startedAt,
+		d.timingState.SnapshotPath(startedAt),
+	)
+}
+
+func (d *ToolDispatcher) admitDirectTiming(guard *tooltiming.ToolGuard, invocation *tool.Invocation, startedAt time.Time) *tooltiming.AdmittedToolTiming {
+	if guard == nil || d.stepGate == nil {
+		return nil
+	}
+	admission := tooltiming.AdmissionExclusive
+	if d.router != nil && d.router.SupportsParallel(invocation.ToolName) {
+		admission = tooltiming.AdmissionParallel
+	}
+	return d.stepGate.Admit(guard, admission, startedAt)
+}
+
+func (d *ToolDispatcher) finishDirectTiming(guard *tooltiming.ToolGuard, admitted *tooltiming.AdmittedToolTiming) {
+	if admitted != nil {
+		admitted.Finish()
+		return
+	}
+	if guard != nil {
+		guard.Finish()
+	}
+}
+
+// reserveInvocation claims this call's ID before admission. Rust reserves in
+// ToolCallRuntime::dispatch and activates after pre-tool hooks (#57586).
+func (d *ToolDispatcher) reserveInvocation(invocation *tool.Invocation) (*agent.InvocationReservation, error) {
+	if d == nil || d.invocationRegistry == nil || invocation == nil {
+		return nil, nil
+	}
+	return d.invocationRegistry.Reserve(d.turnID, invocation.CallID)
+}
+
+// rejectedInvocationResult reports a duplicate active call ID as a model-facing
+// failed tool result, mirroring Rust's FunctionCallError::RespondToModel.
+func (d *ToolDispatcher) rejectedInvocationResult(invocation *tool.Invocation, err error) *ToolExecutionResult {
+	finishedAt := d.nowUTC()
+	message := ""
+	if err != nil {
+		message = err.Error()
+	}
+	output := &tool.Output{
+		CallID:      invocation.CallID,
+		ToolName:    invocation.ToolName,
+		Success:     false,
+		Body:        message,
+		CompletedAt: finishedAt,
+	}
+	result := &ToolExecutionResult{
+		Invocation:      invocation,
+		Output:          output,
+		Response:        ToolResponseFromOutput(invocation, output),
+		StartedAt:       finishedAt,
+		FinishedAt:      finishedAt,
+		HandlerExecuted: false,
+	}
+	if d.onToolCompleted != nil {
+		d.onToolCompleted(context.Background(), result)
+	}
+	return result
+}
+
 func (d *ToolDispatcher) executeToolInvocation(ctx context.Context, invocation *tool.Invocation) (*ToolExecutionResult, error) {
+	reservation, reservationErr := d.reserveInvocation(invocation)
+	if reservationErr != nil {
+		return d.rejectedInvocationResult(invocation, reservationErr), nil
+	}
+	defer reservation.Release()
 	toolCtx, cancel := context.WithCancelCause(ctx)
 	invocation.Cancel = cancel
 	defer func() {
@@ -724,20 +1033,43 @@ func (d *ToolDispatcher) executeToolInvocation(ctx context.Context, invocation *
 	}
 	var notifyMu sync.Mutex
 	notifyItems := []any{}
+	notifyActive := false
 	if invocation.ToolName.Namespace == "" && invocation.ToolName.Name == tool.CodeModeExecToolName {
 		if invocation.Context == nil {
 			invocation.Context = map[string]any{}
 		}
 		invocation.Context[tool.CodeModeOutputCallIDContextKey] = invocation.CallID
+		// Rust #44867: the cell keeps the truncation policy of the model that
+		// started it. Freeze the allowance-bearing budget when the call starts a
+		// cell, so a later model switch cannot re-bound the notification with the
+		// receiving model's budget (Rust `CodeModeCellDelegate::notify`).
+		notifyTokenLimit := codeModeNotificationTokenLimit(invocation.Truncation)
+		notifyMu.Lock()
+		notifyActive = true
+		notifyMu.Unlock()
 		invocation.Context["code_mode_notify"] = tool.CodeModeNotifyFunc(func(callID string, text string) {
 			if strings.TrimSpace(text) == "" {
 				return
 			}
-			item := &ToolResponseItem{Type: "custom_tool_call_output", CallID: callID, Name: tool.CodeModeExecToolName, Output: NewFunctionCallOutputPayload(text, boolPtr(true))}
+			item := &ToolResponseItem{
+				Type:                        "custom_tool_call_output",
+				CallID:                      callID,
+				Name:                        tool.CodeModeExecToolName,
+				Output:                      NewFunctionCallOutputPayload(codeModeNotificationText(text, notifyTokenLimit), boolPtr(true)),
+				HistoryTruncationTokenLimit: notifyTokenLimit,
+			}
 			notifyMu.Lock()
-			notifyItems = append(notifyItems, item)
+			active := notifyActive
+			if active {
+				notifyItems = append(notifyItems, item)
+			}
 			notifyMu.Unlock()
+			if !active && d.injectResponseItems != nil {
+				d.injectResponseItems([]any{item})
+			}
 			if d.onCodeModeNotify != nil {
+				// Rust keeps the full notification text on the raw response item;
+				// only the recorded history item carries the truncation.
 				d.onCodeModeNotify(toolCtx, callID, text)
 			}
 		})
@@ -805,7 +1137,7 @@ func (d *ToolDispatcher) executeToolInvocation(ctx context.Context, invocation *
 						nestedOutput.Body, nestedOutput.Error = nestedErr.Error(), nestedErr.Error()
 					}
 				}
-				d.onToolCompleted(nestedCtx, &ToolExecutionResult{Invocation: nested, Output: nestedOutput, Response: ToolResponseFromOutput(nested, nestedOutput), TelemetryTags: d.router.TelemetryTags(nested), StartedAt: nestedStartedAt, FinishedAt: nestedFinishedAt, HandlerExecuted: nestedErr != nil})
+				d.onToolCompleted(nestedCtx, &ToolExecutionResult{Invocation: nested, Output: nestedOutput, Response: ToolResponseFromOutput(nested, nestedOutput), TelemetryTags: d.stepTelemetryTags(nested), StartedAt: nestedStartedAt, FinishedAt: nestedFinishedAt, HandlerExecuted: nestedErr != nil})
 			})
 		}
 	}
@@ -848,14 +1180,21 @@ func (d *ToolDispatcher) executeToolInvocation(ctx context.Context, invocation *
 	// was actually reached, which the goal extension uses to distinguish a
 	// handler-executed failure from a pre-tool-hook block (#41454).
 	handlerReached := false
+	var invocationGuard *agent.InvocationGuard
 	startedAfterPreHooks := func(updated *tool.Invocation) {
 		handlerReached = true
+		if invocationGuard == nil {
+			invocationGuard = reservation.Activate()
+		}
 		if d.onToolStarted != nil {
 			d.onToolStarted(toolCtx, updated, startedAt)
 		}
 	}
-	telemetryTags := d.router.TelemetryTags(invocation)
+	telemetryTags := d.stepTelemetryTags(invocation)
 	output, dispatchErr := d.router.DispatchWithHooksAfterPreHooks(dispatchCtx, invocation, d.hooks, startedAfterPreHooks)
+	// Rust revokes host access once the handler returns, before the finish
+	// notification, so a completed call is never observable as live (#57586).
+	invocationGuard.Release()
 	// Rust ToolCallOutcome::Failed { handler_executed: true } is produced only
 	// when the executor returned an error (dispatch error), not when the handler
 	// completed with a success=false output. A blocked pre-tool hook leaves
@@ -972,8 +1311,11 @@ func (d *ToolDispatcher) executeToolInvocation(ctx context.Context, invocation *
 	d.emitToolResultReady(dispatchCtx, invocation, traceSource, d.turnID)
 	inputItems := d.postExecutionInputItems(toolCtx, invocation, output)
 	notifyMu.Lock()
-	inputItems = append(notifyItems, inputItems...)
+	notifyActive = false
+	pendingNotifyItems := notifyItems
+	notifyItems = nil
 	notifyMu.Unlock()
+	inputItems = append(pendingNotifyItems, inputItems...)
 	result := &ToolExecutionResult{
 		Invocation:      invocation,
 		Output:          output,
@@ -1046,6 +1388,30 @@ func (d *ToolDispatcher) nowUTC() time.Time {
 	d.clockMu.Lock()
 	defer d.clockMu.Unlock()
 	return d.now().UTC()
+}
+
+// codeModeNotificationTokenLimit mirrors Rust #44867's delegate budget: the
+// originating truncation policy with the 20% serialization allowance applied.
+// A host that supplied no policy leaves the notification unbounded, matching
+// the rest of Go's optional-policy handling; Rust always has one.
+func codeModeNotificationTokenLimit(policy *utils.TruncationPolicy) *uint64 {
+	if policy == nil {
+		return nil
+	}
+	allowance := policy.WithSerializationAllowance()
+	limit := uint64((&allowance).TokenBudget())
+	return &limit
+}
+
+// codeModeNotificationText bounds a notification by the originating budget.
+// Rust attaches the same budget as `history_truncation_token_limit` and
+// truncates the recorded item later; Go applies it while building the item so
+// the next request already carries the originating model's bound.
+func codeModeNotificationText(text string, tokenLimit *uint64) string {
+	if tokenLimit == nil {
+		return text
+	}
+	return utils.TruncateText(text, utils.TokensPolicy(int(*tokenLimit)))
 }
 
 func (d *ToolDispatcher) postExecutionInputItems(ctx context.Context, invocation *tool.Invocation, output *tool.Output) []any {
@@ -1187,6 +1553,9 @@ func responseItemFromAgentItem(item *model.AgentItem) (*tool.ResponseItem, bool)
 			CallID:                firstNonEmptyTurnString(item.CallID, item.ID),
 			Arguments:             item.Arguments,
 			EncryptedFunctionArgs: cloneTurnStringSlicePtr(item.EncryptedFunctionArgs),
+			// Rust #58040 keeps the original wire item for native-review tools;
+			// the registry decides whether dispatch retains it.
+			Raw: marshalTurnAgentItemRaw(item),
 		}, true
 	case "custom_tool_call":
 		return &tool.ResponseItem{
@@ -1217,12 +1586,30 @@ func cloneTurnStringSlicePtr(value *[]string) *[]string {
 	return &cloned
 }
 
+func marshalTurnAgentItemRaw(item *model.AgentItem) json.RawMessage {
+	if item == nil {
+		return nil
+	}
+	raw, err := json.Marshal(item)
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
 func outputBody(output *tool.Output) any {
 	if output == nil {
 		return ""
 	}
 	if output.Data != nil {
 		if value, ok := output.Data["content_items"]; ok {
+			// Rust's CodeModeToolOutput inserts its status header as the body's
+			// first item, so a content-item body leads with it.
+			if header, _ := output.Data[tool.CodeModeResponseHeaderDataKey].(string); header != "" {
+				if body, ok := codeModeBodyWithHeader(value, header); ok {
+					return body
+				}
+			}
 			return value
 		}
 	}
@@ -1242,6 +1629,30 @@ func outputBody(output *tool.Output) any {
 		return fmt.Sprintf("success=%v", output.Success)
 	}
 	return string(data)
+}
+
+// codeModeBodyWithHeader prepends the rendered code-mode header to a body that
+// is a list of content items (Rust's FunctionToolOutput::from_content).
+func codeModeBodyWithHeader(value any, header string) (any, bool) {
+	headerItem := map[string]any{"type": "input_text", "text": header}
+	switch items := value.(type) {
+	case []map[string]any:
+		body := make([]any, 0, len(items)+1)
+		body = append(body, headerItem)
+		for _, item := range items {
+			body = append(body, item)
+		}
+		return body, true
+	case []any:
+		body := make([]any, 0, len(items)+1)
+		body = append(body, headerItem)
+		return append(body, items...), true
+	case []FunctionCallOutputContentItem:
+		body := make([]FunctionCallOutputContentItem, 0, len(items)+1)
+		body = append(body, FunctionCallOutputContentItem{Type: "input_text", Text: header})
+		return append(body, items...), true
+	}
+	return nil, false
 }
 
 func outputTools(output *tool.Output) []any {

@@ -21,6 +21,55 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+type OutputTruncation int32
+
+const (
+	OutputTruncation_OUTPUT_TRUNCATION_UNSPECIFIED OutputTruncation = 0
+	OutputTruncation_OUTPUT_TRUNCATION_CLIENT      OutputTruncation = 1
+	OutputTruncation_OUTPUT_TRUNCATION_SERVER      OutputTruncation = 2
+)
+
+// Enum value maps for OutputTruncation.
+var (
+	OutputTruncation_name = map[int32]string{
+		0: "OUTPUT_TRUNCATION_UNSPECIFIED",
+		1: "OUTPUT_TRUNCATION_CLIENT",
+		2: "OUTPUT_TRUNCATION_SERVER",
+	}
+	OutputTruncation_value = map[string]int32{
+		"OUTPUT_TRUNCATION_UNSPECIFIED": 0,
+		"OUTPUT_TRUNCATION_CLIENT":      1,
+		"OUTPUT_TRUNCATION_SERVER":      2,
+	}
+)
+
+func (x OutputTruncation) Enum() *OutputTruncation {
+	p := new(OutputTruncation)
+	*p = x
+	return p
+}
+
+func (x OutputTruncation) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (OutputTruncation) Descriptor() protoreflect.EnumDescriptor {
+	return file_codex_code_mode_v1_proto_enumTypes[0].Descriptor()
+}
+
+func (OutputTruncation) Type() protoreflect.EnumType {
+	return &file_codex_code_mode_v1_proto_enumTypes[0]
+}
+
+func (x OutputTruncation) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use OutputTruncation.Descriptor instead.
+func (OutputTruncation) EnumDescriptor() ([]byte, []int) {
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{0}
+}
+
 type ToolKind int32
 
 const (
@@ -54,11 +103,11 @@ func (x ToolKind) String() string {
 }
 
 func (ToolKind) Descriptor() protoreflect.EnumDescriptor {
-	return file_codex_code_mode_v1_proto_enumTypes[0].Descriptor()
+	return file_codex_code_mode_v1_proto_enumTypes[1].Descriptor()
 }
 
 func (ToolKind) Type() protoreflect.EnumType {
-	return &file_codex_code_mode_v1_proto_enumTypes[0]
+	return &file_codex_code_mode_v1_proto_enumTypes[1]
 }
 
 func (x ToolKind) Number() protoreflect.EnumNumber {
@@ -67,7 +116,7 @@ func (x ToolKind) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ToolKind.Descriptor instead.
 func (ToolKind) EnumDescriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{0}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{1}
 }
 
 type ImageDetail int32
@@ -109,11 +158,11 @@ func (x ImageDetail) String() string {
 }
 
 func (ImageDetail) Descriptor() protoreflect.EnumDescriptor {
-	return file_codex_code_mode_v1_proto_enumTypes[1].Descriptor()
+	return file_codex_code_mode_v1_proto_enumTypes[2].Descriptor()
 }
 
 func (ImageDetail) Type() protoreflect.EnumType {
-	return &file_codex_code_mode_v1_proto_enumTypes[1]
+	return &file_codex_code_mode_v1_proto_enumTypes[2]
 }
 
 func (x ImageDetail) Number() protoreflect.EnumNumber {
@@ -122,7 +171,111 @@ func (x ImageDetail) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ImageDetail.Descriptor instead.
 func (ImageDetail) EnumDescriptor() ([]byte, []int) {
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{2}
+}
+
+type GetProcessMetricsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetProcessMetricsRequest) Reset() {
+	*x = GetProcessMetricsRequest{}
+	mi := &file_codex_code_mode_v1_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetProcessMetricsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetProcessMetricsRequest) ProtoMessage() {}
+
+func (x *GetProcessMetricsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_codex_code_mode_v1_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetProcessMetricsRequest.ProtoReflect.Descriptor instead.
+func (*GetProcessMetricsRequest) Descriptor() ([]byte, []int) {
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{0}
+}
+
+type GetProcessMetricsResponse struct {
+	state                   protoimpl.MessageState `protogen:"open.v1"`
+	ProcessId               uint32                 `protobuf:"varint,1,opt,name=process_id,json=processId,proto3" json:"process_id,omitempty"`
+	ProcessStartTimeSeconds float64                `protobuf:"fixed64,2,opt,name=process_start_time_seconds,json=processStartTimeSeconds,proto3" json:"process_start_time_seconds,omitempty"`
+	CpuSecondsTotal         float64                `protobuf:"fixed64,3,opt,name=cpu_seconds_total,json=cpuSecondsTotal,proto3" json:"cpu_seconds_total,omitempty"`
+	ResidentMemoryBytes     uint64                 `protobuf:"varint,4,opt,name=resident_memory_bytes,json=residentMemoryBytes,proto3" json:"resident_memory_bytes,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
+}
+
+func (x *GetProcessMetricsResponse) Reset() {
+	*x = GetProcessMetricsResponse{}
+	mi := &file_codex_code_mode_v1_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetProcessMetricsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetProcessMetricsResponse) ProtoMessage() {}
+
+func (x *GetProcessMetricsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_codex_code_mode_v1_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetProcessMetricsResponse.ProtoReflect.Descriptor instead.
+func (*GetProcessMetricsResponse) Descriptor() ([]byte, []int) {
 	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *GetProcessMetricsResponse) GetProcessId() uint32 {
+	if x != nil {
+		return x.ProcessId
+	}
+	return 0
+}
+
+func (x *GetProcessMetricsResponse) GetProcessStartTimeSeconds() float64 {
+	if x != nil {
+		return x.ProcessStartTimeSeconds
+	}
+	return 0
+}
+
+func (x *GetProcessMetricsResponse) GetCpuSecondsTotal() float64 {
+	if x != nil {
+		return x.CpuSecondsTotal
+	}
+	return 0
+}
+
+func (x *GetProcessMetricsResponse) GetResidentMemoryBytes() uint64 {
+	if x != nil {
+		return x.ResidentMemoryBytes
+	}
+	return 0
 }
 
 // FramedMessage carries one code-mode IPC framing payload (JSON) over the
@@ -136,7 +289,7 @@ type FramedMessage struct {
 
 func (x *FramedMessage) Reset() {
 	*x = FramedMessage{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[0]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -148,7 +301,7 @@ func (x *FramedMessage) String() string {
 func (*FramedMessage) ProtoMessage() {}
 
 func (x *FramedMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[0]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -161,7 +314,7 @@ func (x *FramedMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FramedMessage.ProtoReflect.Descriptor instead.
 func (*FramedMessage) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{0}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *FramedMessage) GetPayload() []byte {
@@ -174,13 +327,19 @@ func (x *FramedMessage) GetPayload() []byte {
 type OpenSessionRequest struct {
 	state               protoimpl.MessageState      `protogen:"open.v1"`
 	CellExecutionLimits *SessionCellExecutionLimits `protobuf:"bytes,1,opt,name=cell_execution_limits,json=cellExecutionLimits,proto3,oneof" json:"cell_execution_limits,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// Absent preserves the legacy client-side truncation behavior.
+	OutputTruncation *OutputTruncation `protobuf:"varint,2,opt,name=output_truncation,json=outputTruncation,proto3,enum=codex.code_mode.v1.OutputTruncation,oneof" json:"output_truncation,omitempty"`
+	// Maximum pending tool callbacks the client can accept.
+	// Absent preserves the legacy 1,024 callback budget. Hosts may impose a lower
+	// shared limit, and older hosts ignore this field and retain their own limit.
+	MaxPendingDelegateCalls *uint32 `protobuf:"varint,3,opt,name=max_pending_delegate_calls,json=maxPendingDelegateCalls,proto3,oneof" json:"max_pending_delegate_calls,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *OpenSessionRequest) Reset() {
 	*x = OpenSessionRequest{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[1]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -192,7 +351,7 @@ func (x *OpenSessionRequest) String() string {
 func (*OpenSessionRequest) ProtoMessage() {}
 
 func (x *OpenSessionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[1]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -205,7 +364,7 @@ func (x *OpenSessionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OpenSessionRequest.ProtoReflect.Descriptor instead.
 func (*OpenSessionRequest) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{1}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *OpenSessionRequest) GetCellExecutionLimits() *SessionCellExecutionLimits {
@@ -213,6 +372,20 @@ func (x *OpenSessionRequest) GetCellExecutionLimits() *SessionCellExecutionLimit
 		return x.CellExecutionLimits
 	}
 	return nil
+}
+
+func (x *OpenSessionRequest) GetOutputTruncation() OutputTruncation {
+	if x != nil && x.OutputTruncation != nil {
+		return *x.OutputTruncation
+	}
+	return OutputTruncation_OUTPUT_TRUNCATION_UNSPECIFIED
+}
+
+func (x *OpenSessionRequest) GetMaxPendingDelegateCalls() uint32 {
+	if x != nil && x.MaxPendingDelegateCalls != nil {
+		return *x.MaxPendingDelegateCalls
+	}
+	return 0
 }
 
 type SessionCellExecutionLimits struct {
@@ -225,7 +398,7 @@ type SessionCellExecutionLimits struct {
 
 func (x *SessionCellExecutionLimits) Reset() {
 	*x = SessionCellExecutionLimits{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[2]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -237,7 +410,7 @@ func (x *SessionCellExecutionLimits) String() string {
 func (*SessionCellExecutionLimits) ProtoMessage() {}
 
 func (x *SessionCellExecutionLimits) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[2]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -250,7 +423,7 @@ func (x *SessionCellExecutionLimits) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SessionCellExecutionLimits.ProtoReflect.Descriptor instead.
 func (*SessionCellExecutionLimits) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{2}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *SessionCellExecutionLimits) GetMaxYieldTimeMs() uint64 {
@@ -283,7 +456,7 @@ type SessionEvent struct {
 
 func (x *SessionEvent) Reset() {
 	*x = SessionEvent{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[3]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -295,7 +468,7 @@ func (x *SessionEvent) String() string {
 func (*SessionEvent) ProtoMessage() {}
 
 func (x *SessionEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[3]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -308,7 +481,7 @@ func (x *SessionEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SessionEvent.ProtoReflect.Descriptor instead.
 func (*SessionEvent) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{3}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *SessionEvent) GetEvent() isSessionEvent_Event {
@@ -398,15 +571,17 @@ func (*SessionEvent_NotificationCancelled) isSessionEvent_Event() {}
 func (*SessionEvent_CellClosed) isSessionEvent_Event() {}
 
 type SessionOpened struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	SessionId     string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	SessionId string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	// Absent (including from an older host) means the client owns truncation.
+	OutputTruncation *OutputTruncation `protobuf:"varint,2,opt,name=output_truncation,json=outputTruncation,proto3,enum=codex.code_mode.v1.OutputTruncation,oneof" json:"output_truncation,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *SessionOpened) Reset() {
 	*x = SessionOpened{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[4]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -418,7 +593,7 @@ func (x *SessionOpened) String() string {
 func (*SessionOpened) ProtoMessage() {}
 
 func (x *SessionOpened) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[4]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -431,7 +606,7 @@ func (x *SessionOpened) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SessionOpened.ProtoReflect.Descriptor instead.
 func (*SessionOpened) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{4}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *SessionOpened) GetSessionId() string {
@@ -439,6 +614,13 @@ func (x *SessionOpened) GetSessionId() string {
 		return x.SessionId
 	}
 	return ""
+}
+
+func (x *SessionOpened) GetOutputTruncation() OutputTruncation {
+	if x != nil && x.OutputTruncation != nil {
+		return *x.OutputTruncation
+	}
+	return OutputTruncation_OUTPUT_TRUNCATION_UNSPECIFIED
 }
 
 type CloseSessionRequest struct {
@@ -450,7 +632,7 @@ type CloseSessionRequest struct {
 
 func (x *CloseSessionRequest) Reset() {
 	*x = CloseSessionRequest{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[5]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -462,7 +644,7 @@ func (x *CloseSessionRequest) String() string {
 func (*CloseSessionRequest) ProtoMessage() {}
 
 func (x *CloseSessionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[5]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -475,7 +657,7 @@ func (x *CloseSessionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CloseSessionRequest.ProtoReflect.Descriptor instead.
 func (*CloseSessionRequest) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{5}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *CloseSessionRequest) GetSessionId() string {
@@ -493,7 +675,7 @@ type CloseSessionResponse struct {
 
 func (x *CloseSessionResponse) Reset() {
 	*x = CloseSessionResponse{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[6]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -505,7 +687,7 @@ func (x *CloseSessionResponse) String() string {
 func (*CloseSessionResponse) ProtoMessage() {}
 
 func (x *CloseSessionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[6]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -518,7 +700,7 @@ func (x *CloseSessionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CloseSessionResponse.ProtoReflect.Descriptor instead.
 func (*CloseSessionResponse) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{6}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{8}
 }
 
 type SubscribeToToolCallsRequest struct {
@@ -531,7 +713,7 @@ type SubscribeToToolCallsRequest struct {
 
 func (x *SubscribeToToolCallsRequest) Reset() {
 	*x = SubscribeToToolCallsRequest{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[7]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -543,7 +725,7 @@ func (x *SubscribeToToolCallsRequest) String() string {
 func (*SubscribeToToolCallsRequest) ProtoMessage() {}
 
 func (x *SubscribeToToolCallsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[7]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -556,7 +738,7 @@ func (x *SubscribeToToolCallsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubscribeToToolCallsRequest.ProtoReflect.Descriptor instead.
 func (*SubscribeToToolCallsRequest) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{7}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *SubscribeToToolCallsRequest) GetSessionId() string {
@@ -596,7 +778,7 @@ type ToolCall struct {
 
 func (x *ToolCall) Reset() {
 	*x = ToolCall{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[8]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -608,7 +790,7 @@ func (x *ToolCall) String() string {
 func (*ToolCall) ProtoMessage() {}
 
 func (x *ToolCall) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[8]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -621,7 +803,7 @@ func (x *ToolCall) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ToolCall.ProtoReflect.Descriptor instead.
 func (*ToolCall) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{8}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ToolCall) GetSessionId() string {
@@ -709,7 +891,7 @@ type CompleteToolCallRequest struct {
 
 func (x *CompleteToolCallRequest) Reset() {
 	*x = CompleteToolCallRequest{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[9]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -721,7 +903,7 @@ func (x *CompleteToolCallRequest) String() string {
 func (*CompleteToolCallRequest) ProtoMessage() {}
 
 func (x *CompleteToolCallRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[9]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -734,7 +916,7 @@ func (x *CompleteToolCallRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CompleteToolCallRequest.ProtoReflect.Descriptor instead.
 func (*CompleteToolCallRequest) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{9}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *CompleteToolCallRequest) GetSessionId() string {
@@ -801,7 +983,7 @@ type ToolCallSucceeded struct {
 
 func (x *ToolCallSucceeded) Reset() {
 	*x = ToolCallSucceeded{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[10]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -813,7 +995,7 @@ func (x *ToolCallSucceeded) String() string {
 func (*ToolCallSucceeded) ProtoMessage() {}
 
 func (x *ToolCallSucceeded) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[10]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -826,7 +1008,7 @@ func (x *ToolCallSucceeded) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ToolCallSucceeded.ProtoReflect.Descriptor instead.
 func (*ToolCallSucceeded) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{10}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *ToolCallSucceeded) GetOutputJson() []byte {
@@ -845,7 +1027,7 @@ type ToolCallFailed struct {
 
 func (x *ToolCallFailed) Reset() {
 	*x = ToolCallFailed{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[11]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -857,7 +1039,7 @@ func (x *ToolCallFailed) String() string {
 func (*ToolCallFailed) ProtoMessage() {}
 
 func (x *ToolCallFailed) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[11]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -870,7 +1052,7 @@ func (x *ToolCallFailed) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ToolCallFailed.ProtoReflect.Descriptor instead.
 func (*ToolCallFailed) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{11}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *ToolCallFailed) GetMessage() string {
@@ -888,7 +1070,7 @@ type CompleteToolCallResponse struct {
 
 func (x *CompleteToolCallResponse) Reset() {
 	*x = CompleteToolCallResponse{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[12]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -900,7 +1082,7 @@ func (x *CompleteToolCallResponse) String() string {
 func (*CompleteToolCallResponse) ProtoMessage() {}
 
 func (x *CompleteToolCallResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[12]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -913,7 +1095,7 @@ func (x *CompleteToolCallResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CompleteToolCallResponse.ProtoReflect.Descriptor instead.
 func (*CompleteToolCallResponse) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{12}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{14}
 }
 
 type ToolCallCancelled struct {
@@ -925,7 +1107,7 @@ type ToolCallCancelled struct {
 
 func (x *ToolCallCancelled) Reset() {
 	*x = ToolCallCancelled{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[13]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -937,7 +1119,7 @@ func (x *ToolCallCancelled) String() string {
 func (*ToolCallCancelled) ProtoMessage() {}
 
 func (x *ToolCallCancelled) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[13]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -950,7 +1132,7 @@ func (x *ToolCallCancelled) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ToolCallCancelled.ProtoReflect.Descriptor instead.
 func (*ToolCallCancelled) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{13}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *ToolCallCancelled) GetInvocationId() string {
@@ -973,7 +1155,7 @@ type Notification struct {
 
 func (x *Notification) Reset() {
 	*x = Notification{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[14]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -985,7 +1167,7 @@ func (x *Notification) String() string {
 func (*Notification) ProtoMessage() {}
 
 func (x *Notification) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[14]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -998,7 +1180,7 @@ func (x *Notification) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Notification.ProtoReflect.Descriptor instead.
 func (*Notification) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{14}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *Notification) GetNotificationId() string {
@@ -1045,7 +1227,7 @@ type NotificationCancelled struct {
 
 func (x *NotificationCancelled) Reset() {
 	*x = NotificationCancelled{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[15]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1057,7 +1239,7 @@ func (x *NotificationCancelled) String() string {
 func (*NotificationCancelled) ProtoMessage() {}
 
 func (x *NotificationCancelled) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[15]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1070,7 +1252,7 @@ func (x *NotificationCancelled) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NotificationCancelled.ProtoReflect.Descriptor instead.
 func (*NotificationCancelled) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{15}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *NotificationCancelled) GetNotificationId() string {
@@ -1090,7 +1272,7 @@ type AcknowledgeNotificationRequest struct {
 
 func (x *AcknowledgeNotificationRequest) Reset() {
 	*x = AcknowledgeNotificationRequest{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[16]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1102,7 +1284,7 @@ func (x *AcknowledgeNotificationRequest) String() string {
 func (*AcknowledgeNotificationRequest) ProtoMessage() {}
 
 func (x *AcknowledgeNotificationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[16]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1115,7 +1297,7 @@ func (x *AcknowledgeNotificationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AcknowledgeNotificationRequest.ProtoReflect.Descriptor instead.
 func (*AcknowledgeNotificationRequest) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{16}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *AcknowledgeNotificationRequest) GetSessionId() string {
@@ -1140,7 +1322,7 @@ type AcknowledgeNotificationResponse struct {
 
 func (x *AcknowledgeNotificationResponse) Reset() {
 	*x = AcknowledgeNotificationResponse{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[17]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1152,7 +1334,7 @@ func (x *AcknowledgeNotificationResponse) String() string {
 func (*AcknowledgeNotificationResponse) ProtoMessage() {}
 
 func (x *AcknowledgeNotificationResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[17]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1165,7 +1347,7 @@ func (x *AcknowledgeNotificationResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AcknowledgeNotificationResponse.ProtoReflect.Descriptor instead.
 func (*AcknowledgeNotificationResponse) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{17}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{19}
 }
 
 type CellClosed struct {
@@ -1181,7 +1363,7 @@ type CellClosed struct {
 
 func (x *CellClosed) Reset() {
 	*x = CellClosed{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[18]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1193,7 +1375,7 @@ func (x *CellClosed) String() string {
 func (*CellClosed) ProtoMessage() {}
 
 func (x *CellClosed) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[18]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1206,7 +1388,7 @@ func (x *CellClosed) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CellClosed.ProtoReflect.Descriptor instead.
 func (*CellClosed) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{18}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *CellClosed) GetExecutionId() string {
@@ -1246,7 +1428,7 @@ type ExecuteRequest struct {
 
 func (x *ExecuteRequest) Reset() {
 	*x = ExecuteRequest{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[19]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1258,7 +1440,7 @@ func (x *ExecuteRequest) String() string {
 func (*ExecuteRequest) ProtoMessage() {}
 
 func (x *ExecuteRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[19]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1271,7 +1453,7 @@ func (x *ExecuteRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecuteRequest.ProtoReflect.Descriptor instead.
 func (*ExecuteRequest) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{19}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *ExecuteRequest) GetSessionId() string {
@@ -1336,7 +1518,7 @@ type ExecuteEvent struct {
 
 func (x *ExecuteEvent) Reset() {
 	*x = ExecuteEvent{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[20]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1348,7 +1530,7 @@ func (x *ExecuteEvent) String() string {
 func (*ExecuteEvent) ProtoMessage() {}
 
 func (x *ExecuteEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[20]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1361,7 +1543,7 @@ func (x *ExecuteEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecuteEvent.ProtoReflect.Descriptor instead.
 func (*ExecuteEvent) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{20}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *ExecuteEvent) GetEvent() isExecuteEvent_Event {
@@ -1415,7 +1597,7 @@ type ExecutionStarted struct {
 
 func (x *ExecutionStarted) Reset() {
 	*x = ExecutionStarted{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[21]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1427,7 +1609,7 @@ func (x *ExecutionStarted) String() string {
 func (*ExecutionStarted) ProtoMessage() {}
 
 func (x *ExecutionStarted) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[21]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1440,7 +1622,7 @@ func (x *ExecutionStarted) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecutionStarted.ProtoReflect.Descriptor instead.
 func (*ExecutionStarted) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{21}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *ExecutionStarted) GetExecutionId() string {
@@ -1458,18 +1640,20 @@ func (x *ExecutionStarted) GetCellId() string {
 }
 
 type WaitRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	SessionId     string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
-	CellId        string                 `protobuf:"bytes,2,opt,name=cell_id,json=cellId,proto3" json:"cell_id,omitempty"`
-	WaitId        string                 `protobuf:"bytes,3,opt,name=wait_id,json=waitId,proto3" json:"wait_id,omitempty"`
-	YieldTimeMs   uint64                 `protobuf:"varint,4,opt,name=yield_time_ms,json=yieldTimeMs,proto3" json:"yield_time_ms,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	SessionId   string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	CellId      string                 `protobuf:"bytes,2,opt,name=cell_id,json=cellId,proto3" json:"cell_id,omitempty"`
+	WaitId      string                 `protobuf:"bytes,3,opt,name=wait_id,json=waitId,proto3" json:"wait_id,omitempty"`
+	YieldTimeMs uint64                 `protobuf:"varint,4,opt,name=yield_time_ms,json=yieldTimeMs,proto3" json:"yield_time_ms,omitempty"`
+	// Only set for a session that selected server-side output truncation.
+	MaxOutputTokens *uint64 `protobuf:"varint,5,opt,name=max_output_tokens,json=maxOutputTokens,proto3,oneof" json:"max_output_tokens,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *WaitRequest) Reset() {
 	*x = WaitRequest{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[22]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1481,7 +1665,7 @@ func (x *WaitRequest) String() string {
 func (*WaitRequest) ProtoMessage() {}
 
 func (x *WaitRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[22]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1494,7 +1678,7 @@ func (x *WaitRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WaitRequest.ProtoReflect.Descriptor instead.
 func (*WaitRequest) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{22}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *WaitRequest) GetSessionId() string {
@@ -1525,6 +1709,13 @@ func (x *WaitRequest) GetYieldTimeMs() uint64 {
 	return 0
 }
 
+func (x *WaitRequest) GetMaxOutputTokens() uint64 {
+	if x != nil && x.MaxOutputTokens != nil {
+		return *x.MaxOutputTokens
+	}
+	return 0
+}
+
 type WaitResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to State:
@@ -1538,7 +1729,7 @@ type WaitResponse struct {
 
 func (x *WaitResponse) Reset() {
 	*x = WaitResponse{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[23]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1550,7 +1741,7 @@ func (x *WaitResponse) String() string {
 func (*WaitResponse) ProtoMessage() {}
 
 func (x *WaitResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[23]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1563,7 +1754,7 @@ func (x *WaitResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WaitResponse.ProtoReflect.Descriptor instead.
 func (*WaitResponse) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{23}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *WaitResponse) GetState() isWaitResponse_State {
@@ -1617,7 +1808,7 @@ type CancelWaitRequest struct {
 
 func (x *CancelWaitRequest) Reset() {
 	*x = CancelWaitRequest{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[24]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1629,7 +1820,7 @@ func (x *CancelWaitRequest) String() string {
 func (*CancelWaitRequest) ProtoMessage() {}
 
 func (x *CancelWaitRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[24]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1642,7 +1833,7 @@ func (x *CancelWaitRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelWaitRequest.ProtoReflect.Descriptor instead.
 func (*CancelWaitRequest) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{24}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *CancelWaitRequest) GetSessionId() string {
@@ -1667,7 +1858,7 @@ type CancelWaitResponse struct {
 
 func (x *CancelWaitResponse) Reset() {
 	*x = CancelWaitResponse{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[25]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1679,7 +1870,7 @@ func (x *CancelWaitResponse) String() string {
 func (*CancelWaitResponse) ProtoMessage() {}
 
 func (x *CancelWaitResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[25]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1692,7 +1883,7 @@ func (x *CancelWaitResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelWaitResponse.ProtoReflect.Descriptor instead.
 func (*CancelWaitResponse) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{25}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{27}
 }
 
 type YieldObservationRequest struct {
@@ -1709,7 +1900,7 @@ type YieldObservationRequest struct {
 
 func (x *YieldObservationRequest) Reset() {
 	*x = YieldObservationRequest{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[26]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1721,7 +1912,7 @@ func (x *YieldObservationRequest) String() string {
 func (*YieldObservationRequest) ProtoMessage() {}
 
 func (x *YieldObservationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[26]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1734,7 +1925,7 @@ func (x *YieldObservationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use YieldObservationRequest.ProtoReflect.Descriptor instead.
 func (*YieldObservationRequest) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{26}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *YieldObservationRequest) GetSessionId() string {
@@ -1793,7 +1984,7 @@ type YieldObservationResponse struct {
 
 func (x *YieldObservationResponse) Reset() {
 	*x = YieldObservationResponse{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[27]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1805,7 +1996,7 @@ func (x *YieldObservationResponse) String() string {
 func (*YieldObservationResponse) ProtoMessage() {}
 
 func (x *YieldObservationResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[27]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1818,20 +2009,22 @@ func (x *YieldObservationResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use YieldObservationResponse.ProtoReflect.Descriptor instead.
 func (*YieldObservationResponse) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{27}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{29}
 }
 
 type TerminateRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	SessionId     string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
-	CellId        string                 `protobuf:"bytes,2,opt,name=cell_id,json=cellId,proto3" json:"cell_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	SessionId string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"`
+	CellId    string                 `protobuf:"bytes,2,opt,name=cell_id,json=cellId,proto3" json:"cell_id,omitempty"`
+	// The terminating observation has its own output budget.
+	MaxOutputTokens *uint64 `protobuf:"varint,3,opt,name=max_output_tokens,json=maxOutputTokens,proto3,oneof" json:"max_output_tokens,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *TerminateRequest) Reset() {
 	*x = TerminateRequest{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[28]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1843,7 +2036,7 @@ func (x *TerminateRequest) String() string {
 func (*TerminateRequest) ProtoMessage() {}
 
 func (x *TerminateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[28]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1856,7 +2049,7 @@ func (x *TerminateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TerminateRequest.ProtoReflect.Descriptor instead.
 func (*TerminateRequest) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{28}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *TerminateRequest) GetSessionId() string {
@@ -1871,6 +2064,13 @@ func (x *TerminateRequest) GetCellId() string {
 		return x.CellId
 	}
 	return ""
+}
+
+func (x *TerminateRequest) GetMaxOutputTokens() uint64 {
+	if x != nil && x.MaxOutputTokens != nil {
+		return *x.MaxOutputTokens
+	}
+	return 0
 }
 
 type ExecutionOutcome struct {
@@ -1894,7 +2094,7 @@ type ExecutionOutcome struct {
 
 func (x *ExecutionOutcome) Reset() {
 	*x = ExecutionOutcome{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[29]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1906,7 +2106,7 @@ func (x *ExecutionOutcome) String() string {
 func (*ExecutionOutcome) ProtoMessage() {}
 
 func (x *ExecutionOutcome) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[29]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1919,7 +2119,7 @@ func (x *ExecutionOutcome) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecutionOutcome.ProtoReflect.Descriptor instead.
 func (*ExecutionOutcome) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{29}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *ExecutionOutcome) GetCellId() string {
@@ -2007,7 +2207,7 @@ type ExecutionYielded struct {
 
 func (x *ExecutionYielded) Reset() {
 	*x = ExecutionYielded{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[30]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2019,7 +2219,7 @@ func (x *ExecutionYielded) String() string {
 func (*ExecutionYielded) ProtoMessage() {}
 
 func (x *ExecutionYielded) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[30]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2032,7 +2232,7 @@ func (x *ExecutionYielded) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecutionYielded.ProtoReflect.Descriptor instead.
 func (*ExecutionYielded) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{30}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{32}
 }
 
 type ExecutionTerminated struct {
@@ -2043,7 +2243,7 @@ type ExecutionTerminated struct {
 
 func (x *ExecutionTerminated) Reset() {
 	*x = ExecutionTerminated{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[31]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2055,7 +2255,7 @@ func (x *ExecutionTerminated) String() string {
 func (*ExecutionTerminated) ProtoMessage() {}
 
 func (x *ExecutionTerminated) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[31]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2068,7 +2268,7 @@ func (x *ExecutionTerminated) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecutionTerminated.ProtoReflect.Descriptor instead.
 func (*ExecutionTerminated) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{31}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{33}
 }
 
 type ExecutionCompleted struct {
@@ -2080,7 +2280,7 @@ type ExecutionCompleted struct {
 
 func (x *ExecutionCompleted) Reset() {
 	*x = ExecutionCompleted{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[32]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2092,7 +2292,7 @@ func (x *ExecutionCompleted) String() string {
 func (*ExecutionCompleted) ProtoMessage() {}
 
 func (x *ExecutionCompleted) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[32]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2105,7 +2305,7 @@ func (x *ExecutionCompleted) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecutionCompleted.ProtoReflect.Descriptor instead.
 func (*ExecutionCompleted) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{32}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *ExecutionCompleted) GetErrorText() string {
@@ -2129,7 +2329,7 @@ type ToolDefinition struct {
 
 func (x *ToolDefinition) Reset() {
 	*x = ToolDefinition{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[33]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2141,7 +2341,7 @@ func (x *ToolDefinition) String() string {
 func (*ToolDefinition) ProtoMessage() {}
 
 func (x *ToolDefinition) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[33]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2154,7 +2354,7 @@ func (x *ToolDefinition) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ToolDefinition.ProtoReflect.Descriptor instead.
 func (*ToolDefinition) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{33}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *ToolDefinition) GetName() string {
@@ -2209,7 +2409,7 @@ type ToolName struct {
 
 func (x *ToolName) Reset() {
 	*x = ToolName{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[34]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2221,7 +2421,7 @@ func (x *ToolName) String() string {
 func (*ToolName) ProtoMessage() {}
 
 func (x *ToolName) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[34]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2234,7 +2434,7 @@ func (x *ToolName) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ToolName.ProtoReflect.Descriptor instead.
 func (*ToolName) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{34}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *ToolName) GetName() string {
@@ -2265,7 +2465,7 @@ type ContentItem struct {
 
 func (x *ContentItem) Reset() {
 	*x = ContentItem{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[35]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2277,7 +2477,7 @@ func (x *ContentItem) String() string {
 func (*ContentItem) ProtoMessage() {}
 
 func (x *ContentItem) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[35]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2290,7 +2490,7 @@ func (x *ContentItem) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ContentItem.ProtoReflect.Descriptor instead.
 func (*ContentItem) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{35}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *ContentItem) GetItem() isContentItem_Item {
@@ -2358,7 +2558,7 @@ type TextContent struct {
 
 func (x *TextContent) Reset() {
 	*x = TextContent{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[36]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2370,7 +2570,7 @@ func (x *TextContent) String() string {
 func (*TextContent) ProtoMessage() {}
 
 func (x *TextContent) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[36]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2383,7 +2583,7 @@ func (x *TextContent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TextContent.ProtoReflect.Descriptor instead.
 func (*TextContent) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{36}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *TextContent) GetText() string {
@@ -2403,7 +2603,7 @@ type ImageContent struct {
 
 func (x *ImageContent) Reset() {
 	*x = ImageContent{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[37]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2415,7 +2615,7 @@ func (x *ImageContent) String() string {
 func (*ImageContent) ProtoMessage() {}
 
 func (x *ImageContent) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[37]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2428,7 +2628,7 @@ func (x *ImageContent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImageContent.ProtoReflect.Descriptor instead.
 func (*ImageContent) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{37}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *ImageContent) GetImageUrl() string {
@@ -2454,7 +2654,7 @@ type AudioContent struct {
 
 func (x *AudioContent) Reset() {
 	*x = AudioContent{}
-	mi := &file_codex_code_mode_v1_proto_msgTypes[38]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2466,7 +2666,7 @@ func (x *AudioContent) String() string {
 func (*AudioContent) ProtoMessage() {}
 
 func (x *AudioContent) ProtoReflect() protoreflect.Message {
-	mi := &file_codex_code_mode_v1_proto_msgTypes[38]
+	mi := &file_codex_code_mode_v1_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2479,7 +2679,7 @@ func (x *AudioContent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AudioContent.ProtoReflect.Descriptor instead.
 func (*AudioContent) Descriptor() ([]byte, []int) {
-	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{38}
+	return file_codex_code_mode_v1_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *AudioContent) GetAudioUrl() string {
@@ -2493,12 +2693,23 @@ var File_codex_code_mode_v1_proto protoreflect.FileDescriptor
 
 const file_codex_code_mode_v1_proto_rawDesc = "" +
 	"\n" +
-	"\x18codex.code_mode.v1.proto\x12\x12codex.code_mode.v1\")\n" +
+	"\x18codex.code_mode.v1.proto\x12\x12codex.code_mode.v1\"\x1a\n" +
+	"\x18GetProcessMetricsRequest\"\xd7\x01\n" +
+	"\x19GetProcessMetricsResponse\x12\x1d\n" +
+	"\n" +
+	"process_id\x18\x01 \x01(\rR\tprocessId\x12;\n" +
+	"\x1aprocess_start_time_seconds\x18\x02 \x01(\x01R\x17processStartTimeSeconds\x12*\n" +
+	"\x11cpu_seconds_total\x18\x03 \x01(\x01R\x0fcpuSecondsTotal\x122\n" +
+	"\x15resident_memory_bytes\x18\x04 \x01(\x04R\x13residentMemoryBytes\")\n" +
 	"\rFramedMessage\x12\x18\n" +
-	"\apayload\x18\x01 \x01(\fR\apayload\"\x97\x01\n" +
+	"\apayload\x18\x01 \x01(\fR\apayload\"\xe6\x02\n" +
 	"\x12OpenSessionRequest\x12g\n" +
-	"\x15cell_execution_limits\x18\x01 \x01(\v2..codex.code_mode.v1.SessionCellExecutionLimitsH\x00R\x13cellExecutionLimits\x88\x01\x01B\x18\n" +
-	"\x16_cell_execution_limits\"\xae\x01\n" +
+	"\x15cell_execution_limits\x18\x01 \x01(\v2..codex.code_mode.v1.SessionCellExecutionLimitsH\x00R\x13cellExecutionLimits\x88\x01\x01\x12V\n" +
+	"\x11output_truncation\x18\x02 \x01(\x0e2$.codex.code_mode.v1.OutputTruncationH\x01R\x10outputTruncation\x88\x01\x01\x12@\n" +
+	"\x1amax_pending_delegate_calls\x18\x03 \x01(\rH\x02R\x17maxPendingDelegateCalls\x88\x01\x01B\x18\n" +
+	"\x16_cell_execution_limitsB\x14\n" +
+	"\x12_output_truncationB\x1d\n" +
+	"\x1b_max_pending_delegate_calls\"\xae\x01\n" +
 	"\x1aSessionCellExecutionLimits\x12.\n" +
 	"\x11max_yield_time_ms\x18\x01 \x01(\x04H\x00R\x0emaxYieldTimeMs\x88\x01\x01\x122\n" +
 	"\x13max_heap_size_bytes\x18\x02 \x01(\x04H\x01R\x10maxHeapSizeBytes\x88\x01\x01B\x14\n" +
@@ -2511,10 +2722,12 @@ const file_codex_code_mode_v1_proto_rawDesc = "" +
 	"\x16notification_cancelled\x18\x04 \x01(\v2).codex.code_mode.v1.NotificationCancelledH\x00R\x15notificationCancelled\x12A\n" +
 	"\vcell_closed\x18\x05 \x01(\v2\x1e.codex.code_mode.v1.CellClosedH\x00R\n" +
 	"cellClosedB\a\n" +
-	"\x05event\".\n" +
+	"\x05event\"\x9c\x01\n" +
 	"\rSessionOpened\x12\x1d\n" +
 	"\n" +
-	"session_id\x18\x01 \x01(\tR\tsessionId\"4\n" +
+	"session_id\x18\x01 \x01(\tR\tsessionId\x12V\n" +
+	"\x11output_truncation\x18\x02 \x01(\x0e2$.codex.code_mode.v1.OutputTruncationH\x00R\x10outputTruncation\x88\x01\x01B\x14\n" +
+	"\x12_output_truncation\"4\n" +
 	"\x13CloseSessionRequest\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\"\x16\n" +
@@ -2591,13 +2804,15 @@ const file_codex_code_mode_v1_proto_rawDesc = "" +
 	"\x05event\"N\n" +
 	"\x10ExecutionStarted\x12!\n" +
 	"\fexecution_id\x18\x01 \x01(\tR\vexecutionId\x12\x17\n" +
-	"\acell_id\x18\x02 \x01(\tR\x06cellId\"\x82\x01\n" +
+	"\acell_id\x18\x02 \x01(\tR\x06cellId\"\xc9\x01\n" +
 	"\vWaitRequest\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x17\n" +
 	"\acell_id\x18\x02 \x01(\tR\x06cellId\x12\x17\n" +
 	"\await_id\x18\x03 \x01(\tR\x06waitId\x12\"\n" +
-	"\ryield_time_ms\x18\x04 \x01(\x04R\vyieldTimeMs\"\xa7\x01\n" +
+	"\ryield_time_ms\x18\x04 \x01(\x04R\vyieldTimeMs\x12/\n" +
+	"\x11max_output_tokens\x18\x05 \x01(\x04H\x00R\x0fmaxOutputTokens\x88\x01\x01B\x14\n" +
+	"\x12_max_output_tokens\"\xa7\x01\n" +
 	"\fWaitResponse\x12C\n" +
 	"\tlive_cell\x18\x01 \x01(\v2$.codex.code_mode.v1.ExecutionOutcomeH\x00R\bliveCell\x12I\n" +
 	"\fmissing_cell\x18\x02 \x01(\v2$.codex.code_mode.v1.ExecutionOutcomeH\x00R\vmissingCellB\a\n" +
@@ -2613,11 +2828,13 @@ const file_codex_code_mode_v1_proto_rawDesc = "" +
 	"\fexecution_id\x18\x02 \x01(\tH\x00R\vexecutionId\x12\x19\n" +
 	"\await_id\x18\x03 \x01(\tH\x00R\x06waitIdB\r\n" +
 	"\vobservation\"\x1a\n" +
-	"\x18YieldObservationResponse\"J\n" +
+	"\x18YieldObservationResponse\"\x91\x01\n" +
 	"\x10TerminateRequest\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x17\n" +
-	"\acell_id\x18\x02 \x01(\tR\x06cellId\"\x8d\x03\n" +
+	"\acell_id\x18\x02 \x01(\tR\x06cellId\x12/\n" +
+	"\x11max_output_tokens\x18\x03 \x01(\x04H\x00R\x0fmaxOutputTokens\x88\x01\x01B\x14\n" +
+	"\x12_max_output_tokens\"\x8d\x03\n" +
 	"\x10ExecutionOutcome\x12\x17\n" +
 	"\acell_id\x18\x01 \x01(\tR\x06cellId\x12D\n" +
 	"\rcontent_items\x18\x02 \x03(\v2\x1f.codex.code_mode.v1.ContentItemR\fcontentItems\x12:\n" +
@@ -2660,7 +2877,11 @@ const file_codex_code_mode_v1_proto_rawDesc = "" +
 	"\x06detail\x18\x02 \x01(\x0e2\x1f.codex.code_mode.v1.ImageDetailH\x00R\x06detail\x88\x01\x01B\t\n" +
 	"\a_detail\"+\n" +
 	"\fAudioContent\x12\x1b\n" +
-	"\taudio_url\x18\x01 \x01(\tR\baudioUrl*U\n" +
+	"\taudio_url\x18\x01 \x01(\tR\baudioUrl*q\n" +
+	"\x10OutputTruncation\x12!\n" +
+	"\x1dOUTPUT_TRUNCATION_UNSPECIFIED\x10\x00\x12\x1c\n" +
+	"\x18OUTPUT_TRUNCATION_CLIENT\x10\x01\x12\x1c\n" +
+	"\x18OUTPUT_TRUNCATION_SERVER\x10\x02*U\n" +
 	"\bToolKind\x12\x19\n" +
 	"\x15TOOL_KIND_UNSPECIFIED\x10\x00\x12\x16\n" +
 	"\x12TOOL_KIND_FUNCTION\x10\x01\x12\x16\n" +
@@ -2670,8 +2891,9 @@ const file_codex_code_mode_v1_proto_rawDesc = "" +
 	"\x11IMAGE_DETAIL_AUTO\x10\x01\x12\x14\n" +
 	"\x10IMAGE_DETAIL_LOW\x10\x02\x12\x15\n" +
 	"\x11IMAGE_DETAIL_HIGH\x10\x03\x12\x19\n" +
-	"\x15IMAGE_DETAIL_ORIGINAL\x10\x042\xbf\b\n" +
-	"\fCodeModeHost\x12U\n" +
+	"\x15IMAGE_DETAIL_ORIGINAL\x10\x042\xb1\t\n" +
+	"\fCodeModeHost\x12p\n" +
+	"\x11GetProcessMetrics\x12,.codex.code_mode.v1.GetProcessMetricsRequest\x1a-.codex.code_mode.v1.GetProcessMetricsResponse\x12U\n" +
 	"\tTransport\x12!.codex.code_mode.v1.FramedMessage\x1a!.codex.code_mode.v1.FramedMessage(\x010\x01\x12Y\n" +
 	"\vOpenSession\x12&.codex.code_mode.v1.OpenSessionRequest\x1a .codex.code_mode.v1.SessionEvent0\x01\x12a\n" +
 	"\fCloseSession\x12'.codex.code_mode.v1.CloseSessionRequest\x1a(.codex.code_mode.v1.CloseSessionResponse\x12g\n" +
@@ -2697,105 +2919,112 @@ func file_codex_code_mode_v1_proto_rawDescGZIP() []byte {
 	return file_codex_code_mode_v1_proto_rawDescData
 }
 
-var file_codex_code_mode_v1_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_codex_code_mode_v1_proto_msgTypes = make([]protoimpl.MessageInfo, 39)
+var file_codex_code_mode_v1_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
+var file_codex_code_mode_v1_proto_msgTypes = make([]protoimpl.MessageInfo, 41)
 var file_codex_code_mode_v1_proto_goTypes = []any{
-	(ToolKind)(0),                           // 0: codex.code_mode.v1.ToolKind
-	(ImageDetail)(0),                        // 1: codex.code_mode.v1.ImageDetail
-	(*FramedMessage)(nil),                   // 2: codex.code_mode.v1.FramedMessage
-	(*OpenSessionRequest)(nil),              // 3: codex.code_mode.v1.OpenSessionRequest
-	(*SessionCellExecutionLimits)(nil),      // 4: codex.code_mode.v1.SessionCellExecutionLimits
-	(*SessionEvent)(nil),                    // 5: codex.code_mode.v1.SessionEvent
-	(*SessionOpened)(nil),                   // 6: codex.code_mode.v1.SessionOpened
-	(*CloseSessionRequest)(nil),             // 7: codex.code_mode.v1.CloseSessionRequest
-	(*CloseSessionResponse)(nil),            // 8: codex.code_mode.v1.CloseSessionResponse
-	(*SubscribeToToolCallsRequest)(nil),     // 9: codex.code_mode.v1.SubscribeToToolCallsRequest
-	(*ToolCall)(nil),                        // 10: codex.code_mode.v1.ToolCall
-	(*CompleteToolCallRequest)(nil),         // 11: codex.code_mode.v1.CompleteToolCallRequest
-	(*ToolCallSucceeded)(nil),               // 12: codex.code_mode.v1.ToolCallSucceeded
-	(*ToolCallFailed)(nil),                  // 13: codex.code_mode.v1.ToolCallFailed
-	(*CompleteToolCallResponse)(nil),        // 14: codex.code_mode.v1.CompleteToolCallResponse
-	(*ToolCallCancelled)(nil),               // 15: codex.code_mode.v1.ToolCallCancelled
-	(*Notification)(nil),                    // 16: codex.code_mode.v1.Notification
-	(*NotificationCancelled)(nil),           // 17: codex.code_mode.v1.NotificationCancelled
-	(*AcknowledgeNotificationRequest)(nil),  // 18: codex.code_mode.v1.AcknowledgeNotificationRequest
-	(*AcknowledgeNotificationResponse)(nil), // 19: codex.code_mode.v1.AcknowledgeNotificationResponse
-	(*CellClosed)(nil),                      // 20: codex.code_mode.v1.CellClosed
-	(*ExecuteRequest)(nil),                  // 21: codex.code_mode.v1.ExecuteRequest
-	(*ExecuteEvent)(nil),                    // 22: codex.code_mode.v1.ExecuteEvent
-	(*ExecutionStarted)(nil),                // 23: codex.code_mode.v1.ExecutionStarted
-	(*WaitRequest)(nil),                     // 24: codex.code_mode.v1.WaitRequest
-	(*WaitResponse)(nil),                    // 25: codex.code_mode.v1.WaitResponse
-	(*CancelWaitRequest)(nil),               // 26: codex.code_mode.v1.CancelWaitRequest
-	(*CancelWaitResponse)(nil),              // 27: codex.code_mode.v1.CancelWaitResponse
-	(*YieldObservationRequest)(nil),         // 28: codex.code_mode.v1.YieldObservationRequest
-	(*YieldObservationResponse)(nil),        // 29: codex.code_mode.v1.YieldObservationResponse
-	(*TerminateRequest)(nil),                // 30: codex.code_mode.v1.TerminateRequest
-	(*ExecutionOutcome)(nil),                // 31: codex.code_mode.v1.ExecutionOutcome
-	(*ExecutionYielded)(nil),                // 32: codex.code_mode.v1.ExecutionYielded
-	(*ExecutionTerminated)(nil),             // 33: codex.code_mode.v1.ExecutionTerminated
-	(*ExecutionCompleted)(nil),              // 34: codex.code_mode.v1.ExecutionCompleted
-	(*ToolDefinition)(nil),                  // 35: codex.code_mode.v1.ToolDefinition
-	(*ToolName)(nil),                        // 36: codex.code_mode.v1.ToolName
-	(*ContentItem)(nil),                     // 37: codex.code_mode.v1.ContentItem
-	(*TextContent)(nil),                     // 38: codex.code_mode.v1.TextContent
-	(*ImageContent)(nil),                    // 39: codex.code_mode.v1.ImageContent
-	(*AudioContent)(nil),                    // 40: codex.code_mode.v1.AudioContent
+	(OutputTruncation)(0),                   // 0: codex.code_mode.v1.OutputTruncation
+	(ToolKind)(0),                           // 1: codex.code_mode.v1.ToolKind
+	(ImageDetail)(0),                        // 2: codex.code_mode.v1.ImageDetail
+	(*GetProcessMetricsRequest)(nil),        // 3: codex.code_mode.v1.GetProcessMetricsRequest
+	(*GetProcessMetricsResponse)(nil),       // 4: codex.code_mode.v1.GetProcessMetricsResponse
+	(*FramedMessage)(nil),                   // 5: codex.code_mode.v1.FramedMessage
+	(*OpenSessionRequest)(nil),              // 6: codex.code_mode.v1.OpenSessionRequest
+	(*SessionCellExecutionLimits)(nil),      // 7: codex.code_mode.v1.SessionCellExecutionLimits
+	(*SessionEvent)(nil),                    // 8: codex.code_mode.v1.SessionEvent
+	(*SessionOpened)(nil),                   // 9: codex.code_mode.v1.SessionOpened
+	(*CloseSessionRequest)(nil),             // 10: codex.code_mode.v1.CloseSessionRequest
+	(*CloseSessionResponse)(nil),            // 11: codex.code_mode.v1.CloseSessionResponse
+	(*SubscribeToToolCallsRequest)(nil),     // 12: codex.code_mode.v1.SubscribeToToolCallsRequest
+	(*ToolCall)(nil),                        // 13: codex.code_mode.v1.ToolCall
+	(*CompleteToolCallRequest)(nil),         // 14: codex.code_mode.v1.CompleteToolCallRequest
+	(*ToolCallSucceeded)(nil),               // 15: codex.code_mode.v1.ToolCallSucceeded
+	(*ToolCallFailed)(nil),                  // 16: codex.code_mode.v1.ToolCallFailed
+	(*CompleteToolCallResponse)(nil),        // 17: codex.code_mode.v1.CompleteToolCallResponse
+	(*ToolCallCancelled)(nil),               // 18: codex.code_mode.v1.ToolCallCancelled
+	(*Notification)(nil),                    // 19: codex.code_mode.v1.Notification
+	(*NotificationCancelled)(nil),           // 20: codex.code_mode.v1.NotificationCancelled
+	(*AcknowledgeNotificationRequest)(nil),  // 21: codex.code_mode.v1.AcknowledgeNotificationRequest
+	(*AcknowledgeNotificationResponse)(nil), // 22: codex.code_mode.v1.AcknowledgeNotificationResponse
+	(*CellClosed)(nil),                      // 23: codex.code_mode.v1.CellClosed
+	(*ExecuteRequest)(nil),                  // 24: codex.code_mode.v1.ExecuteRequest
+	(*ExecuteEvent)(nil),                    // 25: codex.code_mode.v1.ExecuteEvent
+	(*ExecutionStarted)(nil),                // 26: codex.code_mode.v1.ExecutionStarted
+	(*WaitRequest)(nil),                     // 27: codex.code_mode.v1.WaitRequest
+	(*WaitResponse)(nil),                    // 28: codex.code_mode.v1.WaitResponse
+	(*CancelWaitRequest)(nil),               // 29: codex.code_mode.v1.CancelWaitRequest
+	(*CancelWaitResponse)(nil),              // 30: codex.code_mode.v1.CancelWaitResponse
+	(*YieldObservationRequest)(nil),         // 31: codex.code_mode.v1.YieldObservationRequest
+	(*YieldObservationResponse)(nil),        // 32: codex.code_mode.v1.YieldObservationResponse
+	(*TerminateRequest)(nil),                // 33: codex.code_mode.v1.TerminateRequest
+	(*ExecutionOutcome)(nil),                // 34: codex.code_mode.v1.ExecutionOutcome
+	(*ExecutionYielded)(nil),                // 35: codex.code_mode.v1.ExecutionYielded
+	(*ExecutionTerminated)(nil),             // 36: codex.code_mode.v1.ExecutionTerminated
+	(*ExecutionCompleted)(nil),              // 37: codex.code_mode.v1.ExecutionCompleted
+	(*ToolDefinition)(nil),                  // 38: codex.code_mode.v1.ToolDefinition
+	(*ToolName)(nil),                        // 39: codex.code_mode.v1.ToolName
+	(*ContentItem)(nil),                     // 40: codex.code_mode.v1.ContentItem
+	(*TextContent)(nil),                     // 41: codex.code_mode.v1.TextContent
+	(*ImageContent)(nil),                    // 42: codex.code_mode.v1.ImageContent
+	(*AudioContent)(nil),                    // 43: codex.code_mode.v1.AudioContent
 }
 var file_codex_code_mode_v1_proto_depIdxs = []int32{
-	4,  // 0: codex.code_mode.v1.OpenSessionRequest.cell_execution_limits:type_name -> codex.code_mode.v1.SessionCellExecutionLimits
-	6,  // 1: codex.code_mode.v1.SessionEvent.opened:type_name -> codex.code_mode.v1.SessionOpened
-	15, // 2: codex.code_mode.v1.SessionEvent.tool_call_cancelled:type_name -> codex.code_mode.v1.ToolCallCancelled
-	16, // 3: codex.code_mode.v1.SessionEvent.notification:type_name -> codex.code_mode.v1.Notification
-	17, // 4: codex.code_mode.v1.SessionEvent.notification_cancelled:type_name -> codex.code_mode.v1.NotificationCancelled
-	20, // 5: codex.code_mode.v1.SessionEvent.cell_closed:type_name -> codex.code_mode.v1.CellClosed
-	36, // 6: codex.code_mode.v1.SubscribeToToolCallsRequest.tool_names:type_name -> codex.code_mode.v1.ToolName
-	36, // 7: codex.code_mode.v1.ToolCall.tool_name:type_name -> codex.code_mode.v1.ToolName
-	0,  // 8: codex.code_mode.v1.ToolCall.tool_kind:type_name -> codex.code_mode.v1.ToolKind
-	12, // 9: codex.code_mode.v1.CompleteToolCallRequest.succeeded:type_name -> codex.code_mode.v1.ToolCallSucceeded
-	13, // 10: codex.code_mode.v1.CompleteToolCallRequest.failed:type_name -> codex.code_mode.v1.ToolCallFailed
-	35, // 11: codex.code_mode.v1.ExecuteRequest.enabled_tools:type_name -> codex.code_mode.v1.ToolDefinition
-	23, // 12: codex.code_mode.v1.ExecuteEvent.started:type_name -> codex.code_mode.v1.ExecutionStarted
-	31, // 13: codex.code_mode.v1.ExecuteEvent.outcome:type_name -> codex.code_mode.v1.ExecutionOutcome
-	31, // 14: codex.code_mode.v1.WaitResponse.live_cell:type_name -> codex.code_mode.v1.ExecutionOutcome
-	31, // 15: codex.code_mode.v1.WaitResponse.missing_cell:type_name -> codex.code_mode.v1.ExecutionOutcome
-	37, // 16: codex.code_mode.v1.ExecutionOutcome.content_items:type_name -> codex.code_mode.v1.ContentItem
-	32, // 17: codex.code_mode.v1.ExecutionOutcome.yielded:type_name -> codex.code_mode.v1.ExecutionYielded
-	33, // 18: codex.code_mode.v1.ExecutionOutcome.terminated:type_name -> codex.code_mode.v1.ExecutionTerminated
-	34, // 19: codex.code_mode.v1.ExecutionOutcome.completed:type_name -> codex.code_mode.v1.ExecutionCompleted
-	36, // 20: codex.code_mode.v1.ToolDefinition.tool_name:type_name -> codex.code_mode.v1.ToolName
-	0,  // 21: codex.code_mode.v1.ToolDefinition.kind:type_name -> codex.code_mode.v1.ToolKind
-	38, // 22: codex.code_mode.v1.ContentItem.text:type_name -> codex.code_mode.v1.TextContent
-	39, // 23: codex.code_mode.v1.ContentItem.image:type_name -> codex.code_mode.v1.ImageContent
-	40, // 24: codex.code_mode.v1.ContentItem.audio:type_name -> codex.code_mode.v1.AudioContent
-	1,  // 25: codex.code_mode.v1.ImageContent.detail:type_name -> codex.code_mode.v1.ImageDetail
-	2,  // 26: codex.code_mode.v1.CodeModeHost.Transport:input_type -> codex.code_mode.v1.FramedMessage
-	3,  // 27: codex.code_mode.v1.CodeModeHost.OpenSession:input_type -> codex.code_mode.v1.OpenSessionRequest
-	7,  // 28: codex.code_mode.v1.CodeModeHost.CloseSession:input_type -> codex.code_mode.v1.CloseSessionRequest
-	9,  // 29: codex.code_mode.v1.CodeModeHost.SubscribeToToolCalls:input_type -> codex.code_mode.v1.SubscribeToToolCallsRequest
-	11, // 30: codex.code_mode.v1.CodeModeHost.CompleteToolCall:input_type -> codex.code_mode.v1.CompleteToolCallRequest
-	18, // 31: codex.code_mode.v1.CodeModeHost.AcknowledgeNotification:input_type -> codex.code_mode.v1.AcknowledgeNotificationRequest
-	21, // 32: codex.code_mode.v1.CodeModeHost.Execute:input_type -> codex.code_mode.v1.ExecuteRequest
-	24, // 33: codex.code_mode.v1.CodeModeHost.Wait:input_type -> codex.code_mode.v1.WaitRequest
-	28, // 34: codex.code_mode.v1.CodeModeHost.YieldObservation:input_type -> codex.code_mode.v1.YieldObservationRequest
-	26, // 35: codex.code_mode.v1.CodeModeHost.CancelWait:input_type -> codex.code_mode.v1.CancelWaitRequest
-	30, // 36: codex.code_mode.v1.CodeModeHost.Terminate:input_type -> codex.code_mode.v1.TerminateRequest
-	2,  // 37: codex.code_mode.v1.CodeModeHost.Transport:output_type -> codex.code_mode.v1.FramedMessage
-	5,  // 38: codex.code_mode.v1.CodeModeHost.OpenSession:output_type -> codex.code_mode.v1.SessionEvent
-	8,  // 39: codex.code_mode.v1.CodeModeHost.CloseSession:output_type -> codex.code_mode.v1.CloseSessionResponse
-	10, // 40: codex.code_mode.v1.CodeModeHost.SubscribeToToolCalls:output_type -> codex.code_mode.v1.ToolCall
-	14, // 41: codex.code_mode.v1.CodeModeHost.CompleteToolCall:output_type -> codex.code_mode.v1.CompleteToolCallResponse
-	19, // 42: codex.code_mode.v1.CodeModeHost.AcknowledgeNotification:output_type -> codex.code_mode.v1.AcknowledgeNotificationResponse
-	22, // 43: codex.code_mode.v1.CodeModeHost.Execute:output_type -> codex.code_mode.v1.ExecuteEvent
-	25, // 44: codex.code_mode.v1.CodeModeHost.Wait:output_type -> codex.code_mode.v1.WaitResponse
-	29, // 45: codex.code_mode.v1.CodeModeHost.YieldObservation:output_type -> codex.code_mode.v1.YieldObservationResponse
-	27, // 46: codex.code_mode.v1.CodeModeHost.CancelWait:output_type -> codex.code_mode.v1.CancelWaitResponse
-	25, // 47: codex.code_mode.v1.CodeModeHost.Terminate:output_type -> codex.code_mode.v1.WaitResponse
-	37, // [37:48] is the sub-list for method output_type
-	26, // [26:37] is the sub-list for method input_type
-	26, // [26:26] is the sub-list for extension type_name
-	26, // [26:26] is the sub-list for extension extendee
-	0,  // [0:26] is the sub-list for field type_name
+	7,  // 0: codex.code_mode.v1.OpenSessionRequest.cell_execution_limits:type_name -> codex.code_mode.v1.SessionCellExecutionLimits
+	0,  // 1: codex.code_mode.v1.OpenSessionRequest.output_truncation:type_name -> codex.code_mode.v1.OutputTruncation
+	9,  // 2: codex.code_mode.v1.SessionEvent.opened:type_name -> codex.code_mode.v1.SessionOpened
+	18, // 3: codex.code_mode.v1.SessionEvent.tool_call_cancelled:type_name -> codex.code_mode.v1.ToolCallCancelled
+	19, // 4: codex.code_mode.v1.SessionEvent.notification:type_name -> codex.code_mode.v1.Notification
+	20, // 5: codex.code_mode.v1.SessionEvent.notification_cancelled:type_name -> codex.code_mode.v1.NotificationCancelled
+	23, // 6: codex.code_mode.v1.SessionEvent.cell_closed:type_name -> codex.code_mode.v1.CellClosed
+	0,  // 7: codex.code_mode.v1.SessionOpened.output_truncation:type_name -> codex.code_mode.v1.OutputTruncation
+	39, // 8: codex.code_mode.v1.SubscribeToToolCallsRequest.tool_names:type_name -> codex.code_mode.v1.ToolName
+	39, // 9: codex.code_mode.v1.ToolCall.tool_name:type_name -> codex.code_mode.v1.ToolName
+	1,  // 10: codex.code_mode.v1.ToolCall.tool_kind:type_name -> codex.code_mode.v1.ToolKind
+	15, // 11: codex.code_mode.v1.CompleteToolCallRequest.succeeded:type_name -> codex.code_mode.v1.ToolCallSucceeded
+	16, // 12: codex.code_mode.v1.CompleteToolCallRequest.failed:type_name -> codex.code_mode.v1.ToolCallFailed
+	38, // 13: codex.code_mode.v1.ExecuteRequest.enabled_tools:type_name -> codex.code_mode.v1.ToolDefinition
+	26, // 14: codex.code_mode.v1.ExecuteEvent.started:type_name -> codex.code_mode.v1.ExecutionStarted
+	34, // 15: codex.code_mode.v1.ExecuteEvent.outcome:type_name -> codex.code_mode.v1.ExecutionOutcome
+	34, // 16: codex.code_mode.v1.WaitResponse.live_cell:type_name -> codex.code_mode.v1.ExecutionOutcome
+	34, // 17: codex.code_mode.v1.WaitResponse.missing_cell:type_name -> codex.code_mode.v1.ExecutionOutcome
+	40, // 18: codex.code_mode.v1.ExecutionOutcome.content_items:type_name -> codex.code_mode.v1.ContentItem
+	35, // 19: codex.code_mode.v1.ExecutionOutcome.yielded:type_name -> codex.code_mode.v1.ExecutionYielded
+	36, // 20: codex.code_mode.v1.ExecutionOutcome.terminated:type_name -> codex.code_mode.v1.ExecutionTerminated
+	37, // 21: codex.code_mode.v1.ExecutionOutcome.completed:type_name -> codex.code_mode.v1.ExecutionCompleted
+	39, // 22: codex.code_mode.v1.ToolDefinition.tool_name:type_name -> codex.code_mode.v1.ToolName
+	1,  // 23: codex.code_mode.v1.ToolDefinition.kind:type_name -> codex.code_mode.v1.ToolKind
+	41, // 24: codex.code_mode.v1.ContentItem.text:type_name -> codex.code_mode.v1.TextContent
+	42, // 25: codex.code_mode.v1.ContentItem.image:type_name -> codex.code_mode.v1.ImageContent
+	43, // 26: codex.code_mode.v1.ContentItem.audio:type_name -> codex.code_mode.v1.AudioContent
+	2,  // 27: codex.code_mode.v1.ImageContent.detail:type_name -> codex.code_mode.v1.ImageDetail
+	3,  // 28: codex.code_mode.v1.CodeModeHost.GetProcessMetrics:input_type -> codex.code_mode.v1.GetProcessMetricsRequest
+	5,  // 29: codex.code_mode.v1.CodeModeHost.Transport:input_type -> codex.code_mode.v1.FramedMessage
+	6,  // 30: codex.code_mode.v1.CodeModeHost.OpenSession:input_type -> codex.code_mode.v1.OpenSessionRequest
+	10, // 31: codex.code_mode.v1.CodeModeHost.CloseSession:input_type -> codex.code_mode.v1.CloseSessionRequest
+	12, // 32: codex.code_mode.v1.CodeModeHost.SubscribeToToolCalls:input_type -> codex.code_mode.v1.SubscribeToToolCallsRequest
+	14, // 33: codex.code_mode.v1.CodeModeHost.CompleteToolCall:input_type -> codex.code_mode.v1.CompleteToolCallRequest
+	21, // 34: codex.code_mode.v1.CodeModeHost.AcknowledgeNotification:input_type -> codex.code_mode.v1.AcknowledgeNotificationRequest
+	24, // 35: codex.code_mode.v1.CodeModeHost.Execute:input_type -> codex.code_mode.v1.ExecuteRequest
+	27, // 36: codex.code_mode.v1.CodeModeHost.Wait:input_type -> codex.code_mode.v1.WaitRequest
+	31, // 37: codex.code_mode.v1.CodeModeHost.YieldObservation:input_type -> codex.code_mode.v1.YieldObservationRequest
+	29, // 38: codex.code_mode.v1.CodeModeHost.CancelWait:input_type -> codex.code_mode.v1.CancelWaitRequest
+	33, // 39: codex.code_mode.v1.CodeModeHost.Terminate:input_type -> codex.code_mode.v1.TerminateRequest
+	4,  // 40: codex.code_mode.v1.CodeModeHost.GetProcessMetrics:output_type -> codex.code_mode.v1.GetProcessMetricsResponse
+	5,  // 41: codex.code_mode.v1.CodeModeHost.Transport:output_type -> codex.code_mode.v1.FramedMessage
+	8,  // 42: codex.code_mode.v1.CodeModeHost.OpenSession:output_type -> codex.code_mode.v1.SessionEvent
+	11, // 43: codex.code_mode.v1.CodeModeHost.CloseSession:output_type -> codex.code_mode.v1.CloseSessionResponse
+	13, // 44: codex.code_mode.v1.CodeModeHost.SubscribeToToolCalls:output_type -> codex.code_mode.v1.ToolCall
+	17, // 45: codex.code_mode.v1.CodeModeHost.CompleteToolCall:output_type -> codex.code_mode.v1.CompleteToolCallResponse
+	22, // 46: codex.code_mode.v1.CodeModeHost.AcknowledgeNotification:output_type -> codex.code_mode.v1.AcknowledgeNotificationResponse
+	25, // 47: codex.code_mode.v1.CodeModeHost.Execute:output_type -> codex.code_mode.v1.ExecuteEvent
+	28, // 48: codex.code_mode.v1.CodeModeHost.Wait:output_type -> codex.code_mode.v1.WaitResponse
+	32, // 49: codex.code_mode.v1.CodeModeHost.YieldObservation:output_type -> codex.code_mode.v1.YieldObservationResponse
+	30, // 50: codex.code_mode.v1.CodeModeHost.CancelWait:output_type -> codex.code_mode.v1.CancelWaitResponse
+	28, // 51: codex.code_mode.v1.CodeModeHost.Terminate:output_type -> codex.code_mode.v1.WaitResponse
+	40, // [40:52] is the sub-list for method output_type
+	28, // [28:40] is the sub-list for method input_type
+	28, // [28:28] is the sub-list for extension type_name
+	28, // [28:28] is the sub-list for extension extendee
+	0,  // [0:28] is the sub-list for field type_name
 }
 
 func init() { file_codex_code_mode_v1_proto_init() }
@@ -2803,54 +3032,57 @@ func file_codex_code_mode_v1_proto_init() {
 	if File_codex_code_mode_v1_proto != nil {
 		return
 	}
-	file_codex_code_mode_v1_proto_msgTypes[1].OneofWrappers = []any{}
-	file_codex_code_mode_v1_proto_msgTypes[2].OneofWrappers = []any{}
-	file_codex_code_mode_v1_proto_msgTypes[3].OneofWrappers = []any{
+	file_codex_code_mode_v1_proto_msgTypes[3].OneofWrappers = []any{}
+	file_codex_code_mode_v1_proto_msgTypes[4].OneofWrappers = []any{}
+	file_codex_code_mode_v1_proto_msgTypes[5].OneofWrappers = []any{
 		(*SessionEvent_Opened)(nil),
 		(*SessionEvent_ToolCallCancelled)(nil),
 		(*SessionEvent_Notification)(nil),
 		(*SessionEvent_NotificationCancelled)(nil),
 		(*SessionEvent_CellClosed)(nil),
 	}
-	file_codex_code_mode_v1_proto_msgTypes[8].OneofWrappers = []any{}
-	file_codex_code_mode_v1_proto_msgTypes[9].OneofWrappers = []any{
+	file_codex_code_mode_v1_proto_msgTypes[6].OneofWrappers = []any{}
+	file_codex_code_mode_v1_proto_msgTypes[10].OneofWrappers = []any{}
+	file_codex_code_mode_v1_proto_msgTypes[11].OneofWrappers = []any{
 		(*CompleteToolCallRequest_Succeeded)(nil),
 		(*CompleteToolCallRequest_Failed)(nil),
 	}
-	file_codex_code_mode_v1_proto_msgTypes[19].OneofWrappers = []any{}
-	file_codex_code_mode_v1_proto_msgTypes[20].OneofWrappers = []any{
+	file_codex_code_mode_v1_proto_msgTypes[21].OneofWrappers = []any{}
+	file_codex_code_mode_v1_proto_msgTypes[22].OneofWrappers = []any{
 		(*ExecuteEvent_Started)(nil),
 		(*ExecuteEvent_Outcome)(nil),
 	}
-	file_codex_code_mode_v1_proto_msgTypes[23].OneofWrappers = []any{
+	file_codex_code_mode_v1_proto_msgTypes[24].OneofWrappers = []any{}
+	file_codex_code_mode_v1_proto_msgTypes[25].OneofWrappers = []any{
 		(*WaitResponse_LiveCell)(nil),
 		(*WaitResponse_MissingCell)(nil),
 	}
-	file_codex_code_mode_v1_proto_msgTypes[26].OneofWrappers = []any{
+	file_codex_code_mode_v1_proto_msgTypes[28].OneofWrappers = []any{
 		(*YieldObservationRequest_ExecutionId)(nil),
 		(*YieldObservationRequest_WaitId)(nil),
 	}
-	file_codex_code_mode_v1_proto_msgTypes[29].OneofWrappers = []any{
+	file_codex_code_mode_v1_proto_msgTypes[30].OneofWrappers = []any{}
+	file_codex_code_mode_v1_proto_msgTypes[31].OneofWrappers = []any{
 		(*ExecutionOutcome_Yielded)(nil),
 		(*ExecutionOutcome_Terminated)(nil),
 		(*ExecutionOutcome_Completed)(nil),
 	}
-	file_codex_code_mode_v1_proto_msgTypes[32].OneofWrappers = []any{}
-	file_codex_code_mode_v1_proto_msgTypes[33].OneofWrappers = []any{}
 	file_codex_code_mode_v1_proto_msgTypes[34].OneofWrappers = []any{}
-	file_codex_code_mode_v1_proto_msgTypes[35].OneofWrappers = []any{
+	file_codex_code_mode_v1_proto_msgTypes[35].OneofWrappers = []any{}
+	file_codex_code_mode_v1_proto_msgTypes[36].OneofWrappers = []any{}
+	file_codex_code_mode_v1_proto_msgTypes[37].OneofWrappers = []any{
 		(*ContentItem_Text)(nil),
 		(*ContentItem_Image)(nil),
 		(*ContentItem_Audio)(nil),
 	}
-	file_codex_code_mode_v1_proto_msgTypes[37].OneofWrappers = []any{}
+	file_codex_code_mode_v1_proto_msgTypes[39].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_codex_code_mode_v1_proto_rawDesc), len(file_codex_code_mode_v1_proto_rawDesc)),
-			NumEnums:      2,
-			NumMessages:   39,
+			NumEnums:      3,
+			NumMessages:   41,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

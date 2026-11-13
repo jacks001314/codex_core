@@ -44,10 +44,15 @@ var Registry = []Spec{
 		ExperimentalName:            "Analytics plan history",
 		ExperimentalMenuDescription: "Preview five-hour and weekly allowance history for consumer accounts in /analytics.",
 	},
-	// Rust (codex-rs/features/src/lib.rs #47179): automatic background-server
-	// startup was promoted to stable and is enabled by default; the
-	// experimental menu entry and announcement are gone.
+	// Rust #59447 restores the flag to stable/default-on: eligible interactive
+	// launches auto-start the shared daemon unless this setting or --no-daemon
+	// disables it.
 	{Key: "daemon_auto_start", Stage: StageStable, DefaultEnabled: true},
+	// Rust (codex-rs/features/src/lib.rs #56097): the TUI may discover and
+	// select among multiple conversation backends. Under development and off
+	// by default; Go launches a single backend session, so the key only keeps
+	// configuration parity.
+	{Key: "tui_multi_backend", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	// Rust #54949: negotiated zstd app-server WebSocket/UDS compression is
 	// opt-in while the transport feature is under development.
 	{Key: "app_server_websocket_compression", Stage: StageUnderDevelopment, DefaultEnabled: false},
@@ -78,18 +83,25 @@ var Registry = []Spec{
 	// Rust (codex-rs/features/src/lib.rs 509565820f): terminate active code-mode
 	// cells when their turn is interrupted.
 	{Key: "code_mode_interrupt", Stage: StageStable, DefaultEnabled: true},
-	// Rust (codex-rs/features/src/lib.rs 95ec468619 #51690): place each tool
-	// description before its namespace description in Code Mode.
-	{Key: "code_mode_tool_description_first", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Removed compatibility flag (Rust #57462): Code Mode always places each
+	// tool description before its namespace description.
+	{Key: "code_mode_tool_description_first", Stage: StageRemoved, DefaultEnabled: false},
 	{Key: "code_mode_only", Stage: StageUnderDevelopment},
 	{Key: "js_repl_tools_only", Stage: StageRemoved},
 	{Key: "terminal_resize_reflow", Stage: StageRemoved, DefaultEnabled: true},
 	{Key: "web_search_request", Stage: StageDeprecated},
 	{Key: "web_search_cached", Stage: StageDeprecated},
 	{Key: "standalone_web_search", Stage: StageUnderDevelopment},
+	// Rust #59033: the host may authorize MCP search independently of native
+	// search through per-turn policy. Under development and off by default.
+	{Key: "hosted_search_policy", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	{Key: "search_tool", Stage: StageRemoved},
 	{Key: "codex_git_commit", Stage: StageRemoved},
 	{Key: "runtime_metrics", Stage: StageUnderDevelopment},
+	// Rust (codex-rs/features/src/lib.rs #57201): capture internal direct-tool
+	// dependency paths for turn attribution. Under development and off by
+	// default.
+	{Key: "critical_path_timing", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	{Key: "sqlite", Stage: StageRemoved, DefaultEnabled: true},
 	{Key: "memories", Stage: StageStable},
 	{Key: "external_agent_memory_import", Stage: StageUnderDevelopment},
@@ -126,11 +138,18 @@ var Registry = []Spec{
 		ExperimentalMenuDescription: "Apply network proxy restrictions to sandboxed sessions that already have network access.",
 		ExperimentalAnnouncement:    "NEW: Network proxy can now be enabled from /experimental. Restart Codex after enabling it.",
 	},
-	{Key: "respect_system_proxy", Stage: StageUnderDevelopment},
+	{
+		Key:                         "respect_system_proxy",
+		Stage:                       StageExperimental,
+		ExperimentalName:            "System proxy",
+		ExperimentalMenuDescription: "Use macOS or Windows system proxy settings for Codex requests.",
+	},
 	// Rust (codex-rs/features/src/lib.rs #46562): retry eligible bootstrap
 	// requests through the system proxy after normal routing fails.
 	{Key: "system_proxy_fallback", Stage: StageStable, DefaultEnabled: true},
-	{Key: "multi_agent", Stage: StageStable, DefaultEnabled: true},
+	// Rust #59479 deprecates features.multi_agent while keeping its V1 fallback
+	// control and default-on behavior; [agents].enabled is the forward setting.
+	{Key: "multi_agent", Stage: StageDeprecated, DefaultEnabled: true},
 	{Key: "multi_agent_v2", Stage: StageStable},
 	{Key: "multi_agent_mode", Stage: StageRemoved},
 	// Rust (codex-rs/features/src/lib.rs #50082): inherit client-defined
@@ -148,22 +167,45 @@ var Registry = []Spec{
 	// observations when new user input arrives, so a queued message is delivered
 	// while the cell keeps running.
 	{Key: "instant_interrupt", Stage: StageUnderDevelopment, DefaultEnabled: true},
+	// Rust (codex-rs/features/src/lib.rs #57864): interrupt upstream inference
+	// when a Responses Lite turn is cancelled so the socket stays reusable and
+	// the completed part of the response keeps its usage accounting.
+	{Key: "interrupt_on_cancel", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	// Rust (codex-rs/features/src/lib.rs #47946): shared discussion tools for an
 	// agent tree (the in-memory agent message board).
 	{Key: "agent_message_board", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs #58973): automatically start a
+	// temporary tree-scoped HTTP MCP message board instead of requiring plugin
+	// or endpoint configuration. It takes precedence over agent_message_board.
+	{Key: "agent_message_board_mcp", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs #58992): show the parent conversation
+	// beside its side conversation in the TUI when the terminal is wide enough.
+	{Key: "tui_workspace", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	{Key: "enable_fanout", Stage: StageRemoved},
 	{Key: "apps", Stage: StageStable, DefaultEnabled: true},
 	{Key: "enable_mcp_apps", Stage: StageUnderDevelopment},
 	{Key: "mcp_2026_07_28", Stage: StageUnderDevelopment},
+	// Rust (codex-rs/features/src/lib.rs #57210): try protocol discovery before
+	// initializing eligible local stdio servers, and share those connections
+	// across chats when they negotiate MCP 2026-07-28 (#57211).
+	{Key: "mcp_connection_sharing", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs #60039): defer optional stdio server
+	// startup in regular chats when a warm tool catalog already covers them.
+	{Key: "mcp_lazy_stdio_startup", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	// Rust (codex-rs/features/src/lib.rs eb680c0558 #44318): hosted Codex Apps
 	// get an independent MCP protocol opt-in.
 	{Key: "codex_apps_mcp_2026_07_28", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs #58352): let host-owned Apps catalog
+	// reads overlap the initial tool inventory. The Go resource path never waits
+	// for the inventory, so only the registry entry is required here.
+	{Key: "apps_early_resource_discovery", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	// Rust (codex-rs/features/src/lib.rs #54656): honor ordinary MCP server
 	// tools/list_changed notifications within a turn.
 	{Key: "mcp_tool_list_changed", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	// Rust (codex-rs/features/src/lib.rs #42413): coordinated MCP OAuth
-	// refresh across servers sharing an account.
-	{Key: "mcp_oauth_refresh_coordination", Stage: StageUnderDevelopment},
+	// refresh across servers sharing an account. Promoted to stable and enabled
+	// by default (#55701).
+	{Key: "mcp_oauth_refresh_coordination", Stage: StageStable, DefaultEnabled: true},
 	// Rust (codex-rs/features/src/lib.rs #44832): enterprise refresh-token
 	// authorization for configured MCP resources; opt-in must come from a
 	// non-project config layer or a managed requirement.
@@ -171,16 +213,49 @@ var Registry = []Spec{
 	{Key: "apps_mcp_path_override", Stage: StageRemoved},
 	{Key: "tool_search", Stage: StageRemoved},
 	{Key: "tool_search_always_defer_mcp_tools", Stage: StageRemoved, DefaultEnabled: true},
-	{Key: "deferred_tool_world_state", Stage: StageUnderDevelopment},
+	// Rust (codex-rs/features/src/lib.rs #58410): deferred tools keep their
+	// world-state entries by default; promoted to stable and enabled by
+	// default.
+	{Key: "deferred_tool_world_state", Stage: StageStable, DefaultEnabled: true},
+	// Rust (codex-rs/features/src/lib.rs #59633): expose retained command
+	// sessions in incremental world state (under development, disabled).
+	{Key: "command_sessions_world_state", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	// Rust (codex-rs/features/src/lib.rs #50464): track top-level tool
 	// definitions in world state and emit incremental context updates.
-	{Key: "incremental_tools", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust #59633: publish retained unified-exec sessions through incremental
+	// world state so a dropped command handle stays discoverable. Under
+	// development and off by default.
+	{Key: "command_sessions_world_state", Stage: StageUnderDevelopment},
+	{Key: "incremental_tools", Stage: StageStable, DefaultEnabled: true},
+	// Rust #59832: publish incremental tool declarations on regular Amazon
+	// Bedrock Responses requests, independently of the Responses Lite flag.
+	{Key: "incremental_tools_legacy", Stage: StageStable, DefaultEnabled: false},
+	// Rust #60848: the same declarations on regular Google Cloud Vertex AI
+	// Responses requests ship enabled by default and toggle separately from
+	// the Bedrock flag.
+	{Key: "incremental_tools_legacy_gcp", Stage: StageStable, DefaultEnabled: true},
+	// Rust #60749/#60773: capture the saved Daybreak choice for native helpers
+	// and their turns. Under development and off by default.
+	{Key: "daybreak_program_propagation", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust #60905: keep same-named HTTP MCP servers discovered on different
+	// executors separate. Under development and off by default.
+	{Key: "multi_environment_mcp", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs #58405): omit the model ID
+	// announcement from incremental context after a model switch while still
+	// sending changed base instructions and tool definitions.
+	{Key: "suppress_model_change_announcements", Stage: StageStable, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs #58122): diff CodeModeOnly exec
+	// definitions within the incremental tool catalog.
+	{Key: "incremental_exec_tools", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "prediction_preserve_parent_tools", Stage: StageStable, DefaultEnabled: true},
+	{Key: "subagent_thread_environments", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	{Key: "non_prefixed_mcp_tool_names", Stage: StageUnderDevelopment},
 	{Key: "omit_app_server_notification_media", Stage: StageUnderDevelopment},
 	{Key: "unavailable_dummy_tools", Stage: StageRemoved},
 	{Key: "tool_suggest", Stage: StageStable, DefaultEnabled: true},
 	{Key: "recommended_plugins", Stage: StageStable, DefaultEnabled: false},
 	{Key: "plugins", Stage: StageStable, DefaultEnabled: true},
+	{Key: "simplified_selection_hints", Stage: StageUnderDevelopment},
 	{Key: "powershell_shell_version", Stage: StageUnderDevelopment},
 	{Key: "executor_capability_discovery", Stage: StageUnderDevelopment},
 	{Key: "plugin_hooks", Stage: StageRemoved},
@@ -193,12 +268,23 @@ var Registry = []Spec{
 	{Key: "browser_use_external", Stage: StageStable, DefaultEnabled: true},
 	{Key: "computer_use", Stage: StageStable, DefaultEnabled: true},
 	{Key: "remote_plugin", Stage: StageStable, DefaultEnabled: true},
+	// Rust (codex-rs/features/src/lib.rs #57249): app-server startup plugin
+	// discovery prefetch (directory, featured, recommendations). Stable and
+	// enabled by default; inventory-only hosts can turn it off.
+	// Rust #59768 retires startup plugin discovery prefetching; the key stays a
+	// parse-compatible removed feature so existing configs keep loading.
+	{Key: "plugin_discovery_prefetch", Stage: StageRemoved, DefaultEnabled: false},
 	{Key: "plugin_sharing", Stage: StageStable, DefaultEnabled: true},
 	{Key: "external_migration", Stage: StageRemoved},
 	{Key: "image_generation", Stage: StageStable, DefaultEnabled: true},
+	// Rust #59073: optional animated GIF output for image generation. Disabled
+	// until the Images API accepts GIF requests for every deployment.
+	{Key: "image_generation_animation", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	{Key: "view_image", Stage: StageStable, DefaultEnabled: true},
 	{Key: "image_resize_notice", Stage: StageUnderDevelopment, DefaultEnabled: false},
-	{Key: "unified_image_budget", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust #59282: unified image preparation is stable and enabled by default
+	// for models that support original image detail or Responses Lite.
+	{Key: "unified_image_budget", Stage: StageStable, DefaultEnabled: true},
 	{Key: "resize_all_images", Stage: StageRemoved, DefaultEnabled: true},
 	{Key: "item_ids", Stage: StageRemoved, DefaultEnabled: true},
 	{Key: "concurrent_reasoning_summaries", Stage: StageUnderDevelopment},
@@ -219,6 +305,14 @@ var Registry = []Spec{
 	// free-form send_message_to_user_async tool without model catalog support.
 	{Key: "send_message_to_user_async", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	{Key: "guardian_approval", Stage: StageStable, DefaultEnabled: true},
+	// Rust (codex-rs/features/src/lib.rs #59238): include standalone
+	// additional-context tool outputs in Guardian review history.
+	{Key: "guardian_include_additional_context", Stage: StageStable, DefaultEnabled: true},
+	// Rust #56124: forward private reviewer items and interruptions to raw-event
+	// observers. Under development and off by default. Go's Guardian reviewer is
+	// an inline single request with no private session event stream or reviewer
+	// thread/turn identity, so the key keeps configuration parity only.
+	{Key: "guardian_recorded_items", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	{Key: "guardian_enhanced_node_repl_transcripts", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	{Key: "guardian_node_repl_transcript_images", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	// Rust (codex-rs/features/src/lib.rs #46522): reuse encrypted parent
@@ -238,12 +332,16 @@ var Registry = []Spec{
 	// a removed compatibility no-op.
 	{Key: "guardian_ext", Stage: StageRemoved, DefaultEnabled: false},
 	{Key: "guardianv2", Stage: StageUnderDevelopment},
+	// Rust (codex-rs/features/src/lib.rs #56459): enable Guardian V3
+	// integrations. Under development and off by default.
+	{Key: "guardianv3", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	{Key: "goals", Stage: StageStable, DefaultEnabled: true},
 	{Key: "token_budget", Stage: StageUnderDevelopment},
 	{Key: "rollout_budget", Stage: StageUnderDevelopment},
 	// Rust (codex-rs/features/src/lib.rs #43795): pin reasoning effort while
-	// configuration overrides are active.
-	{Key: "reasoning_effort_override", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// configuration overrides are active. Promoted to stable and enabled by
+	// default (#56163).
+	{Key: "reasoning_effort_override", Stage: StageStable, DefaultEnabled: true},
 	{Key: "current_time_reminder", Stage: StageUnderDevelopment},
 	// Rust (codex-rs/features/src/lib.rs #45825): report failed clock reads to
 	// the model without failing the turn.
@@ -282,6 +380,9 @@ var Registry = []Spec{
 	// developer messages across compacted context windows.
 	{Key: "retain_client_developer_messages", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	{Key: "use_agent_identity", Stage: StageUnderDevelopment},
+	// Rust (codex-rs/features/src/lib.rs): runtime agent instances are still
+	// under development and disabled by default.
+	{Key: "runtime_agent_instances", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	{Key: "workspace_dependencies", Stage: StageStable, DefaultEnabled: true},
 	// Rust (codex-rs/features/src/lib.rs #42196, #44870): managed Git
 	// worktrees; stable and enabled by default since #44870.
@@ -291,12 +392,33 @@ var Registry = []Spec{
 	// during the sync26 static re-target.
 	// Rust (codex-rs/features/src/lib.rs #46849): the fullscreen transcript
 	// control moved into the TUI configuration; the flag is deprecated.
-	{Key: "transcript_v2", Stage: StageDeprecated, DefaultEnabled: false},
+	{Key: "transcript_v2", Stage: StageRemoved, DefaultEnabled: false},
 	{Key: "content_item_kinds", Stage: StageStable, DefaultEnabled: true},
+	// Rust (codex-rs/features/src/lib.rs #57204): render client-supplied
+	// untrusted context as standalone named tool outputs.
+	// Rust #60487: untrusted additional context (browser information, goal
+	// objectives) reaches the model as agent-namespace function_call_output
+	// items by default; features.untrusted_as_tool_output = false keeps the
+	// user-message format.
+	{Key: "untrusted_as_tool_output", Stage: StageStable, DefaultEnabled: true},
 	{Key: "code_mode_prewarm", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	{Key: "skip_host_skill_discovery", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs #57500/#57262): omit descriptions from
+	// model-visible skill catalogs, and publish incremental skill catalogs.
+	{Key: "omit_skill_descriptions", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	{Key: "skill_catalog_deltas", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	{Key: "in_app_local_automation", Stage: StageStable, DefaultEnabled: true},
-	{Key: "bedrock_setup_wizard", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs #56033): the Bedrock setup wizard is
+	// stable and enabled by default for eligible onboarding; users can still
+	// opt out with features.bedrock_setup_wizard = false.
+	{Key: "bedrock_setup_wizard", Stage: StageStable, DefaultEnabled: true},
+	// Rust #57857 (codex-rs/features/src/lib.rs): the Google Cloud Vertex AI
+	// setup wizard is stable but disabled by default; users opt in with
+	// features.gcp_setup_wizard = true.
+	{Key: "gcp_setup_wizard", Stage: StageStable, DefaultEnabled: false},
+	// Rust #57970 (codex-rs/features/src/lib.rs): the shared UI tree renderer for
+	// the status line is under development and disabled by default.
+	{Key: "tui_extensions_statusline", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	{Key: "step_model_switching", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	// Rust (codex-rs/features/src/lib.rs 307ce6cda9): write_stdin_approval
 	// added; compaction_image_budget promoted to stable/default-on (sync28).
@@ -336,6 +458,9 @@ var Registry = []Spec{
 	// Rust (codex-rs/features/src/lib.rs 5ad6891696 #51207): gate the CLI
 	// Daybreak controls and model selection behind an opt-in.
 	{Key: "cli_daybreak", Stage: StageStable, DefaultEnabled: true},
+	// Rust (codex-rs/features/src/lib.rs #58890): restrict CLI resume of
+	// attributed local threads to their creator.
+	{Key: "cli_resume_account_check", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	// Rust (codex-rs/features/src/lib.rs 7c35e1551f #49406): explicit cyber
 	// access programs with OpenAI API keys.
 	{Key: "api_key_cyber_access_programs", Stage: StageStable, DefaultEnabled: true},
@@ -351,9 +476,15 @@ var Registry = []Spec{
 	// Rust (codex-rs/features/src/lib.rs 6288753b46 #49057): handoff-aware root
 	// context for Guardian reviews.
 	{Key: "guardian_root_handoff_context", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs a5ef02e561 #57441): preserve native
+	// MAv2 tool calls in synchronous Guardian history.
+	{Key: "guardian_native_multi_agent_history", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	// Rust (codex-rs/features/src/lib.rs 41ed72c32b #49036): opt-in
 	// conversation history retrieval for Guardian reviews.
 	{Key: "guardian_conversation_history_tools", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust #59107: reconsider a synchronous Guardian denial once before the
+	// final decision is published. Under development and off by default.
+	{Key: "guardian_denial_reconsideration", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	// Rust (codex-rs/features/src/lib.rs 59f18e8133 #50099): opt-in Decisions
 	// comparison for Guardian V2.
 	{Key: "guardianv2_decisions_comparison", Stage: StageUnderDevelopment, DefaultEnabled: false},
@@ -364,13 +495,30 @@ var Registry = []Spec{
 	// The eight specs below are registered surface-only, all UnderDevelopment
 	// and disabled by default in Rust; behaviour work is tracked separately.
 	{Key: "async_compaction", Stage: StageUnderDevelopment, DefaultEnabled: false},
-	{Key: "code_mode_host_grpc", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust #59598: restrict background compaction to root sessions.
+	{Key: "async_compaction_root_only", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust #59973 (247934cfe5): gRPC over stdio is the default transport for the
+	// process-owned code-mode host; stdio stays reachable through an explicit
+	// `features.code_mode_host_grpc = false` opt-out.
+	{Key: "code_mode_host_grpc", Stage: StageStable, DefaultEnabled: true},
+	// Rust (codex-rs/features/src/lib.rs #58159): let the process-owned
+	// code-mode host apply output budgets before sending results to Core.
+	// Rust #59973 (247934cfe5): the host applies its own output budget before
+	// results cross the transport, also on by default; an explicit opt-out keeps
+	// Core's unbounded transfer.
+	{Key: "code_mode_host_output_truncation", Stage: StageStable, DefaultEnabled: true},
 	{Key: "credential_masking", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	{Key: "executor_capability_discovery_v2", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	{Key: "guardian_trust_orchestrator_connectors", Stage: StageUnderDevelopment, DefaultEnabled: false},
 	{Key: "output_token_replay", Stage: StageUnderDevelopment, DefaultEnabled: false},
-	{Key: "retain_client_tool_outputs", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs #58964): client tool output retention
+	// is stable and on by default.
+	{Key: "retain_client_tool_outputs", Stage: StageStable, DefaultEnabled: true},
 	{Key: "subagent_default_context_limits", Stage: StageUnderDevelopment, DefaultEnabled: false},
+	// Rust (codex-rs/features/src/lib.rs 2497eab251 #60009): the TUI sign-in
+	// wizard that creates and selects custom gateway providers. Stable and
+	// off by default, matching the Rust spec.
+	{Key: "gateway_setup_wizard", Stage: StageStable, DefaultEnabled: false},
 }
 
 func preventIdleSleepStage() Stage {
@@ -419,6 +567,21 @@ func Enabled(settings map[string]bool, key string) bool {
 		enabled = value
 	}
 	return enabled
+}
+
+// ServiceTierEnabled mirrors Rust Features::service_tier_enabled (#51253):
+// flex is never policy-gated, ultrafast follows features.ultrafast_mode, and
+// every other routing tier follows features.fast_mode. Both modes are
+// default-enabled, so an absent key does not disable them.
+func ServiceTierEnabled(settings map[string]bool, serviceTier string) bool {
+	switch strings.ToLower(strings.TrimSpace(serviceTier)) {
+	case "flex":
+		return true
+	case "ultrafast":
+		return Enabled(settings, "ultrafast_mode")
+	default:
+		return Enabled(settings, "fast_mode")
+	}
 }
 
 // PluginRecommendationsEnabled reports whether apps/plugins and either

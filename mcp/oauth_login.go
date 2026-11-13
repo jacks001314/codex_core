@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 
+	managedconfig "codex_core/config"
+
 	"golang.org/x/oauth2"
 )
 
@@ -35,6 +37,9 @@ type OAuthLoginSessionOptions struct {
 	PublicClientAuth           *bool
 	// CallbackMode selects the OAuth callback mix-up defense (Rust #40691).
 	CallbackMode MCPOAuthCallbackMode
+	// TokenEndpointAuthMethod selects Basic or POST client authentication for
+	// a confidential registration (Rust #56001).
+	TokenEndpointAuthMethod managedconfig.MCPEMATokenEndpointAuthMethod
 }
 
 type OAuthLoginSession struct {
@@ -51,6 +56,7 @@ type OAuthLoginSession struct {
 	AuthorizationURL           string
 	Scopes                     []string
 	CallbackMode               MCPOAuthCallbackMode
+	TokenEndpointAuthMethod    managedconfig.MCPEMATokenEndpointAuthMethod
 }
 
 type OAuthCallbackResult struct {
@@ -110,8 +116,10 @@ func NewOAuthLoginSession(options *OAuthLoginSessionOptions) (*OAuthLoginSession
 		callbackMode = MCPOAuthCallbackSpecific
 	}
 	config := &oauth2.Config{
-		ClientID:     strings.TrimSpace(options.ClientID),
-		ClientSecret: strings.TrimSpace(options.ClientSecret),
+		ClientID: strings.TrimSpace(options.ClientID),
+		// Rust #56001 preserves the provisioned secret exactly; only its
+		// emptiness is validated when the registration is resolved.
+		ClientSecret: options.ClientSecret,
 		RedirectURL:  strings.TrimSpace(options.RedirectURL),
 		Scopes:       scopes,
 		Endpoint: oauth2.Endpoint{
@@ -127,7 +135,7 @@ func NewOAuthLoginSession(options *OAuthLoginSessionOptions) (*OAuthLoginSession
 	return &OAuthLoginSession{
 		ServerURL:                  strings.TrimSpace(options.ServerURL),
 		ClientID:                   strings.TrimSpace(options.ClientID),
-		ClientSecret:               strings.TrimSpace(options.ClientSecret),
+		ClientSecret:               options.ClientSecret,
 		OmitClientSecretFromRecord: options.OmitClientSecretFromRecord,
 		Issuer:                     strings.TrimSpace(options.Issuer),
 		TokenEndpoint:              strings.TrimSpace(options.TokenEndpoint),
@@ -138,6 +146,7 @@ func NewOAuthLoginSession(options *OAuthLoginSessionOptions) (*OAuthLoginSession
 		AuthorizationURL:           config.AuthCodeURL(state, authOptions...),
 		Scopes:                     scopes,
 		CallbackMode:               callbackMode,
+		TokenEndpointAuthMethod:    options.TokenEndpointAuthMethod,
 	}, nil
 }
 
@@ -351,6 +360,7 @@ func (s *OAuthLoginSession) CompleteCallback(ctx context.Context, rawPath string
 		Code:                       callback.Code,
 		CodeVerifier:               s.CodeVerifier,
 		Scopes:                     s.Scopes,
+		TokenEndpointAuthMethod:    s.TokenEndpointAuthMethod,
 	})
 }
 
@@ -457,9 +467,35 @@ func MCPOAuthCallbackID(serverURL string) (string, error) {
 	if strings.TrimSpace(parsed.Host) == "" {
 		return "", fmt.Errorf("MCP server URL %q must include a host", serverURL)
 	}
+	// Rust hashes the URL as the `url` crate serializes it, which lowercases the
+	// scheme and host, drops a default port, adds the "/" root path and strips
+	// the fragment. Getting this exactly right matters: the ID persisted by
+	// `codex mcp add` is the one login later validates.
 	parsed.Fragment = ""
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Host = mcpOAuthNormalizedHost(parsed.Scheme, parsed.Host)
+	if parsed.Path == "" {
+		parsed.Path = "/"
+	}
 	digest := sha256.Sum256([]byte(parsed.String()))
 	return base64.RawURLEncoding.EncodeToString(digest[:9]), nil
+}
+
+// mcpOAuthNormalizedHost mirrors the url crate's host serialization for the
+// callback-ID hash: lowercase, and no port that the scheme already implies.
+func mcpOAuthNormalizedHost(scheme string, host string) string {
+	lowered := strings.ToLower(host)
+	defaultPort := ""
+	switch scheme {
+	case "http", "ws":
+		defaultPort = ":80"
+	case "https", "wss":
+		defaultPort = ":443"
+	}
+	if defaultPort != "" && strings.HasSuffix(lowered, defaultPort) {
+		lowered = strings.TrimSuffix(lowered, defaultPort)
+	}
+	return lowered
 }
 
 func AppendMCPOAuthCallbackID(redirectURI string, callbackID string) (string, error) {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -191,7 +192,20 @@ func pruneLogPartition(ctx context.Context, tx *sql.Tx, predicate string, predic
 	if totalBytes <= logPartitionSizeLimitBytes && rowCount <= logPartitionRowLimit {
 		return nil
 	}
-	query := `
+	query := logPruneWindowStatement(predicate)
+	args := append([]any(nil), predicateArgs...)
+	args = append(args, logPartitionSizeLimitBytes, logPartitionRowLimit)
+	_, err := tx.ExecContext(ctx, query, args...)
+	return err
+}
+
+// logPruneWindowStatement returns the bounded-window prune statement for one
+// partition predicate. Rust #60006(c): the frame is stated explicitly, so the
+// size and row windows are one ordered pass over the partition instead of one
+// co-routine per window function. The selected rows are unchanged - both
+// windows keep the default running frame, only spelled out.
+func logPruneWindowStatement(predicate string) string {
+	return `
 DELETE FROM logs
 WHERE id IN (
     SELECT id
@@ -200,19 +214,17 @@ WHERE id IN (
             id,
             SUM(estimated_bytes) OVER (
                 ORDER BY ts DESC, ts_nanos DESC, id DESC
+                ROWS UNBOUNDED PRECEDING
             ) AS cumulative_bytes,
             ROW_NUMBER() OVER (
                 ORDER BY ts DESC, ts_nanos DESC, id DESC
+                ROWS UNBOUNDED PRECEDING
             ) AS row_number
         FROM logs
         WHERE ` + predicate + `
     )
     WHERE cumulative_bytes > ? OR row_number > ?
 )`
-	args := append([]any(nil), predicateArgs...)
-	args = append(args, logPartitionSizeLimitBytes, logPartitionRowLimit)
-	_, err := tx.ExecContext(ctx, query, args...)
-	return err
 }
 
 func (r *StateRuntime) DeleteLogsBefore(ctx context.Context, cutoffTS int64) (int64, error) {
@@ -364,6 +376,40 @@ func (r *StateRuntime) QueryFeedbackLogsForThreads(ctx context.Context, threadID
 	if err := r.requireLogsDB(); err != nil {
 		return nil, err
 	}
+	return queryFeedbackLogsFromDB(ctx, r.logsDB, threadIDs)
+}
+
+// QueryLegacyFeedbackLogsForThreads reads logs from the previous SQLite home
+// location without creating or migrating its database (Rust #55978
+// `query_legacy_feedback_logs_for_threads`). Feedback falls back to this when
+// `log_dir` is unset or the current logs database has nothing for the thread.
+func (r *StateRuntime) QueryLegacyFeedbackLogsForThreads(ctx context.Context, threadIDs []string) ([]byte, error) {
+	if r == nil {
+		return []byte{}, nil
+	}
+	legacyPath, ok := r.sqlite.LegacyLogsDBPath()
+	if !ok {
+		return []byte{}, nil
+	}
+	threadIDs = uniqueStrings(threadIDs)
+	if len(threadIDs) == 0 {
+		return []byte{}, nil
+	}
+	if _, err := os.Stat(legacyPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []byte{}, nil
+		}
+		return nil, fmt.Errorf("stat legacy feedback logs: %w", err)
+	}
+	db, err := r.sqlite.OpenReadOnly(ctx, legacyPath)
+	if err != nil {
+		return nil, fmt.Errorf("open legacy feedback logs: %w", err)
+	}
+	defer db.Close()
+	return queryFeedbackLogsFromDB(ctx, db, threadIDs)
+}
+
+func queryFeedbackLogsFromDB(ctx context.Context, logsDB *sql.DB, threadIDs []string) ([]byte, error) {
 	threadIDs = uniqueStrings(threadIDs)
 	if len(threadIDs) == 0 {
 		return []byte{}, nil
@@ -372,7 +418,7 @@ func (r *StateRuntime) QueryFeedbackLogsForThreads(ctx context.Context, threadID
 	processUUIDs := make(map[string]struct{})
 	for _, threadID := range threadIDs {
 		var processUUID sql.NullString
-		err := r.logsDB.QueryRowContext(ctx, `
+		err := logsDB.QueryRowContext(ctx, `
 SELECT process_uuid
 FROM logs
 WHERE thread_id = ? AND process_uuid IS NOT NULL
@@ -403,7 +449,7 @@ LIMIT 1`, threadID).Scan(&processUUID)
 		}
 	}
 	statement.WriteString(`) ORDER BY ts DESC, ts_nanos DESC, id DESC`)
-	rows, err := r.logsDB.QueryContext(ctx, statement.String(), args...)
+	rows, err := logsDB.QueryContext(ctx, statement.String(), args...)
 	if err != nil {
 		return nil, fmt.Errorf("query feedback logs: %w", err)
 	}
@@ -454,8 +500,16 @@ func formatFeedbackLogLine(ts int64, tsNanos int64, level string, body string) s
 }
 
 func (r *StateRuntime) requireLogsDB() error {
-	if r == nil || r.logsDB == nil {
+	if r == nil {
 		return errors.New("state runtime is nil")
+	}
+	if r.logsDB == nil {
+		// Rust #60466: log operations return the startup failure that kept the
+		// diagnostic database from opening.
+		if r.diagnosticLogsErr != nil {
+			return r.diagnosticLogsErr
+		}
+		return errors.New("diagnostic logs database is unavailable")
 	}
 	return nil
 }

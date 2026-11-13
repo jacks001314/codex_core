@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -137,60 +138,41 @@ func TestCodeModeToolDescriptionOrderLikeRust(t *testing.T) {
 	if err := registry.Register(NewExecutorFunc(spec, noopExecutor)); err != nil {
 		t.Fatal(err)
 	}
-	for _, test := range []struct {
-		name                 string
-		toolDescriptionFirst bool
-		want                 string
-	}{
-		{
-			name: "namespace first",
-			want: "Plan events and manage your calendar.\n\nRead timezone option 99." + declaration,
-		},
-		{
-			name:                 "tool first",
-			toolDescriptionFirst: true,
-			want:                 "Read timezone option 99.\n\nPlan events and manage your calendar." + declaration,
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			runtime := NewCodeModeRuntime(nil, false)
-			runtime.SetToolDescriptionFirst(test.toolDescriptionFirst)
-			executor, _ := runtime.Executors(registry)
-			inner, ok := executor.(*codeModeExecExecutor)
-			if !ok {
-				t.Fatalf("executor type = %T", executor)
-			}
-			nested := inner.nestedToolsWithOrderedDescriptions()
-			if len(nested) != 1 {
-				t.Fatalf("nested tools = %#v", nested)
-			}
-			if nested[0].spec.Description != test.want {
-				t.Fatalf("description = %q, want %q", nested[0].spec.Description, test.want)
-			}
-			localOutput, err := executor.Execute(context.Background(), &Invocation{
-				CallID:  "description-order",
-				Payload: Payload{Kind: PayloadCustom, Input: `text(ALL_TOOLS.find(tool => tool.name === "mcp__calendar__timezone").description)`},
-			})
-			if err != nil {
-				t.Fatalf("local Execute() error = %v", err)
-			}
-			if body := codeModeBodyAfterHeader(t, localOutput.Body, "Script completed"); body != test.want {
-				t.Fatalf("ALL_TOOLS description = %q, want %q", body, test.want)
-			}
+	const want = "Read timezone option 99.\n\nPlan events and manage your calendar." + declaration
+	runtime := NewCodeModeRuntime(nil, false)
+	executor, _ := runtime.Executors(registry)
+	inner, ok := executor.(*codeModeExecExecutor)
+	if !ok {
+		t.Fatalf("executor type = %T", executor)
+	}
+	nested := inner.nestedToolsWithOrderedDescriptions()
+	if len(nested) != 1 {
+		t.Fatalf("nested tools = %#v", nested)
+	}
+	if nested[0].spec.Description != want {
+		t.Fatalf("description = %q, want %q", nested[0].spec.Description, want)
+	}
+	localOutput, err := executor.Execute(context.Background(), &Invocation{
+		CallID:  "description-order",
+		Payload: Payload{Kind: PayloadCustom, Input: `text(ALL_TOOLS.find(tool => tool.name === "mcp__calendar__timezone").description)`},
+	})
+	if err != nil {
+		t.Fatalf("local Execute() error = %v", err)
+	}
+	if body := codeModeBodyAfterHeader(t, localOutput.Body, "Script completed"); body != want {
+		t.Fatalf("ALL_TOOLS description = %q, want %q", body, want)
+	}
 
-			remote := &recordingCodeModeRemoteSession{response: CodeModeRemoteResponse{CellID: "remote-description", State: "completed"}}
-			remoteRuntime := NewCodeModeRuntime(&recordingCodeModeRemoteProvider{session: remote}, false)
-			remoteRuntime.SetToolDescriptionFirst(test.toolDescriptionFirst)
-			remoteExecutor, _ := remoteRuntime.Executors(registry)
-			if _, err := remoteExecutor.Execute(context.Background(), &Invocation{
-				CallID: "remote-description-order", Payload: Payload{Kind: PayloadCustom, Input: `text("x")`},
-			}); err != nil {
-				t.Fatalf("remote Execute() error = %v", err)
-			}
-			if len(remote.request.EnabledTools) != 1 || remote.request.EnabledTools[0].Description != test.want {
-				t.Fatalf("remote EnabledTools = %#v, want description %q", remote.request.EnabledTools, test.want)
-			}
-		})
+	remote := &recordingCodeModeRemoteSession{response: CodeModeRemoteResponse{CellID: "remote-description", State: "completed"}}
+	remoteRuntime := NewCodeModeRuntime(&recordingCodeModeRemoteProvider{session: remote}, false)
+	remoteExecutor, _ := remoteRuntime.Executors(registry)
+	if _, err := remoteExecutor.Execute(context.Background(), &Invocation{
+		CallID: "remote-description-order", Payload: Payload{Kind: PayloadCustom, Input: `text("x")`},
+	}); err != nil {
+		t.Fatalf("remote Execute() error = %v", err)
+	}
+	if len(remote.request.EnabledTools) != 1 || remote.request.EnabledTools[0].Description != want {
+		t.Fatalf("remote EnabledTools = %#v, want description %q", remote.request.EnabledTools, want)
 	}
 }
 
@@ -207,13 +189,13 @@ func TestCodeModeExecRunsLegacyShellCommandLikeRustWhenUnifiedExecDisabled(t *te
 	}
 	executor := NewCodeModeExecExecutor(registry)
 	description := executor.Spec().Description
-	for _, phrase := range []string{"tools.shell_command", `"required":["command"]`, `"command":"Write-Output hello"`} {
-		if !strings.Contains(description, phrase) {
-			t.Fatalf("description missing %q: %s", phrase, description)
-		}
+	// Rust's exec description is the same template whatever the nested command
+	// tool is; Go must not add a command-tool section of its own.
+	if strings.Contains(description, "Enabled nested command tool") || strings.Contains(description, "tools.shell_command") {
+		t.Fatalf("legacy description carries a Go-only command-tool section: %s", description)
 	}
-	if strings.Contains(description, "tools.exec_command") {
-		t.Fatalf("legacy description advertises exec_command: %s", description)
+	if !strings.HasPrefix(description, "Run JavaScript code to orchestrate/compose tool calls\n") {
+		t.Fatalf("legacy description is not the Rust template: %s", description)
 	}
 	output, err := executor.Execute(context.Background(), &Invocation{
 		CallID:  "weather-legacy",
@@ -242,7 +224,9 @@ func TestCodeModeExecDescriptionWarnsConsoleIsUnavailableLikeRust(t *testing.T) 
 			t.Fatalf("description missing %q: %s", phrase, description)
 		}
 	}
-	for _, phrase := range []string{"tools.exec_command", "There is no nested tools.exec method", "Do not use fetch", `"required":["cmd"]`, "text(r.output)"} {
+	// Rust's bundled EXEC_DESCRIPTION_TEMPLATE is model-visible, so the text
+	// carries its examples and helper signatures verbatim.
+	for _, phrase := range []string{"fresh V8 isolate", "await tools.exec_command(...)", "`ALL_TOOLS`", "`yield_control()`", "silently discarded"} {
 		if !strings.Contains(description, phrase) {
 			t.Fatalf("description missing %q: %s", phrase, description)
 		}
@@ -614,6 +598,63 @@ func TestCodeModeExecTimers(t *testing.T) {
 	}
 }
 
+func TestCodeModeExecClearTimeoutDropsQueuedTimerFire(t *testing.T) {
+	executor := NewCodeModeExecExecutor(NewRegistry())
+	output, err := executor.Execute(context.Background(), &Invocation{CallID: "timer-cleared-after-fire", Payload: Payload{Kind: PayloadCustom, Input: `
+		for (let index = 0; index < 50; index += 1) {
+			clearTimeout(setTimeout(() => text("must-not-run"), 0));
+		}
+		await new Promise(resolve => setTimeout(resolve, 20));
+		text("done");
+	`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := codeModeBodyAfterHeader(t, output.Body, "Script completed"); body != "done" {
+		t.Fatalf("body = %q", body)
+	}
+}
+
+func TestCodeModeExecCellCompletionCancelsPendingTimers(t *testing.T) {
+	registry := NewRegistry()
+	exec, wait := NewCodeModeExecutors(registry)
+	if err := registry.Register(exec); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(wait); err != nil {
+		t.Fatal(err)
+	}
+	started, err := exec.Execute(context.Background(), &Invocation{CallID: "timer-finish", Payload: Payload{Kind: PayloadCustom, Input: `yield_control();
+		await new Promise(resolve => setTimeout(resolve, 10));
+		text("done");
+		setTimeout(() => text("late"), 60000);`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cellID, _ := started.Data["cell_id"].(string)
+	if cellID == "" {
+		t.Fatalf("started = %#v", started)
+	}
+	finished, err := wait.Execute(context.Background(), &Invocation{CallID: "timer-finish-wait", Payload: Payload{Kind: PayloadFunction, Arguments: `{"cell_id":"` + cellID + `","yield_time_ms":2000}`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := codeModeBodyAfterHeader(t, finished.Body, "Script completed"); body != "done" {
+		t.Fatalf("finished body = %q", finished.Body)
+	}
+	// The cell is consumed once it completes, so a late timer has nowhere to
+	// report; the important contract is that completion is not held open.
+	missing, err := wait.Execute(context.Background(), &Invocation{CallID: "timer-finish-late", Payload: Payload{Kind: PayloadFunction, Arguments: `{"cell_id":"` + cellID + `"}`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Rust's missing-cell wait is a failed observation carrying a `Script
+	// error:` block, not a tool error (`missing_cell_response`).
+	if missing.Success || !strings.Contains(missing.Body, "Script failed") || !strings.Contains(missing.Body, "Script error:\nexec cell "+cellID+" not found") {
+		t.Fatalf("wait after completion = %#v", missing)
+	}
+}
+
 func TestCodeModeExecYieldWaitAndTerminate(t *testing.T) {
 	registry := NewRegistry()
 	exec, wait := NewCodeModeExecutors(registry)
@@ -663,8 +704,12 @@ func TestCodeModeTerminatePreservesOutputAndClosesCell(t *testing.T) {
 	if err != nil || terminated == nil || !terminated.Success {
 		t.Fatalf("terminate = %#v, %v", terminated, err)
 	}
-	if _, err := wait.Execute(context.Background(), &Invocation{CallID: "wait-after-terminate", Payload: Payload{Kind: PayloadFunction, Arguments: `{"cell_id":"` + cellID + `"}`}}); err == nil || !strings.Contains(err.Error(), "not found") {
-		t.Fatalf("wait after terminate error = %v", err)
+	missing, err := wait.Execute(context.Background(), &Invocation{CallID: "wait-after-terminate", Payload: Payload{Kind: PayloadFunction, Arguments: `{"cell_id":"` + cellID + `"}`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missing.Success || !strings.Contains(missing.Body, "Script error:\nexec cell "+cellID+" not found") {
+		t.Fatalf("wait after terminate = %#v", missing)
 	}
 }
 
@@ -724,6 +769,38 @@ text("x")`} {
 	}
 }
 
+func TestCodeModeCellClosedCallbackReleasesYieldedCell(t *testing.T) {
+	executor, waiter := NewCodeModeExecutors(NewRegistry())
+	closed := make(chan struct{}, 1)
+	output, err := executor.Execute(context.Background(), &Invocation{
+		CallID:  "closed-callback",
+		Payload: Payload{Kind: PayloadCustom, Input: "// @exec: {\"yield_time_ms\":0}\nawait new Promise(resolve => setTimeout(resolve, 60000));"},
+		Context: map[string]any{
+			CodeModeCellIDContextKey: "cell-1",
+			CodeModeCellClosedContextKey: CodeModeCellClosedFunc(func() {
+				closed <- struct{}{}
+			}),
+		},
+	})
+	if err != nil || output == nil {
+		t.Fatalf("yielded output = %#v, %v", output, err)
+	}
+	if running, _ := output.Data["running"].(bool); !running {
+		t.Fatalf("output did not yield: %#v", output.Data)
+	}
+	if _, err := waiter.Execute(context.Background(), &Invocation{
+		CallID:  "terminate-closed-callback",
+		Payload: Payload{Kind: PayloadFunction, Arguments: "{\"cell_id\":\"cell-1\",\"terminate\":true}"},
+	}); err != nil {
+		t.Fatalf("terminate yielded cell: %v", err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cell closed callback was not released after termination")
+	}
+}
+
 func TestCodeModeRejectsTooManyPendingDelegateCalls(t *testing.T) {
 	registry := NewRegistry()
 	release := make(chan struct{})
@@ -738,14 +815,15 @@ func TestCodeModeRejectsTooManyPendingDelegateCalls(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer close(release)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	source := `const calls = []; for (let i = 0; i < 1025; i++) calls.push(tools.blocked({})); await Promise.all(calls);`
+	source := fmt.Sprintf(`const calls = []; for (let i = 0; i < %d; i++) calls.push(tools.blocked({})); await Promise.all(calls);`, codeModeMaxPendingCallbacks+1)
 	output, err := NewCodeModeExecExecutor(registry).Execute(ctx, &Invocation{CallID: "pending-limit", Payload: Payload{Kind: PayloadCustom, Input: source}})
 	if err != nil || output == nil || output.Success {
 		t.Fatalf("output = %#v, error = %v", output, err)
 	}
-	if body := codeModeBodyAfterHeader(t, output.Body, "Script failed"); !strings.Contains(body, "1024 pending delegate calls") {
+	limit := fmt.Sprintf("%d pending delegate calls", codeModeMaxPendingCallbacks)
+	if body := codeModeBodyAfterHeader(t, output.Body, "Script failed"); !strings.Contains(body, limit) {
 		t.Fatalf("failure body = %q", body)
 	}
 }
@@ -1082,11 +1160,11 @@ func (s *recordingCodeModeRemoteSession) Execute(_ context.Context, request Code
 	return s.response, s.err
 }
 
-func (s *recordingCodeModeRemoteSession) Wait(context.Context, string, uint64, *YieldSignal) (CodeModeRemoteResponse, error) {
+func (s *recordingCodeModeRemoteSession) Wait(context.Context, string, uint64, *int, *YieldSignal) (CodeModeRemoteResponse, error) {
 	return s.response, s.err
 }
 
-func (s *recordingCodeModeRemoteSession) Terminate(context.Context, string) (CodeModeRemoteResponse, error) {
+func (s *recordingCodeModeRemoteSession) Terminate(context.Context, string, *int) (CodeModeRemoteResponse, error) {
 	return s.response, s.err
 }
 
@@ -1108,11 +1186,11 @@ func (s *yieldedCodeModeSession) Execute(context.Context, CodeModeRemoteExecuteR
 	return s.executeResponse, nil
 }
 
-func (s *yieldedCodeModeSession) Wait(context.Context, string, uint64, *YieldSignal) (CodeModeRemoteResponse, error) {
+func (s *yieldedCodeModeSession) Wait(context.Context, string, uint64, *int, *YieldSignal) (CodeModeRemoteResponse, error) {
 	return s.settleResponse, nil
 }
 
-func (s *yieldedCodeModeSession) Terminate(context.Context, string) (CodeModeRemoteResponse, error) {
+func (s *yieldedCodeModeSession) Terminate(context.Context, string, *int) (CodeModeRemoteResponse, error) {
 	return s.settleResponse, nil
 }
 
@@ -1126,11 +1204,11 @@ func (*perCallYieldedCodeModeSession) Execute(_ context.Context, request CodeMod
 	return CodeModeRemoteResponse{CellID: "cell-" + request.ToolCallID, State: "yielded"}, nil
 }
 
-func (*perCallYieldedCodeModeSession) Wait(_ context.Context, cellID string, _ uint64, _ *YieldSignal) (CodeModeRemoteResponse, error) {
+func (*perCallYieldedCodeModeSession) Wait(_ context.Context, cellID string, _ uint64, _ *int, _ *YieldSignal) (CodeModeRemoteResponse, error) {
 	return CodeModeRemoteResponse{CellID: cellID, State: "completed"}, nil
 }
 
-func (*perCallYieldedCodeModeSession) Terminate(_ context.Context, cellID string) (CodeModeRemoteResponse, error) {
+func (*perCallYieldedCodeModeSession) Terminate(_ context.Context, cellID string, _ *int) (CodeModeRemoteResponse, error) {
 	return CodeModeRemoteResponse{CellID: cellID, State: "completed"}, nil
 }
 

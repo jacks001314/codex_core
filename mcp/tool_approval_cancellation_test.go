@@ -99,9 +99,9 @@ func TestToolApprovalReportsCancellationProvenanceLikeRust(t *testing.T) {
 			outcome: MCPToolApprovalOutcome{
 				Decision:           MCPToolApprovalDeny,
 				CancellationReason: MCPApprovalCancellationInterrupted,
-				Message:            MCPElicitationHandoffMessage,
+				Message:            MCPToolApprovalUserInputRootThreadMessage,
 			},
-			want: MCPElicitationHandoffMessage,
+			want: MCPToolApprovalUserInputRootThreadMessage,
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -121,7 +121,7 @@ func TestToolApprovalReportsCancellationProvenanceLikeRust(t *testing.T) {
 					}),
 				},
 			})
-			denied, err := executor.approveToolCallIfNeeded(context.Background(), "call-1", map[string]any{})
+			denied, err := executor.approveToolCallIfNeeded(context.Background(), "call-1", map[string]any{}, "")
 			if err != nil {
 				t.Fatalf("approveToolCallIfNeeded() error = %v", err)
 			}

@@ -24,11 +24,12 @@ const localHostStartupTimeout = 30 * time.Second
 type ProcessProvider struct {
 	program string
 
-	mu          sync.Mutex
-	connection  *remoteConnection
-	nextSession atomic.Uint64
-	warned      atomic.Bool
-	available   error
+	mu                 sync.Mutex
+	connection         *remoteConnection
+	nextSession        atomic.Uint64
+	nextCellGeneration atomic.Uint64
+	warned             atomic.Bool
+	available          error
 }
 
 func NewProcessProvider(program string) *ProcessProvider {
@@ -54,8 +55,21 @@ func (p *ProcessProvider) TakeUnavailableWarning(effectiveToolMode string) strin
 }
 
 func (p *ProcessProvider) NewSession(delegate tool.CodeModeRemoteDelegate) tool.CodeModeRemoteSession {
+	return p.NewSessionWithOptions(delegate, tool.CodeModeSessionOptions{})
+}
+
+// NewSessionWithOptions honors the requested session options (Rust
+// CodeModeSessionProvider::create_session_with_options, #58125).
+func (p *ProcessProvider) NewSessionWithOptions(delegate tool.CodeModeRemoteDelegate, options tool.CodeModeSessionOptions) tool.CodeModeRemoteSession {
 	value := p.nextSession.Add(1)
-	return &remoteSession{provider: p, delegate: delegate, id: SessionID(fmt.Sprintf("session-%d", value))}
+	return &remoteSession{provider: p, delegate: delegate, id: SessionID(fmt.Sprintf("session-%d", value)), options: sessionOptionsFromTool(options)}
+}
+
+// nextGeneration matches Rust's host-wide session ordinal: a replacement
+// session gets a fresh generation so its cell IDs never collide with the
+// previous session's (Rust #57615).
+func (p *ProcessProvider) nextGeneration() uint64 {
+	return p.nextCellGeneration.Add(1)
 }
 
 func (p *ProcessProvider) Prewarm(ctx context.Context) error {
@@ -131,11 +145,11 @@ func (s unavailableRemoteSession) Execute(context.Context, tool.CodeModeRemoteEx
 	return tool.CodeModeRemoteResponse{}, s.err
 }
 
-func (s unavailableRemoteSession) Wait(context.Context, string, uint64, *tool.YieldSignal) (tool.CodeModeRemoteResponse, error) {
+func (s unavailableRemoteSession) Wait(context.Context, string, uint64, *int, *tool.YieldSignal) (tool.CodeModeRemoteResponse, error) {
 	return tool.CodeModeRemoteResponse{}, s.err
 }
 
-func (s unavailableRemoteSession) Terminate(context.Context, string) (tool.CodeModeRemoteResponse, error) {
+func (s unavailableRemoteSession) Terminate(context.Context, string, *int) (tool.CodeModeRemoteResponse, error) {
 	return tool.CodeModeRemoteResponse{}, s.err
 }
 

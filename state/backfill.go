@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"codex_core/rollout"
+	"codex_core/sandbox"
 	"codex_core/session"
 )
 
@@ -333,6 +334,7 @@ type rolloutThreadMetadata struct {
 	createdAt, updatedAt, recencyAt              time.Time
 	tokensUsed                                   int64
 	archived                                     bool
+	attachedThreadParentID                       string
 }
 
 func extractRolloutThreadMetadata(path string, archived bool, defaultProvider string) (rolloutThreadMetadata, error) {
@@ -345,7 +347,7 @@ func extractRolloutThreadMetadata(path string, archived bool, defaultProvider st
 	}
 	metadata := rolloutThreadMetadata{
 		path: filepath.Clean(rollout.PlainRolloutPath(path)), historyMode: "legacy",
-		source: "unknown", modelProvider: defaultProvider, sandboxPolicy: "read-only",
+		source: "unknown", modelProvider: defaultProvider, sandboxPolicy: defaultThreadSandboxPolicy(),
 		approvalMode: "on-request", memoryMode: "enabled", archived: archived,
 	}
 	for i := range lines {
@@ -399,6 +401,9 @@ func applySessionMetaToBackfill(metadata *rolloutThreadMetadata, meta *rollout.S
 	}
 	assignNonEmpty(&metadata.source, meta.Source)
 	assignNonEmpty(&metadata.threadSource, meta.ThreadSource)
+	if meta.AttachedThread {
+		metadata.attachedThreadParentID = strings.TrimSpace(meta.ForkedFromID)
+	}
 	metadata.agentNickname = meta.AgentNickname
 	metadata.agentRole = meta.AgentRole
 	metadata.agentPath = meta.AgentPath
@@ -413,6 +418,44 @@ func applySessionMetaToBackfill(metadata *rolloutThreadMetadata, meta *rollout.S
 		metadata.creatorAccountID = strings.TrimSpace(meta.CreatorAccountID)
 	}
 	applyGitToBackfill(metadata, meta.Git)
+	if metadataIsGuardianReview(metadata) {
+		applyGuardianDisplayDefaults(metadata)
+	}
+}
+
+// metadataIsGuardianReview mirrors codex-rs/state/src/extract.rs
+// metadata_is_guardian_review (Rust #47302): the rollout source identifies an
+// internal Guardian review thread whose user messages are synthetic approval
+// prompts rather than user input.
+func metadataIsGuardianReview(metadata *rolloutThreadMetadata) bool {
+	return metadata != nil && session.IsGuardianReviewSource(metadata.source)
+}
+
+// defaultThreadSandboxPolicy is the stored default for a thread whose rollout
+// recorded no permission settings (Rust #60472): the serialized read-only
+// permission profile, matching the format turn contexts and session settings
+// use. Readers still accept the legacy "read-only" string.
+func defaultThreadSandboxPolicy() string {
+	encoded, err := sandbox.RuntimePermissionProfileJSON(sandbox.ReadOnlyPermissionProfile())
+	if err != nil || strings.TrimSpace(encoded) == "" {
+		return "read-only"
+	}
+	return encoded
+}
+
+// applyGuardianDisplayDefaults mirrors the Guardian defaults Rust applies in
+// ThreadMetadataBuilder (Rust #47302): compact title and preview, with no
+// first user message derived from the synthetic approval prompt.
+func applyGuardianDisplayDefaults(metadata *rolloutThreadMetadata) {
+	if metadata == nil {
+		return
+	}
+	if strings.TrimSpace(metadata.title) == "" {
+		metadata.title = session.GuardianThreadTitle
+	}
+	if strings.TrimSpace(metadata.preview) == "" {
+		metadata.preview = session.GuardianThreadPreview
+	}
 }
 
 func applyTurnContextToBackfill(metadata *rolloutThreadMetadata, raw json.RawMessage) {
@@ -447,18 +490,27 @@ func applyEventToBackfill(metadata *rolloutThreadMetadata, raw json.RawMessage) 
 			}
 		}
 	case "user_message":
-		applyUserPreviewToBackfill(metadata, userTextFromEvent(event), true)
+		if !metadataIsGuardianReview(metadata) {
+			applyUserPreviewToBackfill(metadata, userTextFromEvent(event), true)
+		}
 	case "item_completed":
 		item, _ := event["item"].(map[string]any)
 		itemType := normalizeBackfillKind(stringFromJSON(item["type"]))
 		if itemType == "user_message" {
-			applyUserPreviewToBackfill(metadata, userTextFromEvent(item), true)
+			if !metadataIsGuardianReview(metadata) {
+				applyUserPreviewToBackfill(metadata, userTextFromEvent(item), true)
+			}
 		} else if preview, ok := delegatedPreviewFromBackfillItem(item); ok {
 			// Rust #50462 (codex-rs/state/src/extract.rs): delegated turns have no
 			// user message but must still be discoverable; fill only the preview.
 			applyDelegatedPreviewToBackfill(metadata, preview)
 		}
 	case "thread_goal_updated":
+		// Rust #47302: a Guardian review thread's goal never feeds display
+		// metadata; the synthetic prompt is not user input.
+		if metadataIsGuardianReview(metadata) {
+			return
+		}
 		goal, _ := event["goal"].(map[string]any)
 		if metadata.preview == "" {
 			metadata.preview = strings.TrimSpace(stringFromJSON(goal["objective"]))
@@ -550,8 +602,10 @@ func (r *StateRuntime) upsertRolloutThread(ctx context.Context, metadata rollout
 	if exists {
 		existingTitleTrimmed := strings.TrimSpace(existing.title.String)
 		incomingTitleTrimmed := strings.TrimSpace(metadata.title)
+		// Rust #47302: a Guardian thread's default title never replaces an
+		// explicit name recorded for the thread.
 		if existingTitleTrimmed != "" && strings.TrimSpace(existing.firstUserMessage.String) != existingTitleTrimmed &&
-			(incomingTitleTrimmed == "" || strings.TrimSpace(metadata.firstUserMessage) == incomingTitleTrimmed) {
+			(metadataIsGuardianReview(&metadata) || incomingTitleTrimmed == "" || strings.TrimSpace(metadata.firstUserMessage) == incomingTitleTrimmed) {
 			metadata.title = existing.title.String
 		}
 		if metadata.historyMode == "paginated" && existing.historyMode.String == "paginated" {
@@ -573,8 +627,16 @@ func (r *StateRuntime) upsertRolloutThread(ctx context.Context, metadata rollout
 	// column here, so the narrow write is taken only when the stored row already
 	// matches the rebuild outcome and the rollout path is unchanged. Missing rows,
 	// changed rollout paths and any metadata difference keep the full repair path.
-	if exists && rolloutThreadRowMatchesExceptTimestamps(existing, intendedRolloutThreadRow(metadata, existing, createdMillis, updatedMillis)) {
+	intended := intendedRolloutThreadRow(metadata, existing, createdMillis, updatedMillis)
+	if exists && rolloutThreadRowMatchesExceptTimestamps(existing, intended) {
 		return r.touchThreadUpdatedAt(ctx, metadata.id, metadata.updatedAt.Unix(), updatedMillis)
+	}
+	// Rust #60006(a): usage-only observations take a three-column write as well.
+	// A rollout that only grew its token count must not rewrite the metadata or
+	// its indexes, so the narrow branch is taken whenever nothing but tokens_used
+	// and the thread timestamps moved.
+	if exists && rolloutThreadRowMatchesExceptTokens(existing, intended) {
+		return r.UpdateThreadTokenUsage(ctx, metadata.id, metadata.tokensUsed, metadata.updatedAt.Unix(), updatedMillis)
 	}
 	_, err = ExecWrite(ctx, r.stateDB, `
 INSERT INTO threads (
@@ -585,9 +647,10 @@ INSERT INTO threads (
     sandbox_policy, approval_mode, tokens_used, first_user_message,
     archived, archived_at, thread_section_id, section_position, section_entered_at_ms,
     git_sha, git_branch, git_origin_url, memory_mode,
-    creator_user_id, creator_account_id
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)
+    creator_user_id, creator_account_id, attached_thread_parent_id
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
+    attached_thread_parent_id = COALESCE(excluded.attached_thread_parent_id, threads.attached_thread_parent_id),
     rollout_path = excluded.rollout_path,
     created_at = excluded.created_at,
     updated_at = excluded.updated_at,
@@ -629,7 +692,8 @@ ON CONFLICT(id) DO UPDATE SET
 		metadata.sandboxPolicy, metadata.approvalMode, metadata.tokensUsed, metadata.firstUserMessage,
 		metadata.archived, archivedAt,
 		nullableString(metadata.gitSHA), nullableString(metadata.gitBranch), nullableString(metadata.gitOriginURL), metadata.memoryMode,
-		nullableString(metadata.creatorUserID), nullableString(metadata.creatorAccountID))
+		nullableString(metadata.creatorUserID), nullableString(metadata.creatorAccountID),
+		nullableString(metadata.attachedThreadParentID))
 	if err != nil {
 		return fmt.Errorf("upsert rollout thread %s: %w", metadata.id, err)
 	}
@@ -792,6 +856,7 @@ type storedRolloutThreadRow struct {
 	createdAt, updatedAt, recencyAt                 sql.NullInt64
 	createdAtMs, updatedAtMs, recencyAtMs           sql.NullInt64
 	tokensUsed, archived, archivedAt                sql.NullInt64
+	attachedThreadParentID                          sql.NullString
 }
 
 func (r *StateRuntime) readRolloutThreadRow(ctx context.Context, threadID string) (storedRolloutThreadRow, bool, error) {
@@ -804,7 +869,7 @@ SELECT rollout_path, source, history_mode, thread_source,
        first_user_message, git_sha, git_branch, git_origin_url,
        creator_user_id, creator_account_id,
        created_at, created_at_ms, updated_at, updated_at_ms, recency_at, recency_at_ms,
-       tokens_used, archived, archived_at
+       tokens_used, archived, archived_at, attached_thread_parent_id
 FROM threads WHERE id = ?`, threadID).Scan(
 		&row.rolloutPath, &row.source, &row.historyMode, &row.threadSource,
 		&row.agentNickname, &row.agentRole, &row.agentPath,
@@ -813,7 +878,7 @@ FROM threads WHERE id = ?`, threadID).Scan(
 		&row.firstUserMessage, &row.gitSHA, &row.gitBranch, &row.gitOriginURL,
 		&row.creatorUserID, &row.creatorAccountID,
 		&row.createdAt, &row.createdAtMs, &row.updatedAt, &row.updatedAtMs, &row.recencyAt, &row.recencyAtMs,
-		&row.tokensUsed, &row.archived, &row.archivedAt,
+		&row.tokensUsed, &row.archived, &row.archivedAt, &row.attachedThreadParentID,
 	)
 	if err == sql.ErrNoRows {
 		return storedRolloutThreadRow{}, false, nil
@@ -880,6 +945,11 @@ func intendedRolloutThreadRow(metadata rolloutThreadMetadata, existing storedRol
 	if !existing.creatorAccountID.Valid {
 		row.creatorAccountID = nullThreadText(metadata.creatorAccountID)
 	}
+	// attached_thread_parent_id = COALESCE(excluded.attached_thread_parent_id,
+	// threads.attached_thread_parent_id)
+	if metadata.attachedThreadParentID != "" {
+		row.attachedThreadParentID = nullThreadText(metadata.attachedThreadParentID)
+	}
 	// The follow-up repair names a paginated thread only while its name is blank.
 	if metadata.historyMode == "paginated" && !rolloutThreadNamePresent(existing.name) {
 		name := strings.TrimSpace(metadata.title)
@@ -922,7 +992,30 @@ func rolloutThreadRowMatchesExceptTimestamps(stored, intended storedRolloutThrea
 		stored.createdAtMs == intended.createdAtMs &&
 		stored.tokensUsed == intended.tokensUsed &&
 		stored.archived == intended.archived &&
-		stored.archivedAt == intended.archivedAt
+		stored.archivedAt == intended.archivedAt &&
+		stored.attachedThreadParentID == intended.attachedThreadParentID
+}
+
+// rolloutThreadRowMatchesExceptTokens is rolloutThreadRowMatchesExceptTimestamps
+// with tokens_used excluded: the stored row already carries every other rebuilt
+// value, so only the token count and the thread timestamps would move.
+func rolloutThreadRowMatchesExceptTokens(stored, intended storedRolloutThreadRow) bool {
+	stored.tokensUsed = intended.tokensUsed
+	return rolloutThreadRowMatchesExceptTimestamps(stored, intended)
+}
+
+// UpdateThreadTokenUsage moves only the recorded token count and the thread
+// timestamps (Rust #60006(a)). Usage advances far more often than the rest of
+// the row, so the narrow write keeps WAL frames and the metadata indexes
+// untouched.
+func (r *StateRuntime) UpdateThreadTokenUsage(ctx context.Context, threadID string, tokensUsed int64, updatedAtUnix int64, updatedAtMillis int64) error {
+	if _, err := ExecWrite(ctx, r.stateDB, `
+UPDATE threads
+SET tokens_used = ?, updated_at = ?, updated_at_ms = ?
+WHERE id = ?`, tokensUsed, updatedAtUnix, updatedAtMillis, threadID); err != nil {
+		return fmt.Errorf("update thread token usage %s: %w", threadID, err)
+	}
+	return nil
 }
 
 // touchThreadUpdatedAt moves only the stored thread timestamps. Rust keeps the

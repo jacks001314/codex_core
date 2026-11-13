@@ -2,13 +2,13 @@ package windowssandbox
 
 import (
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 
 	coresandbox "codex_core/sandbox"
+	"codex_core/sandbox/sandboxpath"
 )
 
 type DenyReadPolicy struct {
@@ -22,19 +22,29 @@ type DenyReadPolicy struct {
 // (Rust #38660): exact-path and glob deny-read entries become the planned
 // deny-read paths, with unbounded root-level globs failing closed.
 func ResolveDenyReadPathsFromProfile(profile *coresandbox.PermissionProfile, cwd string) ([]string, error) {
-	if profile == nil || !profile.HasDenyReadEntries() {
+	if profile == nil {
 		return nil, nil
 	}
-	var policy DenyReadPolicy
-	for _, entry := range profile.DeniedReadEntries {
-		switch entry.Path.Type {
-		case "glob_pattern":
-			policy.Globs = append(policy.Globs, entry.Path.Pattern)
-		case "path":
-			policy.Paths = append(policy.Paths, entry.Path.Path)
-		}
+	resolved, err := coresandbox.ResolveFileSystemPermissionsForEnforcement(profile, cwd, sandboxpath.ProjectionNative)
+	if err != nil {
+		return nil, err
 	}
-	return ResolveWindowsDenyReadPolicyPaths(policy, cwd)
+	return ResolveDenyReadPathsFromResolvedPermissions(resolved, cwd)
+}
+
+// ResolveDenyReadPathsFromResolvedPermissions mirrors Rust
+// expand_windows_deny_read_paths (#59233): the resolved enforcement projection
+// owns the concrete denials and deny globs the native ACL pass expands, so a
+// narrower grant that reopens a deny path is not masked again.
+func ResolveDenyReadPathsFromResolvedPermissions(resolved sandboxpath.ResolvedFileSystemPermissions, cwd string) ([]string, error) {
+	if len(resolved.UnreadableRoots) == 0 && len(resolved.UnreadableGlobs) == 0 {
+		return nil, nil
+	}
+	return resolveWindowsDenyReadPolicyPaths(DenyReadPolicy{
+		Paths:            append([]string(nil), resolved.UnreadableRoots...),
+		Globs:            append([]string(nil), resolved.UnreadableGlobs...),
+		GlobScanMaxDepth: resolved.GlobScanMaxDepth,
+	}, cwd)
 }
 
 type GlobScanPlan struct {
@@ -48,6 +58,25 @@ func ResolveWindowsDenyReadPaths(paths []string) []string {
 }
 
 func ResolveWindowsDenyReadPolicyPaths(policy DenyReadPolicy, cwd string) ([]string, error) {
+	return resolveWindowsDenyReadPolicyPaths(policy, cwd)
+}
+
+// ResolveWindowsDenyReadPathsInEnvironment keeps the launcher call shape while
+// expansion runs in-process. The command environment no longer selects an
+// external scanner (Rust #59250).
+func ResolveWindowsDenyReadPathsInEnvironment(
+	policy DenyReadPolicy,
+	cwd string,
+	_ map[string]string,
+	_ string,
+) ([]string, error) {
+	return resolveWindowsDenyReadPolicyPaths(policy, cwd)
+}
+
+func resolveWindowsDenyReadPolicyPaths(
+	policy DenyReadPolicy,
+	cwd string,
+) ([]string, error) {
 	var paths []string
 	seen := map[string]bool{}
 	for _, path := range policy.Paths {
@@ -92,14 +121,31 @@ func GlobScanPlanForPattern(pattern string, configuredMaxDepth *int) GlobScanPla
 }
 
 func collectExistingGlobMatches(path string, matcher func(string) bool, paths *[]string, seenPaths map[string]bool, seenScanDirs map[string]bool, maxDepth *int, depth int) error {
-	if _, err := os.Lstat(path); err != nil {
+	info, err := os.Lstat(path)
+	if err != nil {
 		return nil
 	}
+	isLink := info.Mode()&os.ModeSymlink != 0
 	if matcher(path) {
-		pushDenyReadPath(paths, seenPaths, path)
+		// A matching symlink is itself denied only when its target exists. A
+		// dangling link is skipped like ignore::WalkBuilder's metadata check.
+		if !isLink {
+			pushDenyReadPath(paths, seenPaths, path)
+		} else if _, targetErr := os.Stat(path); targetErr == nil {
+			pushDenyReadPath(paths, seenPaths, path)
+		}
 	}
-	info, err := os.Stat(path)
-	if err != nil || !info.IsDir() {
+	if isLink {
+		// Explicitly linked scan roots are followed; directory links below the
+		// root are not traversed (Rust #59250).
+		if depth != 0 {
+			return nil
+		}
+		target, targetErr := os.Stat(path)
+		if targetErr != nil || !target.IsDir() {
+			return nil
+		}
+	} else if !info.IsDir() {
 		return nil
 	}
 	key := CanonicalPathKey(path)
@@ -110,12 +156,12 @@ func collectExistingGlobMatches(path string, matcher func(string) bool, paths *[
 	if maxDepth != nil && depth >= *maxDepth {
 		return nil
 	}
-	entries, err := os.ReadDir(path)
-	if err != nil {
+	entries, readErr := os.ReadDir(path)
+	if readErr != nil {
 		return nil
 	}
 	for _, entry := range entries {
-		if err := collectExistingGlobMatches(filepath.Join(path, entry.Name()), matcher, paths, seenPaths, seenScanDirs, maxDepth, depth+1); err != nil && !strings.Contains(err.Error(), fs.SkipDir.Error()) {
+		if err := collectExistingGlobMatches(filepath.Join(path, entry.Name()), matcher, paths, seenPaths, seenScanDirs, maxDepth, depth+1); err != nil {
 			return err
 		}
 	}
@@ -176,7 +222,7 @@ func globPatternToRegexp(pattern string) (string, error) {
 			out.WriteString(`[^/]`)
 		case '[':
 			end := strings.IndexByte(pattern[i+1:], ']')
-			if end < 0 {
+			if end <= 0 {
 				out.WriteString(`\[`)
 				continue
 			}

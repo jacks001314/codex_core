@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"codex_core/realtime"
 	"codex_core/rollout"
 )
 
@@ -22,6 +23,7 @@ const maxSQLiteInteger = uint64(1<<63 - 1)
 
 type threadHistoryTurnChange struct {
 	TurnID      string
+	RootTurnID  *string
 	Status      string
 	Error       json.RawMessage
 	StartedAt   *int64
@@ -38,15 +40,27 @@ type threadHistoryItemChange struct {
 	CompletedAtMS *int64
 }
 
+// threadHistoryRealtimeChange is one canonical realtime timeline item
+// projected into thread_realtime_items (Rust RolloutItem::RealtimeItem).
+type threadHistoryRealtimeChange struct {
+	ItemID      string
+	ItemType    string
+	ItemJSON    json.RawMessage
+	CreatedAtMS int64
+}
+
 type threadHistoryChanges struct {
-	Turns []threadHistoryTurnChange
-	Items []threadHistoryItemChange
+	Turns    []threadHistoryTurnChange
+	Items    []threadHistoryItemChange
+	Realtime []threadHistoryRealtimeChange
 }
 
 type threadHistoryEvent struct {
 	Type               string          `json:"type"`
 	TurnID             string          `json:"turn_id"`
 	TurnIDCamel        string          `json:"turnId"`
+	RootTurnID         *string         `json:"root_turn_id"`
+	RootTurnIDCamel    *string         `json:"rootTurnId"`
 	StartedAt          *int64          `json:"started_at"`
 	StartedAtCamel     *int64          `json:"startedAt"`
 	CompletedAt        *int64          `json:"completed_at"`
@@ -84,7 +98,21 @@ WHERE thread_id = ?`, threadID).Scan(&byteOffset, &ordinal)
 
 // MaterializeThreadHistory projects a newline-terminated rollout suffix and
 // advances its byte/ordinal checkpoint atomically with the projected rows.
+//
+// This entry does not take the runtime's writer permit; callers that own a
+// runtime must use StateRuntime.MaterializeThreadHistory so their write is
+// admitted like every other thread-history writer (Rust #60006(b)).
 func MaterializeThreadHistory(ctx context.Context, db *sql.DB, threadID string, rolloutPath string, initialOrdinal uint64, subagentHistoryStartOrdinal *uint64) error {
+	return materializeThreadHistory(ctx, db, nil, threadID, rolloutPath, initialOrdinal, subagentHistoryStartOrdinal)
+}
+
+// MaterializeThreadHistory projects one rollout suffix under the runtime's
+// single-writer admission.
+func (r *StateRuntime) MaterializeThreadHistory(ctx context.Context, db *sql.DB, threadID string, rolloutPath string, initialOrdinal uint64, subagentHistoryStartOrdinal *uint64) error {
+	return materializeThreadHistory(ctx, db, r.acquireHistoryWriter, threadID, rolloutPath, initialOrdinal, subagentHistoryStartOrdinal)
+}
+
+func materializeThreadHistory(ctx context.Context, db *sql.DB, admit func(context.Context) (func(), error), threadID string, rolloutPath string, initialOrdinal uint64, subagentHistoryStartOrdinal *uint64) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -123,7 +151,7 @@ func MaterializeThreadHistory(ctx context.Context, db *sql.DB, threadID string, 
 	if len(steps) == 0 && startOffset == nextOffset {
 		return nil
 	}
-	return applyThreadHistoryProjection(ctx, db, threadID, startOffset, nextOffset, initialOrdinal, subagentHistoryStartOrdinal, steps)
+	return applyThreadHistoryProjection(ctx, db, admit, threadID, startOffset, nextOffset, initialOrdinal, subagentHistoryStartOrdinal, steps)
 }
 
 // readThreadHistoryProjectionSteps mirrors Rust #53947's
@@ -134,13 +162,28 @@ func MaterializeThreadHistory(ctx context.Context, db *sql.DB, threadID string, 
 // predicate is passed into the rollout reader, whose checks are the
 // cancellation points (before opening, during decompression, and between
 // history records).
+// admitHistoryWrite takes the writer permit when the caller supplied one.
+func admitHistoryWrite(ctx context.Context, admit func(context.Context) (func(), error)) (func(), error) {
+	if admit == nil {
+		return func() {}, nil
+	}
+	release, err := admit(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if release == nil {
+		release = func() {}
+	}
+	return release, nil
+}
+
 func readThreadHistoryProjectionSteps(ctx context.Context, rolloutPath string, startOffset uint64, expectedOrdinal uint64, validate func(*rollout.Line) error) ([]rollout.ProjectionStep, uint64, error) {
 	return rollout.ReadProjectionStepsCancellable(rolloutPath, startOffset, expectedOrdinal, validate, func() bool {
 		return ctx.Err() != nil
 	})
 }
 
-func applyThreadHistoryProjection(ctx context.Context, db *sql.DB, threadID string, startOffset uint64, nextOffset uint64, initialOrdinal uint64, subagentHistoryStartOrdinal *uint64, steps []rollout.ProjectionStep) (err error) {
+func applyThreadHistoryProjection(ctx context.Context, db *sql.DB, admit func(context.Context) (func(), error), threadID string, startOffset uint64, nextOffset uint64, initialOrdinal uint64, subagentHistoryStartOrdinal *uint64, steps []rollout.ProjectionStep) (err error) {
 	if startOffset > maxSQLiteInteger || nextOffset > maxSQLiteInteger || initialOrdinal > maxSQLiteInteger {
 		return errors.New("thread history projection checkpoint exceeds SQLite integer range")
 	}
@@ -149,6 +192,15 @@ func applyThreadHistoryProjection(ctx context.Context, db *sql.DB, threadID stri
 			return errors.New("thread history projection step exceeds SQLite integer range")
 		}
 	}
+	// Rust #60006(b): the writer permit is taken before the snapshot, so a
+	// projection never starts its write transaction while another one holds it.
+	// Without that, several IMMEDIATE writers queue on SQLite's write lock and
+	// every reader behind them pays for the queue.
+	release, err := admitHistoryWrite(ctx, admit)
+	if err != nil {
+		return fmt.Errorf("admit thread history projection: %w", err)
+	}
+	defer release()
 	// Writer admission retries a busy slot before any read snapshot is taken
 	// (Rust #54369 `7ae8319917`).
 	conn, err := BeginImmediate(ctx, db)
@@ -225,6 +277,9 @@ ON CONFLICT(thread_id) DO UPDATE SET
 
 func projectThreadHistoryLine(line *rollout.Line) (threadHistoryChanges, error) {
 	changes := threadHistoryChanges{}
+	if line != nil && line.Type == "realtime_item" {
+		return projectThreadHistoryRealtimeLine(line)
+	}
 	if line == nil || line.Type != "event_msg" || len(line.Payload) == 0 {
 		return changes, nil
 	}
@@ -233,12 +288,13 @@ func projectThreadHistoryLine(line *rollout.Line) (threadHistoryChanges, error) 
 		return changes, err
 	}
 	turnID := firstHistoryString(event.TurnID, event.TurnIDCamel)
+	rootTurnID := firstHistoryStringPtr(event.RootTurnID, event.RootTurnIDCamel)
 	switch normalizeThreadHistoryEventType(event.Type) {
 	case "turn_started":
 		if turnID == "" {
 			return changes, errors.New("turn_started event is missing turn_id")
 		}
-		changes.Turns = append(changes.Turns, threadHistoryTurnChange{TurnID: turnID, Status: "inProgress", StartedAt: firstHistoryInt64(event.StartedAt, event.StartedAtCamel)})
+		changes.Turns = append(changes.Turns, threadHistoryTurnChange{TurnID: turnID, RootTurnID: rootTurnID, Status: "inProgress", StartedAt: firstHistoryInt64(event.StartedAt, event.StartedAtCamel)})
 	case "turn_complete":
 		if turnID == "" {
 			return changes, errors.New("turn_complete event is missing turn_id")
@@ -248,7 +304,7 @@ func projectThreadHistoryLine(line *rollout.Line) (threadHistoryChanges, error) 
 			status = "failed"
 		}
 		changes.Turns = append(changes.Turns, threadHistoryTurnChange{
-			TurnID: turnID, Status: status, Error: cloneRawJSON(event.Error),
+			TurnID: turnID, RootTurnID: rootTurnID, Status: status, Error: cloneRawJSON(event.Error),
 			StartedAt: firstHistoryInt64(event.StartedAt, event.StartedAtCamel), CompletedAt: firstHistoryInt64(event.CompletedAt, event.CompletedAtCamel), DurationMS: firstHistoryInt64(event.DurationMS, event.DurationMSCamel),
 		})
 	case "turn_aborted":
@@ -256,7 +312,7 @@ func projectThreadHistoryLine(line *rollout.Line) (threadHistoryChanges, error) 
 			return changes, nil
 		}
 		changes.Turns = append(changes.Turns, threadHistoryTurnChange{
-			TurnID: turnID, Status: "interrupted", StartedAt: firstHistoryInt64(event.StartedAt, event.StartedAtCamel), CompletedAt: firstHistoryInt64(event.CompletedAt, event.CompletedAtCamel), DurationMS: firstHistoryInt64(event.DurationMS, event.DurationMSCamel),
+			TurnID: turnID, RootTurnID: rootTurnID, Status: "interrupted", Error: cloneRawJSON(event.Error), StartedAt: firstHistoryInt64(event.StartedAt, event.StartedAtCamel), CompletedAt: firstHistoryInt64(event.CompletedAt, event.CompletedAtCamel), DurationMS: firstHistoryInt64(event.DurationMS, event.DurationMSCamel),
 		})
 	case "item_completed":
 		if turnID == "" || !rawJSONPresent(event.Item) {
@@ -284,6 +340,44 @@ func projectThreadHistoryLine(line *rollout.Line) (threadHistoryChanges, error) 
 	return changes, nil
 }
 
+// projectThreadHistoryRealtimeLine validates and canonicalizes one
+// `realtime_item` rollout record.
+func projectThreadHistoryRealtimeLine(line *rollout.Line) (threadHistoryChanges, error) {
+	changes := threadHistoryChanges{}
+	payload := line.RealtimeItem
+	if len(payload) == 0 {
+		payload = line.Payload
+	}
+	if len(payload) == 0 {
+		return changes, errors.New("realtime_item record is missing its payload")
+	}
+	var item realtime.RealtimeItem
+	if err := item.UnmarshalRolloutJSON(payload); err != nil {
+		return changes, fmt.Errorf("decode realtime_item record: %w", err)
+	}
+	normalized, err := item.MarshalRolloutJSON()
+	if err != nil {
+		return changes, fmt.Errorf("encode realtime_item record %s: %w", item.ID, err)
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, line.Timestamp)
+	if err != nil {
+		return changes, fmt.Errorf("realtime_item record %s has an invalid timestamp: %w", item.ID, err)
+	}
+	var tagged struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(normalized, &tagged); err != nil {
+		return changes, fmt.Errorf("read realtime_item record %s type: %w", item.ID, err)
+	}
+	changes.Realtime = append(changes.Realtime, threadHistoryRealtimeChange{
+		ItemID:      item.ID,
+		ItemType:    tagged.Type,
+		ItemJSON:    normalized,
+		CreatedAtMS: createdAt.UnixMilli(),
+	})
+	return changes, nil
+}
+
 func applyThreadHistoryChanges(ctx context.Context, conn *sql.Conn, threadID string, step rollout.ProjectionStep, changes threadHistoryChanges) error {
 	ordinal, startOffset, endOffset := sqliteInt(step.Ordinal), sqliteInt(step.StartByteOffset), sqliteInt(step.EndByteOffset)
 	for _, turn := range changes.Turns {
@@ -297,19 +391,20 @@ func applyThreadHistoryChanges(ctx context.Context, conn *sql.Conn, threadID str
 		}
 		if _, err := conn.ExecContext(ctx, `
 INSERT INTO thread_turns (
-    thread_id, turn_id, rollout_ordinal, rollout_byte_offset, rollout_end_ordinal,
+    thread_id, turn_id, root_turn_id, rollout_ordinal, rollout_byte_offset, rollout_end_ordinal,
     rollout_end_byte_offset, status, error_json, started_at, completed_at, duration_ms
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(thread_id, turn_id) DO UPDATE SET
+    root_turn_id = COALESCE(thread_turns.root_turn_id, excluded.root_turn_id),
     rollout_end_ordinal = excluded.rollout_end_ordinal,
     rollout_end_byte_offset = excluded.rollout_end_byte_offset,
     status = excluded.status,
     error_json = excluded.error_json,
-    started_at = excluded.started_at,
+    started_at = COALESCE(excluded.started_at, thread_turns.started_at),
     completed_at = excluded.completed_at,
     duration_ms = excluded.duration_ms
 WHERE thread_turns.rollout_end_ordinal IS NULL
-  AND thread_turns.status = 'inProgress'`, threadID, turn.TurnID, ordinal, startOffset, terminalOrdinal, terminalOffset, turn.Status, errorJSON, nullableInt64(turn.StartedAt), nullableInt64(turn.CompletedAt), nullableInt64(turn.DurationMS)); err != nil {
+  AND thread_turns.status = 'inProgress'`, threadID, turn.TurnID, nullableStringPtr(turn.RootTurnID), ordinal, startOffset, terminalOrdinal, terminalOffset, turn.Status, errorJSON, nullableInt64(turn.StartedAt), nullableInt64(turn.CompletedAt), nullableInt64(turn.DurationMS)); err != nil {
 			return fmt.Errorf("project thread turn: %w", err)
 		}
 		if err := refreshThreadSummaryIDs(ctx, conn, threadID, turn.TurnID, ordinal); err != nil {
@@ -323,12 +418,14 @@ WHERE thread_turns.rollout_end_ordinal IS NULL
 		if _, err := conn.ExecContext(ctx, `
 INSERT INTO thread_items (
     thread_id, turn_id, item_id, rollout_ordinal, updated_at_ordinal,
-    created_at_ms, item_type, item_json
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    created_at_ms, started_at_ms, completed_at_ms, item_type, item_json
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(thread_id, turn_id, item_id) DO UPDATE SET
     updated_at_ordinal = excluded.updated_at_ordinal,
+    started_at_ms = COALESCE(thread_items.started_at_ms, excluded.started_at_ms),
+    completed_at_ms = COALESCE(thread_items.completed_at_ms, excluded.completed_at_ms),
     item_type = excluded.item_type,
-    item_json = excluded.item_json`, threadID, item.TurnID, item.ItemID, ordinal, ordinal, *item.StartedAtMS, item.ItemType, string(item.ItemJSON)); err != nil {
+    item_json = excluded.item_json`, threadID, item.TurnID, item.ItemID, ordinal, ordinal, *item.StartedAtMS, nullableInt64(item.StartedAtMS), nullableInt64(item.CompletedAtMS), item.ItemType, string(item.ItemJSON)); err != nil {
 			return fmt.Errorf("project thread item: %w", err)
 		}
 		switch item.ItemType {
@@ -349,6 +446,18 @@ WHERE thread_id = ? AND turn_id = ? AND rollout_end_ordinal IS NULL AND status =
 					return fmt.Errorf("update final agent item: %w", err)
 				}
 			}
+		}
+	}
+	for _, item := range changes.Realtime {
+		if strings.TrimSpace(item.ItemID) == "" || strings.TrimSpace(item.ItemType) == "" {
+			return fmt.Errorf("thread history projection for %s has an incomplete realtime item", threadID)
+		}
+		if _, err := conn.ExecContext(ctx, `
+INSERT INTO thread_realtime_items (
+    thread_id, item_id, rollout_ordinal, created_at_ms, item_type, item_json
+) VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(thread_id, item_id) DO NOTHING`, threadID, item.ItemID, ordinal, item.CreatedAtMS, item.ItemType, string(item.ItemJSON)); err != nil {
+			return fmt.Errorf("project thread realtime item: %w", err)
 		}
 	}
 	return nil
@@ -444,6 +553,30 @@ func firstHistoryString(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func firstHistoryStringPtr(values ...*string) *string {
+	for _, value := range values {
+		if value == nil {
+			continue
+		}
+		if trimmed := strings.TrimSpace(*value); trimmed != "" {
+			copy := trimmed
+			return &copy
+		}
+	}
+	return nil
+}
+
+func nullableStringPtr(value *string) any {
+	if value == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*value)
+	if trimmed == "" {
+		return nil
+	}
+	return trimmed
 }
 
 func firstHistoryInt64(values ...*int64) *int64 {

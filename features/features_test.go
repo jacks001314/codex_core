@@ -1,6 +1,9 @@
 package features
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestKnownFeature(t *testing.T) {
 	if !Known("unified_exec") {
@@ -14,6 +17,66 @@ func TestKnownFeature(t *testing.T) {
 	}
 	if err := Validate("does_not_exist"); err == nil || err.Error() != "Unknown feature flag: does_not_exist" {
 		t.Fatalf("Validate unknown error = %v", err)
+	}
+}
+
+// TestGuardianV3FeatureRegisteredLikeRust pins Rust #56459: guardianv3 is an
+// under-development, default-disabled feature.
+func TestGuardianV3FeatureRegisteredLikeRust(t *testing.T) {
+	const key = "guardianv3"
+	if !Known(key) {
+		t.Fatalf("%s should be known", key)
+	}
+	if got := StageFor(key); got != StageUnderDevelopment {
+		t.Fatalf("StageFor(%s) = %q, want %q", key, got, StageUnderDevelopment)
+	}
+	if Defaults()[key] {
+		t.Fatalf("%s default = true, want false", key)
+	}
+}
+
+// TestGuardianRecordedItemsFeatureRegisteredLikeRust pins Rust #56124: the
+// reviewer raw-event forwarding flag is registered under development and off
+// by default.
+func TestGuardianRecordedItemsFeatureRegisteredLikeRust(t *testing.T) {
+	const key = "guardian_recorded_items"
+	if !Known(key) {
+		t.Fatalf("%s should be known", key)
+	}
+	if got := StageFor(key); got != StageUnderDevelopment {
+		t.Fatalf("StageFor(%s) = %q, want %q", key, got, StageUnderDevelopment)
+	}
+	if Defaults()[key] {
+		t.Fatalf("%s default = true, want false", key)
+	}
+}
+
+// TestAnalyticsPlanHistoryExperimentalLikeRust pins Rust #45772: plan history
+// appears in the experimental menu with its preview copy and stays off by
+// default.
+func TestAnalyticsPlanHistoryExperimentalLikeRust(t *testing.T) {
+	const key = "analytics_plan_history"
+	var spec Spec
+	for _, candidate := range Registry {
+		if candidate.Key == key {
+			spec = candidate
+			break
+		}
+	}
+	if spec.Key == "" {
+		t.Fatalf("%s should be registered", key)
+	}
+	if spec.Stage != StageExperimental {
+		t.Fatalf("%s stage = %q, want %q", key, spec.Stage, StageExperimental)
+	}
+	if spec.ExperimentalName != "Analytics plan history" {
+		t.Fatalf("%s menu name = %q", key, spec.ExperimentalName)
+	}
+	if want := "Preview five-hour and weekly allowance history for consumer accounts in /analytics."; spec.ExperimentalMenuDescription != want {
+		t.Fatalf("%s menu description = %q, want %q", key, spec.ExperimentalMenuDescription, want)
+	}
+	if spec.DefaultEnabled || Defaults()[key] {
+		t.Fatalf("%s must stay disabled by default", key)
 	}
 }
 
@@ -43,26 +106,120 @@ func TestIncrementalToolsFeatureRegisteredLikeRust(t *testing.T) {
 	if !Known("incremental_tools") {
 		t.Fatal("incremental_tools should be known")
 	}
-	if got := StageFor("incremental_tools"); got != StageUnderDevelopment {
-		t.Fatalf("StageFor(incremental_tools) = %q, want %q", got, StageUnderDevelopment)
+	if got := StageFor("incremental_tools"); got != StageStable {
+		t.Fatalf("StageFor(incremental_tools) = %q, want %q", got, StageStable)
 	}
-	if Defaults()["incremental_tools"] {
-		t.Fatal("incremental_tools default = true, want false")
+	if !Defaults()["incremental_tools"] {
+		t.Fatal("incremental_tools default = false, want true")
 	}
 }
 
-// TestCodeModeToolDescriptionFirstRegisteredLikeRust pins Rust #51690, which
-// registers an under-development, default-disabled flag for placing each tool
-// description before its namespace description in Code Mode.
-func TestCodeModeToolDescriptionFirstRegisteredLikeRust(t *testing.T) {
+func TestIncrementalExecToolsFeatureRegisteredLikeRust(t *testing.T) {
+	// Rust (codex-rs/features/src/lib.rs #58122): the incremental exec catalog
+	// diff is under development and off by default.
+	const key = "incremental_exec_tools"
+	if !Known(key) {
+		t.Fatalf("%s should be known", key)
+	}
+	if got := StageFor(key); got != StageUnderDevelopment {
+		t.Fatalf("StageFor(%s) = %q, want %q", key, got, StageUnderDevelopment)
+	}
+	if Defaults()[key] {
+		t.Fatalf("%s default = true, want false", key)
+	}
+}
+
+func TestRespectSystemProxyFeatureIsExperimentalLikeRust(t *testing.T) {
+	// Rust #58157: the system-proxy opt-in appears in the experimental menu.
+	const key = "respect_system_proxy"
+	if !Known(key) {
+		t.Fatalf("%s should be known", key)
+	}
+	if got := StageFor(key); got != StageExperimental {
+		t.Fatalf("StageFor(%s) = %q, want %q", key, got, StageExperimental)
+	}
+	spec, ok := byKey()[key]
+	if !ok || spec.ExperimentalName != "System proxy" || !strings.Contains(spec.ExperimentalMenuDescription, "system proxy settings") {
+		t.Fatalf("spec = %#v, ok = %v", spec, ok)
+	}
+	if Defaults()[key] {
+		t.Fatalf("%s default = true, want false", key)
+	}
+}
+
+// TestGuardianNativeMultiAgentHistoryRegisteredLikeRust pins Rust #57441: the
+// flag is registered under development and stays off by default.
+func TestGuardianNativeMultiAgentHistoryRegisteredLikeRust(t *testing.T) {
+	const key = "guardian_native_multi_agent_history"
+	if !Known(key) {
+		t.Fatalf("%s should be known", key)
+	}
+	if got := StageFor(key); got != StageUnderDevelopment {
+		t.Fatalf("StageFor(%s) = %q, want %q", key, got, StageUnderDevelopment)
+	}
+	if Defaults()[key] {
+		t.Fatalf("%s default = true, want false", key)
+	}
+}
+
+// TestBedrockSetupWizardEnabledByDefaultLikeRust pins Rust #56033: the wizard
+// is stable and enabled by default, while an explicit false still opts out.
+func TestBedrockSetupWizardEnabledByDefaultLikeRust(t *testing.T) {
+	const key = "bedrock_setup_wizard"
+	if !Known(key) {
+		t.Fatalf("%s should be known", key)
+	}
+	if got := StageFor(key); got != StageStable {
+		t.Fatalf("StageFor(%s) = %q, want %q", key, got, StageStable)
+	}
+	if !Enabled(nil, key) {
+		t.Fatalf("%s default = false, want true", key)
+	}
+	if Enabled(map[string]bool{key: false}, key) {
+		t.Fatalf("%s explicit false = true, want false", key)
+	}
+}
+
+// TestMCPOAuthRefreshCoordinationEnabledByDefaultLikeRust pins Rust #55701.
+func TestMCPOAuthRefreshCoordinationEnabledByDefaultLikeRust(t *testing.T) {
+	const key = "mcp_oauth_refresh_coordination"
+	if got := StageFor(key); got != StageStable {
+		t.Fatalf("StageFor(%s) = %q, want %q", key, got, StageStable)
+	}
+	if !Enabled(nil, key) {
+		t.Fatalf("%s default = false, want true", key)
+	}
+	if Enabled(map[string]bool{key: false}, key) {
+		t.Fatalf("%s explicit false = true, want false", key)
+	}
+}
+
+// TestReasoningEffortOverrideEnabledByDefaultLikeRust pins Rust #56163.
+func TestReasoningEffortOverrideEnabledByDefaultLikeRust(t *testing.T) {
+	const key = "reasoning_effort_override"
+	if got := StageFor(key); got != StageStable {
+		t.Fatalf("StageFor(%s) = %q, want %q", key, got, StageStable)
+	}
+	if !Enabled(nil, key) {
+		t.Fatalf("%s default = false, want true", key)
+	}
+	if Enabled(map[string]bool{key: false}, key) {
+		t.Fatalf("%s explicit false = true, want false", key)
+	}
+}
+
+// TestCodeModeToolDescriptionFirstRemovedLikeRust pins Rust #57462: the
+// compatibility flag remains known but is removed now that Code Mode always
+// places tool descriptions before namespace descriptions.
+func TestCodeModeToolDescriptionFirstRemovedLikeRust(t *testing.T) {
 	const key = "code_mode_tool_description_first"
 	if !Known(key) {
 		t.Fatalf("%s should be known", key)
 	}
 	for _, spec := range Registry {
 		if spec.Key == key {
-			if spec.Stage != StageUnderDevelopment || spec.DefaultEnabled {
-				t.Fatalf("%s spec = %#v, want under development and disabled by default", key, spec)
+			if spec.Stage != StageRemoved || spec.DefaultEnabled {
+				t.Fatalf("%s spec = %#v, want removed and disabled by default", key, spec)
 			}
 			return
 		}
@@ -335,5 +492,79 @@ func TestRetiredWorktreeAndVoiceConfigOverridesAreIgnoredLikeRust(t *testing.T) 
 				t.Fatalf("%s = false once the override is ignored, want the default true", key)
 			}
 		}
+	}
+}
+
+// TestGuardianIncludeAdditionalContextFeatureRegistration mirrors Rust #59238:
+// the inclusion policy is stable and enabled by default, while the configuration
+// still allows disabling it for Guardian review history.
+func TestGuardianIncludeAdditionalContextFeatureRegistration(t *testing.T) {
+	const key = "guardian_include_additional_context"
+	var spec *Spec
+	for index := range Registry {
+		if Registry[index].Key == key {
+			spec = &Registry[index]
+			break
+		}
+	}
+	if spec == nil {
+		t.Fatalf("%s is missing from the feature registry", key)
+	}
+	if spec.Stage != StageStable || !spec.DefaultEnabled {
+		t.Fatalf("%s spec = %#v, want stable and enabled by default", key, *spec)
+	}
+	if !Known(key) || !Enabled(Defaults(), key) {
+		t.Fatalf("%s is not recognized and enabled by default", key)
+	}
+	settings, usages := ResolveSettings(map[string]any{key: false})
+	if len(usages) != 0 {
+		t.Fatalf("ResolveSettings(%s=false) legacy usages = %#v, want none", key, usages)
+	}
+	if enabled, ok := settings[key]; !ok || enabled {
+		t.Fatalf("ResolveSettings(%s=false) = %#v, want an explicit false", key, settings)
+	}
+}
+
+// TestGuardianDenialReconsiderationFeatureRegistration mirrors Rust #59107:
+// the reconsideration pass is under development and disabled by default.
+func TestGuardianDenialReconsiderationFeatureRegistration(t *testing.T) {
+	const key = "guardian_denial_reconsideration"
+	var spec *Spec
+	for index := range Registry {
+		if Registry[index].Key == key {
+			spec = &Registry[index]
+			break
+		}
+	}
+	if spec == nil {
+		t.Fatalf("%s is missing from the feature registry", key)
+	}
+	if spec.Stage != StageUnderDevelopment || spec.DefaultEnabled {
+		t.Fatalf("%s spec = %#v, want under development and off by default", key, *spec)
+	}
+	if enabled := Enabled(Defaults(), key); enabled {
+		t.Fatalf("%s = true by default", key)
+	}
+}
+
+// TestUnifiedImageBudgetIsStableAndOnByDefaultLikeRust mirrors Rust #59282.
+func TestUnifiedImageBudgetIsStableAndOnByDefaultLikeRust(t *testing.T) {
+	const key = "unified_image_budget"
+	var spec *Spec
+	for index := range Registry {
+		if Registry[index].Key == key {
+			spec = &Registry[index]
+			break
+		}
+	}
+	if spec == nil || spec.Stage != StageStable || !spec.DefaultEnabled {
+		t.Fatalf("%s spec = %#v, want stable and enabled by default", key, spec)
+	}
+	if !Enabled(Defaults(), key) {
+		t.Fatalf("%s is disabled by default", key)
+	}
+	settings, _ := ResolveSettings(map[string]any{key: false})
+	if enabled, ok := settings[key]; !ok || enabled {
+		t.Fatalf("ResolveSettings(%s=false) = %#v, want explicit false", key, settings)
 	}
 }

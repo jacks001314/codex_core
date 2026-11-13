@@ -15,15 +15,19 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"codex_core/envutil"
 	"codex_core/execpolicy"
 	execserverclient "codex_core/execserver"
+	"codex_core/network"
 	"codex_core/sandbox"
 	"codex_core/shell"
+	"codex_core/utils"
 )
 
 // DefaultSnapshotTimeout bounds a capture or validation run, mirroring Rust's
@@ -83,6 +87,26 @@ type SnapshotCaptureRequest struct {
 	EnvironmentPolicy   map[string]any
 	PermissionProfile   *sandbox.PermissionProfile
 	PermissionProfileID string
+	// Protected asks for a broker-protected capture (Rust #43909): the capture
+	// runs in Env, known real credentials are replaced by their dummies, and the
+	// snapshot only becomes replayable once the launch environment carries the
+	// broker-prepared keys returned by ShellSnapshotFile.BrokeredEnv.
+	Protected bool
+	// Env is the broker-virtualized launch environment used by a protected
+	// capture. SourceEnv is the pre-virtualization environment, used to mark
+	// credentials the broker stripped from the child.
+	Env       map[string]string
+	SourceEnv map[string]string
+	// CredentialPairs are the real-to-dummy mappings the broker registered for
+	// this launch.
+	CredentialPairs []network.CredentialMaskPair
+	// CredentialEnvKeys are every environment key the broker may virtualize,
+	// including configured providers.
+	CredentialEnvKeys []string
+	// CredentialTextUnsafe reports whether captured text still contains a real
+	// credential. A protected capture that fails this check is discarded
+	// instead of persisting the secret (Rust #44040).
+	CredentialTextUnsafe func(string) bool
 }
 
 // SnapshotProviderRequest describes a launch asking for its session's snapshot.
@@ -106,6 +130,12 @@ type SnapshotProviderRequest struct {
 	// (core/src/tools/runtimes/unified_exec/snapshot_metrics.rs), so the provider
 	// reads it to decide whether to observe; it never changes replay.
 	ShellMode UnifiedExecShellMode
+	// Protected reports that the launch carries an active credential broker, so
+	// a POSIX `-c` launch is eligible for a protected snapshot and the provider
+	// may return broker-prepared environment keys.
+	Protected bool
+	// Env is the launch's environment, used by a protected capture.
+	Env map[string]string
 }
 
 // SnapshotProviderResult is one launch's snapshot answer: the path the launch
@@ -115,13 +145,21 @@ type SnapshotProviderResult struct {
 	// Path is the snapshot to replay in front of the launch's command, or "".
 	Path string
 	// Remote asks the selected executor to capture and replay its own shell
-	// snapshot. Path is used for local environments.
+	// snapshot (Rust #39957's executor request). The shell_snapshot_v2 gate is
+	// the only producer; the session file snapshot stays local-only.
 	Remote *execserverclient.ShellSnapshotRequest
+	// Local asks the in-process executor to capture and replay its own shell
+	// snapshot for a local launch (Rust #39957).
+	Local *execserverclient.ShellSnapshotRequest
 	// ObserveCommandOutcome, when non-nil, is called exactly once after the
 	// launch decides whether it replayed the snapshot. used is Rust's
 	// `snapshot_used = wrapped != command`: true when the command was rewritten
 	// to replay the snapshot, false when normal shell startup was used.
 	ObserveCommandOutcome func(used bool)
+	// Env carries the broker-prepared snapshot keys a protected launch must
+	// merge into its command environment before replay (Rust's
+	// ShellSnapshotFile::restore_credentials).
+	Env map[string]string
 }
 
 // snapshotExplicitOverrides returns the policy-driven environment overrides that
@@ -138,16 +176,21 @@ func snapshotExplicitOverrides(req *ShellRequest) map[string]string {
 // captures it, and other launches wait for that capture instead of starting a
 // second one.
 type SnapshotBuilder struct {
-	mu        sync.Mutex
-	options   SnapshotBuilderOptions
-	snapshots map[string]*ShellSnapshotFile
-	cleaned   bool
+	mu         sync.Mutex
+	options    SnapshotBuilderOptions
+	snapshots  map[string]*ShellSnapshotFile
+	prewarmed  map[string]struct{}
+	captureCtx context.Context
+	cancel     context.CancelFunc
+	closed     atomic.Bool
+	cleaned    bool
 }
 
 // ShellSnapshotFile is a captured snapshot on disk. Closing it removes the file,
 // mirroring Rust's `Drop for ShellSnapshotFile`.
 type ShellSnapshotFile struct {
-	path string
+	path        string
+	brokeredEnv map[string]string
 }
 
 // Path returns the snapshot's location, or "" for no snapshot.
@@ -156,6 +199,15 @@ func (f *ShellSnapshotFile) Path() string {
 		return ""
 	}
 	return f.path
+}
+
+// BrokeredEnv returns the broker-prepared environment keys a protected
+// snapshot needs on its launch, or nil for an ordinary snapshot.
+func (f *ShellSnapshotFile) BrokeredEnv() map[string]string {
+	if f == nil || len(f.brokeredEnv) == 0 {
+		return nil
+	}
+	return cloneEnvMap(f.brokeredEnv)
 }
 
 // Close removes the snapshot file.
@@ -181,7 +233,14 @@ func NewSnapshotBuilder(options SnapshotBuilderOptions) *SnapshotBuilder {
 	if options.Timeout <= 0 {
 		options.Timeout = DefaultSnapshotTimeout
 	}
-	return &SnapshotBuilder{options: options, snapshots: map[string]*ShellSnapshotFile{}}
+	captureCtx, cancel := context.WithCancel(context.Background())
+	return &SnapshotBuilder{
+		options:    options,
+		snapshots:  map[string]*ShellSnapshotFile{},
+		prewarmed:  map[string]struct{}{},
+		captureCtx: captureCtx,
+		cancel:     cancel,
+	}
 }
 
 // Snapshot returns the session's snapshot for the request, capturing it on first
@@ -196,6 +255,9 @@ func (b *SnapshotBuilder) Snapshot(ctx context.Context, request SnapshotCaptureR
 	key := snapshotCaptureKey(request)
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.closed.Load() {
+		return nil, ""
+	}
 	b.cleanupStaleSnapshotsLocked()
 	if existing := b.snapshots[key]; existing != nil {
 		if _, err := os.Stat(existing.path); err == nil {
@@ -209,6 +271,51 @@ func (b *SnapshotBuilder) Snapshot(ctx context.Context, request SnapshotCaptureR
 	}
 	b.snapshots[key] = created
 	return created, ""
+}
+
+// PrewarmSnapshot starts the session's speculative capture once. Rust keeps the
+// prewarm handle in session state and only stores a replaced one on a new turn,
+// so later turns do not repeat the capture or its telemetry (#42137). The
+// attempt flag reports whether this call actually ran a capture; a cached
+// snapshot or an already-started prewarm returns false.
+func (b *SnapshotBuilder) PrewarmSnapshot(ctx context.Context, request SnapshotCaptureRequest) (*ShellSnapshotFile, SnapshotFailureReason, bool) {
+	if b == nil {
+		return nil, "", false
+	}
+	key := snapshotCaptureKey(request)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed.Load() {
+		return nil, "", false
+	}
+	if _, started := b.prewarmed[key]; started {
+		return nil, "", false
+	}
+	b.prewarmed[key] = struct{}{}
+	b.cleanupStaleSnapshotsLocked()
+	if existing := b.snapshots[key]; existing != nil {
+		if _, err := os.Stat(existing.path); err == nil {
+			return existing, "", false
+		}
+		delete(b.snapshots, key)
+	}
+	created, reason := b.captureLocked(ctx, request)
+	if created == nil {
+		return nil, reason, true
+	}
+	b.snapshots[key] = created
+	return created, "", true
+}
+
+// Closed reports whether Close has begun. A prewarm that lost its capture to
+// shutdown is not a capture failure, so callers skip its telemetry.
+func (b *SnapshotBuilder) Closed() bool {
+	if b == nil {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.closed.Load()
 }
 
 // PrewarmedSnapshot reports whether a snapshot captured under this request's
@@ -238,6 +345,12 @@ func (b *SnapshotBuilder) PrewarmedSnapshot(request SnapshotCaptureRequest) bool
 func (b *SnapshotBuilder) Close() {
 	if b == nil {
 		return
+	}
+	// Cancel an in-flight prewarm before waiting for the capture lock, so
+	// unloading a thread does not block on the capture timeout (#42137).
+	b.closed.Store(true)
+	if b.cancel != nil {
+		b.cancel()
 	}
 	b.mu.Lock()
 	snapshots := b.snapshots
@@ -269,13 +382,24 @@ func (b *SnapshotBuilder) captureLocked(ctx context.Context, request SnapshotCap
 	script, ok := shell.SnapshotCaptureScript(captureType, shell.SnapshotCaptureOptions{
 		Startup:      startup,
 		Declarations: true,
+		Environment:  request.Protected,
 	})
 	if !ok {
 		return nil, ""
 	}
 	runCtx, cancel := context.WithTimeout(ctx, b.options.Timeout)
 	defer cancel()
+	if b.captureCtx != nil {
+		stop := context.AfterFunc(b.captureCtx, cancel)
+		defer stop()
+	}
 	env := snapshotCaptureEnv()
+	if request.Protected {
+		if len(request.Env) == 0 {
+			return nil, SnapshotReasonWriteFailed
+		}
+		env = brokeredSnapshotCaptureEnv(request.Env, request.CredentialEnvKeys)
+	}
 	captured, err := b.options.Runner(runCtx, snapshotExecArgs(request, script), request.CWD, env, request.PermissionProfile, request.PermissionProfileID)
 	if err != nil {
 		return nil, SnapshotReasonWriteFailed
@@ -306,11 +430,34 @@ func (b *SnapshotBuilder) writeSnapshot(
 		return nil, SnapshotReasonWriteFailed
 	}
 	policy := shellSnapshotEnvironmentPolicy(request)
-	if err := os.WriteFile(tempPath, []byte(decoded.RenderScript(policy)), 0o600); err != nil {
+	rendered := decoded.RenderScript(policy)
+	var brokeredEnv map[string]string
+	if request.Protected {
+		rendered = network.MaskSnapshotText(rendered, request.CredentialPairs)
+		if request.CredentialTextUnsafe != nil && snapshotTextUnsafe(request.CredentialTextUnsafe, snapshotShellType(request), rendered) {
+			_ = os.Remove(tempPath)
+			return nil, SnapshotReasonWriteFailed
+		}
+		brokeredEnv = brokeredSnapshotLaunchEnv(request)
+	}
+	if err := os.WriteFile(tempPath, []byte(rendered), 0o600); err != nil {
 		return nil, SnapshotReasonWriteFailed
 	}
 	validation := "set -e; . \"" + tempPath + "\""
-	if _, err := b.options.Runner(ctx, snapshotExecArgs(request, validation), request.CWD, env, request.PermissionProfile, request.PermissionProfileID); err != nil {
+	validationProfile := request.PermissionProfile
+	if request.Protected && validationProfile != nil {
+		// The snapshot lives under the Codex home, which the launch profile may
+		// not read. Rust grants the validation run a read-only root for exactly
+		// this path (shell_snapshot_sandbox::snapshot_read_permissions).
+		additional := &sandbox.AdditionalPermissionProfile{ReadFileSystem: []string{tempPath}}
+		merged, mergeErr := sandbox.PermissionProfileWithAdditionalPermissionsForConvention(validationProfile, additional, utils.NativePathConvention())
+		if mergeErr != nil {
+			_ = os.Remove(tempPath)
+			return nil, SnapshotReasonValidationFailed
+		}
+		validationProfile = merged
+	}
+	if _, err := b.options.Runner(ctx, snapshotExecArgs(request, validation), request.CWD, env, validationProfile, request.PermissionProfileID); err != nil {
 		_ = os.Remove(tempPath)
 		return nil, SnapshotReasonValidationFailed
 	}
@@ -318,7 +465,25 @@ func (b *SnapshotBuilder) writeSnapshot(
 		_ = os.Remove(tempPath)
 		return nil, SnapshotReasonWriteFailed
 	}
-	return &ShellSnapshotFile{path: path}, ""
+	return &ShellSnapshotFile{path: path, brokeredEnv: brokeredEnv}, ""
+}
+
+// snapshotTextUnsafe reports whether the replay text, or any literal word the
+// shell rebuilds from it, still carries a credential the broker could not
+// virtualize. Masking the raw text cannot see a secret that an alias or
+// function body reassembles from quoted fragments, so the decoded words are
+// checked as well (Rust's literal_words re-check in
+// shell_snapshot_credentials::prepare_snapshot_credentials).
+func snapshotTextUnsafe(unsafe func(string) bool, shellType shell.ShellType, text string) bool {
+	if unsafe(text) {
+		return true
+	}
+	for _, word := range shell.SnapshotLiteralWords(shellType, text) {
+		if unsafe(word) {
+			return true
+		}
+	}
+	return false
 }
 
 // snapshotShellType resolves the capture dialect for a launch. Go's tool-level
@@ -377,14 +542,18 @@ func snapshotCaptureKey(request SnapshotCaptureRequest) string {
 			policy = request.PermissionProfileID + "\x00" + encoded
 		}
 	}
-	return strings.Join([]string{
+	parts := []string{
 		string(request.ShellType),
 		request.ShellPath,
 		request.CWD,
 		boolKey(request.AllowLoginShell),
 		snapshotEnvironmentPolicyKey(request.EnvironmentPolicy),
 		policy,
-	}, "\x01")
+	}
+	if request.Protected {
+		parts = append(parts, "protected", brokeredSnapshotKey(request))
+	}
+	return strings.Join(parts, "\x01")
 }
 
 func boolKey(value bool) string {
@@ -410,6 +579,96 @@ func snapshotCaptureEnv() map[string]string {
 	envutil.SetThreadIDEnv(env, nil)
 	envutil.SetToolCallIDEnv(env, nil)
 	return envutil.ScrubMap(env)
+}
+
+// brokeredSnapshotCaptureEnv is the environment a protected capture runs in:
+// the broker-virtualized child environment with launch metadata scrubbed and
+// any provider credential the broker could not virtualize removed, so a startup
+// file cannot read a real secret through it.
+func brokeredSnapshotCaptureEnv(env map[string]string, credentialKeys []string) map[string]string {
+	out := cloneEnvMap(env)
+	dummyKeys := map[string]struct{}{}
+	for _, key := range network.ProxyBrokeredCredentialDummyEnvKeys(out) {
+		dummyKeys[key] = struct{}{}
+	}
+	if len(credentialKeys) == 0 {
+		credentialKeys = network.ProxyCredentialBrokerEnvKeys()
+	}
+	for _, key := range credentialKeys {
+		if _, ok := dummyKeys[key]; !ok {
+			delete(out, key)
+		}
+	}
+	delete(out, network.CredentialBrokerActiveEnvKey)
+	delete(out, network.BrokeredCredentialsEnvKey)
+	envutil.SetThreadIDEnv(out, nil)
+	envutil.SetToolCallIDEnv(out, nil)
+	return envutil.ScrubMap(out)
+}
+
+// brokeredSnapshotLaunchEnv builds the broker-prepared keys a protected
+// launch carries: child-visible dummy copies, unset markers for credentials the
+// broker stripped, and the original startup-file variables the replay wrapper
+// restores around the command (Rust #43909).
+func brokeredSnapshotLaunchEnv(request SnapshotCaptureRequest) map[string]string {
+	out := map[string]string{snapshotBrokeredPreparedEnvKey: "1"}
+	dummyKeys := map[string]struct{}{}
+	for _, key := range network.ProxyBrokeredCredentialDummyEnvKeys(request.Env) {
+		out[snapshotBrokeredValueEnvPrefix+key] = request.Env[key]
+		dummyKeys[key] = struct{}{}
+	}
+	for _, pair := range request.CredentialPairs {
+		if pair.Key == "" || pair.Dummy == "" {
+			continue
+		}
+		if _, ok := dummyKeys[pair.Key]; ok {
+			continue
+		}
+		out[snapshotBrokeredValueEnvPrefix+pair.Key] = pair.Dummy
+		dummyKeys[pair.Key] = struct{}{}
+	}
+	credentialKeys := request.CredentialEnvKeys
+	if len(credentialKeys) == 0 {
+		credentialKeys = network.ProxyCredentialBrokerEnvKeys()
+	}
+	for _, key := range credentialKeys {
+		if _, ok := dummyKeys[key]; ok {
+			continue
+		}
+		if strings.TrimSpace(request.SourceEnv[key]) != "" {
+			out[snapshotBrokeredUnsetEnvPrefix+key] = "1"
+		}
+	}
+	for _, entry := range []struct {
+		source string
+		target string
+	}{
+		{"BASH_ENV", snapshotOriginalBashEnvKey},
+		{"ENV", snapshotOriginalPosixEnvKey},
+		{"ZDOTDIR", snapshotOriginalZdotdirEnvKey},
+	} {
+		if value, ok := request.SourceEnv[entry.source]; ok {
+			out[entry.target] = value
+		}
+	}
+	return out
+}
+
+// brokeredSnapshotKey identifies a protected capture by the broker-prepared
+// keys it will replay, so a snapshot captured under another broker state is
+// never reused (Rust #43954).
+func brokeredSnapshotKey(request SnapshotCaptureRequest) string {
+	prepared := brokeredSnapshotLaunchEnv(request)
+	keys := make([]string, 0, len(prepared))
+	for key := range prepared {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, key+"="+prepared[key])
+	}
+	return strings.Join(parts, "\x00")
 }
 
 // RunSandboxedSnapshotCommand is the default capture runner: it applies the
@@ -470,7 +729,7 @@ func RunSandboxedSnapshotCommand(
 	process.Stderr = &stderr
 	// The capture runs with its process group owned, so a failed capture
 	// takes the helpers its startup files spawned down with it (#49782).
-	if err := runSnapshotCaptureProcess(process); err != nil {
+	if err := runSnapshotCaptureProcess(ctx, process); err != nil {
 		var exitErr *exec.ExitError
 		if !errors.As(err, &exitErr) {
 			return nil, err
@@ -493,7 +752,7 @@ func runSnapshotCommandDirect(ctx context.Context, command []string, cwd string,
 	process.Stderr = &stderr
 	// The capture runs with its process group owned, so a failed capture
 	// takes the helpers its startup files spawned down with it (#49782).
-	if err := runSnapshotCaptureProcess(process); err != nil {
+	if err := runSnapshotCaptureProcess(ctx, process); err != nil {
 		var exitErr *exec.ExitError
 		if !errors.As(err, &exitErr) {
 			return nil, err

@@ -20,7 +20,12 @@ const (
 	errorPasswordExpired    uint32 = 1330
 	errorPasswordMustChange uint32 = 1907
 	errorNoSuchLogonSession uint32 = 1312
-	errorNotFound           uint32 = 1168
+	// errorAccountDisabled is ERROR_ACCOUNT_DISABLED: an uninstall or an
+	// interrupted cleanup can disable the sandbox accounts, so a runner logon
+	// must refresh credentials instead of surfacing the native failure
+	// (Rust #42375 is_refreshable_windows_error).
+	errorAccountDisabled uint32 = 1311
+	errorNotFound        uint32 = 1168
 	// errorServiceAlreadyRunning is ERROR_SERVICE_ALREADY_RUNNING. Rust #49325
 	// (upstream 26dd19ef47) retries a runner logon that fails with this code once
 	// using the unchanged credentials: no runner - and therefore no user command -
@@ -196,6 +201,21 @@ func RetryRunnerSpawnOnce[T any](
 	spawn func(SandboxCredentials) (T, error),
 	refresh func() (SandboxCredentials, error),
 ) (T, error) {
+	result, err := retryRunnerSpawnOnce(creds, command, spawn, refresh)
+	if err != nil {
+		recordRunnerResult("startup", "error")
+	} else {
+		recordRunnerResult("startup", "success")
+	}
+	return result, err
+}
+
+func retryRunnerSpawnOnce[T any](
+	creds SandboxCredentials,
+	command []string,
+	spawn func(SandboxCredentials) (T, error),
+	refresh func() (SandboxCredentials, error),
+) (T, error) {
 	result, err := spawn(creds)
 	if err == nil {
 		return result, nil
@@ -244,7 +264,7 @@ func readFrameWithTimeout(reader io.Reader, timeout time.Duration) (*FramedMessa
 }
 
 func isRefreshableWindowsError(code uint32) bool {
-	return code == errorLogonFailure || code == errorNoSuchLogonSession
+	return code == errorAccountDisabled || code == errorLogonFailure || code == errorNoSuchLogonSession
 }
 
 func commandTargetsWindowsApps(command []string) bool {

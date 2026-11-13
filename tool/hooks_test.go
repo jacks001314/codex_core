@@ -2,9 +2,11 @@ package tool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRouterDispatchWithHooksBlocksBeforeTool(t *testing.T) {
@@ -30,6 +32,69 @@ func TestRouterDispatchWithHooksBlocksBeforeTool(t *testing.T) {
 	}
 	if called {
 		t.Fatal("tool executed after pre hook block")
+	}
+}
+
+type environmentScopedTestExecutor struct {
+	*ExecutorFunc
+}
+
+// HookEnvironmentIDs derives the target from the call arguments so the test
+// can prove the router captures them before a PreToolUse input rewrite.
+func (e *environmentScopedTestExecutor) HookEnvironmentIDs(invocation *Invocation) []string {
+	var args struct {
+		Command string `json:"command"`
+	}
+	if err := invocation.DecodeArguments(&args); err != nil {
+		return nil
+	}
+	if strings.Contains(args.Command, "original") {
+		return []string{"env-a"}
+	}
+	return []string{"env-b"}
+}
+
+type environmentRecordingHooks struct {
+	pre  []string
+	post []string
+}
+
+func (h *environmentRecordingHooks) RunPreToolUse(_ context.Context, _ *Invocation, payload *PreToolUsePayload) (*PreToolUseHookOutcome, error) {
+	h.pre = append([]string(nil), payload.TargetEnvironments...)
+	return &PreToolUseHookOutcome{UpdatedInput: map[string]any{"command": "echo rewritten"}}, nil
+}
+
+func (h *environmentRecordingHooks) RunPostToolUse(_ context.Context, _ *Invocation, payload *PostToolUsePayload) (*PostToolUseHookOutcome, error) {
+	h.post = append([]string(nil), payload.TargetEnvironments...)
+	return nil, nil
+}
+
+// Rust captures the invocation environments before PreToolUse and reuses them
+// for PostToolUse (`ToolInvocation::environments`), so an input rewrite cannot
+// retarget the environment-scoped hooks.
+func TestRouterDispatchWithHooksCapturesTargetEnvironmentsLikeRust(t *testing.T) {
+	registry := NewRegistry()
+	executor := &environmentScopedTestExecutor{ExecutorFunc: NewExecutorFunc(Spec{Name: PlainName("Bash")}, func(ctx context.Context, invocation *Invocation) (*Output, error) {
+		return &Output{Success: true, Body: "ok"}, nil
+	})}
+	if err := registry.Register(executor); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	hooks := &environmentRecordingHooks{}
+	router := NewRouter(registry)
+
+	if _, err := router.DispatchWithHooks(context.Background(), &Invocation{
+		CallID:   "call-1",
+		ToolName: PlainName("Bash"),
+		Payload:  Payload{Kind: PayloadFunction, Arguments: `{"command":"echo original"}`},
+	}, hooks); err != nil {
+		t.Fatalf("DispatchWithHooks() error = %v", err)
+	}
+	if len(hooks.pre) != 1 || hooks.pre[0] != "env-a" {
+		t.Fatalf("pre targets = %#v", hooks.pre)
+	}
+	if len(hooks.post) != 1 || hooks.post[0] != "env-a" {
+		t.Fatalf("post targets = %#v, want the pre-tool capture", hooks.post)
 	}
 }
 
@@ -269,6 +334,137 @@ func TestRouterDispatchWithHooksPlainHookErrorIsFatal(t *testing.T) {
 	if !AsFunctionCallError(err, &callErr) || !callErr.IsFatal() {
 		t.Fatalf("error = %T %v", err, err)
 	}
+}
+
+// TestRouterDispatchWithHooksCancelsBlockedHooksLikeRust covers Rust #51556:
+// cancellation must settle dispatch even when a hook ignores its context, while
+// the hook is still blocked. Their outcome settles as a cancelled tool call.
+func TestRouterDispatchWithHooksCancelsBlockedHooksLikeRust(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		blockPre  bool
+		blockPost bool
+	}{
+		{name: "pre hook", blockPre: true},
+		{name: "post hook", blockPost: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			registry := NewRegistry()
+			if err := registry.Register(NewExecutorFunc(Spec{Name: PlainName("echo")}, func(ctx context.Context, invocation *Invocation) (*Output, error) {
+				return &Output{Success: true, Body: "ok"}, nil
+			})); err != nil {
+				t.Fatalf("register: %v", err)
+			}
+			hooks := &blockingHookRunner{
+				blockPre:  tc.blockPre,
+				blockPost: tc.blockPost,
+				started:   make(chan struct{}),
+				release:   make(chan struct{}),
+			}
+			router := NewRouter(registry)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go func() {
+				<-hooks.started
+				cancel()
+			}()
+
+			done := make(chan error, 1)
+			go func() {
+				_, err := router.DispatchWithHooks(ctx, &Invocation{
+					CallID:   "call-1",
+					ToolName: PlainName("echo"),
+					Payload:  Payload{Kind: PayloadFunction, Arguments: `{}`},
+				}, hooks)
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				if !errors.Is(err, ErrToolCancelled) {
+					t.Fatalf("dispatch error = %v, want ErrToolCancelled", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("dispatch did not settle while the hook remained blocked")
+			}
+			close(hooks.release)
+		})
+	}
+}
+
+// TestRouterWaitUntilReadyCancelsBlockedWaiterLikeRust covers Rust #51556's
+// cancellable readiness wait: an interrupted call must not wait for a readiness
+// source that ignores its context.
+func TestRouterWaitUntilReadyCancelsBlockedWaiterLikeRust(t *testing.T) {
+	registry := NewRegistry()
+	waiter := &blockingReadinessExecutor{
+		ExecutorFunc: NewExecutorFunc(Spec{Name: PlainName("waiting")}, func(context.Context, *Invocation) (*Output, error) {
+			return &Output{Success: true}, nil
+		}),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	if err := registry.Register(waiter); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	router := NewRouter(registry)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-waiter.started
+		cancel()
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- router.WaitUntilReady(ctx, &Invocation{CallID: "call-1", ToolName: PlainName("waiting")})
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrToolCancelled) {
+			t.Fatalf("WaitUntilReady() error = %v, want ErrToolCancelled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitUntilReady did not settle while the waiter remained blocked")
+	}
+	close(waiter.release)
+}
+
+type blockingHookRunner struct {
+	blockPre  bool
+	blockPost bool
+	started   chan struct{}
+	release   chan struct{}
+}
+
+func (h *blockingHookRunner) block() {
+	close(h.started)
+	<-h.release
+}
+
+func (h *blockingHookRunner) RunPreToolUse(context.Context, *Invocation, *PreToolUsePayload) (*PreToolUseHookOutcome, error) {
+	if h.blockPre {
+		h.block()
+	}
+	return nil, nil
+}
+
+func (h *blockingHookRunner) RunPostToolUse(context.Context, *Invocation, *PostToolUsePayload) (*PostToolUseHookOutcome, error) {
+	if h.blockPost {
+		h.block()
+	}
+	return nil, nil
+}
+
+type blockingReadinessExecutor struct {
+	*ExecutorFunc
+	started chan struct{}
+	release chan struct{}
+}
+
+func (e *blockingReadinessExecutor) WaitUntilReady(context.Context, *Invocation) error {
+	close(e.started)
+	<-e.release
+	return nil
 }
 
 type fakeToolHooks struct {

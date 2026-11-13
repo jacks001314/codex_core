@@ -14,6 +14,117 @@ import (
 	"codex_core/utils"
 )
 
+// Rust #48812 tags only the sampling request that consumes the prepared warmup
+// response; later tool-follow-up requests in the same turn are not tagged.
+func TestAgentLoopTagsOnlyFirstRequestAfterPrewarmLikeRust(t *testing.T) {
+	agent := &fakeLoopAgent{}
+	registry := tool.NewRegistry()
+	if err := registry.Register(tool.NewExecutorFunc(tool.Spec{Name: tool.PlainName("echo")}, func(ctx context.Context, invocation *tool.Invocation) (*tool.Output, error) {
+		return &tool.Output{Success: true, Body: "tool result"}, nil
+	})); err != nil {
+		t.Fatalf("register echo: %v", err)
+	}
+	loop := NewAgentLoop(&AgentLoopOptions{
+		Agent:      agent,
+		Dispatcher: NewToolDispatcher(&ToolDispatcherOptions{Router: tool.NewRouter(registry)}),
+		MaxTurns:   3,
+	})
+	if _, err := loop.Run(context.Background(), &AgentLoopRequest{
+		Prompt:                      "run echo",
+		Model:                       "gpt-test",
+		PreviousResponseID:          "prewarm-response",
+		PreviousResponseFromPrewarm: true,
+	}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(agent.requests) != 2 {
+		t.Fatalf("requests = %d, want 2", len(agent.requests))
+	}
+	if !agent.requests[0].PreviousResponseFromPrewarm {
+		t.Fatalf("first request did not carry after_prewarm")
+	}
+	if agent.requests[1].PreviousResponseFromPrewarm {
+		t.Fatalf("tool follow-up request carried after_prewarm")
+	}
+}
+
+func TestAgentLoopCapturesSamplingCheckpointBeforeRequest(t *testing.T) {
+	sequence := uint64(3)
+	agent := &checkpointLoopAgent{sequence: &sequence}
+	loop := NewAgentLoop(&AgentLoopOptions{Agent: agent})
+	result, err := loop.Run(context.Background(), &AgentLoopRequest{
+		Prompt: "finish",
+		Model:  "gpt-test",
+		SamplingCheckpoint: func() (uint64, bool) {
+			return *agent.sequence, true
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if *agent.sequence != 7 {
+		t.Fatalf("sequence after request = %d, want 7", *agent.sequence)
+	}
+	if result.SampledThroughSequence == nil || *result.SampledThroughSequence != 3 {
+		t.Fatalf("result checkpoint = %#v, want 3", result.SampledThroughSequence)
+	}
+	if result.Response == nil || result.Response.SampledThroughSequence == nil || *result.Response.SampledThroughSequence != 3 {
+		t.Fatalf("response checkpoint = %#v, want 3", result.Response)
+	}
+}
+
+func TestAgentLoopHoldsSearchReservationThroughEmittedTools(t *testing.T) {
+	agent := &fakeLoopAgent{}
+	registry := tool.NewRegistry()
+	if err := registry.Register(tool.NewExecutorFunc(tool.Spec{Name: tool.PlainName("echo")}, func(ctx context.Context, invocation *tool.Invocation) (*tool.Output, error) {
+		return &tool.Output{Success: true, Body: "tool result"}, nil
+	})); err != nil {
+		t.Fatalf("register echo: %v", err)
+	}
+	reserved, released := 0, 0
+	loop := NewAgentLoop(&AgentLoopOptions{Agent: agent, Dispatcher: NewToolDispatcher(&ToolDispatcherOptions{Router: tool.NewRouter(registry)}), MaxTurns: 3})
+	if _, err := loop.Run(context.Background(), &AgentLoopRequest{
+		Prompt: "run echo", Model: "gpt-test",
+		ReserveSearch: func() (func(), error) {
+			reserved++
+			return func() { released++ }, nil
+		},
+	}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if reserved != 2 || released != 2 {
+		t.Fatalf("reservations = %d/%d, want 2/2 including the tool-owning step", reserved, released)
+	}
+}
+
+func TestAgentLoopRemovesNativeSearchWhenFallbackReservationLosesRace(t *testing.T) {
+	agent := &fakeLoopAgent{}
+	registry := tool.NewRegistry()
+	if err := registry.Register(tool.NewExecutorFunc(tool.Spec{Name: tool.PlainName("echo")}, func(ctx context.Context, invocation *tool.Invocation) (*tool.Output, error) {
+		return &tool.Output{Success: true, Body: "tool result"}, nil
+	})); err != nil {
+		t.Fatalf("register echo: %v", err)
+	}
+	loop := NewAgentLoop(&AgentLoopOptions{Agent: agent, Dispatcher: NewToolDispatcher(&ToolDispatcherOptions{Router: tool.NewRouter(registry)}), MaxTurns: 2})
+	if _, err := loop.Run(context.Background(), &AgentLoopRequest{
+		Prompt: "run echo", Model: "gpt-test",
+		Tools: []any{
+			map[string]any{"type": "web_search"},
+			map[string]any{"type": "namespace", "name": "web"},
+			map[string]any{"type": "function", "name": "echo"},
+		},
+		ReserveSearch: func() (func(), error) { return nil, ErrSearchReservationUnavailable },
+	}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(agent.requests) == 0 || len(agent.requests[0].Tools) != 1 {
+		t.Fatalf("tools = %#v, want echo only", agent.requests)
+	}
+	if got := agent.requests[0].Tools[0].(map[string]any)["name"]; got != "echo" {
+		t.Fatalf("remaining tool = %#v", agent.requests[0].Tools[0])
+	}
+}
+
 func TestAgentLoopRunsToolsAndContinuesSampling(t *testing.T) {
 	agent := &fakeLoopAgent{}
 	executedToolCalls := NewExecutedToolCallRecorder()
@@ -40,6 +151,7 @@ func TestAgentLoopRunsToolsAndContinuesSampling(t *testing.T) {
 		PreviousResponseID: "resp-prev",
 		ServiceTier:        "priority",
 		PromptCacheKey:     "cache-key",
+		PromptCacheTTL:     "12h",
 		ClientMetadata:     map[string]string{"thread_id": "thread-1"},
 		OutputSchema:       map[string]any{"type": "object"},
 		OnAssistantMessage: func(response *model.AgentResponse, iteration int, hasToolCalls bool) {
@@ -69,7 +181,7 @@ func TestAgentLoopRunsToolsAndContinuesSampling(t *testing.T) {
 	if len(agent.requests) != 2 || len(agent.requests[1].InputItems) != 4 {
 		t.Fatalf("agent requests = %#v", agent.requests)
 	}
-	if !agent.requests[0].Store || agent.requests[0].Originator != "codex_app_server" || agent.requests[0].PreviousResponseID != "resp-prev" || agent.requests[0].ServiceTier != "priority" || agent.requests[0].PromptCacheKey != "cache-key" || agent.requests[0].ClientMetadata["thread_id"] != "thread-1" {
+	if !agent.requests[0].Store || agent.requests[0].Originator != "codex_app_server" || agent.requests[0].PreviousResponseID != "resp-prev" || agent.requests[0].ServiceTier != "priority" || agent.requests[0].PromptCacheKey != "cache-key" || agent.requests[0].PromptCacheTTL != "12h" || agent.requests[0].ClientMetadata["thread_id"] != "thread-1" {
 		t.Fatalf("request controls = %#v", agent.requests[0])
 	}
 	if agent.requests[1].PreviousResponseID != "resp-tool" {
@@ -159,6 +271,90 @@ func TestAgentLoopRebuildsToolsForLaterModelStepsLikeRust(t *testing.T) {
 	}
 	if len(agent.requests) < 2 || len(agent.requests[1].Tools) != 1 || agent.requests[1].Tools[0] != "rebuilt-second-model" {
 		t.Fatalf("second-step tools = %#v", agent.requests[len(agent.requests)-1].Tools)
+	}
+}
+
+// Rust #47458 keeps instruction refresh and tool preparation independent and
+// delivers refresh warnings before tools are assembled, so a failed tool
+// preparation cannot swallow them. Go's step tool rebuild is an in-memory list
+// assembly that cannot fail, and the loop calls the instructions provider first
+// on every step; this pins that ordering.
+func TestAgentLoopRefreshesInstructionsBeforeStepToolsLikeRust(t *testing.T) {
+	agent := &fakeLoopAgent{}
+	registry := tool.NewRegistry()
+	if err := registry.Register(tool.NewExecutorFunc(tool.Spec{Name: tool.PlainName("echo")}, func(context.Context, *tool.Invocation) (*tool.Output, error) {
+		return &tool.Output{Success: true, Body: "ok"}, nil
+	})); err != nil {
+		t.Fatal(err)
+	}
+	loop := NewAgentLoop(&AgentLoopOptions{
+		Agent:      agent,
+		Dispatcher: NewToolDispatcher(&ToolDispatcherOptions{Router: tool.NewRouter(registry)}),
+		MaxTurns:   3,
+	})
+	var order []string
+	if _, err := loop.Run(context.Background(), &AgentLoopRequest{
+		Prompt:       "run echo",
+		Model:        "first-model",
+		Tools:        []any{"initial-tools"},
+		Instructions: "base",
+		InstructionsProvider: func() string {
+			order = append(order, "instructions")
+			return "refreshed"
+		},
+		ToolsForStep: func(modelID string) []any {
+			order = append(order, "tools")
+			return []any{"rebuilt"}
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(order, ","); got != "instructions,instructions,tools" {
+		t.Fatalf("preparation order = %q", got)
+	}
+	if len(agent.requests) < 2 {
+		t.Fatalf("agent requests = %d", len(agent.requests))
+	}
+	if agent.requests[1].Instructions != "refreshed" {
+		t.Fatalf("second-step instructions = %q", agent.requests[1].Instructions)
+	}
+	if len(agent.requests[1].Tools) != 1 || agent.requests[1].Tools[0] != "rebuilt" {
+		t.Fatalf("second-step tools = %#v", agent.requests[1].Tools)
+	}
+}
+
+// TestRuntimeRefreshesMultiAgentCatalogOverridesForStepModelLikeRust mirrors
+// Rust #46505 step settings: the Multi-Agent V2 catalog overrides are resolved
+// again for every later sampling step's model, so a mid-turn model change
+// publishes that model's tool schemas.
+func TestRuntimeRefreshesMultiAgentCatalogOverridesForStepModelLikeRust(t *testing.T) {
+	agent := &fakeLoopAgent{}
+	registry := tool.NewRegistry()
+	if err := registry.Register(tool.NewExecutorFunc(tool.Spec{Name: tool.PlainName("echo")}, func(context.Context, *tool.Invocation) (*tool.Output, error) {
+		return &tool.Output{Success: true, Body: "ok"}, nil
+	})); err != nil {
+		t.Fatalf("register echo: %v", err)
+	}
+	var refreshed []string
+	runtime := NewRuntime(&RuntimeOptions{
+		Agent:    agent,
+		Router:   tool.NewRouter(registry),
+		MaxTurns: 3,
+		MultiAgentOverridesForModel: func(modelID string) {
+			refreshed = append(refreshed, modelID)
+		},
+	})
+	if _, err := runtime.Run(context.Background(), &AgentLoopRequest{
+		Prompt: "run echo",
+		Model:  "first-model",
+		StepSettings: func() *AgentStepSettings {
+			return &AgentStepSettings{Model: "second-model"}
+		},
+	}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(refreshed) == 0 || refreshed[0] != "second-model" {
+		t.Fatalf("override refresh models = %#v", refreshed)
 	}
 }
 
@@ -638,6 +834,19 @@ type fakeLoopAgent struct {
 	steerMailbox               *SteerMailbox
 }
 
+type checkpointLoopAgent struct {
+	sequence *uint64
+}
+
+func (a *checkpointLoopAgent) Run(_ context.Context, _ *model.AgentRequest) (*model.AgentResponse, error) {
+	*a.sequence += 4
+	return &model.AgentResponse{
+		ResponseID: "resp-checkpoint",
+		Message:    "done",
+		Items:      []model.AgentItem{{Type: "agent_message", Text: "done"}},
+	}, nil
+}
+
 type countingToolLoopAgent struct {
 	requests   []model.AgentRequest
 	toolRounds int
@@ -1066,6 +1275,58 @@ func TestAgentLoopUsesStepModelForToolTruncationLikeRust(t *testing.T) {
 	}
 }
 
+// Rust #45248: pre/post tool hooks use the captured settings of the step that
+// issued the call, so a mid-turn model or approval-policy update changes the
+// attribution seen by the next step's tools.
+func TestAgentLoopUsesCapturedStepSettingsForToolHooksLikeRust(t *testing.T) {
+	agent := &toolPerStepLoopAgent{}
+	registry := tool.NewRegistry()
+	type seenAttribution struct{ model, effort, permission string }
+	var seen []seenAttribution
+	if err := registry.Register(tool.NewExecutorFunc(tool.Spec{Name: tool.PlainName("echo")}, func(_ context.Context, invocation *tool.Invocation) (*tool.Output, error) {
+		attribution := invocation.StepAttribution
+		if attribution == nil {
+			return nil, errors.New("missing step attribution")
+		}
+		seen = append(seen, seenAttribution{attribution.Model, attribution.ReasoningEffort, attribution.PermissionMode})
+		return &tool.Output{Success: true, Body: "tool result"}, nil
+	})); err != nil {
+		t.Fatalf("register echo: %v", err)
+	}
+	loop := NewAgentLoop(&AgentLoopOptions{
+		Agent:      agent,
+		Dispatcher: NewToolDispatcher(&ToolDispatcherOptions{Router: tool.NewRouter(registry)}),
+		MaxTurns:   4,
+	})
+	_, err := loop.Run(context.Background(), &AgentLoopRequest{
+		Prompt:          "run echo twice",
+		Model:           "gpt-initial",
+		ReasoningEffort: "low",
+		StepSettings: func() *AgentStepSettings {
+			return &AgentStepSettings{
+				Model:              "gpt-updated",
+				ReasoningEffort:    "high",
+				HookPermissionMode: "bypassPermissions",
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	want := []seenAttribution{
+		{model: "gpt-initial", effort: "low"},
+		{model: "gpt-updated", effort: "high", permission: "bypassPermissions"},
+	}
+	if len(seen) != len(want) {
+		t.Fatalf("attributions = %#v, want %#v", seen, want)
+	}
+	for i := range want {
+		if seen[i] != want[i] {
+			t.Fatalf("attribution %d = %#v, want %#v", i, seen[i], want[i])
+		}
+	}
+}
+
 // Rust builds request-scoped world state from the StepContext captured for each
 // sampling request. The Go loop must therefore resolve step input after the
 // step settings refresh and retain the resulting context for later requests.
@@ -1109,5 +1370,16 @@ func TestAgentLoopBuildsStepInputItemsFromCapturedStepLikeRust(t *testing.T) {
 	}
 	if !inputItemsContainText(result.InputItems, "guidance for gpt-updated") {
 		t.Fatalf("step input was not retained in the turn: %#v", result.InputItems)
+	}
+}
+
+func TestAgentLoopPromptCacheTTLOmittedWhenUnsetLikeRust(t *testing.T) {
+	agent := &singleTurnAgent{}
+	loop := NewAgentLoop(&AgentLoopOptions{Agent: agent, MaxTurns: 1})
+	if _, err := loop.Run(context.Background(), &AgentLoopRequest{Prompt: "hello", Model: "gpt-test"}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(agent.requests) != 1 || agent.requests[0].PromptCacheTTL != "" {
+		t.Fatalf("requests = %#v, want omitted prompt cache TTL", agent.requests)
 	}
 }

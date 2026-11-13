@@ -34,6 +34,30 @@ func TestEnvironmentFromChatGPTBaseURL(t *testing.T) {
 	if _, err := EnvironmentFromChatGPTBaseURL("http://localhost:8080"); err == nil {
 		t.Fatalf("custom urls should be rejected")
 	}
+	// Rust #59177: supported ChatGPT subdomains select the environment they
+	// belong to.
+	env, err = EnvironmentFromChatGPTBaseURL("https://us.chatgpt.com/backend-api")
+	if err != nil || env != ChatGPTProduction {
+		t.Fatalf("production subdomain env = %s %v", env, err)
+	}
+	env, err = EnvironmentFromChatGPTBaseURL("https://us.chatgpt-staging.com/backend-api")
+	if err != nil || env != ChatGPTStaging {
+		t.Fatalf("staging subdomain env = %s %v", env, err)
+	}
+	// Rust #59177: lookalike hosts, non-443 ports, userinfo and unknown paths
+	// stay rejected.
+	for _, base := range []string{
+		"http://us.chatgpt.com",
+		"https://chatgpt.com.evil.example",
+		"https://us.chatgpt.com:8443",
+		"https://u@us.chatgpt.com",
+		"https://chatgpt.com/custom",
+		"https://us.chatgpt.com/backend-api?x=1",
+	} {
+		if _, err := EnvironmentFromChatGPTBaseURL(base); err == nil {
+			t.Fatalf("url %q should be rejected", base)
+		}
+	}
 }
 
 func TestAuthorizationHeaderForAgentTask(t *testing.T) {
@@ -123,6 +147,7 @@ func TestDecodeAgentIdentityJWTRejectsUntrustedKID(t *testing.T) {
 	payload, _ := json.Marshal(map[string]any{
 		"iss":                        JWTIssuer,
 		"aud":                        JWTAudience,
+		"iat":                        time.Now().Unix(),
 		"exp":                        time.Now().Add(time.Hour).Unix(),
 		"agent_runtime_id":           "agent-runtime-id",
 		"agent_private_key":          "private-key",
@@ -337,5 +362,58 @@ func writeJSONAgent(t *testing.T, w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(value); err != nil {
 		t.Fatalf("Encode() error = %v", err)
+	}
+}
+
+// TestDecodeJWTPayloadRequiresEveryClaimLikeRust pins serde's decoding rules
+// for AgentIdentityJwtClaims: every field except `email` is mandatory, so a
+// document that omits one fails with Rust's "payload is not valid JSON" text.
+func TestDecodeJWTPayloadRequiresEveryClaimLikeRust(t *testing.T) {
+	full := map[string]any{
+		"iss":                        JWTIssuer,
+		"aud":                        JWTAudience,
+		"iat":                        int64(1700000000),
+		"exp":                        int64(1900000000),
+		"agent_runtime_id":           "agent-runtime-id",
+		"agent_private_key":          "private-key",
+		"account_id":                 "account-id",
+		"chatgpt_user_id":            "user-id",
+		"plan_type":                  "pro",
+		"chatgpt_account_is_fedramp": false,
+	}
+	encode := func(claims map[string]any) string {
+		payload, err := json.Marshal(claims)
+		if err != nil {
+			t.Fatalf("Marshal() error = %v", err)
+		}
+		return "header." + base64.RawURLEncoding.EncodeToString(payload) + ".sig"
+	}
+	if _, err := DecodeJWTPayload(encode(full)); err != nil {
+		t.Fatalf("DecodeJWTPayload(full) error = %v", err)
+	}
+	for _, field := range []string{"iss", "aud", "iat", "exp", "agent_runtime_id", "agent_private_key", "account_id", "chatgpt_user_id", "plan_type", "chatgpt_account_is_fedramp"} {
+		trimmed := map[string]any{}
+		for key, value := range full {
+			if key != field {
+				trimmed[key] = value
+			}
+		}
+		if _, err := DecodeJWTPayload(encode(trimmed)); err == nil || err.Error() != "agent identity JWT payload is not valid JSON" {
+			t.Fatalf("missing %s: error = %v, want Rust's invalid-JSON message", field, err)
+		}
+	}
+	stringIssued := map[string]any{}
+	for key, value := range full {
+		stringIssued[key] = value
+	}
+	stringIssued["iat"] = "1700000000"
+	if _, err := DecodeJWTPayload(encode(stringIssued)); err == nil || err.Error() != "agent identity JWT payload is not valid JSON" {
+		t.Fatalf("string iat: error = %v", err)
+	}
+	if _, err := DecodeJWTPayload("a.b.c"); err == nil || err.Error() != "agent identity JWT payload is not valid base64url" {
+		t.Fatalf("garbage payload: error = %v", err)
+	}
+	if _, err := DecodeJWTPayload("not-a-jwt"); err == nil || err.Error() != "invalid agent identity JWT format" {
+		t.Fatalf("garbage token: error = %v", err)
 	}
 }

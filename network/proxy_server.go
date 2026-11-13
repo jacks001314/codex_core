@@ -64,18 +64,58 @@ type ProxyServer struct {
 	// (Rust NetworkProxyHandle::wait).
 	serveErrMu sync.Mutex
 	serveErr   error
+	// baseEnv is the process environment this proxy was started with; it names
+	// the HTTP CONNECT next hop for upstream-routed TCP traffic (Rust #60523).
+	baseEnv map[string]string
+}
+
+// localAWSSigners lists the signing pairs whose placeholders a local process may
+// use. Credential masking is only meaningful when brokerage and MITM are on.
+func (p *proxyRuntimePolicy) localAWSSigners() []*AWSSigV4Signer {
+	if p == nil || !p.settings.Enabled || !p.settings.CredentialBroker || !p.settings.MITM {
+		return nil
+	}
+	var signers []*AWSSigV4Signer
+	for _, hooks := range p.mitmHooks {
+		for _, hook := range hooks {
+			if hook.Actions.AWSSigV4 != nil {
+				signers = append(signers, hook.Actions.AWSSigV4)
+			}
+		}
+	}
+	return signers
+}
+
+func maskLocalAWSCredentials(policy *proxyRuntimePolicy, env map[string]string, mitm *proxyMITMRuntime) {
+	signers := policy.localAWSSigners()
+	if len(signers) == 0 {
+		return
+	}
+	caPath := ""
+	if mitm != nil {
+		caPath = mitm.trustBundlePath
+	}
+	MaskLocalAWSEnv(signers, env, caPath)
 }
 
 type proxyRuntimePolicy struct {
 	settings         ProxySettings
 	allowMatcher     *ProxyDomainMatcher
 	denyMatcher      *ProxyDomainMatcher
+	reviewMatcher    *ProxyDomainMatcher
 	mitmHooks        ProxyMITMHooksByHost
 	broker           *ProxyCredentialBroker
 	headerInjections []ProxyHeaderInjection
 }
 
 func StartProxyManagedNetwork(ctx context.Context, config ProxyConfig, baseEnv map[string]string) (*PreparedProxyManagedNetwork, error) {
+	return startProxyManagedNetworkWithClient(ctx, config, baseEnv, true)
+}
+
+// startProxyManagedNetworkWithClient builds the managed network environment for
+// a local sandboxed process. Remote environments keep the caller's AWS
+// credentials: only a local process receives the placeholder pair (#56554).
+func startProxyManagedNetworkWithClient(ctx context.Context, config ProxyConfig, baseEnv map[string]string, maskLocalAWS bool) (*PreparedProxyManagedNetwork, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -92,10 +132,13 @@ func StartProxyManagedNetwork(ctx context.Context, config ProxyConfig, baseEnv m
 	if server.socksListener != nil {
 		socksAddr = *server.socksListener.Addr().(*net.TCPAddr)
 	}
-	prepared := PrepareProxyManagedNetwork(baseEnv, httpAddr, socksAddr, server.socksListener != nil, config.Network.AllowLocalBinding)
+	prepared := PrepareProxyManagedNetwork(baseEnv, httpAddr, socksAddr, server.socksListener != nil, config.Network)
 	server.mitm.ApplyChildEnv(prepared.Env)
 	server.runtimePolicy().broker.SetDestinationHints(baseEnv)
 	server.runtimePolicy().broker.VirtualizeChildEnv(prepared.Env)
+	if maskLocalAWS {
+		maskLocalAWSCredentials(server.runtimePolicy(), prepared.Env, server.mitm)
+	}
 	prepared.server = server
 	prepared.baseEnv = cloneProxyEnv(baseEnv)
 	prepared.config = config
@@ -150,6 +193,7 @@ func startProxyServer(parent context.Context, config ProxyConfig, runtimeConfig 
 		auditMetadata: config.AuditMetadata,
 		auditProvider: config.AuditMetadataProvider,
 		environmentID: config.EnvironmentID,
+		baseEnv:       cloneProxyEnv(baseEnv),
 	}
 	server.policy.Store(policy)
 	server.SetProxyPrivateIPsViaUpstream(config.PrivateIPsViaUpstream)
@@ -292,6 +336,10 @@ func buildProxyRuntimePolicy(settings ProxySettings, broker *ProxyCredentialBrok
 	if err != nil {
 		return nil, fmt.Errorf("compile network.denied_domains: %w", err)
 	}
+	reviewMatcher, err := CompileProxyDomainMatcher(settings.ReviewDomains, false)
+	if err != nil {
+		return nil, fmt.Errorf("compile network.review_domains: %w", err)
+	}
 	// A disabled proxy must not activate brokerage even when the settings
 	// still carry credential_broker = true (Rust
 	// core/src/config/network_proxy_spec.rs:381-390).
@@ -303,11 +351,12 @@ func buildProxyRuntimePolicy(settings ProxySettings, broker *ProxyCredentialBrok
 		)
 	}
 	return &proxyRuntimePolicy{
-		settings:     settings,
-		allowMatcher: allowMatcher,
-		denyMatcher:  denyMatcher,
-		mitmHooks:    hooks,
-		broker:       broker,
+		settings:      settings,
+		allowMatcher:  allowMatcher,
+		denyMatcher:   denyMatcher,
+		reviewMatcher: reviewMatcher,
+		mitmHooks:     hooks,
+		broker:        broker,
 	}, nil
 }
 
@@ -1093,13 +1142,36 @@ func (s *ProxyServer) handleHTTPRequest(request *http.Request, ctx *goproxy.Prox
 	// brokered dummy credential is replaced: an unhooked provider alias bound to
 	// a hooked host must not receive the real credential (#52661,
 	// network-proxy/src/http_proxy.rs:910-975).
+	var awsSigner *AWSSigV4Signer
+	var awsGuest *awsGuestSignature
+	var substitution *BodySecretSubstitution
+	bodyFramingSupported := bodySubstitutionHeadersSupported(request.Header)
 	if isMITM || injectCredentials {
-		evaluation := evaluateProxyMITMHookRequest(policy.mitmHooks, policy.broker, host, NewProxyHTTPRequestFromHTTP(request), credentialDestinations)
+		origin := ProxyHookOrigin{Scheme: scheme, Port: int(requestPort)}
+		evaluation := evaluateProxyMITMHookRequest(policy.mitmHooks, policy.broker, host, origin, NewProxyHTTPRequestFromHTTP(request), credentialDestinations)
 		switch evaluation.Kind {
 		case ProxyHookEvaluationHookedNoMatch:
 			return request, proxyBlockedHTTPResponse(request, ProxyReasonMITMHookDenied)
 		case ProxyHookEvaluationMatched:
+			if !proxyPlaceholdersMatch(origin, request.Header, evaluation.Actions) {
+				return request, proxyBlockedHTTPResponse(request, ProxyReasonMITMHookDenied)
+			}
 			if isMITM {
+				// Select the guest credential from the request as it arrived,
+				// before hook actions and brokered credentials rewrite headers.
+				if evaluation.Actions.AWSSigV4 != nil {
+					guest, err := evaluation.Actions.AWSSigV4.Plan(request, PreserveSigningHeaders(request.Header))
+					if err != nil {
+						return request, proxyBlockedHTTPResponse(request, ProxyReasonMITMHookDenied)
+					}
+					if guest != nil {
+						awsSigner = evaluation.Actions.AWSSigV4
+						awsGuest = guest
+					}
+				}
+				if evaluation.Actions.BodySecretSubstitution != nil {
+					substitution = evaluation.Actions.BodySecretSubstitution
+				}
 				applyProxyMITMHookActions(request.Header, evaluation.Actions)
 			}
 		}
@@ -1108,6 +1180,20 @@ func (s *ProxyServer) handleHTTPRequest(request *http.Request, ctx *goproxy.Prox
 		policy.broker.InjectRequestHeadersForDestination(scheme, host, requestPort, path, request.Header)
 	}
 	removeProxyHopByHopRequestHeaders(request.Header)
+	if substitution != nil {
+		if err := substitution.Apply(request, bodyFramingSupported); err != nil {
+			return request, proxyBlockedHTTPResponse(request, ProxyReasonMITMHookDenied)
+		}
+	}
+	if awsSigner != nil && awsGuest != nil {
+		if request.URL != nil && request.URL.Scheme == "" {
+			request.URL.Scheme = scheme
+		}
+		if err := awsSigner.Sign(request, awsGuest); err != nil {
+			return request, proxyBlockedHTTPResponse(request, ProxyReasonMITMHookDenied)
+		}
+		request.TransferEncoding = nil
+	}
 	return request, nil
 }
 
@@ -1176,6 +1262,25 @@ func proxyBlockedHTTPResponse(request *http.Request, reason string) *http.Respon
 
 func proxyBadRequestResponse(request *http.Request, message string) *http.Response {
 	return goproxy.NewResponse(request, goproxy.ContentTypeText, http.StatusBadRequest, message)
+}
+
+// proxyPlaceholdersMatch mirrors Rust's placeholders_match: a placeholder-bound
+// secret is substituted only for HTTPS on 443 when the guest sent exactly that
+// whole header value once.
+func proxyPlaceholdersMatch(origin ProxyHookOrigin, headers http.Header, actions ProxyMITMHookActions) bool {
+	for _, header := range actions.InjectRequestHeaders {
+		if header.Placeholder == "" {
+			continue
+		}
+		if !strings.EqualFold(origin.Scheme, "https") || origin.Port != 443 {
+			return false
+		}
+		values := headers.Values(header.Name)
+		if len(values) != 1 || values[0] != header.Placeholder {
+			return false
+		}
+	}
+	return true
 }
 
 func applyProxyMITMHookActions(headers http.Header, actions ProxyMITMHookActions) {
@@ -1535,13 +1640,17 @@ func (s *ProxyServer) dialSOCKS5Target(ctx context.Context, network string, addr
 		if err != nil {
 			return nil, err
 		}
-		conn, err := s.dialCheckedTarget(ctx, network, address)
+		// UDP cannot ride an HTTP CONNECT tunnel, so it always dials directly.
+		conn, err := s.dialCheckedTargetForProtocol(ctx, network, address, ProxyProtocolSocks5UDP)
 		if err != nil {
 			return nil, err
 		}
 		return &proxyPolicyUDPConn{Conn: conn, server: s, host: host, port: uint16(port)}, nil
 	}
-	return s.dialCheckedTarget(ctx, network, address)
+	if conn, used, err := s.dialSOCKSUpstreamTunnel(ctx, address); used {
+		return conn, err
+	}
+	return s.dialCheckedTargetForProtocol(ctx, network, address, ProxyProtocolSocks5TCP)
 }
 
 type proxyPolicyUDPConn struct {
@@ -1574,11 +1683,24 @@ func (c *proxyPolicyUDPConn) Write(payload []byte) (int, error) {
 	return c.Conn.Write(payload)
 }
 
+// dialCheckedTarget dials a CONNECT-side target: the HTTP transport and the
+// MITM forwarder both go through it.
 func (s *ProxyServer) dialCheckedTarget(ctx context.Context, network string, address string) (net.Conn, error) {
-	settings := s.runtimePolicy().settings
+	return s.dialCheckedTargetForProtocol(ctx, network, address, ProxyProtocolHTTP)
+}
+
+func (s *ProxyServer) dialCheckedTargetForProtocol(ctx context.Context, network string, address string, protocol ProxyProtocol) (net.Conn, error) {
+	policy := s.runtimePolicy()
+	settings := policy.settings
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, err
+	}
+	// Rust #56154: the connect-time re-check for an approved target still
+	// honors an explicit denial, so a denial recorded after policy evaluation
+	// cannot be bypassed by the already-authorized request.
+	if policy.denyMatcher != nil && policy.denyMatcher.Match(host) {
+		return nil, fmt.Errorf("network target rejected by policy")
 	}
 	dialer := net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
 	if ip := proxyIPLiteral(host); ip != nil {
@@ -1597,6 +1719,13 @@ func (s *ProxyServer) dialCheckedTarget(ctx context.Context, network string, add
 			lastErr = fmt.Errorf("network target rejected by policy")
 			continue
 		}
+		// Rust #60523: allowing a hostname must not bypass deny or review rules
+		// written against the addresses it resolves to. A blocked resolution is
+		// reported as a policy denial and the remaining addresses are skipped.
+		if reason := s.resolvedAddressPolicyReason(ctx, protocol, host, port, resolved.IP); reason != "" {
+			lastErr = fmt.Errorf("network target rejected by policy: %s", reason)
+			continue
+		}
 		resolvedHost := resolved.IP.String()
 		if resolved.Zone != "" {
 			resolvedHost += "%" + resolved.Zone
@@ -1611,6 +1740,165 @@ func (s *ProxyServer) dialCheckedTarget(ctx context.Context, network string, add
 		lastErr = fmt.Errorf("no addresses resolved for %s", host)
 	}
 	return nil, lastErr
+}
+
+// resolvedAddressPolicyReason applies destination-scoped deny and review rules
+// to an address the proxy is about to dial (Rust #60523). The audit entry names
+// the requested host, so a denial caused by a resolved address stays
+// attributable to the request that triggered it.
+func (s *ProxyServer) resolvedAddressPolicyReason(ctx context.Context, protocol ProxyProtocol, host string, portText string, ip net.IP) string {
+	if s == nil || ip == nil {
+		return ""
+	}
+	policy := s.runtimePolicy()
+	if policy == nil || (policy.denyMatcher == nil && policy.reviewMatcher == nil) {
+		return ""
+	}
+	port := uint16(0)
+	if parsed, err := strconv.ParseUint(strings.TrimSpace(portText), 10, 16); err == nil {
+		port = uint16(parsed)
+	}
+	request := ProxyPolicyRequest{
+		Protocol:      protocol,
+		Host:          NormalizeProxyHost(host),
+		Port:          port,
+		EnvironmentID: s.environmentID,
+	}
+	for _, spelling := range proxyIPSpellings(ip) {
+		if policy.denyMatcher != nil && policy.denyMatcher.Match(spelling) {
+			decision := DenyProxyDecisionWithSource(ProxyReasonDenied, ProxyDecisionSourceBaselinePolicy)
+			s.emitProxyPolicyAudit(request, decision, false)
+			s.recordBlockedRequest(ctx, request, decision, policy.settings.Mode)
+			return decision.Reason
+		}
+		if policy.reviewMatcher != nil && policy.reviewMatcher.Match(spelling) {
+			// A review rule scoped to this address is not satisfied by an
+			// approval granted for the hostname, so the connection fails closed.
+			decision := DenyProxyDecisionWithSource(ProxyReasonPolicyDenied, ProxyDecisionSourceBaselinePolicy)
+			s.emitProxyPolicyAudit(request, decision, false)
+			s.recordBlockedRequest(ctx, request, decision, policy.settings.Mode)
+			return decision.Reason
+		}
+	}
+	return ""
+}
+
+// proxyIPSpellings lists the textual forms a restrictive rule may use for the
+// same address: the canonical Go form, the four-byte IPv4 form, and the
+// IPv4-mapped IPv6 form, so a rule written as ::ffff:10.0.0.5 also matches a
+// resolved 10.0.0.5.
+func proxyIPSpellings(ip net.IP) []string {
+	if ip == nil {
+		return nil
+	}
+	spellings := []string{ip.String()}
+	if v4 := ip.To4(); v4 != nil {
+		if text := v4.String(); !containsProxySpelling(spellings, text) {
+			spellings = append(spellings, text)
+		}
+		// net.IP.String() renders an IPv4-mapped address as a dotted quad, so
+		// the mapped spelling has to be formatted explicitly.
+		if text := "::ffff:" + v4.String(); !containsProxySpelling(spellings, text) {
+			spellings = append(spellings, text)
+		}
+	} else if v6 := ip.To16(); v6 != nil {
+		if text := v6.String(); !containsProxySpelling(spellings, text) {
+			spellings = append(spellings, text)
+		}
+	}
+	return spellings
+}
+
+func containsProxySpelling(spellings []string, value string) bool {
+	for _, spelling := range spellings {
+		if spelling == value {
+			return true
+		}
+	}
+	return false
+}
+
+// dialSOCKSUpstreamTunnel forwards opaque SOCKS TCP through the configured HTTP
+// CONNECT next hop (Rust #60523 TcpUpstreamProxy). The caller keeps the target
+// policy decision; this only changes how the connection is established. used
+// reports whether an upstream hop applies, so the caller falls back to a direct
+// dial for loopback, local, or upstream-disabled traffic.
+func (s *ProxyServer) dialSOCKSUpstreamTunnel(ctx context.Context, address string) (conn net.Conn, used bool, err error) {
+	if s == nil {
+		return nil, false, nil
+	}
+	policy := s.runtimePolicy()
+	if policy == nil || !policy.settings.AllowUpstreamProxy || !s.mayUseUpstreamProxyForAddress(address) {
+		return nil, false, nil
+	}
+	upstream := ProxyAddressForConnect(s.baseEnv)
+	if upstream == nil || strings.TrimSpace(upstream.Host) == "" {
+		return nil, false, nil
+	}
+	port := strings.TrimSpace(upstream.Port)
+	if port == "" {
+		port = "80"
+	}
+	upstreamAddress := net.JoinHostPort(upstream.Host, port)
+	// Rust #60523 rejects an upstream hop that points back at this proxy: the
+	// tunnel would re-enter the same listener forever.
+	if s.listenerOwnsAddress(upstreamAddress) {
+		return nil, true, fmt.Errorf("upstream proxy loop rejected: %s", upstreamAddress)
+	}
+	dialer := net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	raw, err := dialer.DialContext(ctx, "tcp", upstreamAddress)
+	if err != nil {
+		return nil, true, fmt.Errorf("dial upstream proxy: %w", err)
+	}
+	tunnel, err := authenticateProxyTunnel(ctx, raw, address, upstream.Host, nil)
+	if err != nil {
+		_ = raw.Close()
+		return nil, true, err
+	}
+	return tunnel, true, nil
+}
+
+// listenerOwnsAddress reports whether address is one of this proxy's own listen
+// addresses, which would make an upstream hop a loop.
+func (s *ProxyServer) listenerOwnsAddress(address string) bool {
+	if s == nil {
+		return false
+	}
+	listeners := []net.Listener{s.httpListener}
+	if s.socksListener != nil {
+		listeners = append(listeners, s.socksListener)
+	}
+	host, port, err := net.SplitHostPort(strings.TrimSpace(address))
+	if err != nil {
+		return false
+	}
+	for _, listener := range listeners {
+		if listener == nil {
+			continue
+		}
+		listenHost, listenPort, splitErr := net.SplitHostPort(listener.Addr().String())
+		if splitErr != nil || listenPort != port {
+			continue
+		}
+		if listenHost == host || loopbackUpstreamHostsEqual(listenHost, host) {
+			return true
+		}
+	}
+	return false
+}
+
+// loopbackUpstreamHostsEqual treats a wildcard and loopback spelling of the same
+// port as the same listener, so a loop is still caught when the proxy bound
+// 0.0.0.0 and the upstream names 127.0.0.1.
+func loopbackUpstreamHostsEqual(left, right string) bool {
+	loopback := func(host string) bool {
+		if host == "" || host == "0.0.0.0" || host == "::" {
+			return true
+		}
+		ip := net.ParseIP(host)
+		return ip != nil && ip.IsLoopback()
+	}
+	return loopback(left) && loopback(right)
 }
 
 func socks5Destination(address *statute.AddrSpec) (string, uint16) {
@@ -1671,12 +1959,15 @@ func (s *ProxyServer) evaluateProxyPolicy(ctx context.Context, request ProxyPoli
 		allowMatcher, _ = CompileProxyDomainMatcher(allowlist, false)
 	}
 	allowed := allowMatcher.Match(request.Host)
+	// Rust #56154: managed review selectors precede every ordinary allow rule,
+	// so a matching host is not yet authorized for the pre-approval DNS guard.
+	needsReview := policy.reviewMatcher != nil && policy.reviewMatcher.Match(request.Host)
 	if !settings.AllowLocalBinding {
-		if baselineLocalBindingReason(request, allowlist, allowed) != "" {
+		if baselineLocalBindingReason(request, allowlist, allowed && !needsReview) != "" {
 			return deny(ProxyReasonNotAllowedLocal, ProxyDecisionSourceBaselinePolicy)
 		}
 	}
-	if len(allowlist) > 0 && allowed {
+	if !needsReview && len(allowlist) > 0 && allowed {
 		decision := AllowProxyDecision()
 		decision.Source = ProxyDecisionSourceBaselinePolicy
 		decision.Reason = "allow"
@@ -1716,11 +2007,11 @@ func (s *ProxyServer) evaluateProxyPolicy(ctx context.Context, request ProxyPoli
 // branch only runs for a host that is already allowlisted. A request that is
 // merely *decidable* (policyDecider configured) is not yet authorized to touch
 // DNS; an approval grants that later, in approvedLocalBindingReason.
-func baselineLocalBindingReason(request ProxyPolicyRequest, allowlist []string, allowlisted bool) string {
+func baselineLocalBindingReason(request ProxyPolicyRequest, allowlist []string, authorized bool) string {
 	if handled, reason := literalLocalBindingReason(request, allowlist); handled {
 		return reason
 	}
-	if allowlisted && proxyHostResolvesToNonPublicIP(request.Host, request.Port) {
+	if authorized && proxyHostResolvesToNonPublicIP(request.Host, request.Port) {
 		return ProxyReasonNotAllowedLocal
 	}
 	return ""
@@ -1796,9 +2087,6 @@ func (s *ProxyServer) recordBlockedRequest(ctx context.Context, request ProxyPol
 }
 
 func (s *ProxyServer) emitProxyPolicyAudit(request ProxyPolicyRequest, decision ProxyDecision, policyOverride bool) {
-	if s.auditSink == nil {
-		return
-	}
 	value := "allow"
 	if !decision.Allow {
 		value = string(decision.Decision)
@@ -1810,7 +2098,7 @@ func (s *ProxyServer) emitProxyPolicyAudit(request ProxyPolicyRequest, decision 
 	if s.auditProvider != nil {
 		metadata = s.auditProvider(request)
 	}
-	s.auditSink(ProxyPolicyAuditEvent{
+	event := ProxyPolicyAuditEvent{
 		Request:        request,
 		Timestamp:      time.Now().UTC().Format(time.RFC3339Nano),
 		Scope:          "domain",
@@ -1821,7 +2109,11 @@ func (s *ProxyServer) emitProxyPolicyAudit(request ProxyPolicyRequest, decision 
 		Reason:         decision.Reason,
 		PolicyOverride: policyOverride,
 		Metadata:       metadata,
-	})
+	}
+	logProxyPolicyAudit(event)
+	if s.auditSink != nil {
+		s.auditSink(event)
+	}
 }
 
 func proxyAddrString(address net.Addr) string {

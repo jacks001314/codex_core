@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -43,9 +44,9 @@ func TestParseResponsesStreamRecoversDeclaredCustomToolFromFunctionCallEnvelope(
 	}
 }
 
-// TestResponseFailedErrorClassifiesPolicyCodesLikeRust mirrors Rust #46306:
-// a streaming `bio_policy` failure keeps its own non-retryable classification
-// while `invalid_prompt` stays a generic invalid request.
+// TestResponseFailedErrorClassifiesPolicyCodesLikeRust mirrors Rust
+// #46306/#47353: streaming `bio_policy` and `invalid_prompt` failures keep
+// their own non-retryable classifications.
 func TestResponseFailedErrorClassifiesPolicyCodesLikeRust(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -76,10 +77,10 @@ func TestResponseFailedErrorClassifiesPolicyCodesLikeRust(t *testing.T) {
 			wantMessage: BioPolicyFallbackMessage,
 		},
 		{
-			name:        "invalid prompt stays an invalid request",
+			name:        "invalid prompt keeps its own classification",
 			code:        "invalid_prompt",
 			message:     "bad prompt",
-			wantKind:    codexapi.ErrorInvalidRequest,
+			wantKind:    codexapi.ErrorInvalidPrompt,
 			wantMessage: "bad prompt",
 		},
 	}
@@ -257,6 +258,35 @@ func TestResponsesStreamAccumulatorPrefersAccumulatedFunctionArguments(t *testin
 	acc.applyToolInputDeltas(item)
 	if item.Arguments != `{"cmd":"echo ok"}` {
 		t.Fatalf("function arguments = %q, want accumulated delta", item.Arguments)
+	}
+}
+
+// Mirrors Rust #57563: once an output item is complete, the accumulator keeps
+// only the item it will return and releases the separately accumulated tool
+// argument payload instead of holding both until the response ends.
+func TestResponsesStreamAccumulatorReleasesCompletedToolInputDeltas(t *testing.T) {
+	acc := newResponsesStreamAccumulator(&AgentRequest{})
+	deltas := []string{
+		`{"type":"response.function_call_arguments.delta","item_id":"call-item","call_id":"call-1","delta":"{\"cmd\":"}`,
+		`{"type":"response.function_call_arguments.delta","item_id":"call-item","call_id":"call-1","delta":"\"echo ok\"}"}`,
+	}
+	for _, data := range deltas {
+		if _, err := acc.apply(&responsesSSEEvent{Event: "response.function_call_arguments.delta", Data: []byte(data)}, nil); err != nil {
+			t.Fatalf("apply delta error = %v", err)
+		}
+	}
+	if len(acc.functionCallArgDeltas) == 0 {
+		t.Fatal("the accumulator did not retain the in-flight argument deltas")
+	}
+	done := `{"type":"response.output_item.done","item":{"id":"call-item","type":"function_call","name":"echo","call_id":"call-1","arguments":""}}`
+	if _, err := acc.apply(&responsesSSEEvent{Event: "response.output_item.done", Data: []byte(done)}, nil); err != nil {
+		t.Fatalf("apply done error = %v", err)
+	}
+	if len(acc.functionCallArgDeltas) != 0 {
+		t.Fatalf("completed item kept %d argument buffers: %#v", len(acc.functionCallArgDeltas), acc.functionCallArgDeltas)
+	}
+	if len(acc.items) != 1 || acc.items[0].Arguments != `{"cmd":"echo ok"}` {
+		t.Fatalf("completed items = %#v, want the applied arguments", acc.items)
 	}
 }
 
@@ -563,8 +593,10 @@ func TestResponseFailedErrorClassifiesRateLimitExceededLikeRust(t *testing.T) {
 	if !ok {
 		t.Fatal("retry delay not reported for rate_limit_exceeded")
 	}
-	if delay.Milliseconds() != 11054 {
-		t.Fatalf("retry delay = %v, want 11054ms", delay)
+	// The parser applies a small safety offset and time.Duration.Milliseconds
+	// truncates, so compare against the message's value with a narrow bound.
+	if delay < 11050*time.Millisecond || delay > 11060*time.Millisecond {
+		t.Fatalf("retry delay = %v, want about 11054ms", delay)
 	}
 }
 
@@ -587,7 +619,7 @@ func TestResponseFailedErrorDistinguishesCapacityFromSlowDownLikeRust(t *testing
 			t.Fatal("slow_down should be retryable")
 		}
 		delay, ok := codexapi.RetryDelayInfo(err)
-		if !ok || delay != 3*time.Second {
+		if !ok || delay < 2990*time.Millisecond || delay > 3*time.Second {
 			t.Fatalf("retry delay = %v (ok=%v), want 3s", delay, ok)
 		}
 	})
@@ -674,5 +706,270 @@ func TestResponseFailedErrorUnknownCodeStaysRetryableLikeRust(t *testing.T) {
 	}
 	if _, ok := codexapi.RetryDelayInfo(err); ok {
 		t.Fatal("retry delay reported for unknown error code, want none (Rust preserves only unclassified codes as Retryable without delay)")
+	}
+}
+
+// TestModelNotFoundStreamErrorsTerminateLikeRust mirrors Rust #56445: a
+// statusless `model_not_found` arrives either as a streamed `error` event or as
+// the `response.error` payload of `response.failed`, ends the turn without
+// retries, and keeps the provider message.
+func TestModelNotFoundStreamErrorsTerminateLikeRust(t *testing.T) {
+	t.Run("response.failed", func(t *testing.T) {
+		raw := `{"type":"response.failed","response":{"error":{"code":"model_not_found","message":"Access to this deployment ended."}}}`
+		err := responseFailedError([]byte(raw))
+		var apiErr *codexapi.APIError
+		if !errors.As(err, &apiErr) || apiErr.Kind != codexapi.ErrorModelNotFound {
+			t.Fatalf("error = %#v, want modelNotFound", err)
+		}
+		if apiErr.Status != 0 {
+			t.Fatalf("status = %d, want 0 for a statusless stream error", apiErr.Status)
+		}
+		if apiErr.Message != "Access to this deployment ended." {
+			t.Fatalf("message = %q, want the provider message", apiErr.Message)
+		}
+		if isRetryableResponsesStreamError(err) {
+			t.Fatal("model_not_found must not be retryable")
+		}
+	})
+
+	t.Run("statusless streamed error event", func(t *testing.T) {
+		acc := &responsesStreamAccumulator{}
+		_, err := acc.apply(&responsesSSEEvent{
+			Event: "error",
+			Data:  []byte(`{"type":"error","error":{"code":"model_not_found","message":"Access to this deployment ended."}}`),
+		}, nil)
+		var apiErr *codexapi.APIError
+		if !errors.As(err, &apiErr) || apiErr.Kind != codexapi.ErrorModelNotFound {
+			t.Fatalf("error = %#v, want modelNotFound", err)
+		}
+		if apiErr.Status != 0 || apiErr.Message != "Access to this deployment ended." {
+			t.Fatalf("error = %#v, want status 0 and the provider message", apiErr)
+		}
+		if isRetryableResponsesStreamError(err) {
+			t.Fatal("model_not_found must not be retryable")
+		}
+	})
+
+	t.Run("blank message falls back to the code", func(t *testing.T) {
+		err := responseFailedError([]byte(`{"type":"response.failed","response":{"error":{"code":"model_not_found"}}}`))
+		var apiErr *codexapi.APIError
+		if !errors.As(err, &apiErr) || apiErr.Kind != codexapi.ErrorModelNotFound {
+			t.Fatalf("error = %#v, want modelNotFound", err)
+		}
+		if apiErr.Message != "model_not_found" {
+			t.Fatalf("message = %q, want model_not_found", apiErr.Message)
+		}
+	})
+}
+
+// Mirrors Rust #57452 (sse/responses_error_tests.rs
+// policy_capacity_classification_preserves_overload_retry_behavior): the
+// explicit policy code keeps its own terminal classification while the overload
+// code ignores a policy error type, and both retry only with server advice.
+func TestResponseFailedPolicyCapacityClassificationLikeRust(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		code       string
+		errorType  string
+		retryAfter string
+		wantKind   codexapi.APIErrorKind
+		wantText   string
+	}{
+		{
+			name:       "policy capacity with advice",
+			code:       "policy_capacity_unavailable",
+			retryAfter: "3",
+			wantKind:   codexapi.ErrorPolicyCapacityUnavailable,
+			wantText:   "Policy-restricted capacity is unavailable. Please try again later.",
+		},
+		{
+			name:     "policy capacity without advice",
+			code:     "policy_capacity_unavailable",
+			wantKind: codexapi.ErrorPolicyCapacityUnavailable,
+			wantText: "Policy-restricted capacity is unavailable. Please try again later.",
+		},
+		{
+			name:       "overload with policy error type",
+			code:       "server_is_overloaded",
+			errorType:  "policy_error",
+			retryAfter: "3",
+			wantKind:   codexapi.ErrorServerOverloaded,
+			wantText:   "Selected model is at capacity. Please try a different model.",
+		},
+		{
+			name:     "overload without policy error type",
+			code:     "server_is_overloaded",
+			wantKind: codexapi.ErrorServerOverloaded,
+			wantText: "Selected model is at capacity. Please try a different model.",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			errorBody := map[string]any{"code": testCase.code}
+			if testCase.errorType != "" {
+				errorBody["type"] = testCase.errorType
+			}
+			if testCase.retryAfter != "" {
+				errorBody["headers"] = map[string]any{"Retry-After": testCase.retryAfter}
+			}
+			raw, err := json.Marshal(map[string]any{
+				"type":     "response.failed",
+				"response": map[string]any{"error": errorBody},
+			})
+			if err != nil {
+				t.Fatalf("marshal event: %v", err)
+			}
+			failed := responseFailedError(raw)
+			var apiErr *codexapi.APIError
+			if !errors.As(failed, &apiErr) || apiErr.Kind != testCase.wantKind {
+				t.Fatalf("error = %#v, want kind %q", failed, testCase.wantKind)
+			}
+			if apiErr.Error() != testCase.wantText {
+				t.Fatalf("display = %q, want %q", apiErr.Error(), testCase.wantText)
+			}
+			if got := isRetryableResponsesStreamError(failed); got != (testCase.retryAfter != "") {
+				t.Fatalf("retryable = %t, want %t", got, testCase.retryAfter != "")
+			}
+			delay, advised := codexapi.RetryDelayInfo(failed)
+			if advised != (testCase.retryAfter != "") {
+				t.Fatalf("retry advice present = %t, want %t", advised, testCase.retryAfter != "")
+			}
+			if advised && (delay < 2990*time.Millisecond || delay > 3*time.Second) {
+				t.Fatalf("retry advice = %s, want 3s", delay)
+			}
+		})
+	}
+}
+
+func TestWebsocketErrorEventInvalidPromptRequiresHTTP400LikeRust(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		status     any
+		message    string
+		wantKind   codexapi.APIErrorKind
+		wantStatus int
+		wantText   string
+	}{
+		{
+			name:       "bad request with message",
+			status:     http.StatusBadRequest,
+			message:    "The prompt is invalid.",
+			wantKind:   codexapi.ErrorInvalidPrompt,
+			wantStatus: http.StatusBadRequest,
+			wantText:   "The prompt is invalid.",
+		},
+		{
+			name:       "bad request without message",
+			status:     http.StatusBadRequest,
+			wantKind:   codexapi.ErrorInvalidPrompt,
+			wantStatus: http.StatusBadRequest,
+			wantText:   InvalidPromptFallbackMessage,
+		},
+		{name: "missing status"},
+		{name: "internal error", status: http.StatusInternalServerError},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			errorBody := map[string]any{"code": "invalid_prompt"}
+			if testCase.message != "" {
+				errorBody["message"] = testCase.message
+			}
+			event := map[string]any{"type": "error", "error": errorBody}
+			if testCase.status != nil {
+				event["status"] = testCase.status
+			}
+			apiErr := websocketErrorEventAPIError(event)
+			if testCase.wantKind == "" {
+				if apiErr != nil {
+					t.Fatalf("event classified as %#v, want the generic path", apiErr)
+				}
+				return
+			}
+			if apiErr == nil || apiErr.Kind != testCase.wantKind {
+				t.Fatalf("error = %#v, want kind %q", apiErr, testCase.wantKind)
+			}
+			if apiErr.Status != testCase.wantStatus || apiErr.Error() != testCase.wantText {
+				t.Fatalf("error = status:%d display:%q, want status:%d display:%q", apiErr.Status, apiErr.Error(), testCase.wantStatus, testCase.wantText)
+			}
+			if isRetryableResponsesStreamError(apiErr) {
+				t.Fatal("invalid_prompt must be terminal")
+			}
+		})
+	}
+}
+
+// Mirrors Rust #57452's WebSocket terminal attribution: a policy or overload
+// capacity event keeps its classification with or without server advice, and
+// retries only when that advice is present.
+func TestWebsocketErrorEventCapacityClassificationLikeRust(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		code       string
+		retryAfter string
+		wantKind   codexapi.APIErrorKind
+		wantText   string
+	}{
+		{
+			name:       "policy capacity with advice",
+			code:       "policy_capacity_unavailable",
+			retryAfter: "1",
+			wantKind:   codexapi.ErrorPolicyCapacityUnavailable,
+			wantText:   "Policy-restricted capacity is unavailable. Please try again later.",
+		},
+		{
+			name:     "policy capacity without advice",
+			code:     "policy_capacity_unavailable",
+			wantKind: codexapi.ErrorPolicyCapacityUnavailable,
+			wantText: "Policy-restricted capacity is unavailable. Please try again later.",
+		},
+		{
+			name:       "server overload with advice",
+			code:       "server_is_overloaded",
+			retryAfter: "1",
+			wantKind:   codexapi.ErrorServerOverloaded,
+			wantText:   "Selected model is at capacity. Please try a different model.",
+		},
+		{
+			name:     "server overload without advice",
+			code:     "server_is_overloaded",
+			wantKind: codexapi.ErrorServerOverloaded,
+			wantText: "Selected model is at capacity. Please try a different model.",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			errorBody := map[string]any{"code": testCase.code, "message": "This model is disabled."}
+			if testCase.retryAfter != "" {
+				errorBody["headers"] = map[string]any{"Retry-After": testCase.retryAfter}
+			}
+			event := map[string]any{
+				"type":   "error",
+				"status": float64(http.StatusServiceUnavailable),
+				"error":  errorBody,
+			}
+			apiErr := websocketErrorEventAPIError(event)
+			if apiErr == nil {
+				t.Fatal("capacity event was not classified")
+			}
+			if apiErr.Kind != testCase.wantKind {
+				t.Fatalf("kind = %q, want %q", apiErr.Kind, testCase.wantKind)
+			}
+			if apiErr.Error() != testCase.wantText {
+				t.Fatalf("display = %q, want %q", apiErr.Error(), testCase.wantText)
+			}
+			if got := isRetryableResponsesStreamError(apiErr); got != (testCase.retryAfter != "") {
+				t.Fatalf("retryable = %t, want %t", got, testCase.retryAfter != "")
+			}
+			_, advised := codexapi.RetryDelayInfo(apiErr)
+			if advised != (testCase.retryAfter != "") {
+				t.Fatalf("retry advice present = %t, want %t", advised, testCase.retryAfter != "")
+			}
+		})
+	}
+
+	// Headerless rate limits keep the existing generic-error path.
+	headerlessRateLimit := map[string]any{
+		"type":  "error",
+		"error": map[string]any{"code": "rate_limit_exceeded", "message": "slow down"},
+	}
+	if apiErr := websocketErrorEventAPIError(headerlessRateLimit); apiErr != nil {
+		t.Fatalf("headerless rate limit classified as %#v, want the generic path", apiErr)
 	}
 }

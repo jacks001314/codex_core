@@ -202,6 +202,56 @@ func TestPersistChatGPTTokens(t *testing.T) {
 	}
 }
 
+func TestChatGPTRefreshUsesRecordedOAuthProvenance(t *testing.T) {
+	home := t.TempDir()
+	var clientID, refreshToken string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/oauth/token" {
+			http.NotFound(writer, request)
+			return
+		}
+		var body map[string]string
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			http.Error(writer, err.Error(), http.StatusBadRequest)
+			return
+		}
+		clientID = body["client_id"]
+		refreshToken = body["refresh_token"]
+		_, _ = writer.Write([]byte(`{"access_token":"new-access","refresh_token":"new-refresh"}`))
+	}))
+	defer server.Close()
+	if err := PersistChatGPTTokens(home, &ExchangedTokens{
+		AccessToken: "old-access", RefreshToken: "old-refresh",
+		Issuer: server.URL, ClientID: "client-from-login",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := NewStore(home).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	loginOwner := before.Tokens["login_owner_id"]
+	if _, err := RefreshChatGPTTokens(context.Background(), &RefreshChatGPTTokenOptions{
+		CodexHome: home, HTTPClient: server.Client(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if clientID != "client-from-login" || refreshToken != "old-refresh" {
+		t.Fatalf("refresh provenance = client %q token %q", clientID, refreshToken)
+	}
+	after, err := NewStore(home).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenance := oauthProvenanceFromTokens(after.Tokens)
+	if provenance.Issuer != server.URL || provenance.ClientID != "client-from-login" {
+		t.Fatalf("stored provenance = %#v", provenance)
+	}
+	if after.Tokens["login_owner_id"] != loginOwner || loginOwner == "" {
+		t.Fatalf("login owner rotated: before=%v after=%v", loginOwner, after.Tokens["login_owner_id"])
+	}
+}
+
 func TestLogoutWithRevokeRevokesRefreshTokenThenRemovesAuth(t *testing.T) {
 	home := t.TempDir()
 	jwt := fakeJWT(map[string]any{"chatgpt_account_id": "account-123"})
@@ -738,13 +788,17 @@ func TestStartBrowserLoginRedirectsToSuccessPage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartBrowserLogin returned error: %v", err)
 	}
+	// Rust #47927: the authorize URL and success page use 127.0.0.1.
+	if !strings.Contains(server.AuthURL, "redirect_uri=http%3A%2F%2F127.0.0.1%3A"+portStringOAuthTest(server.Port)+"%2Fauth%2Fcallback") {
+		t.Fatalf("AuthURL = %q, want a 127.0.0.1 redirect_uri", server.AuthURL)
+	}
 	callback := "http://127.0.0.1:" + portStringOAuthTest(server.Port) + "/auth/callback?code=auth-code&state=state-browser"
 	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	resp, err := client.Get(callback)
 	if err != nil {
 		t.Fatalf("callback GET returned error: %v", err)
 	}
-	if resp.StatusCode != http.StatusFound || !strings.Contains(resp.Header.Get("Location"), "/success?") {
+	if resp.StatusCode != http.StatusFound || !strings.HasPrefix(resp.Header.Get("Location"), "http://127.0.0.1:") || !strings.Contains(resp.Header.Get("Location"), "/success?") {
 		t.Fatalf("callback status=%d location=%q", resp.StatusCode, resp.Header.Get("Location"))
 	}
 	_ = resp.Body.Close()

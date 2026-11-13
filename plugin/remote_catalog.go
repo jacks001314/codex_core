@@ -20,6 +20,12 @@ const (
 	RemoteCatalogScopeUser      = "USER"
 	RemoteCatalogScopeWorkspace = "WORKSPACE"
 
+	RemoteCreatedByMeMarketplaceName       = "created-by-me-remote"
+	RemoteWorkspaceMarketplaceName         = "workspace-directory"
+	RemoteWorkspaceSharedWithMeMarketplace = "workspace-shared-with-me"
+	RemoteWorkspaceSharedWithMePrivate     = "workspace-shared-with-me-private"
+	RemoteWorkspaceSharedWithMeUnlisted    = "workspace-shared-with-me-unlisted"
+
 	remoteCatalogCacheDir    = "cache/remote_plugin_catalog"
 	remoteCatalogPageLimit   = 100
 	remoteCatalogCacheTTL    = 10 * time.Minute
@@ -37,6 +43,9 @@ type RemoteCatalogOptions struct {
 	CodexHome    string
 	HTTPClient   HTTPDoer
 	ForceRefresh bool
+	// RuntimeAuth resolves runtime request credentials per request when runtime
+	// agent instances are enabled (Rust #59564).
+	RuntimeAuth RuntimeAuthProvider
 }
 
 // RemoteCatalogRelease is the release metadata returned by the remote catalog.
@@ -79,9 +88,9 @@ type remoteCatalogCacheFile struct {
 func RemoteMarketplaceNameForScope(scope string) string {
 	switch strings.ToUpper(strings.TrimSpace(scope)) {
 	case RemoteCatalogScopeUser:
-		return "created-by-me-remote"
+		return RemoteCreatedByMeMarketplaceName
 	case RemoteCatalogScopeWorkspace:
-		return "workspace-directory"
+		return RemoteWorkspaceMarketplaceName
 	default:
 		return RemoteGlobalMarketplaceName
 	}
@@ -93,9 +102,12 @@ func RemoteCatalogScopeForMarketplace(name string) (string, bool) {
 	switch strings.TrimSpace(name) {
 	case RemoteGlobalMarketplaceName:
 		return RemoteCatalogScopeGlobal, true
-	case "created-by-me-remote":
+	case RemoteCreatedByMeMarketplaceName:
 		return RemoteCatalogScopeUser, true
-	case "workspace-directory", "workspace-shared-with-me":
+	case RemoteWorkspaceMarketplaceName,
+		RemoteWorkspaceSharedWithMeMarketplace,
+		RemoteWorkspaceSharedWithMePrivate,
+		RemoteWorkspaceSharedWithMeUnlisted:
 		return RemoteCatalogScopeWorkspace, true
 	default:
 		return "", false
@@ -177,6 +189,9 @@ func FetchRemotePluginDetail(ctx context.Context, opts *RemoteCatalogOptions, re
 		sku = CODEXProductSKU
 	}
 	request.Header.Set("OAI-Product-Sku", sku)
+	if err := ApplyRuntimeAuth(requestCtx, request, opts.RuntimeAuth); err != nil {
+		return nil, fmt.Errorf("authorize remote plugin request: %w", err)
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("fetch remote plugin detail: %w", err)
@@ -234,6 +249,10 @@ func fetchRemoteCatalogPages(ctx context.Context, opts *RemoteCatalogOptions, ba
 			sku = CODEXProductSKU
 		}
 		request.Header.Set("OAI-Product-Sku", sku)
+		if err := ApplyRuntimeAuth(requestCtx, request, opts.RuntimeAuth); err != nil {
+			cancel()
+			return nil, fmt.Errorf("authorize remote plugin request: %w", err)
+		}
 		response, err := client.Do(request)
 		if err != nil {
 			cancel()
@@ -262,11 +281,16 @@ func remoteCatalogCachePath(opts *RemoteCatalogOptions, baseURL, scope string) (
 	if home == "" {
 		return "", false
 	}
+	productSKU := strings.TrimSpace(opts.ProductSKU)
+	if productSKU == "" {
+		productSKU = CODEXProductSKU
+	}
 	key := strings.Join([]string{
 		baseURL,
 		strings.TrimSpace(opts.AccountID),
 		scope,
 		strings.TrimSpace(opts.Collection),
+		productSKU,
 	}, "\x00")
 	sum := sha256.Sum256([]byte(key))
 	return filepath.Join(home, remoteCatalogCacheDir, hex.EncodeToString(sum[:])+".json"), true
@@ -358,6 +382,9 @@ func remotePluginMutation(ctx context.Context, opts *RemoteCatalogOptions, remot
 		sku = CODEXProductSKU
 	}
 	request.Header.Set("OAI-Product-Sku", sku)
+	if err := ApplyRuntimeAuth(requestCtx, request, opts.RuntimeAuth); err != nil {
+		return nil, fmt.Errorf("authorize remote plugin request: %w", err)
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("remote plugin %s failed: %w", action, err)

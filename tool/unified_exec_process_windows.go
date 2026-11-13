@@ -43,14 +43,13 @@ func startUnifiedExecWindowsSandboxCommand(req *ShellRequest) (*startedUnifiedEx
 		Capture: windowssandbox.CaptureRequest{
 			PermissionProfileID:    req.PermissionProfileID,
 			PermissionProfile:      req.PermissionProfile,
-			WorkspaceRoots:         []string{req.CWD},
+			WorkspaceRoots:         windowsCaptureWorkspaceRoots(req.WorkspaceRoots, req.CWD),
 			CodexHome:              codexHome,
 			Command:                append([]string(nil), req.Command...),
 			CWD:                    req.CWD,
 			Env:                    env,
 			TTY:                    req.TTY,
 			StdinOpen:              req.TTY,
-			UsePrivateDesktop:      req.WindowsSandboxPrivateDesktop,
 			ProxyEnforced:          req.EnforceManagedNetwork,
 			ProxySettingsMode:      windowsSandboxProxySettingsMode(req.WindowsSandboxProxySettingsMode),
 			DisallowSetupElevation: req.ApprovalPolicy == sandbox.ApprovalNever,
@@ -80,28 +79,58 @@ func startUnifiedExecCommand(cmd *osexec.Cmd, tty bool) (*startedUnifiedExecComm
 	// Rust #48483: a piped unified-exec child must not allocate a console window
 	// when the runner itself has no console (shared app-server daemon).
 	envutil.SuppressConsoleWindow(cmd)
-	stdout, err := cmd.StdoutPipe()
+	// Own the output pipes instead of using cmd.StdoutPipe: os/exec's Wait
+	// closes the pipes it created as soon as the child exits, so a process that
+	// writes and exits quickly can lose its buffered output before the reader
+	// goroutines drain it.
+	stdout, stdoutWriter, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
-	stderr, err := cmd.StderrPipe()
+	stderr, stderrWriter, err := os.Pipe()
 	if err != nil {
+		_ = stdout.Close()
+		_ = stdoutWriter.Close()
 		return nil, err
 	}
+	cmd.Stdout = stdoutWriter
+	cmd.Stderr = stderrWriter
 	var stdin io.WriteCloser
 	if tty {
 		stdin, err = cmd.StdinPipe()
 		if err != nil {
+			_ = stdout.Close()
+			_ = stdoutWriter.Close()
+			_ = stderr.Close()
+			_ = stderrWriter.Close()
 			return nil, err
 		}
 	}
 	if err := cmd.Start(); err != nil {
+		if stdin != nil {
+			_ = stdin.Close()
+		}
+		_ = stdout.Close()
+		_ = stdoutWriter.Close()
+		_ = stderr.Close()
+		_ = stderrWriter.Close()
 		return nil, err
 	}
+	// The child owns its duplicated ends now; the parent's copies must close or
+	// the readers never see EOF.
+	_ = stdoutWriter.Close()
+	_ = stderrWriter.Close()
 	return &startedUnifiedExecCommand{stdin: stdin, readers: []io.ReadCloser{stdout, stderr}}, nil
 }
 
 func interruptUnifiedExecProcess(process *os.Process) error {
+	if process == nil {
+		return nil
+	}
+	return process.Kill()
+}
+
+func terminateUnifiedExecProcess(process *os.Process) error {
 	if process == nil {
 		return nil
 	}

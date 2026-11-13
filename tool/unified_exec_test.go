@@ -24,9 +24,27 @@ import (
 	"codex_core/execpolicy"
 	"codex_core/execserver"
 	"codex_core/network"
+	"codex_core/protocol"
 	"codex_core/sandbox"
 	"github.com/coder/websocket"
 )
+
+func TestUnifiedExecLaunchContextCarriesW3CTraceLikeRust(t *testing.T) {
+	ctx := protocol.WithTraceContext(context.Background(), &protocol.W3CTraceContext{
+		Traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+	})
+	launchCtx, cancel := unifiedExecLaunchContext(ctx)
+	defer cancel()
+	trace := execserver.TraceContextFromContext(launchCtx)
+	if trace.TraceID != "4bf92f3577b34da6a3ce929d0e0e4736" || trace.SpanID != "00f067aa0ba902b7" {
+		t.Fatalf("launch trace = %#v", trace)
+	}
+	untracedCtx, untracedCancel := unifiedExecLaunchContext(context.Background())
+	defer untracedCancel()
+	if trace := execserver.TraceContextFromContext(untracedCtx); !trace.IsZero() {
+		t.Fatalf("untraced launch context = %#v", trace)
+	}
+}
 
 // TestExecEnvPolicyFromShellPolicy pins the unified-exec wire conversion of
 // the selected environment's shell environment policy (#38902): the exec-server
@@ -752,6 +770,18 @@ func TestUnifiedExecRemoteNetworkProxyLaunchWireShapeLikeRust(t *testing.T) {
 	}
 }
 
+// finalPollQuietStreamReads is the `process/read` Go's quiet-stream reconcile
+// issues while the output-open-at-final-poll scenario is still collecting. The
+// reconcile fires after a second of silence, so it only happens when the
+// initial collection stays open longer than that: the Windows initial-yield
+// floor, not the 250ms floor Unix uses.
+func finalPollQuietStreamReads() int {
+	if runtime.GOOS == "windows" {
+		return 1
+	}
+	return 0
+}
+
 func TestUnifiedExecConsumesPushedRemoteEventsAndRecoversReplayLikeRust(t *testing.T) {
 	type scenario struct {
 		name      string
@@ -773,10 +803,12 @@ func TestUnifiedExecConsumesPushedRemoteEventsAndRecoversReplayLikeRust(t *testi
 		// output plus the exit code, emit the command completion event and
 		// remove the background session. Rust also asserts
 		// `process_read_requests == 0`; Go additionally reconciles a quiet
-		// event stream with one `process/read` per second
-		// (unified_exec.go:1518-1532), which is the single read this scenario
-		// records: the fixture answers it with the live state, never an exit.
-		{name: "output-open-at-final-poll", finalPoll: true, wantReads: 1, wantBytes: len("pushed remote output\n")},
+		// event stream with one `process/read` per second. That reconcile can
+		// only fire while the first collection is still open, and Unix stops
+		// collecting at the 250ms yield floor, so only the Windows floor of ten
+		// seconds leaves the window open: the fixture answers the read with the
+		// live state, never an exit.
+		{name: "output-open-at-final-poll", finalPoll: true, wantReads: finalPollQuietStreamReads(), wantBytes: len("pushed remote output\n")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			readCount := make(chan int, 1)
@@ -951,11 +983,12 @@ func TestUnifiedExecConsumesPushedRemoteEventsAndRecoversReplayLikeRust(t *testi
 				// Rust's initial exec_command asks for `yield_time_ms: 1_000`
 				// (unified_exec_process_events.rs:859) and keeps the executor's
 				// output stream open past that deadline. The fixture asks for the
-				// smallest initial yield, which Go raises to the Windows floor
-				// (unified_exec.go:1414-1417, matching Rust's documented
-				// "Effective range on Windows is 10000-30000 ms"), so the stage-one
-				// window outlasts pollRemote's one-second reconcile and exactly one
-				// compatibility read happens before the exit is pushed.
+				// smallest initial yield, which Go raises to its floor
+				// (clampUnifiedExecInitialYield): ten seconds on Windows, matching
+				// Rust's documented "Effective range on Windows is 10000-30000 ms",
+				// and 250ms elsewhere. Only the longer window outlasts pollRemote's
+				// one-second reconcile, so only Windows sees that read before the
+				// exit is pushed.
 				initialYield = unifiedExecMinYieldMS
 			}
 			result, err := manager.Exec(context.Background(), &ShellRequest{
@@ -1519,6 +1552,23 @@ func TestUnifiedExecHeadTailBufferCapsAndPreservesEdgesLikeRust(t *testing.T) {
 	}
 }
 
+// Rust #57185: captured unified-exec output keeps an explicit omission marker
+// between the retained head and tail.
+func TestUnifiedExecHeadTailBufferRendersOmissionMarkerLikeRust(t *testing.T) {
+	buffer := newUnifiedExecHeadTailBuffer(10)
+	_, _ = buffer.Write([]byte("hello"))
+	_, _ = buffer.Write([]byte(" middle "))
+	_, _ = buffer.Write([]byte("world"))
+	got, omitted := buffer.DrainWithOmissionMarker()
+	if omitted != 8 {
+		t.Fatalf("omitted = %d, want 8", omitted)
+	}
+	want := "hello\n... 8 bytes omitted ...\nworld"
+	if string(got) != want {
+		t.Fatalf("DrainWithOmissionMarker() = %q, want %q", got, want)
+	}
+}
+
 func TestUnifiedExecProcessAllocationReservesParallelSlot(t *testing.T) {
 	manager := NewUnifiedExecManagerWithOptions(1, unifiedExecMinEmptyPollYieldMS)
 	start := make(chan struct{})
@@ -1897,6 +1947,46 @@ func TestUnifiedExecWriteStdinCarriesRuntimeGrantsLikeRust(t *testing.T) {
 	}
 	if reviewed != 1 {
 		t.Fatalf("approval calls = %d, want 1", reviewed)
+	}
+}
+
+// #59633 keeps a session handle private until its initial exec_command call
+// returns the first result (Rust initial_exec_command_active).
+func TestUnifiedExecCommandSessionsHideInitialExecLikeRust(t *testing.T) {
+	manager := NewUnifiedExecManagerWithOptions(4, unifiedExecMinEmptyPollYieldMS)
+	defer manager.Close()
+	const threadID = "thread-command-sessions-initial"
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = manager.Exec(context.Background(), &ShellRequest{
+			Command:             unifiedExecHelperCommand("long"),
+			CWD:                 t.TempDir(),
+			YieldTimeMS:         unifiedExecMinYieldMS,
+			UnifiedExecThreadID: threadID,
+		}, "exec-call")
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		manager.mu.Lock()
+		registered := len(manager.processes)
+		manager.mu.Unlock()
+		if registered > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("initial exec call never registered a process")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sessions := manager.CommandSessions(threadID); len(sessions) != 0 {
+		t.Fatalf("sessions during initial call = %#v, want none", sessions)
+	}
+	manager.TerminateAll(threadID)
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("initial exec call did not return after termination")
 	}
 }
 

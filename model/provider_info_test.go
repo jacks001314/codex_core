@@ -6,6 +6,28 @@ import (
 	"time"
 )
 
+// Mirrors Rust #57439's provider test: only the Codex backend base URL (or the
+// provider default) supports the dedicated backend routes; a direct
+// `/api/codex` endpoint is a custom Responses URL, not a backend route.
+func TestSupportsCodexBackendRoutesLikeRust(t *testing.T) {
+	for _, test := range []struct {
+		baseURL string
+		want    bool
+	}{
+		{baseURL: "", want: true},
+		{baseURL: "https://chatgpt.com/backend-api/codex", want: true},
+		{baseURL: "https://chatgpt-staging.com/backend-api/codex/", want: true},
+		{baseURL: "https://backend.example.com/api/codex", want: false},
+		{baseURL: "https://backend.example.com/api/codex/", want: false},
+		{baseURL: "https://proxy.example.com/v1", want: false},
+	} {
+		provider := CreateOpenAIProvider(test.baseURL)
+		if got := provider.SupportsCodexBackendRoutes(); got != test.want {
+			t.Fatalf("SupportsCodexBackendRoutes(%q) = %t, want %t", test.baseURL, got, test.want)
+		}
+	}
+}
+
 func TestParseWireAPIRejectsChat(t *testing.T) {
 	_, err := ParseWireAPI("chat")
 	if err == nil {
@@ -244,6 +266,22 @@ func TestCreateAmazonBedrockProvider(t *testing.T) {
 	}
 	if provider.AWS == nil {
 		t.Fatal("AWS auth config is nil")
+	}
+}
+
+// Mirrors Rust #47964: both the Mantle and Bedrock Runtime builders publish the
+// x-amzn-mantle-client-agent header, so a Bedrock Runtime request is not
+// reported as an unknown client.
+func TestAmazonBedrockProvidersKeepClientAgentHeaderLikeRust(t *testing.T) {
+	providers := []ProviderInfo{
+		CreateAmazonBedrockProvider(nil),
+		CreateAmazonBedrockRuntimeProvider(nil),
+		CreateAmazonBedrockRuntimeProvider(&ProviderAWSAuthInfo{Region: "us-west-2"}),
+	}
+	for _, provider := range providers {
+		if got := provider.HTTPHeaders[AmazonBedrockMantleClientHeader]; got != AmazonBedrockMantleClientValue {
+			t.Fatalf("provider %q %s = %q, want %q", provider.Name, AmazonBedrockMantleClientHeader, got, AmazonBedrockMantleClientValue)
+		}
 	}
 }
 

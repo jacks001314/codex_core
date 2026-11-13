@@ -113,8 +113,9 @@ type mcpEMAOIDCClaims struct {
 	Exp      uint64               `json:"exp"`
 }
 
-// mcpEMAOIDCIdentity mirrors Rust oidc_identity.
-func mcpEMAOIDCIdentity(assertion string, expectedIssuer string, expectedAudience string) (*mcpEMAOIDCClaims, error) {
+// mcpEMAOIDCIdentityClaims parses the identity assertion claims without binding
+// them to an expected issuer or audience.
+func mcpEMAOIDCIdentityClaims(assertion string) (*mcpEMAOIDCClaims, error) {
 	parts, err := mcpEMASignedJWTParts(assertion)
 	if err != nil {
 		return nil, err
@@ -126,6 +127,19 @@ func mcpEMAOIDCIdentity(assertion string, expectedIssuer string, expectedAudienc
 	if claims.Audience == nil {
 		return nil, errors.New("invalid identity assertion JWT claims")
 	}
+	return &claims, nil
+}
+
+// mcpEMAOIDCIdentity mirrors Rust oidc_identity (#55685): an empty expected
+// issuer or client can never bind an assertion.
+func mcpEMAOIDCIdentity(assertion string, expectedIssuer string, expectedAudience string) (*mcpEMAOIDCClaims, error) {
+	if strings.TrimSpace(expectedIssuer) == "" || strings.TrimSpace(expectedAudience) == "" {
+		return nil, errors.New("OIDC identity assertion requires a non-empty expected issuer and client")
+	}
+	claims, err := mcpEMAOIDCIdentityClaims(assertion)
+	if err != nil {
+		return nil, err
+	}
 	if claims.Issuer != expectedIssuer || strings.TrimSpace(claims.Subject) == "" {
 		return nil, errors.New("OIDC identity assertion issuer or subject does not match the enterprise IdP")
 	}
@@ -135,7 +149,15 @@ func mcpEMAOIDCIdentity(assertion string, expectedIssuer string, expectedAudienc
 		(multipleAudiences && (claims.AZP == nil || *claims.AZP != expectedAudience)) {
 		return nil, errors.New("OIDC identity assertion audience or authorized party does not match the IdP client")
 	}
-	return &claims, nil
+	return claims, nil
+}
+
+// mcpEMAOIDCIssuerHint mirrors Rust oidc_issuer_hint: the unverified issuer
+// claim, used only to explain a legacy login migration. Never use this hint to
+// choose where a refresh token is sent.
+func mcpEMAOIDCIssuerHint(assertion string, expectedIssuer string) bool {
+	claims, err := mcpEMAOIDCIdentityClaims(assertion)
+	return err == nil && claims.Issuer == expectedIssuer
 }
 
 // ValidateMCPEMAOIDCIdentityAssertion mirrors Rust
@@ -161,6 +183,9 @@ type mcpEMAIDJAGClaims struct {
 	Iat      uint64               `json:"iat"`
 	Resource *mcpEMAOAuthResource `json:"resource"`
 	Scope    *string              `json:"scope"`
+	// AuthorizationDetails is unsupported by the EMA profile; a non-empty value
+	// must fail the exchange instead of being ignored (Rust rmcp EmaError).
+	AuthorizationDetails *[]json.RawMessage `json:"authorization_details"`
 }
 
 // MCPEMAIDJAGBinding carries the trusted values an ID-JAG must be bound to.
@@ -176,12 +201,13 @@ type MCPEMAIDJAGBinding struct {
 }
 
 type mcpEMAIDJAGResponse struct {
-	AccessToken     string               `json:"access_token"`
-	IssuedTokenType string               `json:"issued_token_type"`
-	TokenType       string               `json:"token_type"`
-	Resource        *mcpEMAOAuthResource `json:"resource"`
-	Scope           *string              `json:"scope"`
-	RefreshToken    *string              `json:"refresh_token"`
+	AccessToken          string               `json:"access_token"`
+	IssuedTokenType      string               `json:"issued_token_type"`
+	TokenType            string               `json:"token_type"`
+	Resource             *mcpEMAOAuthResource `json:"resource"`
+	Scope                *string              `json:"scope"`
+	RefreshToken         *string              `json:"refresh_token"`
+	AuthorizationDetails *[]json.RawMessage   `json:"authorization_details"`
 }
 
 // Validate mirrors Rust IdJagResponse::validate, returning the granted scopes.
@@ -200,6 +226,10 @@ func (r *mcpEMAIDJAGResponse) Validate(binding MCPEMAIDJAGBinding) (map[string]s
 	var claims mcpEMAIDJAGClaims
 	if err := json.Unmarshal(parts.Claims, &claims); err != nil {
 		return nil, errors.New("invalid identity assertion JWT claims")
+	}
+	if mcpEMAHasUnsupportedAuthorizationDetails(r.AuthorizationDetails) ||
+		mcpEMAHasUnsupportedAuthorizationDetails(claims.AuthorizationDetails) {
+		return nil, errors.New("enterprise authorization_details is not supported")
 	}
 	if typ != "oauth-id-jag+jwt" ||
 		claims.Issuer != binding.Issuer ||
@@ -244,12 +274,13 @@ func (r *mcpEMAIDJAGResponse) Validate(binding MCPEMAIDJAGBinding) (map[string]s
 }
 
 type mcpEMAMCPAccessTokenResponse struct {
-	AccessToken  string               `json:"access_token"`
-	TokenType    string               `json:"token_type"`
-	ExpiresIn    *uint64              `json:"expires_in"`
-	Resource     *mcpEMAOAuthResource `json:"resource"`
-	Scope        *string              `json:"scope"`
-	RefreshToken *string              `json:"refresh_token"`
+	AccessToken          string               `json:"access_token"`
+	TokenType            string               `json:"token_type"`
+	ExpiresIn            *uint64              `json:"expires_in"`
+	Resource             *mcpEMAOAuthResource `json:"resource"`
+	Scope                *string              `json:"scope"`
+	RefreshToken         *string              `json:"refresh_token"`
+	AuthorizationDetails *[]json.RawMessage   `json:"authorization_details"`
 }
 
 // Validate mirrors Rust McpAccessTokenResponse::validate.
@@ -262,6 +293,9 @@ func (r *mcpEMAMCPAccessTokenResponse) Validate(resource string, idJAGScopes map
 	}
 	if r.RefreshToken != nil || (r.ExpiresIn != nil && *r.ExpiresIn == 0) {
 		return nil, errors.New("MCP authorization server returned a refresh token or zero token lifetime")
+	}
+	if mcpEMAHasUnsupportedAuthorizationDetails(r.AuthorizationDetails) {
+		return nil, errors.New("MCP authorization server returned unsupported authorization_details")
 	}
 	// The stable EMA response does not require the resource to be echoed; when
 	// present it must agree with the resource bound in the ID-JAG.
@@ -285,6 +319,13 @@ func (r *mcpEMAMCPAccessTokenResponse) Validate(resource string, idJAGScopes map
 		token.ExpiresIn = &lifetime
 	}
 	return token, nil
+}
+
+// mcpEMAHasUnsupportedAuthorizationDetails mirrors the rmcp EMA profile: an
+// omitted or empty authorization_details list is ignored, any other value is
+// rejected before credentials are forwarded or a bearer is returned.
+func mcpEMAHasUnsupportedAuthorizationDetails(details *[]json.RawMessage) bool {
+	return details != nil && len(*details) > 0
 }
 
 // mcpEMAParseScope mirrors Rust parse_scope: ASCII whitespace separated tokens

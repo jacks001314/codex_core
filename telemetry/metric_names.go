@@ -1,10 +1,17 @@
 package telemetry
 
-import "codex_core/metrics"
+import (
+	"sort"
+
+	"codex_core/metrics"
+)
 
 // Metric names emitted by Codex, mirroring codex-rs/otel/src/metrics/names.rs.
 // Keep the values byte-for-byte identical to Rust: they are the OTLP instrument
 // names and the Statsig-disabled list matches on exact strings.
+// ReasoningItemsRemovedBoundaries are Rust's fixed removal-count buckets.
+var ReasoningItemsRemovedBoundaries = []float64{0, 1, 2, 4, 8, 16, 32, 64, 128, 256}
+
 const (
 	ToolCallCountMetric                        = "codex.tool.call"
 	ToolCallDurationMetric                     = "codex.tool.call.duration_ms"
@@ -12,6 +19,15 @@ const (
 	ArtifactOperationStartedMetric             = "codex.artifact.operation.started"
 	ArtifactOperationExpectedOutputCountMetric = "codex.artifact.operation.expected_output_count"
 	ProcessStartMetric                         = "codex.process.start"
+	// AdditionalContextCountMetric counts submitted additional-context entries,
+	// including entries that did not change, by kind and truncation status. The
+	// `name` tag appears only when the entry supplies one; opaque source keys
+	// never become tags (Rust #58144).
+	AdditionalContextCountMetric = "codex.additional_context"
+	// AdditionalContextValueBytesMetric measures UTF-8 value bytes before and
+	// after the truncation limit, excluding message wrappers and including the
+	// truncation marker after truncation.
+	AdditionalContextValueBytesMetric = "codex.additional_context.value_bytes"
 	// ExecServerClientRequestCountMetric counts caller-side exec-server RPC
 	// attempts, including local admission and transport failures.
 	ExecServerClientRequestCountMetric          = metrics.ExecServerClientRequestCountMetric
@@ -29,6 +45,14 @@ const (
 	ResponsesAPIEngineServiceTTFTDurationMetric = "codex.responses_api_engine_service_ttft.duration_ms"
 	ResponsesAPIEngineIAPITBTDurationMetric     = "codex.responses_api_engine_iapi_tbt.duration_ms"
 	ResponsesAPIEngineServiceTBTDurationMetric  = "codex.responses_api_engine_service_tbt.duration_ms"
+	// ReasoningReplayCountMetric classifies every completed response's
+	// reasoning-replay report (Rust #61017). The `report` tag distinguishes an
+	// unavailable report, a report with no removals, a prefix mismatch, and
+	// other reported removals.
+	ReasoningReplayCountMetric = "codex.responses.reasoning_replay"
+	// ReasoningItemsRemovedMetric observes the reported removals per completed
+	// response and bounded reason, including zero observations.
+	ReasoningItemsRemovedMetric                 = "codex.responses.reasoning_items_removed"
 	TurnE2EDurationMetric                       = "codex.turn.e2e_duration_ms"
 	TurnTTFTDurationMetric                      = "codex.turn.ttft.duration_ms"
 	TurnTTFMDurationMetric                      = "codex.turn.ttfm.duration_ms"
@@ -39,25 +63,36 @@ const (
 	TurnCostMicroUSDMetric                      = "codex.turn.cost_microusd"
 	TurnUnifiedExecRunningProcessesMetric       = "codex.turn.unified_exec.running_processes"
 	GuardianReviewCountMetric                   = "codex.guardian.review"
+	GuardianReviewReconsiderationMetric         = "codex.guardian.review.reconsideration"
+	GuardianReviewReconsiderationDurationMetric = "codex.guardian.review.reconsideration_duration_ms"
 	GuardianReviewDurationMetric                = "codex.guardian.review.duration_ms"
 	GuardianReviewTTFTDurationMetric            = "codex.guardian.review.ttft.duration_ms"
 	GuardianReviewTokenUsageMetric              = "codex.guardian.review.token_usage"
-	GuardianContextRequestTokensMetric          = "codex.guardian.context.request_tokens"
-	GuardianContextSectionCostMetric            = "codex.guardian.context.section_cost"
-	GoalCreatedMetric                           = "codex.goal.created"
-	GoalResumedMetric                           = "codex.goal.resumed"
-	GoalCompletedMetric                         = "codex.goal.completed"
-	GoalBudgetLimitedMetric                     = "codex.goal.budget_limited"
-	GoalUsageLimitedMetric                      = "codex.goal.usage_limited"
-	GoalBlockedMetric                           = "codex.goal.blocked"
-	GoalTokenCountMetric                        = "codex.goal.token_count"
-	GoalDurationSecondsMetric                   = "codex.goal.duration_s"
-	PluginInstallElicitationSentMetric          = "codex.plugins.install_elicitation.sent"
-	PluginInstallSuggestionMetric               = "codex.plugins.install_suggestion"
-	CuratedPluginsStartupSyncMetric             = "codex.plugins.startup_sync"
-	CuratedPluginsStartupSyncFinalMetric        = "codex.plugins.startup_sync.final"
-	HookRunMetric                               = "codex.hooks.run"
-	HookRunDurationMetric                       = "codex.hooks.run.duration_ms"
+	GuardianReviewAttemptCountMetric            = "codex.guardian.review.attempt_count"
+	GuardianReviewRetryOutcomeMetric            = "codex.guardian.review.retry_outcome"
+	GuardianReviewRetryWaitMetric               = "codex.guardian.review.retry_wait_ms"
+	GuardianReviewRetryMetric                   = "codex.guardian.review.retry"
+	GuardianReviewRouteMetric                   = "codex.guardian.review.route"
+	// GuardianV2FastDecisionMetric counts Guardian v2 decisions that skipped the
+	// synchronous review, tagged by decision and reason (Rust #41666's
+	// `codex.guardian_v2.fast_decision`).
+	GuardianV2FastDecisionMetric         = "codex.guardian_v2.fast_decision"
+	GuardianContextRequestTokensMetric   = "codex.guardian.context.request_tokens"
+	GuardianContextSectionCostMetric     = "codex.guardian.context.section_cost"
+	GoalCreatedMetric                    = "codex.goal.created"
+	GoalResumedMetric                    = "codex.goal.resumed"
+	GoalCompletedMetric                  = "codex.goal.completed"
+	GoalBudgetLimitedMetric              = "codex.goal.budget_limited"
+	GoalUsageLimitedMetric               = "codex.goal.usage_limited"
+	GoalBlockedMetric                    = "codex.goal.blocked"
+	GoalTokenCountMetric                 = "codex.goal.token_count"
+	GoalDurationSecondsMetric            = "codex.goal.duration_s"
+	PluginInstallElicitationSentMetric   = "codex.plugins.install_elicitation.sent"
+	PluginInstallSuggestionMetric        = "codex.plugins.install_suggestion"
+	CuratedPluginsStartupSyncMetric      = "codex.plugins.startup_sync"
+	CuratedPluginsStartupSyncFinalMetric = "codex.plugins.startup_sync.final"
+	HookRunMetric                        = "codex.hooks.run"
+	HookRunDurationMetric                = "codex.hooks.run.duration_ms"
 	// StartupPhaseDurationMetric measures coarse startup phases, tagged by
 	// low-cardinality phase and status.
 	StartupPhaseDurationMetric = "codex.startup.phase.duration_ms"
@@ -66,11 +101,17 @@ const (
 	StartupPrewarmDurationMetric = "codex.startup_prewarm.duration_ms"
 	// StartupPrewarmAgeAtFirstTurnMetric measures the age of the startup prewarm
 	// attempt when the first real turn resolves it, tagged by outcome.
+	// StartupPrewarmWebsocketCheckMetric counts the warmup's cached-WebSocket
+	// check, tagged by outcome and input mode (Rust #48812).
+	StartupPrewarmWebsocketCheckMetric = "codex.startup_prewarm.websocket_check"
 	// ShellSnapshotDurationMetric measures one shell-snapshot capture attempt
-	// (Rust core/src/shell_snapshot.rs), tagged by version and success.
+	// (Rust core/src/shell_snapshot.rs), tagged by version and success. The v2
+	// exec-server sample also carries purpose, attempt, shell and sandbox plus
+	// the bounded failure reason (Rust #43454).
 	ShellSnapshotDurationMetric = "codex.shell_snapshot.duration_ms"
 	// ShellSnapshotCountMetric counts shell-snapshot capture attempts, tagged by
-	// version, success and the failure reason when one failed.
+	// version, success, the v2 diagnostic labels and the failure reason when one
+	// failed.
 	ShellSnapshotCountMetric = "codex.shell_snapshot"
 	// ShellSnapshotCommandMetric counts one eligible command preparation that
 	// considered the session's shell snapshot (Rust #51347
@@ -93,6 +134,10 @@ const (
 	ThreadToolsNamespacesTotalMetric = "codex.thread.tools.namespaces_total"
 	ThreadToolsFragmentBytesMetric   = "codex.thread.tools.fragment_bytes"
 
+	// GuardianTurnBlockingDurationMetric measures, per turn, the union of the
+	// thread's pending approval waits the turn serviced, tagged by outcome
+	// (completed/aborted) (Rust #55591, ext/guardian-reviewer/src/blocking.rs).
+	GuardianTurnBlockingDurationMetric = "codex.guardian.turn.blocking_ms"
 	// GuardianDecisionDurationMetric measures the complete Guardian approval
 	// decision -- fast decisions, preparation and cancellation alongside the
 	// model review that GuardianReviewDurationMetric covers (Rust #51330,
@@ -126,3 +171,20 @@ const (
 // ConversationTurnCountMetric mirrors config.rs's local
 // CONVERSATION_TURN_COUNT_METRIC.
 const ConversationTurnCountMetric = "codex.conversation.turn.count"
+
+// AdditionalContextValueBytesBuckets mirrors Rust
+// ADDITIONAL_CONTEXT_VALUE_BYTES_BUCKETS (#58939): logarithmic byte buckets
+// through 4 MiB, with a 4 KiB boundary near the truncation cap.
+var AdditionalContextValueBytesBuckets = additionalContextValueBytesBuckets()
+
+func additionalContextValueBytesBuckets() []float64 {
+	buckets := append(metrics.ContextLogBuckets(22), 4096)
+	sort.Float64s(buckets)
+	out := buckets[:0]
+	for _, bucket := range buckets {
+		if len(out) == 0 || out[len(out)-1] != bucket {
+			out = append(out, bucket)
+		}
+	}
+	return out
+}

@@ -15,6 +15,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 
 	"codex_core/metrics"
+	"codex_core/session"
 )
 
 // tag mirrors Rust's `RolloutCompressionTrigger::tag`.
@@ -101,6 +102,9 @@ func RunRolloutCompression(ctx context.Context, codexHome string, trigger Rollou
 	rolloutCompressionRun(trigger, "started")
 	startedAt := time.Now()
 	stats := RolloutCompressionStats{}
+	// Writers own their thread lock until background file work finishes, so the
+	// compressor must share the same lock namespace as the local thread store.
+	writerStore := session.NewStore(filepath.Join(codexHome, SessionsSubdir))
 	// Rust cleans up temp files from interrupted passes before scanning, and a
 	// cleanup error is reported without failing the pass.
 	stats.CleanupErrors = cleanStaleRolloutTemps(codexHome, trigger)
@@ -113,7 +117,7 @@ func RunRolloutCompression(ctx context.Context, codexHome string, trigger Rollou
 			stats.TimeBudgetExhausted = true
 			break
 		}
-		if err := compressRolloutsInRoot(ctx, root, deadline, &stats, trigger); err != nil {
+		if err := compressRolloutsInRoot(ctx, root, deadline, &stats, trigger, writerStore); err != nil {
 			rolloutCompressionFailure(rolloutCompressionRunCounter, "status", &trigger, "scan", err)
 			rolloutCompressionRunDurationTags(
 				map[string]string{"status": "failed", "trigger": trigger.tag()},
@@ -290,7 +294,7 @@ const (
 
 // compressRolloutsInRoot mirrors Rust's `compress_rollouts_in_root`: walk a
 // sessions root and compress every cold plain rollout.
-func compressRolloutsInRoot(ctx context.Context, root string, deadline time.Time, stats *RolloutCompressionStats, trigger RolloutCompressionTrigger) error {
+func compressRolloutsInRoot(ctx context.Context, root string, deadline time.Time, stats *RolloutCompressionStats, trigger RolloutCompressionTrigger, writerStore *session.Store) error {
 	// Rust tolerates a missing or unreadable root, reporting it as a scan error
 	// instead of failing the pass.
 	if _, err := os.Stat(root); err != nil {
@@ -357,7 +361,7 @@ func compressRolloutsInRoot(ctx context.Context, root string, deadline time.Time
 		go func(path string, threadID string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			outcome, err := compressRolloutIfCold(path, threadID, trigger)
+			outcome, err := compressRolloutIfCold(path, threadID, trigger, writerStore)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -405,9 +409,9 @@ func logRolloutMetadataSkip(trigger RolloutCompressionTrigger, path string, reas
 // compressRolloutIfCold mirrors Rust's `compress_rollout_if_cold_blocking`: a
 // cold plain rollout is encoded to a sibling temp file, verified, and published
 // with a no-clobber rename before the plain file is removed.
-func compressRolloutIfCold(path string, threadID string, trigger RolloutCompressionTrigger) (compressionOutcome, error) {
+func compressRolloutIfCold(path string, threadID string, trigger RolloutCompressionTrigger, writerStore *session.Store) (compressionOutcome, error) {
 	startedAt := time.Now()
-	outcome, sourceBytes, compressedBytes, err := compressRolloutIfColdInner(path, threadID)
+	outcome, sourceBytes, compressedBytes, err := compressRolloutIfColdInner(path, threadID, writerStore)
 	if err != nil {
 		// Rust labels the failing stage; Go's encode/publish steps are one
 		// function, so the pass records the single "compress" stage.
@@ -425,7 +429,7 @@ func compressRolloutIfCold(path string, threadID string, trigger RolloutCompress
 	return outcome, nil
 }
 
-func compressRolloutIfColdInner(path string, threadID string) (compressionOutcome, int64, int64, error) {
+func compressRolloutIfColdInner(path string, threadID string, writerStore *session.Store) (compressionOutcome, int64, int64, error) {
 	before, err := coldRolloutState(path)
 	if err != nil {
 		return "", 0, 0, err
@@ -445,19 +449,12 @@ func compressRolloutIfColdInner(path string, threadID string) (compressionOutcom
 		return "", 0, 0, err
 	}
 	tempPath := temp.Name()
+	defer temp.Close()
 	defer func() { _ = os.Remove(tempPath) }()
 	if err := encodeRolloutZstd(path, temp); err != nil {
-		temp.Close()
 		return "", 0, 0, err
 	}
 	if err := temp.Sync(); err != nil {
-		temp.Close()
-		return "", 0, 0, err
-	}
-	if err := temp.Close(); err != nil {
-		return "", 0, 0, err
-	}
-	if err := verifyZstdRollout(tempPath); err != nil {
 		return "", 0, 0, err
 	}
 	same, err := sameRolloutState(path, before)
@@ -467,10 +464,40 @@ func compressRolloutIfColdInner(path string, threadID string) (compressionOutcom
 	if !same {
 		return compressionSkippedChanged, before.size, 0, nil
 	}
-	// Keep the source's timestamp so cold-file decisions stay stable across the
-	// representation change.
-	if err := os.Chtimes(tempPath, before.modTime, before.modTime); err != nil {
+	// Preserve the source's access metadata before verifying or publishing.
+	// Metadata failures leave the source intact instead of changing who can
+	// read or append to the transcript.
+	if err := preserveRolloutAccessMetadata(path, tempPath, before.info); err != nil {
 		return "", 0, 0, err
+	}
+	// Reopen after applying final metadata: the owner-only temporary file can
+	// be readable while the published access policy is not.
+	if err := verifyZstdRollout(tempPath); err != nil {
+		return "", 0, 0, err
+	}
+	if err := temp.Sync(); err != nil {
+		return "", 0, 0, err
+	}
+	if err := temp.Close(); err != nil {
+		return "", 0, 0, err
+	}
+	// Encoding and verification do not block writers. Take publication ownership
+	// only now, so an active writer's append can neither race the final state
+	// check nor be lost with the source file (Rust #44138).
+	publication, err := writerStore.TryAcquireForPublication(session.ThreadID(threadID))
+	if err != nil {
+		if errors.Is(err, session.ErrConflict) {
+			return compressionSkippedBusy, before.size, 0, nil
+		}
+		return "", 0, 0, err
+	}
+	defer func() { _ = publication.Release() }()
+	same, err = sameRolloutState(path, before)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	if !same {
+		return compressionSkippedChanged, before.size, 0, nil
 	}
 	if _, err := os.Stat(compressedPath); err == nil {
 		return compressionSkippedAlreadyCompressed, before.size, 0, nil
@@ -499,8 +526,12 @@ func compressRolloutIfColdInner(path string, threadID string) (compressionOutcom
 }
 
 type rolloutFileState struct {
-	size    int64
-	modTime time.Time
+	size       int64
+	modTime    time.Time
+	mode       os.FileMode
+	changeTime rolloutChangeTime
+	hasCTime   bool
+	info       os.FileInfo
 }
 
 // coldRolloutState returns the file state when the rollout is cold, nil when it
@@ -519,7 +550,15 @@ func coldRolloutState(path string) (*rolloutFileState, error) {
 	if time.Since(info.ModTime()) < minRolloutAge {
 		return nil, nil
 	}
-	return &rolloutFileState{size: info.Size(), modTime: info.ModTime()}, nil
+	changeTime, hasCTime := rolloutInfoChangeTime(info)
+	return &rolloutFileState{
+		size:       info.Size(),
+		modTime:    info.ModTime(),
+		mode:       info.Mode().Perm(),
+		changeTime: changeTime,
+		hasCTime:   hasCTime,
+		info:       info,
+	}, nil
 }
 
 // sameRolloutState mirrors Rust's `same_file_state`: the source must not have
@@ -532,7 +571,16 @@ func sameRolloutState(path string, expected *rolloutFileState) (bool, error) {
 		}
 		return false, err
 	}
-	return info.Size() == expected.size && info.ModTime().Equal(expected.modTime), nil
+	if info.Size() != expected.size || !info.ModTime().Equal(expected.modTime) ||
+		info.Mode().Perm() != expected.mode {
+		return false, nil
+	}
+	// Ownership and ACL edits change ctime even when mode, length, and mtime
+	// are unchanged. Never publish stale access metadata.
+	if changeTime, ok := rolloutInfoChangeTime(info); expected.hasCTime && ok {
+		return changeTime == expected.changeTime, nil
+	}
+	return true, nil
 }
 
 // encodeRolloutZstd writes the zstd representation of a rollout file.

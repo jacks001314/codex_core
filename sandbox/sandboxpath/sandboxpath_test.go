@@ -82,6 +82,58 @@ func TestFindExecutableInPathSkipsSymlinkedWritableRootLikeRust(t *testing.T) {
 	}
 }
 
+func TestFindExecutableInPathSkipsWritableSymlinkToReadOnlyTargetLikeRust(t *testing.T) {
+	tempDir := t.TempDir()
+	bin := filepath.Join(tempDir, "bin")
+	protected := filepath.Join(tempDir, "protected")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := writeFakeBwrapIn(t, protected)
+	if err := os.Symlink(target, filepath.Join(bin, "bwrap")); err != nil {
+		t.Fatal(err)
+	}
+	policy := FilesystemPolicy{WritableRoots: []WritableRoot{{Root: bin}}}
+	if got := FindExecutableInPath("bwrap", bin, "/", policy); got != "" {
+		t.Fatalf("writable symlink candidate = %q, want none", got)
+	}
+}
+
+func TestFindExecutableInPathSkipsSymlinkedSearchDirectoryIntoWritableRootLikeRust(t *testing.T) {
+	tempDir := t.TempDir()
+	workspace := filepath.Join(tempDir, "workspace")
+	bin := filepath.Join(workspace, "bin")
+	alias := filepath.Join(tempDir, "alias")
+	protected := filepath.Join(tempDir, "protected")
+	target := writeFakeBwrapIn(t, protected)
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(bin, "bwrap")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(workspace, alias); err != nil {
+		t.Fatal(err)
+	}
+	policy := FilesystemPolicy{WritableRoots: []WritableRoot{{Root: workspace}}}
+	if got := FindExecutableInPath("bwrap", filepath.Join(alias, "bin"), "/", policy); got != "" {
+		t.Fatalf("symlinked search directory candidate = %q, want none", got)
+	}
+}
+
+func TestFindExecutableInPathResolvesRelativeSearchEntriesLikeRust(t *testing.T) {
+	tempDir := t.TempDir()
+	cwd := filepath.Join(tempDir, "cwd:with-colon")
+	bin := filepath.Join(tempDir, "bin")
+	expected := writeFakeBwrapIn(t, bin)
+	if err := os.MkdirAll(cwd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := FindExecutableInPath("bwrap", "../bin", cwd, FilesystemPolicy{}); got != canonical(t, expected) {
+		t.Fatalf("relative search entry = %q, want %q", got, canonical(t, expected))
+	}
+}
+
 // TestFindExecutableInPathRejectsOwnedBwrapOnFullDiskWriteLikeRust mirrors Rust
 // `full_disk_write_rejects_owned_bwrap_even_when_chmod_read_only`: ownership
 // alone is enough for the current user to chmod and replace the launcher.
@@ -125,8 +177,10 @@ func TestFindExecutableInPathKeepsReadOnlyCarveoutWithReplaceableParentLikeRust(
 // every writable root and the current user cannot modify its ancestors.
 func TestFindExecutableInPathPreservesProtectedInstallationLikeRust(t *testing.T) {
 	systemBinary := canonical(t, "/bin/true")
+	systemProgram := filepath.Base(systemBinary)
+	systemSearchPath := filepath.Dir(systemBinary)
 	protectedRoot := ""
-	for path := filepath.Dir(systemBinary); ; path = filepath.Dir(path) {
+	for path := systemSearchPath; ; path = filepath.Dir(path) {
 		if filepath.Dir(path) == "/" {
 			protectedRoot = path
 			break
@@ -134,12 +188,6 @@ func TestFindExecutableInPathPreservesProtectedInstallationLikeRust(t *testing.T
 		if path == "/" {
 			t.Fatalf("system binary %q is not below a top-level directory", systemBinary)
 		}
-	}
-
-	tempDir := t.TempDir()
-	link := filepath.Join(tempDir, "bwrap")
-	if err := os.Symlink(systemBinary, link); err != nil {
-		t.Fatalf("Symlink error = %v", err)
 	}
 	// Root write narrowed by a read-only carveout over the protected directory.
 	policy := FilesystemPolicy{WritableRoots: []WritableRoot{{
@@ -157,7 +205,7 @@ func TestFindExecutableInPathPreservesProtectedInstallationLikeRust(t *testing.T
 		if candidate.FullDiskWriteAccess && os.Geteuid() == 0 {
 			want = ""
 		}
-		if got := FindExecutableInPath("bwrap", tempDir, "/", candidate); got != want {
+		if got := FindExecutableInPath(systemProgram, systemSearchPath, "/", candidate); got != want {
 			t.Fatalf("FindExecutableInPath(protected installation, fullDisk=%v) = %q, want %q", candidate.FullDiskWriteAccess, got, want)
 		}
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -36,7 +37,7 @@ type V2ToolController interface {
 	FollowupTask(context.Context, *FollowupTaskArgs) error
 	WaitForActivity(context.Context, *WaitForActivityArgs) (*WaitForActivityResult, error)
 	InterruptAgent(context.Context, *InterruptAgentArgs) (*InterruptAgentResult, error)
-	ListAgents(context.Context, *ListAgentsArgs) (*ListAgentsResult, error)
+	ListAgents(context.Context, *ListAgentsArgs) ([]LiveAgent, error)
 }
 
 type SendMessageArgs struct {
@@ -86,6 +87,15 @@ type ListedAgent struct {
 	AgentStatus any    `json:"agent_status"`
 }
 
+// LiveAgent mirrors Rust agent::types::LiveAgent (#46553): the control plane
+// reports the live record (thread id, spawn metadata, and status) and the
+// list_agents tool handler formats it for the model.
+type LiveAgent struct {
+	ThreadID string
+	Metadata Metadata
+	Status   AgentMessageStatus
+}
+
 type ListAgentsResult struct {
 	Agents []ListedAgent `json:"agents"`
 }
@@ -112,8 +122,47 @@ type multiAgentV2ToolExecutor struct {
 	waitDefault               time.Duration
 	hideSpawnMetadata         bool
 	exposeSpawnModelOverrides bool
+	// guardianNativeMultiAgentReview opts state-changing MAv2 calls into
+	// synchronous Guardian review (Rust #57451).
+	guardianNativeMultiAgentReview bool
 	// toolOverrides carries the catalog's per-tool overrides (Rust #46505).
 	toolOverrides map[string]MultiAgentToolOverride
+	// overrideStore carries the turn's live catalog overrides when a mid-turn
+	// model change may replace them (Rust #46505).
+	overrideStore *MultiAgentToolOverrideStore
+}
+
+// overrideFor returns the catalog override for a tool, preferring the live
+// store so a mid-turn model change reaches the next step's schema.
+func (e *multiAgentV2ToolExecutor) overrideFor(toolName string) (MultiAgentToolOverride, bool) {
+	if e != nil && e.overrideStore != nil {
+		return e.overrideStore.Get(toolName)
+	}
+	if e == nil {
+		return MultiAgentToolOverride{}, false
+	}
+	override, ok := e.toolOverrides[toolName]
+	return override, ok
+}
+
+// NativeReviewRequired mirrors Rust #58040: with native MAv2 history enabled,
+// state-changing calls in the configured namespace are reviewed before
+// dispatch, and the registry captures that policy when the tool is registered.
+func (e *multiAgentV2ToolExecutor) NativeReviewRequired() bool {
+	if e == nil || !e.guardianNativeMultiAgentReview {
+		return false
+	}
+	namespace := e.namespace
+	if namespace == "" {
+		namespace = MultiAgentV2Namespace
+	}
+	return tool.IsStateChangingMultiAgentTool(tool.NamespacedName(namespace, string(e.kind)), &namespace)
+}
+
+// RequiresGuardianReview mirrors Rust MultiAgentV2ToolOverrides for callers
+// that still query the executor directly.
+func (e *multiAgentV2ToolExecutor) RequiresGuardianReview(*tool.Invocation) bool {
+	return e.NativeReviewRequired()
 }
 
 func registerMultiAgentV2Handlers(registry *tool.Registry, options *MultiAgentHandlerOptions) error {
@@ -154,8 +203,10 @@ func registerMultiAgentV2Handlers(registry *tool.Registry, options *MultiAgentHa
 			kind: kind, controller: v2, exposure: options.Exposure, namespace: namespace,
 			usageHintText: options.UsageHintText,
 			waitMin:       waitMin, waitMax: waitMax, waitDefault: waitDefault, hideSpawnMetadata: options.HideSpawnMetadata,
-			exposeSpawnModelOverrides: options.ExposeSpawnModelOverrides,
-			toolOverrides:             options.ToolOverrides,
+			exposeSpawnModelOverrides:      options.ExposeSpawnModelOverrides,
+			guardianNativeMultiAgentReview: options.GuardianNativeMultiAgentReview,
+			toolOverrides:                  options.ToolOverrides,
+			overrideStore:                  options.ToolOverrideStore,
 		}); err != nil {
 			return err
 		}
@@ -183,7 +234,7 @@ func (e *multiAgentV2ToolExecutor) Spec() tool.Spec {
 		// catalog description while keeping runtime guidance (Rust #46297):
 		// missing/null keeps the bundled text, an empty string suppresses the
 		// static text, and the usage hint is appended either way.
-		if override, ok := e.toolOverrides[string(e.kind)]; ok && override.Description != nil {
+		if override, ok := e.overrideFor(string(e.kind)); ok && override.Description != nil {
 			spec.Description = *override.Description
 		}
 		// Rust #26114: state the inherited-model default whenever the model
@@ -264,7 +315,7 @@ func (e *multiAgentV2ToolExecutor) Spec() tool.Spec {
 			}, []string{"agent_name", "agent_status"}),
 		}}, []string{"agents"})
 	}
-	if override, ok := e.toolOverrides[string(e.kind)]; ok {
+	if override, ok := e.overrideFor(string(e.kind)); ok {
 		applyMultiAgentToolOverride(&spec, e.kind, override)
 	}
 	return spec
@@ -466,7 +517,10 @@ func (e *multiAgentV2ToolExecutor) Execute(ctx context.Context, invocation *tool
 	case multiAgentV2List:
 		var args ListAgentsArgs
 		if err = invocation.DecodeArguments(&args); err == nil {
-			result, err = e.controller.ListAgents(ctx, &args)
+			var live []LiveAgent
+			if live, err = e.controller.ListAgents(ctx, &args); err == nil {
+				result = &ListAgentsResult{Agents: ListedAgentsFromLive(live)}
+			}
 		}
 	default:
 		err = fmt.Errorf("unknown multi-agent v2 tool %q", e.kind)
@@ -526,6 +580,23 @@ func V2AgentStatusValue(status AgentMessageStatus) any {
 	default:
 		return string(status.Kind)
 	}
+}
+
+// ListedAgentsFromLive mirrors Rust #46553's list_agents handler: the control
+// plane returns LiveAgent records and the handler formats them, keeping the
+// agent path as agent_name and falling back to the thread id when the live
+// record has no path.
+func ListedAgentsFromLive(live []LiveAgent) []ListedAgent {
+	agents := make([]ListedAgent, 0, len(live))
+	for _, entry := range live {
+		name := strings.TrimSpace(string(entry.Metadata.Path))
+		if name == "" {
+			name = entry.ThreadID
+		}
+		agents = append(agents, ListedAgent{AgentName: name, AgentStatus: V2AgentStatusValue(entry.Status)})
+	}
+	sort.SliceStable(agents, func(i int, j int) bool { return agents[i].AgentName < agents[j].AgentName })
+	return agents
 }
 
 func validateTargetMessage(target, message string) error {
@@ -626,7 +697,7 @@ func (c *MemoryToolController) InterruptAgent(_ context.Context, args *Interrupt
 	return &InterruptAgentResult{PreviousStatus: V2AgentStatusValue(previous)}, nil
 }
 
-func (c *MemoryToolController) ListAgents(_ context.Context, args *ListAgentsArgs) (*ListAgentsResult, error) {
+func (c *MemoryToolController) ListAgents(_ context.Context, args *ListAgentsArgs) ([]LiveAgent, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.ensure()
@@ -634,14 +705,18 @@ func (c *MemoryToolController) ListAgents(_ context.Context, args *ListAgentsArg
 	if args != nil && args.PathPrefix != nil {
 		prefix = strings.TrimSpace(*args.PathPrefix)
 	}
-	result := &ListAgentsResult{Agents: []ListedAgent{{AgentName: "/root", AgentStatus: "running"}}}
+	live := []LiveAgent{{
+		ThreadID: "root",
+		Metadata: Metadata{ThreadID: "root", Path: "/root"},
+		Status:   AgentMessageStatus{Kind: AgentMessageStatusRunning},
+	}}
 	for id, status := range c.statuses {
 		name := "/root/" + id
 		if prefix == "" || strings.HasPrefix(name, prefix) {
-			result.Agents = append(result.Agents, ListedAgent{AgentName: name, AgentStatus: V2AgentStatusValue(status)})
+			live = append(live, LiveAgent{ThreadID: id, Metadata: Metadata{ThreadID: id, Path: AgentPath(name)}, Status: status})
 		}
 	}
-	return result, nil
+	return live, nil
 }
 
 var _ V2ToolController = (*MemoryToolController)(nil)

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"testing"
+	"time"
 
 	"codex_core/codexapi"
 )
@@ -178,5 +179,160 @@ func TestWebsocketUsageLimitErrorPreservesWindowLikeRust(t *testing.T) {
 		"error": map[string]any{"type": "usage_limit_reached", "message": "usage limit reached"},
 	}); ok {
 		t.Fatal("a status-less usage-limit event must not be mapped")
+	}
+}
+
+// TestResponsesHTTPErrorTreatsModelNotFoundAsTerminalLikeRust mirrors Rust
+// #56445: a `model_not_found` provider error on 400/403/404 ends the turn
+// without retries and keeps the provider message and status.
+func TestResponsesHTTPErrorTreatsModelNotFoundAsTerminalLikeRust(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusForbidden, http.StatusNotFound} {
+		err := responsesHTTPError("OpenAI", status, http.Header{},
+			[]byte(`{"error":{"code":"model_not_found","message":"Access to this deployment ended."}}`))
+		var apiErr *codexapi.APIError
+		if !errors.As(err, &apiErr) || apiErr.Kind != codexapi.ErrorModelNotFound {
+			t.Fatalf("status %d error = %#v, want modelNotFound", status, err)
+		}
+		if apiErr.Status != status {
+			t.Fatalf("status %d preserved status = %d", status, apiErr.Status)
+		}
+		if apiErr.Message != "Access to this deployment ended." {
+			t.Fatalf("status %d message = %q, want the provider message", status, apiErr.Message)
+		}
+		if isRetryableResponsesStreamError(err) {
+			t.Fatalf("status %d model_not_found must not be retryable", status)
+		}
+	}
+
+	// A blank provider message falls back to the error code, like Rust's
+	// `parse_terminal_provider_error`.
+	blank := responsesHTTPError("OpenAI", http.StatusNotFound, http.Header{},
+		[]byte(`{"error":{"code":"model_not_found","message":"   "}}`))
+	var blankErr *codexapi.APIError
+	if !errors.As(blank, &blankErr) || blankErr.Kind != codexapi.ErrorModelNotFound || blankErr.Message != "model_not_found" {
+		t.Fatalf("blank message error = %#v, want model_not_found", blank)
+	}
+
+	// Only 400/403/404 are eligible; other statuses keep their existing
+	// classification.
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusInternalServerError} {
+		err := responsesHTTPError("OpenAI", status, http.Header{},
+			[]byte(`{"error":{"code":"model_not_found","message":"Access to this deployment ended."}}`))
+		var apiErr *codexapi.APIError
+		if errors.As(err, &apiErr) && apiErr.Kind == codexapi.ErrorModelNotFound {
+			t.Fatalf("status %d classified as modelNotFound", status)
+		}
+	}
+}
+
+// TestWebsocketTerminalProviderErrorLikeRust mirrors Rust #56445's
+// wrapped-WebSocket handling: `model_not_found` is terminal on 400/403/404 and
+// on a statusless event, keeping the provider message.
+func TestWebsocketTerminalProviderErrorLikeRust(t *testing.T) {
+	for _, status := range []any{nil, float64(http.StatusBadRequest), float64(http.StatusForbidden), float64(http.StatusNotFound)} {
+		event := map[string]any{
+			"type":  "error",
+			"error": map[string]any{"code": "model_not_found", "message": "Access to this deployment ended."},
+		}
+		want := 0
+		if status != nil {
+			event["status"] = status
+			want = int(status.(float64))
+		}
+		apiErr := websocketTerminalProviderError(event)
+		if apiErr == nil || apiErr.Kind != codexapi.ErrorModelNotFound {
+			t.Fatalf("status %v error = %#v, want modelNotFound", status, apiErr)
+		}
+		if apiErr.Status != want {
+			t.Fatalf("status %v preserved status = %d, want %d", status, apiErr.Status, want)
+		}
+		if apiErr.Message != "Access to this deployment ended." {
+			t.Fatalf("status %v message = %q", status, apiErr.Message)
+		}
+	}
+
+	// Statuses outside 400/403/404 keep their existing classification.
+	for _, status := range []float64{http.StatusTooManyRequests, http.StatusInternalServerError} {
+		apiErr := websocketTerminalProviderError(map[string]any{
+			"type":   "error",
+			"status": status,
+			"error":  map[string]any{"code": "model_not_found", "message": "not found"},
+		})
+		if apiErr != nil {
+			t.Fatalf("status %v mapped to %#v", status, apiErr)
+		}
+	}
+}
+
+// Mirrors Rust #57452 (api_bridge_tests.rs
+// http_policy_capacity_preserves_retry_advice_and_terminal_behavior): only the
+// explicit `policy_capacity_unavailable` code changes a 503's attribution, and
+// both capacity kinds keep the response's Retry-After advice while remaining
+// terminal without it.
+func TestResponsesHTTPErrorDistinguishesPolicyCapacityLikeRust(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		code       string
+		errorType  string
+		retryAfter string
+		wantKind   codexapi.APIErrorKind
+		wantText   string
+	}{
+		{
+			name:       "policy capacity with advice",
+			code:       "policy_capacity_unavailable",
+			errorType:  "service_unavailable_error",
+			retryAfter: "6",
+			wantKind:   codexapi.ErrorPolicyCapacityUnavailable,
+			wantText:   "Policy-restricted capacity is unavailable. Please try again later.",
+		},
+		{
+			name:      "policy capacity without advice",
+			code:      "policy_capacity_unavailable",
+			errorType: "service_unavailable_error",
+			wantKind:  codexapi.ErrorPolicyCapacityUnavailable,
+			wantText:  "Policy-restricted capacity is unavailable. Please try again later.",
+		},
+		{
+			// A policy error type on the overload code does not reattribute it.
+			name:       "server overload with policy error type",
+			code:       "server_is_overloaded",
+			errorType:  "policy_error",
+			retryAfter: "6",
+			wantKind:   codexapi.ErrorServerOverloaded,
+			wantText:   "Selected model is at capacity. Please try a different model.",
+		},
+		{
+			name:     "server overload without policy error type",
+			code:     "server_is_overloaded",
+			wantKind: codexapi.ErrorServerOverloaded,
+			wantText: "Selected model is at capacity. Please try a different model.",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			headers := http.Header{}
+			if testCase.retryAfter != "" {
+				headers.Set("Retry-After", testCase.retryAfter)
+			}
+			body := []byte(`{"error":{"type":"` + testCase.errorType + `","code":"` + testCase.code + `","message":"detail"}}`)
+			err := responsesHTTPError(OpenAIProviderName, http.StatusServiceUnavailable, headers, body)
+			var apiErr *codexapi.APIError
+			if !errors.As(err, &apiErr) || apiErr.Kind != testCase.wantKind {
+				t.Fatalf("error = %#v, want kind %q", err, testCase.wantKind)
+			}
+			if apiErr.Error() != testCase.wantText {
+				t.Fatalf("display = %q, want %q", apiErr.Error(), testCase.wantText)
+			}
+			if got := isRetryableResponsesStreamError(err); got != (testCase.retryAfter != "") {
+				t.Fatalf("retryable = %t, want %t", got, testCase.retryAfter != "")
+			}
+			delay, advised := codexapi.RetryDelayInfo(err)
+			if advised != (testCase.retryAfter != "") {
+				t.Fatalf("retry advice present = %t, want %t", advised, testCase.retryAfter != "")
+			}
+			if advised && (delay <= 5*time.Second || delay > 6*time.Second) {
+				t.Fatalf("retry advice = %s, want ~6s", delay)
+			}
+		})
 	}
 }

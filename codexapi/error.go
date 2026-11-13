@@ -2,21 +2,26 @@ package codexapi
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
 type APIErrorKind string
 
 const (
-	ErrorTransport                   APIErrorKind = "transport"
-	ErrorAPI                         APIErrorKind = "api"
-	ErrorStream                      APIErrorKind = "stream"
-	ErrorContextWindowExceeded       APIErrorKind = "contextWindowExceeded"
-	ErrorQuotaExceeded               APIErrorKind = "quotaExceeded"
-	ErrorUsageNotIncluded            APIErrorKind = "usageNotIncluded"
+	ErrorTransport             APIErrorKind = "transport"
+	ErrorAPI                   APIErrorKind = "api"
+	ErrorStream                APIErrorKind = "stream"
+	ErrorContextWindowExceeded APIErrorKind = "contextWindowExceeded"
+	ErrorQuotaExceeded         APIErrorKind = "quotaExceeded"
+	ErrorUsageNotIncluded      APIErrorKind = "usageNotIncluded"
+	// ErrorSessionBudgetExceeded is the provider's terminal `budget_reached`
+	// failure (Rust #59228).
+	ErrorSessionBudgetExceeded       APIErrorKind = "sessionBudgetExceeded"
 	ErrorRetryable                   APIErrorKind = "retryable"
 	ErrorRateLimit                   APIErrorKind = "rateLimit"
 	ErrorInvalidRequest              APIErrorKind = "invalidRequest"
+	ErrorInvalidPrompt               APIErrorKind = "invalidPrompt"
 	ErrorCyberPolicy                 APIErrorKind = "cyberPolicy"
 	ErrorBioPolicy                   APIErrorKind = "bioPolicy"
 	ErrorMisalignmentPolicyViolation APIErrorKind = "misalignmentPolicyViolation"
@@ -25,6 +30,33 @@ const (
 	// ErrorFlexUnavailable is the terminal Flex-capacity failure Rust surfaces
 	// for a `flex_unavailable` error code (Rust #47967).
 	ErrorFlexUnavailable APIErrorKind = "flexUnavailable"
+	// ErrorPolicyCapacityUnavailable is a capacity failure on a route restricted
+	// by server policy (Rust #57452). It keeps overload retry advice.
+	ErrorPolicyCapacityUnavailable APIErrorKind = "policyCapacityUnavailable"
+	// ErrorModelNotFound is the terminal provider failure for a
+	// `model_not_found` error code (Rust #56445).
+	ErrorModelNotFound APIErrorKind = "modelNotFound"
+	// ErrorInvalidAudioInput is the terminal provider failure for audio
+	// validation codes (Rust #58434). It surfaces as BadRequest and is never
+	// retried because resending the same audio cannot succeed.
+	ErrorInvalidAudioInput APIErrorKind = "invalidAudioInput"
+	// ErrorWorkspaceAccessDenied is the terminal 403 failure for the
+	// `invalid_workspace_selected` and `codex_workspace_access_denied` provider
+	// codes (Rust #60475/#60480). The account cannot use Codex in the selected
+	// workspace, so retries and compaction model fallbacks stop.
+	ErrorWorkspaceAccessDenied APIErrorKind = "workspaceAccessDenied"
+	// ErrorAccessProgramNotEnabled is the terminal failure for
+	// `access_program_not_enabled` (Rust #60476): the provider denied the access
+	// program required by the request.
+	ErrorAccessProgramNotEnabled APIErrorKind = "accessProgramNotEnabled"
+	// ErrorInferenceHookDenied is the terminal failure for a workspace
+	// inference-hook denial (Rust #60511). Retries, compaction model fallbacks
+	// and guardian review stop on it.
+	ErrorInferenceHookDenied APIErrorKind = "inferenceHookDenied"
+	// ErrorContentPolicyViolation is the terminal failure for
+	// `content_policy_violation` (Rust #60479). It keeps the provider status and
+	// message instead of being retried as a generic API error.
+	ErrorContentPolicyViolation APIErrorKind = "contentPolicyViolation"
 )
 
 type APIError struct {
@@ -48,6 +80,10 @@ type APIError struct {
 	// instruction for a misalignment policy block (Rust #40952). It is exposed
 	// to live clients but never serialized into rollout storage.
 	Misalignment *MisalignmentDetails `json:"-"`
+	// AudioValidationCode keeps the provider code behind an invalid-audio
+	// failure so the host can tell a per-recording rejection from a request-wide
+	// size failure (Rust #59234 per_recording = code != "audio_too_large").
+	AudioValidationCode string `json:"audioValidationCode,omitempty"`
 	// Delay is retained for compatibility. New code should use WithRetryDelay
 	// and RetryDelay so retry metadata remains independent from error details.
 	Delay time.Duration `json:"delay,omitempty"`
@@ -106,6 +142,8 @@ func (e *APIError) Error() string {
 		return "Quota exceeded. Check your plan and billing details."
 	case ErrorUsageNotIncluded:
 		return "To use Codex with your ChatGPT plan, upgrade to Plus: https://chatgpt.com/explore/plus."
+	case ErrorSessionBudgetExceeded:
+		return "budget reached"
 	case ErrorRetryable:
 		// Rust maps ApiError::Retryable onto CodexErr::Stream, whose display is
 		// the stream copy.
@@ -118,6 +156,9 @@ func (e *APIError) Error() string {
 	case ErrorInvalidRequest:
 		// Rust's CodexErrorDetails::InvalidRequest(String) displays the message.
 		return e.Message
+	case ErrorInvalidPrompt:
+		// Rust's CodexErrorDetails::InvalidPrompt displays the provider message.
+		return e.Message
 	case ErrorCyberPolicy:
 		return e.Message
 	case ErrorBioPolicy:
@@ -128,9 +169,27 @@ func (e *APIError) Error() string {
 		return "rate limit exceeded: " + e.Message
 	case ErrorServerOverloaded:
 		return "Selected model is at capacity. Please try a different model."
+	case ErrorPolicyCapacityUnavailable:
+		return "Policy-restricted capacity is unavailable. Please try again later."
 	case ErrorFlexUnavailable:
 		// Rust's CodexErr display for CodexErrorDetails::FlexUnavailable.
 		return "Flex capacity unavailable."
+	case ErrorModelNotFound:
+		// Rust's CodexErrorDetails::ModelNotFound displays the provider message
+		// and falls back to the error code when it is blank.
+		if strings.TrimSpace(e.Message) == "" {
+			return "model_not_found"
+		}
+		return e.Message
+	case ErrorInvalidAudioInput:
+		// Rust's CodexErrorDetails::InvalidAudioInput displays the provider
+		// message verbatim; classification supplies the fallback text.
+		return e.Message
+	case ErrorWorkspaceAccessDenied, ErrorAccessProgramNotEnabled, ErrorContentPolicyViolation, ErrorInferenceHookDenied:
+		// Rust's CodexErrorDetails::WorkspaceAccessDenied,
+		// AccessProgramNotEnabled and ContentPolicyViolation all display the
+		// provider message verbatim, matching #[error("{0}")].
+		return e.Message
 	default:
 		return e.Message
 	}

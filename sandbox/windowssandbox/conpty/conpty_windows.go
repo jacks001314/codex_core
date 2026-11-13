@@ -99,9 +99,14 @@ func SpawnProcessAsUserWithToken(req SpawnRequest) (*windowssandbox.CreatedProce
 	if err != nil {
 		return nil, nil, err
 	}
-	desktop, err := windowssandbox.PrepareLaunchDesktop(req.UsePrivateDesktop)
-	if err != nil {
-		return nil, nil, err
+	desktop := req.Desktop
+	if desktop == nil {
+		// Rust #40672: callers that own a permission policy pass a validated
+		// parent-owned desktop; generic launches still create a private one.
+		desktop, err = windowssandbox.PrepareLaunchDesktop(true)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	instance, err := Create(columns, rows)
 	if err != nil {

@@ -216,7 +216,7 @@ func runSandboxedFSOperation(ctx *FileSystemSandboxContext, operation string, pa
 		return true, err
 	}
 	cmd := exec.Command(command[0], command[1:]...)
-	cmd.Dir = cwd
+	cmd.Dir = fsHelperLaunchRoot(cwd)
 	cmd.Env = envPairs(env)
 	// Rust #48483: the helper is piped, so it must not allocate a console window
 	// when the exec server itself has no console.
@@ -424,6 +424,11 @@ func fsSandboxCommand(ctx *FileSystemSandboxContext, profile *sandbox.Permission
 		ResolvedPermissionProfileID:   "exec-server-fs-helper",
 		ResolvedPermissionProfileJSON: profileJSON,
 		CWD:                           cwd,
+		WorkspaceRoots:                workspaceRoots,
+		// Rust #46112: requests carry absolute paths, so launch the helper from
+		// the filesystem root. The policy cwd still anchors relative permission
+		// rules and the Windows sandbox payload.
+		CommandCWD: fsHelperLaunchRoot(cwd),
 		// Rust #38561: filesystem helpers only need access to their own
 		// executables; granting the containing directory would make unrelated
 		// sibling files readable.
@@ -460,15 +465,35 @@ func fsSandboxCommand(ctx *FileSystemSandboxContext, profile *sandbox.Permission
 		Env:                              env,
 		PermissionProfile:                profile,
 		WindowsSandboxLevel:              level,
-		WindowsSandboxPrivateDesktop:     ctx.WindowsSandboxPrivateDesktop,
 		ProxySettingsMode:                windowsSandboxProxySettingsModeForFS(ctx.WindowsSandboxProxySettingsMode),
 		ReadRootsIncludePlatformDefaults: true,
 		CodexHome:                        fsHelperCodexHome(),
+		// Rust #44658: filesystem helpers run through short-lived wrappers, so
+		// the executor keeps the desktop alive and hands over its name.
+		PreparePrivateDesktop: true,
 	})
 	if err != nil {
 		return nil, nil, requestError(-32602, fmt.Sprintf("failed to prepare fs sandbox: %v", err))
 	}
+	// The wrapper runs in a separate process and must inherit the parent's
+	// runtime selection, not a shell-supplied override (Rust #45550).
+	windowssandbox.ApplyWrapperRuntimeEnv(env)
 	return append([]string{executable}, args...), env, nil
+}
+
+// fsHelperLaunchRoot returns the filesystem root that contains the policy cwd.
+// The helper receives absolute paths, so starting there keeps filesystem RPCs
+// working after the selected working directory has been removed (Rust #46112).
+func fsHelperLaunchRoot(cwd string) string {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
+		return ""
+	}
+	volume := filepath.VolumeName(cwd)
+	if volume == "" {
+		return string(filepath.Separator)
+	}
+	return volume + string(filepath.Separator)
 }
 
 // fsHelperReadableRoots returns the absolute readable roots for a filesystem
@@ -482,13 +507,55 @@ func fsHelperReadableRoots(executable string) []string {
 }
 
 func fsHelperEnvironment() map[string]string {
+	return fsHelperEnvironmentFrom(os.Environ(), runtime.GOOS)
+}
+
+// fsHelperEnvironmentFrom filters the helper's launch environment like Rust's
+// `helper_env_from_vars` (exec-server/src/fs_sandbox.rs): a small portable
+// allowlist, plus the platform-specific entries the sandboxed helper needs.
+// Windows environment names are case-insensitive, so SystemDrive, SystemRoot
+// and LOCALAPPDATA match in any spelling and keep the host's own casing
+// (Rust #56468: MXC needs SystemRoot to create the helper process).
+func fsHelperEnvironmentFrom(vars []string, goos string) map[string]string {
 	env := map[string]string{}
 	for _, key := range []string{"PATH", "TMPDIR", "TMP", "TEMP"} {
-		if value, ok := os.LookupEnv(key); ok {
+		if value, ok := lookupEnvVar(vars, key, false); ok {
 			env[key] = value
 		}
 	}
+	if goos == "windows" {
+		for _, key := range []string{"PATH", "SystemDrive", "SystemRoot", "LOCALAPPDATA"} {
+			for _, candidate := range vars {
+				name, value, found := strings.Cut(candidate, "=")
+				if !found || !strings.EqualFold(name, key) {
+					continue
+				}
+				env[name] = value
+				break
+			}
+		}
+	}
+	// CoreFoundation consults this before falling back to user lookup during
+	// helper startup on macOS.
+	if goos == "darwin" {
+		if value, ok := lookupEnvVar(vars, "__CF_USER_TEXT_ENCODING", false); ok {
+			env["__CF_USER_TEXT_ENCODING"] = value
+		}
+	}
 	return env
+}
+
+func lookupEnvVar(vars []string, key string, caseInsensitive bool) (string, bool) {
+	for _, candidate := range vars {
+		name, value, found := strings.Cut(candidate, "=")
+		if !found {
+			continue
+		}
+		if name == key || (caseInsensitive && strings.EqualFold(name, key)) {
+			return value, true
+		}
+	}
+	return "", false
 }
 
 func fsHelperCodexHome() string {

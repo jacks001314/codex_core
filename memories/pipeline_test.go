@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"codex_core/config"
+	"codex_core/memorylock"
 	"codex_core/model"
 	"codex_core/rollout"
 	"codex_core/state"
@@ -233,6 +234,14 @@ func TestStartupPipelineReportsStorageBytesWithoutWorkspaceChanges(t *testing.T)
 		t.Fatal(err)
 	}
 	if err := RebuildRawMemoriesFile(root, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := SeedExtensionInstructions(root); err != nil {
+		t.Fatal(err)
+	}
+	// Rust #57240: PrepareWorkspace only installs an empty recovery baseline, so
+	// seed the prior successful consolidation's baseline explicitly.
+	if err := ResetWorkspaceBaseline(ctx, root); err != nil {
 		t.Fatal(err)
 	}
 
@@ -493,5 +502,42 @@ func TestSanitizeMemoryResponseItemDropsCiphertextLikeRust(t *testing.T) {
 	}
 	if _, ok := sanitizeMemoryResponseItem(developer); ok {
 		t.Fatal("developer message was retained")
+	}
+}
+
+func TestPhaseTwoSkipsBusyWorkspaceLikeRust(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	runtime := newMemoryPipelineRuntime(t, home)
+	root := Root(home)
+	workspaceLock, err := memorylock.TryAcquire(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consolidator := &artifactConsolidator{}
+	pipeline := &StartupPipeline{
+		State: runtime, CodexHome: home, PhaseTwo: consolidator,
+		PhaseTwoModel: "consolidate-model", Config: config.DefaultMemoriesConfig(),
+	}
+	report, err := pipeline.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.PhaseTwoStatus != "skipped_workspace_busy" {
+		t.Fatalf("phase two status = %q, want skipped_workspace_busy", report.PhaseTwoStatus)
+	}
+	if len(consolidator.requests) != 0 {
+		t.Fatalf("busy consolidation ran %d times", len(consolidator.requests))
+	}
+
+	if err := workspaceLock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	report, err = pipeline.Run(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.PhaseTwoStatus == "skipped_workspace_busy" {
+		t.Fatal("phase two still skipped after the workspace lock was released")
 	}
 }

@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
+	"time"
 )
 
 const (
@@ -18,7 +20,9 @@ const (
 	mcpProtocolVersionMetadataKey    = "io.modelcontextprotocol/protocolVersion"
 	mcpClientInfoMetadataKey         = "io.modelcontextprotocol/clientInfo"
 	mcpClientCapabilitiesMetadataKey = "io.modelcontextprotocol/clientCapabilities"
+	mcpJSONRPCInvalidRequestCode     = int64(-32600)
 	mcpJSONRPCMethodNotFoundCode     = int64(-32601)
+	mcpJSONRPCInvalidParamsCode      = int64(-32602)
 	mcpLegacyPrevalidationErrorCode  = int64(-32000)
 	maxMCPInputRequiredRounds        = 1000
 )
@@ -35,6 +39,11 @@ type MCPProtocolMode uint8
 const (
 	MCPProtocolLegacy MCPProtocolMode = iota
 	MCPProtocol20260728
+	// MCPProtocolDiscoverLocalStdio probes an eligible local stdio server with
+	// `server/discover` even when its launch config omits a version
+	// (Rust #57210). A helper that cannot answer discovery is restarted with the
+	// legacy handshake.
+	MCPProtocolDiscoverLocalStdio
 )
 
 var errMCPModernProtocolUnsupported = errors.New("MCP server does not support protocol version 2026-07-28")
@@ -99,10 +108,18 @@ func isHostOwnedCodexAppsRegistration(name string, registration ServerRegistrati
 }
 
 func (m MCPProtocolMode) protocolVersion() string {
-	if m == MCPProtocol20260728 {
+	if m.usesModernMCPLifecycle() {
 		return modernMCPProtocol
 	}
 	return defaultMCPProtocol
+}
+
+// usesModernMCPLifecycle reports whether this mode speaks the MCP 2026-07-28
+// lifecycle: discovery, protocol metadata on every request, multi-round input
+// and bounded message framing. Discovery mode does so until it falls back to the
+// legacy handshake.
+func (m MCPProtocolMode) usesModernMCPLifecycle() bool {
+	return m == MCPProtocol20260728 || m == MCPProtocolDiscoverLocalStdio
 }
 
 func mcpClientCapabilities(openAIForm bool) map[string]any {
@@ -119,23 +136,54 @@ func mcpClientCapabilitiesWithAuthChange(openAIForm bool, advertiseAuthChange bo
 // mcpClientCapabilitiesWithFeatures mirrors Rust #43524: user verification is
 // advertised only to the host-owned apps MCP server.
 func mcpClientCapabilitiesWithFeatures(openAIForm bool, advertiseAuthChange bool, userVerification bool) map[string]any {
+	return mcpClientCapabilitiesWithAllFeatures(openAIForm, advertiseAuthChange, userVerification, false)
+}
+
+func mcpClientCapabilitiesWithAllFeatures(openAIForm bool, advertiseAuthChange bool, userVerification bool, emaAuth bool) map[string]any {
+	return mcpClientCapabilitiesForFeatures(mcpClientFeatures{
+		OpenAIForm:       openAIForm,
+		AuthChange:       advertiseAuthChange,
+		UserVerification: userVerification,
+		EMAAuth:          emaAuth,
+	})
+}
+
+// mcpClientCapabilitiesForFeatures builds the client capabilities one
+// connection offers. Network policy is an experimental capability projected
+// only to trusted ChatGPT origins (Rust #56278).
+func mcpClientCapabilitiesForFeatures(features mcpClientFeatures) map[string]any {
 	capabilities := map[string]any{
 		"roots": map[string]any{"listChanged": false},
 	}
-	if openAIForm {
-		elicitation := map[string]any{"form": map[string]any{}}
-		if userVerification {
+	if features.OpenAIForm || features.UserVerification {
+		elicitation := map[string]any{}
+		if features.OpenAIForm {
+			elicitation["form"] = map[string]any{}
+		}
+		if features.UserVerification {
 			elicitation["userVerification"] = map[string]any{}
 		}
-		capabilities["extensions"] = map[string]any{
+		extensions := map[string]any{"openai/elicitation": elicitation}
+		if features.OpenAIForm {
 			// Rust #41447 advertises the umbrella elicitation form capability
 			// alongside the legacy openai/form extension.
-			"openai/form":        map[string]any{},
-			"openai/elicitation": elicitation,
+			extensions["openai/form"] = map[string]any{}
 		}
+		capabilities["extensions"] = extensions
 	}
-	if advertiseAuthChange {
+	if features.AuthChange {
 		mcpAdvertiseAuthChangeCapability(capabilities)
+	}
+	if features.EMAAuth {
+		extensions, _ := capabilities["extensions"].(map[string]any)
+		if extensions == nil {
+			extensions = map[string]any{}
+		}
+		extensions["io.modelcontextprotocol/enterprise-managed-authorization"] = map[string]any{}
+		capabilities["extensions"] = extensions
+	}
+	if features.NetworkPolicy {
+		mcpAdvertiseExperimentalCapability(capabilities, MCPNetworkPolicyMetaCapability)
 	}
 	return capabilities
 }
@@ -149,7 +197,23 @@ func mcpParamsWithProtocolMetadataAndAuthChange(params any, mode MCPProtocolMode
 }
 
 func mcpParamsWithProtocolMetadataAndFeatures(params any, mode MCPProtocolMode, openAIForm bool, advertiseAuthChange bool, userVerification bool) any {
-	if mode != MCPProtocol20260728 {
+	return mcpParamsWithProtocolMetadataAndAllFeatures(params, mode, openAIForm, advertiseAuthChange, userVerification, false)
+}
+
+func mcpParamsWithProtocolMetadataAndAllFeatures(params any, mode MCPProtocolMode, openAIForm bool, advertiseAuthChange bool, userVerification bool, emaAuth bool) any {
+	return mcpParamsWithProtocolMetadataForFeatures(params, mode, mcpClientFeatures{
+		OpenAIForm:       openAIForm,
+		AuthChange:       advertiseAuthChange,
+		UserVerification: userVerification,
+		EMAAuth:          emaAuth,
+	})
+}
+
+// mcpParamsWithProtocolMetadataForFeatures adds the protocol metadata every
+// modern request carries, including the client capabilities this connection
+// advertised during initialization.
+func mcpParamsWithProtocolMetadataForFeatures(params any, mode MCPProtocolMode, features mcpClientFeatures) any {
+	if !mode.usesModernMCPLifecycle() {
 		return params
 	}
 	out := map[string]any{}
@@ -166,7 +230,7 @@ func mcpParamsWithProtocolMetadataAndFeatures(params any, mode MCPProtocolMode, 
 	}
 	meta[mcpProtocolVersionMetadataKey] = modernMCPProtocol
 	meta[mcpClientInfoMetadataKey] = map[string]string{"name": "codex-go", "version": "go-port"}
-	meta[mcpClientCapabilitiesMetadataKey] = mcpClientCapabilitiesWithFeatures(openAIForm, advertiseAuthChange, userVerification)
+	meta[mcpClientCapabilitiesMetadataKey] = mcpClientCapabilitiesForFeatures(features)
 	out["_meta"] = meta
 	return out
 }
@@ -247,6 +311,17 @@ func isLegacyMCPProtocolDate(version string) bool {
 	return true
 }
 
+// mcpInputRequestSequence numbers prompts raised by MCP input-required
+// continuations. Rust #57196 requires globally unique input ids because a
+// prompt outlives the transport request that raised it; the id never reaches the
+// server, which correlates responses by the request's own map key.
+var mcpInputRequestSequence atomic.Uint64
+
+func nextMCPInputRequestIDValue() json.RawMessage {
+	id := mcpInputRequestSequence.Add(1) - 1
+	return json.RawMessage(fmt.Sprintf("%q", fmt.Sprintf("mcp-input/%d", id)))
+}
+
 type mcpInputRequiredResult struct {
 	ResultType    string                             `json:"resultType"`
 	InputRequests map[string]mcpInputRequiredRequest `json:"inputRequests"`
@@ -258,13 +333,23 @@ type mcpInputRequiredRequest struct {
 	Params json.RawMessage `json:"params"`
 }
 
-func nextMCP2026RequestParams(ctx context.Context, serverName string, elicitation MCPElicitationHandler, baseParams any, result *json.RawMessage) (any, bool, error) {
+// mcpContinuationState carries one tool call's input-required bookkeeping
+// across rounds, mirroring Rust's request_input loop state (Rust #44346).
+type mcpContinuationState struct {
+	stateOnlyRounds            int
+	submittedVerificationProof bool
+}
+
+func nextMCP2026RequestParams(ctx context.Context, serverName string, elicitation MCPElicitationHandler, features mcpClientFeatures, state *mcpContinuationState, baseParams any, result *json.RawMessage) (any, bool, error) {
 	if result == nil {
 		return nil, false, nil
 	}
 	var required mcpInputRequiredResult
 	if err := json.Unmarshal(*result, &required); err != nil || required.ResultType != "input_required" {
 		return nil, false, nil
+	}
+	if state == nil {
+		state = &mcpContinuationState{}
 	}
 
 	params := map[string]any{}
@@ -277,33 +362,245 @@ func nextMCP2026RequestParams(ctx context.Context, serverName string, elicitatio
 			return nil, false, err
 		}
 	}
-	if state := bytes.TrimSpace(required.RequestState); len(state) > 0 && !bytes.Equal(state, []byte("null")) {
-		params["requestState"] = append(json.RawMessage(nil), state...)
+	hasRequestState := false
+	if rawState := bytes.TrimSpace(required.RequestState); len(rawState) > 0 && !bytes.Equal(rawState, []byte("null")) {
+		params["requestState"] = append(json.RawMessage(nil), rawState...)
+		hasRequestState = true
 	}
+	if len(required.InputRequests) == 0 {
+		if !hasRequestState {
+			// Rust treats a continuation that carries neither prompts nor the
+			// opaque state as an unexpected response.
+			return nil, false, fmt.Errorf("MCP input-required response carried neither input requests nor request state")
+		}
+		// A state-only round means the server is still working; back off
+		// 50/100/200/250ms instead of spinning on the transport.
+		delay := 50 << min(state.stateOnlyRounds, 3)
+		if delay > 250 {
+			delay = 250
+		}
+		state.stateOnlyRounds++
+		if err := sleepMCPContinuationRound(ctx, time.Duration(delay)*time.Millisecond); err != nil {
+			return nil, false, err
+		}
+		return params, true, nil
+	}
+	state.stateOnlyRounds = 0
 
-	if len(required.InputRequests) > 0 {
-		keys := make([]string, 0, len(required.InputRequests))
-		for key := range required.InputRequests {
-			keys = append(keys, key)
-		}
-		sort.Strings(keys)
-		responses := make(map[string]any, len(keys))
-		for _, key := range keys {
-			request := required.InputRequests[key]
-			id, _ := json.Marshal(key)
-			response, rpcErr := mcpClientRequestResult(ctx, serverName, elicitation, request.Method, id, request.Params)
-			if rpcErr != nil {
-				return nil, false, newMCPRemoteError(request.Method, rpcErr)
-			}
-			responses[key] = response
-		}
-		params["inputResponses"] = responses
+	keys := make([]string, 0, len(required.InputRequests))
+	for key := range required.InputRequests {
+		keys = append(keys, key)
 	}
+	sort.Strings(keys)
+	// Parse the whole round before presenting any prompt. Only standard MCP
+	// inputs and supported OpenAI elicitation modes are accepted, so an
+	// unsupported or malformed request never reaches the user (Rust #44346).
+	for _, key := range keys {
+		request := required.InputRequests[key]
+		if rpcErr := validateMCPToolInputRequest(request.Method, request.Params, features); rpcErr != nil {
+			return nil, false, newMCPRemoteError(request.Method, rpcErr)
+		}
+	}
+	responses := make(map[string]any, len(keys))
+	for _, key := range keys {
+		request := required.InputRequests[key]
+		response, rpcErr := mcpToolInputRequestResult(ctx, serverName, elicitation, request.Method, nextMCPInputRequestIDValue(), request.Params)
+		if rpcErr != nil {
+			return nil, false, newMCPRemoteError(request.Method, rpcErr)
+		}
+		if isNativeVerificationRequest(request.Method, request.Params) && mcpElicitationResponseAccepted(response) {
+			// Once a signed proof is on the wire the call must not be replayed
+			// by session recovery (Rust #44346).
+			state.submittedVerificationProof = true
+		}
+		responses[key] = response
+	}
+	params["inputResponses"] = responses
 	return params, true, nil
 }
 
+// validateMCPToolInputRequest mirrors Rust's tool_input::parse_input plus the
+// capability-gated elicitation dispatch: unsupported methods, modes, and
+// unadvertised capabilities are rejected before the user is prompted.
+func validateMCPToolInputRequest(method string, params json.RawMessage, features mcpClientFeatures) *stdioRPCError {
+	method = strings.TrimSpace(method)
+	switch method {
+	case "roots/list":
+		return nil
+	case "elicitation/create":
+		if !isMCPJSONObject(params) {
+			return mcpInvalidRequest("invalid MCP tool input request")
+		}
+		return nil
+	case "openai/elicitation/create":
+		switch mcpElicitationRequestMode(params) {
+		case "form":
+			if rpcErr := validateMCPOpenAIElicitationForm(params); rpcErr != nil {
+				return rpcErr
+			}
+			if !features.OpenAIForm {
+				if features.UserVerification {
+					return mcpInvalidParams("invalid elicitation mode")
+				}
+				return mcpMethodNotFound(method)
+			}
+			return nil
+		case UserVerificationMode:
+			if rpcErr := validateMCPUserVerificationRequest(params); rpcErr != nil {
+				return rpcErr
+			}
+			if !features.UserVerification {
+				return mcpMethodNotFound(method)
+			}
+			return nil
+		default:
+			return mcpInvalidRequest("unsupported OpenAI elicitation mode")
+		}
+	default:
+		return mcpInvalidRequest("unsupported MCP tool input request")
+	}
+}
+
+// validateMCPOpenAIElicitationForm requires the fields Rust's
+// OpenAiElicitationRequestParams deserializer requires for the form mode.
+func validateMCPOpenAIElicitationForm(params json.RawMessage) *stdioRPCError {
+	var payload struct {
+		Mode            string          `json:"mode"`
+		Message         *string         `json:"message"`
+		RequestedSchema json.RawMessage `json:"requestedSchema"`
+	}
+	if len(params) == 0 || json.Unmarshal(params, &payload) != nil || payload.Mode != "form" || payload.Message == nil {
+		return mcpInvalidParams("invalid OpenAI elicitation request")
+	}
+	schema := bytes.TrimSpace(payload.RequestedSchema)
+	if len(schema) == 0 || bytes.Equal(schema, []byte("null")) {
+		return mcpInvalidParams("invalid OpenAI elicitation request")
+	}
+	return nil
+}
+
+// mcpToolInputRequestResult answers one validated continuation prompt through
+// the same elicitation handler the connection uses for server-initiated
+// requests.
+func mcpToolInputRequestResult(ctx context.Context, serverName string, elicitation MCPElicitationHandler, method string, id json.RawMessage, params json.RawMessage) (any, *stdioRPCError) {
+	switch strings.TrimSpace(method) {
+	case "roots/list":
+		return map[string]any{"roots": mcpRootsFromContext(ctx)}, nil
+	case "elicitation/create", "openai/form", "openai/elicitation/create":
+		return mcpElicitationResult(ctx, serverName, elicitation, method, id, params), nil
+	default:
+		return nil, mcpMethodNotFound(method)
+	}
+}
+
+func isNativeVerificationRequest(method string, params json.RawMessage) bool {
+	return strings.TrimSpace(method) == "openai/elicitation/create" && mcpElicitationRequestMode(params) == UserVerificationMode
+}
+
+func mcpElicitationResponseAccepted(response any) bool {
+	switch value := response.(type) {
+	case *MCPElicitationResponse:
+		return value != nil && value.Action == MCPElicitationActionAccept
+	case MCPElicitationResponse:
+		return value.Action == MCPElicitationActionAccept
+	case map[string]any:
+		action, _ := value["action"].(string)
+		return action == string(MCPElicitationActionAccept)
+	default:
+		return false
+	}
+}
+
+func isMCPJSONObject(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && trimmed[0] == '{' && json.Valid(trimmed)
+}
+
+func mcpInvalidRequest(message string) *stdioRPCError {
+	return &stdioRPCError{Code: mcpJSONRPCInvalidRequestCode, Message: message}
+}
+
+func mcpInvalidParams(message string) *stdioRPCError {
+	return &stdioRPCError{Code: mcpJSONRPCInvalidParamsCode, Message: message}
+}
+
+func mcpMethodNotFound(method string) *stdioRPCError {
+	return &stdioRPCError{Code: mcpJSONRPCMethodNotFoundCode, Message: "method not found: " + method}
+}
+
+func sleepMCPContinuationRound(ctx context.Context, delay time.Duration) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// mcpStdioHandshakeMode maps a configured protocol policy plus the server's
+// declared CODEX_MCP_PROTOCOL_VERSION to the handshake that will run. The
+// boolean reports whether the declaration is usable at all; an unrecognized
+// version is invalid, exactly like Rust's McpProtocolMode::stdio_mode.
+func mcpStdioHandshakeMode(mode MCPProtocolMode, env map[string]string) (MCPProtocolMode, bool) {
+	if mode != MCPProtocol20260728 && mode != MCPProtocolDiscoverLocalStdio {
+		return MCPProtocolLegacy, true
+	}
+	requested, configured := env[mcpProtocolVersionEnvVar]
+	if !configured {
+		if mode == MCPProtocolDiscoverLocalStdio {
+			return MCPProtocolDiscoverLocalStdio, true
+		}
+		return MCPProtocolLegacy, true
+	}
+	if requested != modernMCPProtocol {
+		return MCPProtocolLegacy, false
+	}
+	return MCPProtocol20260728, true
+}
+
+// mcpServerCanDiscoverLocalStdio mirrors Rust McpServer::can_discover_local_stdio
+// (#57210): the reserved codex_apps server keeps a per-chat catalog, servers
+// with runtime or enterprise-managed credentials need that chat's
+// authentication state, and only stdio launches whose declared version lets
+// discovery run qualify.
+func mcpServerCanDiscoverLocalStdio(name string, config *ServerConfig) bool {
+	if config == nil || strings.TrimSpace(name) == CodexAppsServerName {
+		return false
+	}
+	if !config.IsLocalEnvironment() || strings.TrimSpace(config.Command) == "" {
+		return false
+	}
+	if config.ApplyHTTPRequest != nil || config.EffectiveAuth() == ServerAuthEMAAuth {
+		return false
+	}
+	handshake, valid := mcpStdioHandshakeMode(MCPProtocolDiscoverLocalStdio, config.Env)
+	return valid && handshake.usesModernMCPLifecycle()
+}
+
+// isMCPLegacyInitializeResult reports whether a `server/discover` reply is
+// actually a legacy initialize result: some helpers assume their first request
+// is initialize. Such a helper has already spent its startup budget, so the
+// legacy handshake needs a fresh process (Rust #57210).
+func isMCPLegacyInitializeResult(result *json.RawMessage) bool {
+	if result == nil {
+		return false
+	}
+	var initialized struct {
+		ProtocolVersion string `json:"protocolVersion"`
+	}
+	if err := json.Unmarshal(*result, &initialized); err != nil {
+		return false
+	}
+	return isLegacyMCPProtocolDate(strings.TrimSpace(initialized.ProtocolVersion))
+}
+
 func modernMCPMessageLimit(mode MCPProtocolMode) int64 {
-	if mode == MCPProtocol20260728 {
+	if mode.usesModernMCPLifecycle() {
 		return maxModernMCPMessageBytes
 	}
 	return 0

@@ -19,6 +19,7 @@ import (
 	"codex_core/execserver"
 	"codex_core/network"
 	"codex_core/plugin"
+	"codex_core/safety"
 	"codex_core/sandbox"
 	"codex_core/utils"
 )
@@ -27,6 +28,13 @@ const (
 	DefaultExecCommandToolName        = "exec_command"
 	DefaultShellCommandToolName       = "shell_command"
 	DefaultExecCommandMaxOutputTokens = 10000
+	// execCommandRejectionMaxBytes bounds a model-facing exec_command failure
+	// message (Rust #42113). The truncation marker sits outside the retained
+	// bytes, so the marker itself remains legible.
+	execCommandRejectionMaxBytes = 900
+	// sandboxDenialRetryReason is Rust's build_denial_reason_from_output: a
+	// short, stable sentence the approval overlay shows above the command.
+	sandboxDenialRetryReason = "command failed; retry without sandbox?"
 )
 
 // ToolDecisionSink reports the approval decisions a tool call received without
@@ -92,6 +100,10 @@ type ShellExecutorOptions struct {
 	// `shell_snapshot`, which the launch replays before the model's script). Its
 	// result also carries the Rust #51347 command-level observation hook.
 	SnapshotProvider func(ctx context.Context, request SnapshotProviderRequest) SnapshotProviderResult
+	// ShellSnapshotMode is the configured shell snapshot mode reported as the
+	// `shell_snapshot_mode` telemetry tag (Rust #57235): "disabled", "v1", or
+	// "v2". It records configuration, not whether a launch used a snapshot.
+	ShellSnapshotMode string
 	// PluginMeasurementTracker publishes a validated plugin measurement batch.
 	PluginMeasurementTracker func(context.Context, plugin.PluginMeasurementBatch)
 	// ModelContext reports the resolved model and reasoning effort that invoked a
@@ -141,6 +153,7 @@ type ShellExecutor struct {
 	managedNetworkResolver   ManagedNetworkResolver
 	pluginMetricsResolver    func(command []string, cwd string) *plugin.ResolvedPluginMetricsOperation
 	snapshotProvider         func(ctx context.Context, request SnapshotProviderRequest) SnapshotProviderResult
+	shellSnapshotMode        string
 	pluginMeasurementTracker func(context.Context, plugin.PluginMeasurementBatch)
 	modelContext             func() (modelSlug string, reasoningEffort string)
 	grantedPermissions       func(turnID, environmentID string) *sandbox.AdditionalPermissionProfile
@@ -171,6 +184,10 @@ type ManagedNetworkResolution struct {
 	RemoteNetworkProxy           *execserver.RemoteNetworkProxyLaunchConfig
 	NetworkPolicyDecider         network.ProxyPolicyDecider
 	NetworkPolicyDecisionTimeout time.Duration
+	// RestoreUnbrokeredEnvironment restores the executor's pre-virtualization
+	// values into a child environment and removes broker activation. Rust uses
+	// it for shells that cannot replay a protected snapshot (#43909).
+	RestoreUnbrokeredEnvironment func(env map[string]string)
 }
 
 type ManagedNetworkResolver func(environmentID string, remote bool) (*ManagedNetworkResolution, error)
@@ -218,6 +235,7 @@ func NewShellExecutor(options *ShellExecutorOptions) *ShellExecutor {
 	executor.managedNetworkResolver = options.ManagedNetworkResolver
 	executor.pluginMetricsResolver = options.PluginMetricsResolver
 	executor.snapshotProvider = options.SnapshotProvider
+	executor.shellSnapshotMode = strings.TrimSpace(options.ShellSnapshotMode)
 	executor.pluginMeasurementTracker = options.PluginMeasurementTracker
 	executor.modelContext = options.ModelContext
 	executor.grantedPermissions = options.GrantedPermissions
@@ -557,22 +575,66 @@ func unifiedExecAdditionalPermissionsSchema() map[string]any {
 	}
 }
 
+// credentialBrokerProtectedShell reports whether this shell needs a protected
+// snapshot before a brokered launch may run (Rust #43909).
+func credentialBrokerProtectedShell(shellType ShellType) bool {
+	switch shellType {
+	case ShellBash, ShellZsh:
+		return true
+	default:
+		return false
+	}
+}
+
 const unifiedExecWindowsShellGuidance = "Windows safety rules:\n" +
 	"- Do not compose destructive filesystem commands across shells. Do not enumerate paths in PowerShell and then pass them to `cmd /c`, batch builtins, or another shell for deletion or moving. Use one shell end-to-end, prefer native PowerShell cmdlets such as `Remove-Item` / `Move-Item` with `-LiteralPath`, and avoid string-built shell commands for file operations.\n" +
 	"- Before any recursive delete or move on Windows, verify the resolved absolute target paths stay within the intended workspace or explicitly named target directory. Never issue a recursive delete or move against a computed path if the final target has not been checked.\n" +
 	"- When using `Start-Process` to launch a background helper or service, pass `-WindowStyle Hidden` unless the user explicitly asked for a visible interactive window. Use visible windows only for interactive tools the user needs to see or control."
 
-func (e *ShellExecutor) Execute(ctx context.Context, invocation *Invocation) (*Output, error) {
-	args, err := decodeExecCommandInvocation(invocation)
+// ExecCommandPreparation is the resolved state of an exec_command invocation up
+// to (but not including) execution. Rust's RecordedExecCall::prepare (#58028)
+// resolves the same pieces so a recorded call is reviewed with the live approval
+// request instead of an approximation of it.
+type ExecCommandPreparation struct {
+	Args        *ExecCommandArgs
+	Request     *ShellRequest
+	Environment *UnifiedExecEnvironment
+	Validation  ShellValidationOptions
+	Shell       *Shell
+}
+
+// PrepareExecCommand resolves a recorded exec_command invocation without
+// executing it: the selected environment, its permissions and the shell request
+// whose ApprovalRequired reports the command's approval requirement.
+func (e *ShellExecutor) PrepareExecCommand(invocation *Invocation) (*ExecCommandPreparation, error) {
+	prepared, err := e.prepareExecCommand(invocation)
 	if err != nil {
 		return nil, err
 	}
-	// Rust #45445: the command's analytics attribution is the model that invoked
-	// it, captured before execution so a model switch during a background process
-	// cannot retarget it.
-	modelSlug, reasoningEffort := "", ""
-	if e.modelContext != nil {
-		modelSlug, reasoningEffort = e.modelContext()
+	return &ExecCommandPreparation{
+		Args:        prepared.args,
+		Request:     prepared.req,
+		Environment: prepared.environment,
+		Validation:  prepared.validation,
+		Shell:       prepared.shell,
+	}, nil
+}
+
+type execCommandPreparation struct {
+	args        *ExecCommandArgs
+	req         *ShellRequest
+	environment *UnifiedExecEnvironment
+	validation  ShellValidationOptions
+	shell       *Shell
+}
+
+// prepareExecCommand builds the shell request an exec_command runs or is
+// reviewed with, resolving the environment and every approval-relevant option
+// before the approval decision.
+func (e *ShellExecutor) prepareExecCommand(invocation *Invocation) (*execCommandPreparation, error) {
+	args, err := decodeExecCommandInvocation(invocation)
+	if err != nil {
+		return nil, err
 	}
 	args.MaxOutputTokens = clampShellMaxOutputTokens(args.MaxOutputTokens, e.maxOutputTokens)
 	if args.TTY && !e.allowTTY {
@@ -598,6 +660,13 @@ func (e *ShellExecutor) Execute(ctx context.Context, invocation *Invocation) (*O
 			args.Workdir = ""
 		}
 		validation.CWD = environmentCWD
+		if remoteEnvironment {
+			// Rust #42577: the approval request and the launch both carry the
+			// selected executor's working directory, so the path grammar of the
+			// target (not the host) decides how it is resolved and how
+			// permission grants are materialized.
+			validation.PathConvention = PathConventionForPath(environmentCWD)
+		}
 		if environment.Shell != nil {
 			sessionShell = environment.Shell
 		}
@@ -620,6 +689,7 @@ func (e *ShellExecutor) Execute(ctx context.Context, invocation *Invocation) (*O
 			validation.PermissionProfile = environment.PermissionProfile
 			validation.PermissionProfileID = environment.PermissionProfileID
 		}
+		validation.WorkspaceRoots = cloneStrings(environment.WorkspaceRoots)
 	}
 	if e.grantedPermissions != nil {
 		if granted := e.grantedPermissions(e.unifiedExecTurnID, grantEnvironmentID); !granted.IsEmpty() {
@@ -658,6 +728,21 @@ func (e *ShellExecutor) Execute(ctx context.Context, invocation *Invocation) (*O
 				validation.RemoteNetworkProxy = resolvedNetwork.RemoteNetworkProxy
 				validation.NetworkPolicyDecider = resolvedNetwork.NetworkPolicyDecider
 				validation.NetworkPolicyDecisionTimeout = resolvedNetwork.NetworkPolicyDecisionTimeout
+				if validation.Env[network.CredentialBrokerActiveEnvKey] == "1" {
+					if validation.ShellMode == UnifiedExecShellModeZshFork {
+						return nil, RespondToModel("credential brokerage does not yet support shell_zsh_fork; disable shell_zsh_fork to use the broker")
+					}
+					launchShellType := ShellBash
+					if sessionShell != nil {
+						launchShellType = sessionShell.Type
+					}
+					if strings.TrimSpace(args.Shell) != "" {
+						launchShellType = DetectShellType(args.Shell)
+					}
+					if !remoteEnvironment && (launchShellType == ShellPowerShell || launchShellType == ShellCmd) && resolvedNetwork.RestoreUnbrokeredEnvironment != nil {
+						resolvedNetwork.RestoreUnbrokeredEnvironment(validation.Env)
+					}
+				}
 			}
 		}
 	}
@@ -676,6 +761,63 @@ func (e *ShellExecutor) Execute(ctx context.Context, invocation *Invocation) (*O
 	if err != nil {
 		return nil, RespondToModel(err.Error())
 	}
+	// Rust #42113 (unified_exec/process_manager): dangerous-command checks use
+	// the selected executor's platform, falling back to host semantics for a
+	// legacy executor that reports none. A dangerous command can never run
+	// without approval and is rejected when approvals are disabled.
+	commandPlatformOS := ""
+	if environment != nil {
+		commandPlatformOS = environment.PlatformOS
+	}
+	commandPlatform := execpolicy.DangerousCommandPlatformForExecutorOS(commandPlatformOS)
+	if err := applyDangerousCommandRequirement(req, validation.ApprovalPolicy, commandPlatform, validation.PermissionsPreapproved); err != nil {
+		return nil, RespondToModel(err.Error())
+	}
+	// Rust's orchestrator asks the exec policy for the approval requirement
+	// before the first attempt, including the amendment the approval menu can
+	// offer for a command that failed to run in the sandbox.
+	if err := applyExecPolicyRequirement(req, validation, commandPlatform); err != nil {
+		return nil, RespondToModel(err.Error())
+	}
+	// Rust's ExecCommand approval (and its PermissionRequest hook) names the
+	// environment the command runs in, so the resolved id must be visible before
+	// the approval callback. The implicit local executor is `local`.
+	if environment != nil {
+		req.UnifiedExecEnvironmentID = environment.ID
+	}
+	return &execCommandPreparation{args: args, req: req, environment: environment, validation: validation, shell: sessionShell}, nil
+}
+
+// boundedExecCommandError turns a launch/execution failure into the bounded,
+// model-facing rejection Rust's exec_command handler returns (#42113). The
+// message never prepends the rejected command, so a long command cannot be
+// echoed back through the error path. Cancellation stays unwrapped so callers
+// (and the exec span) can still classify it with errors.Is.
+func boundedExecCommandError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		(ctx != nil && ctx.Err() != nil) {
+		return err
+	}
+	message := "exec_command failed: " + err.Error()
+	return RespondToModel(utils.TruncateMiddleChars(message, execCommandRejectionMaxBytes))
+}
+
+func (e *ShellExecutor) Execute(ctx context.Context, invocation *Invocation) (*Output, error) {
+	// Rust #45445: the command's analytics attribution is the model that invoked
+	// it, captured before execution so a model switch during a background process
+	// cannot retarget it.
+	modelSlug, reasoningEffort := "", ""
+	if e.modelContext != nil {
+		modelSlug, reasoningEffort = e.modelContext()
+	}
+	prepared, err := e.prepareExecCommand(invocation)
+	if err != nil {
+		return nil, err
+	}
+	args, req, environment, validation, sessionShell := prepared.args, prepared.req, prepared.environment, prepared.validation, prepared.shell
 	if req.ApprovalRequired {
 		if e.approval != nil {
 			decision, approvalErr := e.approval(ctx, &ShellApprovalRequest{Request: req, Invocation: invocation})
@@ -760,7 +902,6 @@ func (e *ShellExecutor) Execute(ctx context.Context, invocation *Invocation) (*O
 		}
 	}
 	if environment != nil {
-		req.UnifiedExecEnvironmentID = environment.ID
 		req.UnifiedExecRemoteURL = environment.ExecServerURL
 		req.UnifiedExecNoiseProvider = environment.NoiseProvider
 		req.UnifiedExecInitializeTimeout = environment.ExecServerInitializeTimeout
@@ -839,7 +980,19 @@ func (e *ShellExecutor) Execute(ctx context.Context, invocation *Invocation) (*O
 			EnvironmentID:       req.UnifiedExecEnvironmentID,
 			Remote:              remoteEnvironment,
 			ShellMode:           validation.ShellMode,
+			Protected:           req.Env[network.CredentialBrokerActiveEnvKey] == "1",
+			Env:                 cloneEnv(req.Env),
 		})
+		if len(snapshot.Env) > 0 {
+			// A protected snapshot hands back the broker-prepared keys its replay
+			// wrapper restores from (Rust's ShellSnapshotFile::restore_credentials).
+			if req.Env == nil {
+				req.Env = map[string]string{}
+			}
+			for key, value := range snapshot.Env {
+				req.Env[key] = value
+			}
+		}
 		snapshotUsed := false
 		if snapshot.Path != "" {
 			snapshotEnv := cloneEnv(req.Env)
@@ -857,6 +1010,20 @@ func (e *ShellExecutor) Execute(ctx context.Context, invocation *Invocation) (*O
 		if snapshot.Remote != nil {
 			req.RemoteShellSnapshot = snapshot.Remote
 			snapshotUsed = true
+		}
+		// The executor-owned snapshot (Rust #39957) is replayed by the selected
+		// executor, so it does not rewrite the command here and stays outside the
+		// session-file snapshot observation.
+		if snapshot.Local != nil {
+			req.LocalShellSnapshot = snapshot.Local
+		}
+		if req.Env[network.CredentialBrokerActiveEnvKey] == "1" && !remoteEnvironment &&
+			snapshot.Path == "" && snapshot.Remote == nil &&
+			credentialBrokerProtectedShell(snapshotShell.Type) {
+			// Rust #43909: POSIX launches under the broker must replay a protected
+			// snapshot; running without one could let startup files restore real
+			// credentials the broker had masked.
+			return nil, RespondToModel("credential brokerage could not create a protected shell snapshot")
 		}
 		// Emit after the decision so `used` is final, exactly like Rust
 		// recording at the end of `UnifiedExecRuntime::prepare`.
@@ -893,17 +1060,31 @@ func (e *ShellExecutor) Execute(ctx context.Context, invocation *Invocation) (*O
 	if useUnifiedExec {
 		req, err = prepareUnifiedExecShellRequest(req)
 		if err != nil {
-			return nil, err
+			return nil, boundedExecCommandError(ctx, err)
 		}
 		req.UnifiedExecEventSink = e.unifiedExecEvents
 		req.UnifiedExecThreadID = e.unifiedExecThreadID
 		req.UnifiedExecTurnID = e.unifiedExecTurnID
-		result, err = e.unifiedExec.Exec(ctx, req, invocation.CallID)
-	} else {
-		result, err = e.shellRunner().Run(ctx, req)
 	}
+	runAttempt := func(attempt *ShellRequest) (*ShellResult, error) {
+		if useUnifiedExec {
+			return e.unifiedExec.Exec(ctx, attempt, invocation.CallID)
+		}
+		return e.shellRunner().Run(ctx, attempt)
+	}
+	result, err = runAttempt(req)
 	if err != nil {
-		return nil, err
+		return nil, boundedExecCommandError(ctx, err)
+	}
+	// Rust's orchestrator (core/src/tools/orchestrator.rs) retries a command the
+	// sandbox denied: it rewrites the action to escalated permissions, asks for
+	// approval with the denial as the reason, and runs the command once without
+	// the sandbox. Without that retry the operator never sees an approval menu
+	// for a blocked command.
+	if retried, retryErr := e.retrySandboxDenied(ctx, invocation, req, validation, result, runAttempt); retryErr != nil {
+		return nil, boundedExecCommandError(ctx, retryErr)
+	} else if retried != nil {
+		result = retried
 	}
 	// Rust #41393: a one-shot (completion-only) command terminated on timeout or
 	// turn cancellation reports a timed-out command with exit code 124.
@@ -922,6 +1103,9 @@ func (e *ShellExecutor) Execute(ctx context.Context, invocation *Invocation) (*O
 			}
 			if batch := metricsSidecar.Finish(exitCode); batch != nil && e.pluginMeasurementTracker != nil {
 				batch.ModelSlug, batch.ReasoningEffort = modelSlug, reasoningEffort
+				// Rust #42445 labels the measurement with the call that produced
+				// it: `item_id` is the tool call id.
+				batch.ItemID = strings.TrimSpace(invocation.CallID)
 				e.pluginMeasurementTracker(ctx, *batch)
 			}
 		}
@@ -941,11 +1125,82 @@ func (e *ShellExecutor) Execute(ctx context.Context, invocation *Invocation) (*O
 	}
 	body := shellResultModelTextWithMetadata(result, result.MaxOutputTokensUsed, result.ChunkID)
 	return &Output{
-		Success:    true,
-		Body:       body,
-		Data:       shellResultData(result, result.MaxOutputTokensUsed, result.ChunkID),
-		LogPreview: shellLogPreview(body),
+		Success:       true,
+		Body:          body,
+		Data:          shellResultData(result, result.MaxOutputTokensUsed, result.ChunkID),
+		LogPreview:    shellLogPreview(body),
+		SandboxType:   cloneSandboxTypePtr(result.SandboxType),
+		SandboxDenied: result.SandboxDenied,
 	}, nil
+}
+
+// retrySandboxDenied mirrors Rust's orchestrator retry for
+// `SandboxErr::Denied` (core/src/tools/orchestrator.rs): the action is
+// rewritten to escalated permissions with the agent's additional permissions
+// cleared, the operator is asked once, and an approved command runs without
+// the sandbox. Every other denial keeps Rust's behavior of reporting the
+// sandbox output to the model without a prompt.
+func (e *ShellExecutor) retrySandboxDenied(
+	ctx context.Context,
+	invocation *Invocation,
+	req *ShellRequest,
+	validation ShellValidationOptions,
+	result *ShellResult,
+	run func(*ShellRequest) (*ShellResult, error),
+) (*ShellResult, error) {
+	if e == nil || invocation == nil || req == nil || result == nil || run == nil {
+		return nil, nil
+	}
+	if !result.SandboxDenied || result.ProcessID != nil || result.TimedOut {
+		return nil, nil
+	}
+	// The attempt already ran unsandboxed, so a denial cannot be escaped further.
+	if req.SandboxPermissions == sandbox.SandboxPermissionsRequireEscalated {
+		return nil, nil
+	}
+	if e.approval == nil {
+		return nil, nil
+	}
+	// Managed networking owns its own approval path, and the sandboxed attempt
+	// may have installed a proxy this retry must not inherit.
+	if req.EnforceManagedNetwork || req.ManagedNetwork != nil || req.RemoteNetworkProxy != nil {
+		return nil, nil
+	}
+	if _, rejected := safety.PromptRejectedByPolicy(shellApprovalPolicy(&validation), false); rejected {
+		return nil, nil
+	}
+	retry := *req
+	retry.SandboxPermissions = sandbox.SandboxPermissionsRequireEscalated
+	retry.AdditionalPermissions = nil
+	retry.ApprovalRequired = true
+	retry.ApprovalReason = sandboxDenialRetryReason
+	retry.Justification = sandboxDenialRetryReason
+	decision, err := e.approval(ctx, &ShellApprovalRequest{Request: &retry, Invocation: invocation})
+	if err != nil || !decision.Approved {
+		return nil, nil
+	}
+	// The approval covers exactly this unsandboxed attempt: rebuild the launch
+	// the way BuildShellRequest does once permissions are preapproved.
+	profileID, profile, err := effectiveShellPermissionProfile(
+		"", nil, retry.SandboxPermissions, nil, true, retry.PathConvention,
+	)
+	if err != nil {
+		return nil, nil
+	}
+	// The approval consumer may retain the request it was handed, so the
+	// escalated launch is a separate value.
+	launch := retry
+	launch.PermissionProfileID = profileID
+	launch.PermissionProfile = profile
+	launch.PermissionProfileJSON = ""
+	launch.SandboxProfile = buildShellSandboxProfile(profile, nil, launch.CWD)
+	launch.ApprovalRequired = false
+	launch.ApprovalReason = ""
+	// The retried launch reports the backend it really runs under so a later
+	// permission-denied line is not classified against the sandbox it left.
+	noSandbox := sandbox.SandboxTypeNone
+	launch.ProcessSandboxType = &noSandbox
+	return run(&launch)
 }
 
 // resolveUnifiedExecEnvironment mirrors Rust's `resolve_tool_environment`
@@ -1055,6 +1310,7 @@ func cloneUnifiedExecEnvironments(values []UnifiedExecEnvironment) []UnifiedExec
 			profile := *values[i].PermissionProfile
 			out[i].PermissionProfile = &profile
 		}
+		out[i].WorkspaceRoots = cloneStrings(values[i].WorkspaceRoots)
 	}
 	return out
 }
@@ -1156,7 +1412,22 @@ func (e *ShellExecutor) shouldUseUnifiedExec(req *ShellRequest) bool {
 }
 
 func prepareUnifiedExecShellRequest(req *ShellRequest) (*ShellRequest, error) {
-	if req == nil || strings.TrimSpace(req.UnifiedExecRemoteURL) != "" || req.UnifiedExecNoiseProvider != nil || req.UnifiedExecRemoteStdioCommand != nil || req.PermissionProfile == nil || req.PermissionProfile.Disabled {
+	if req == nil {
+		return req, nil
+	}
+	remote := strings.TrimSpace(req.UnifiedExecRemoteURL) != "" || req.UnifiedExecNoiseProvider != nil || req.UnifiedExecRemoteStdioCommand != nil
+	if req.PermissionProfile == nil || req.PermissionProfile.Disabled {
+		if remote || req.ProcessSandboxType != nil {
+			return req, nil
+		}
+		// A local unified-exec launch outside the sandbox still has a known
+		// backend (Rust #47568): the process ran, and analytics must distinguish
+		// that explicit `none` from an unobserved/legacy launch.
+		prepared := *req
+		prepared.ProcessSandboxType = cloneSandboxType(sandbox.SandboxTypeNone)
+		return &prepared, nil
+	}
+	if remote {
 		return req, nil
 	}
 	plan, err := sandbox.BuildCommandRunPlan(&sandbox.CommandRunRequest{
@@ -1164,6 +1435,7 @@ func prepareUnifiedExecShellRequest(req *ShellRequest) (*ShellRequest, error) {
 		ResolvedPermissionProfileID:   req.PermissionProfileID,
 		ResolvedPermissionProfileJSON: req.PermissionProfileJSON,
 		CWD:                           req.CWD,
+		WorkspaceRoots:                req.WorkspaceRoots,
 		Command:                       append([]string(nil), req.Command...),
 	})
 	if err != nil {
@@ -1176,6 +1448,10 @@ func prepareUnifiedExecShellRequest(req *ShellRequest) (*ShellRequest, error) {
 	prepared.Command = append([]string(nil), plan.Command...)
 	prepared.CWD = plan.CWD
 	prepared.ProcessSandboxType = cloneSandboxType(plan.SandboxType)
+	if plan.PermissionProfile != nil {
+		prepared.PermissionProfile = plan.PermissionProfile
+		prepared.PermissionProfileJSON = plan.PermissionProfileJSON
+	}
 	prepared.Env = cloneEnv(req.Env)
 	if prepared.Env == nil {
 		prepared.Env = map[string]string{}
@@ -1214,6 +1490,13 @@ func applyInternalPermissionsToLaunch(req *ShellRequest, internal *sandbox.Addit
 func cloneSandboxType(value sandbox.SandboxType) *sandbox.SandboxType {
 	cloned := value
 	return &cloned
+}
+
+func cloneSandboxTypePtr(value *sandbox.SandboxType) *sandbox.SandboxType {
+	if value == nil {
+		return nil
+	}
+	return cloneSandboxType(*value)
 }
 
 func clampShellMaxOutputTokens(requested *int, policy *int) *int {
@@ -1330,6 +1613,42 @@ func (e *ShellExecutor) hasUsableEnvironment() bool {
 	return e != nil && len(e.unifiedExecEnvironments) > 0
 }
 
+// TelemetryTags reports the configured shell snapshot mode so commands that fall
+// back without using a snapshot stay in their rollout cohort (Rust #57235).
+func (e *ShellExecutor) TelemetryTags(_ *Invocation) map[string]string {
+	if e == nil || e.shellSnapshotMode == "" {
+		return nil
+	}
+	return map[string]string{"shell_snapshot_mode": e.shellSnapshotMode}
+}
+
+// hookToolCWD is the working directory a local exec_command will run in,
+// reported to tool hooks as their input cwd (Rust #57198's
+// ExecCommandHandler::pre_tool_use_cwd). It shares resolveShellRequestCWD with
+// command execution, and returns nil for remote environments because their
+// paths are not meaningful on the host where hooks run.
+func (e *ShellExecutor) hookToolCWD(args *ExecCommandArgs) *string {
+	if e == nil || args == nil {
+		return nil
+	}
+	environment, err := e.resolveUnifiedExecEnvironment(args.EnvironmentID)
+	if err != nil {
+		return nil
+	}
+	base := e.validationOptions().CWD
+	if environment != nil {
+		if environment.Remote() {
+			return nil
+		}
+		base = environment.CWD
+	}
+	cwd, err := resolveShellRequestCWD(base, firstNonEmptyString(args.CWD, args.Workdir))
+	if err != nil {
+		return nil
+	}
+	return &cwd
+}
+
 func (e *ShellExecutor) PreToolUsePayload(invocation *Invocation) (*PreToolUsePayload, bool) {
 	args, err := decodeExecCommandInvocation(invocation)
 	if err != nil {
@@ -1338,7 +1657,31 @@ func (e *ShellExecutor) PreToolUsePayload(invocation *Invocation) (*PreToolUsePa
 	return &PreToolUsePayload{
 		ToolName:  bashHookToolName(),
 		ToolInput: shellHookInput(args),
+		ToolCWD:   e.hookToolCWD(args),
 	}, true
+}
+
+// HookEnvironmentIDs reports the environment the command will run in (Rust
+// `Tool::environments_for_input` for exec_command). The implicit local executor
+// is named `local`, matching Rust's LOCAL_ENVIRONMENT_ID selection, so a call
+// cannot run another environment's managed hooks.
+func (e *ShellExecutor) HookEnvironmentIDs(invocation *Invocation) []string {
+	args, err := decodeExecCommandInvocation(invocation)
+	if err != nil {
+		return nil
+	}
+	environment, err := e.resolveUnifiedExecEnvironment(args.EnvironmentID)
+	if err != nil {
+		return nil
+	}
+	if environment == nil {
+		return []string{execserver.LocalEnvironmentID}
+	}
+	id := strings.TrimSpace(environment.ID)
+	if id == "" {
+		return []string{execserver.LocalEnvironmentID}
+	}
+	return []string{id}
 }
 
 func (e *ShellExecutor) PostToolUsePayload(invocation *Invocation, output *Output) (*PostToolUsePayload, bool) {
@@ -1368,6 +1711,7 @@ func (e *ShellExecutor) PostToolUsePayload(invocation *Invocation, output *Outpu
 		ToolUseID:    toolUseID,
 		ToolInput:    shellHookInput(args),
 		ToolResponse: response,
+		ToolCWD:      e.hookToolCWD(args),
 	}, true
 }
 
@@ -1447,7 +1791,7 @@ func shellResultHookResponse(result *ShellResult, maxOutputTokens *int) *shellTr
 	if maxOutputTokens != nil {
 		maxTokens = *maxOutputTokens
 	}
-	return truncateShellText(output, maxTokens)
+	return truncateShellText(output, maxTokens, result.OmittedBytes)
 }
 
 func decodeExecCommandInvocation(invocation *Invocation) (*ExecCommandArgs, error) {
@@ -1560,8 +1904,8 @@ func shellResultData(result *ShellResult, maxOutputTokens *int, chunkID string) 
 	if maxOutputTokens != nil {
 		maxTokens = *maxOutputTokens
 	}
-	stdout := truncateShellText(result.Stdout, maxTokens)
-	stderr := truncateShellText(result.Stderr, maxTokens)
+	stdout := truncateShellText(result.Stdout, maxTokens, result.OmittedBytes)
+	stderr := truncateShellText(result.Stderr, maxTokens, 0)
 	hookResponse := shellResultHookResponse(result, maxOutputTokens)
 	data := map[string]any{
 		"chunk_id":                chunkID,
@@ -1688,19 +2032,37 @@ func shellOutputText(result *ShellResult) string {
 	return strings.TrimRight(result.Stdout, "\r\n") + "\n\nstderr:\n" + result.Stderr
 }
 
-func truncateShellText(content string, maxTokens int) *shellTruncatedText {
+func truncateShellText(content string, maxTokens int, omittedBytes int) *shellTruncatedText {
 	if content == "" {
 		return &shellTruncatedText{}
 	}
 	policy := utils.TokensPolicy(maxTokens)
+	totalLines := shellOutputLineCount(content)
 	if len(content) <= (&policy).ByteBudget() {
-		return &shellTruncatedText{Text: content, TotalLines: shellOutputLineCount(content)}
+		return &shellTruncatedText{Text: content, TotalLines: totalLines}
+	}
+	originalTokenCount := utils.ApproxTokenCount(content)
+	if omittedBytes > 0 {
+		// Rust's CapturedStream::render keeps the collection omission notice
+		// above the middle truncation when truncation removed it.
+		truncated := utils.TruncateText(content, policy)
+		marker := unifiedExecOmissionMarker(omittedBytes)
+		notice := marker + "\n"
+		if strings.Contains(truncated, marker) {
+			notice = ""
+		}
+		return &shellTruncatedText{
+			Text:               fmt.Sprintf("Warning: truncated output (original token count: %d)\n%s\n%s", originalTokenCount, notice, truncated),
+			Truncated:          true,
+			OriginalTokenCount: originalTokenCount,
+			TotalLines:         totalLines,
+		}
 	}
 	return &shellTruncatedText{
 		Text:               utils.FormattedTruncateText(content, policy),
 		Truncated:          true,
-		OriginalTokenCount: utils.ApproxTokenCount(content),
-		TotalLines:         shellOutputLineCount(content),
+		OriginalTokenCount: originalTokenCount,
+		TotalLines:         totalLines,
 	}
 }
 
@@ -1734,4 +2096,5 @@ func updatedHookCommand(updatedInput any) (string, error) {
 var _ Executor = (*ShellExecutor)(nil)
 var _ PreToolUsePayloadProvider = (*ShellExecutor)(nil)
 var _ PostToolUsePayloadProvider = (*ShellExecutor)(nil)
+var _ HookEnvironmentSelector = (*ShellExecutor)(nil)
 var _ HookInputUpdater = (*ShellExecutor)(nil)

@@ -25,6 +25,21 @@ type ThreadEvent struct {
 	// milliseconds) for events whose lifetime needs a live timer, such as a
 	// context compaction item resumed from an app-server snapshot.
 	StartedAtMS *int64 `json:"startedAtMs,omitempty"`
+	// InternalTurnID carries the in-process turn identity when the public exec
+	// JSON event intentionally omits it. The TUI needs the id to scope safety
+	// recourse to the blocked turn.
+	InternalTurnID string `json:"-"`
+	// Metadata carries internal-only turn moderation metadata
+	// (turn/moderationMetadata). The exec JSON stream never encodes it.
+	Metadata any `json:"-"`
+	// TurnFailed marks an internal turn/completed for a failed turn. The exec
+	// JSON stream reports failures as `error`/`turn.failed` events instead, so
+	// this flag never leaves the TUI.
+	TurnFailed bool `json:"-"`
+	// Summary and Details carry an app-server deprecation notice
+	// (Rust #47065 deprecationNotice notification).
+	Summary string `json:"summary,omitempty"`
+	Details string `json:"details,omitempty"`
 }
 
 type ThreadTokenUsage struct {
@@ -63,6 +78,12 @@ func Compacted() ThreadEvent {
 	return ThreadEvent{Type: "turn.compacted", Item: &ThreadItem{Type: "compaction"}}
 }
 
+// DeprecationNotice carries an app-server deprecation notice into the
+// transcript (Rust #47065 TUI deprecationNotice notification).
+func DeprecationNotice(summary, details string) ThreadEvent {
+	return ThreadEvent{Type: "deprecation.notice", Summary: summary, Details: details}
+}
+
 type RateLimitSnapshot struct {
 	LimitID              string           `json:"limitId,omitempty"`
 	LimitName            string           `json:"limitName,omitempty"`
@@ -87,6 +108,20 @@ type CreditsSnapshot struct {
 
 type ThreadError struct {
 	Message string `json:"message"`
+	// Kind carries the app-server codex error classification for in-process
+	// consumers (for example "cyberPolicy"); exec JSON never encodes it.
+	Kind string `json:"-"`
+}
+
+// CommandAction is the command-execution display action supplied by the app
+// server (Rust's `CommandAction`). The TUI renders these instead of re-parsing
+// the raw command so a shell alias the executor cannot classify stays Unknown.
+type CommandAction struct {
+	Type    string `json:"type"`
+	Command string `json:"command,omitempty"`
+	Name    string `json:"name,omitempty"`
+	Path    string `json:"path,omitempty"`
+	Query   string `json:"query,omitempty"`
 }
 
 type ThreadItem struct {
@@ -128,26 +163,44 @@ type ThreadItem struct {
 	AgentPath         string                       `json:"agent_path,omitempty"`
 	// Model and ReasoningEffort are the resolved settings of a started sub-agent
 	// activity (Rust #51463); older records and other activity kinds omit them.
-	Model                 *string        `json:"model,omitempty"`
-	ReasoningEffort       *string        `json:"reasoning_effort,omitempty"`
-	Arguments             *any           `json:"arguments,omitempty"`
-	Result                *MCPToolResult `json:"result,omitempty"`
-	CallError             *MCPToolError  `json:"error,omitempty"`
-	Command               string         `json:"command,omitempty"`
-	PluginID              string         `json:"plugin_id,omitempty"`
-	ScriptPath            string         `json:"script_path,omitempty"`
-	AggregatedOutput      *string        `json:"aggregated_output,omitempty"`
-	ExitCode              *int           `json:"exit_code,omitempty"`
-	Status                string         `json:"status,omitempty"`
-	Stdout                string         `json:"stdout,omitempty"`
-	Stderr                string         `json:"stderr,omitempty"`
-	AutoApproved          *bool          `json:"auto_approved,omitempty"`
-	RevisedPrompt         string         `json:"revised_prompt,omitempty"`
-	SavedPath             string         `json:"saved_path,omitempty"`
-	TransparentBackground *bool          `json:"transparent_background,omitempty"`
-	Success               *bool          `json:"success,omitempty"`
-	Items                 []TodoItem     `json:"items,omitempty"`
-	Metadata              map[string]any `json:"metadata,omitempty"`
+	Model           *string        `json:"model,omitempty"`
+	ReasoningEffort *string        `json:"reasoning_effort,omitempty"`
+	Arguments       *any           `json:"arguments,omitempty"`
+	Result          *MCPToolResult `json:"result,omitempty"`
+	CallError       *MCPToolError  `json:"error,omitempty"`
+	Command         string         `json:"command,omitempty"`
+	// CommandActions preserves the app server's parsed display actions for a
+	// commandExecution item. A nil pointer means the payload omitted them, so
+	// the TUI keeps its local-parse fallback; a present-but-empty slice keeps
+	// Rust's "no standard action" result instead of re-deriving one. It stays
+	// in-process: the exec/SDK JSON shape does not carry command actions.
+	CommandActions        *[]CommandAction `json:"-"`
+	PluginID              string           `json:"plugin_id,omitempty"`
+	ScriptPath            string           `json:"script_path,omitempty"`
+	AggregatedOutput      *string          `json:"aggregated_output,omitempty"`
+	ExitCode              *int             `json:"exit_code,omitempty"`
+	Status                string           `json:"status,omitempty"`
+	Stdout                string           `json:"stdout,omitempty"`
+	Stderr                string           `json:"stderr,omitempty"`
+	AutoApproved          *bool            `json:"auto_approved,omitempty"`
+	RevisedPrompt         string           `json:"revised_prompt,omitempty"`
+	SavedPath             string           `json:"saved_path,omitempty"`
+	TransparentBackground *bool            `json:"transparent_background,omitempty"`
+	// GenerationID is the backend-provided image generation identifier
+	// (Rust #57552). It is omitted for older records that predate the field.
+	GenerationID *string        `json:"generation_id,omitempty"`
+	Success      *bool          `json:"success,omitempty"`
+	Items        []TodoItem     `json:"items,omitempty"`
+	Metadata     map[string]any `json:"metadata,omitempty"`
+	// ClientID is the app server's echoed clientUserMessageId on a completed
+	// user message (Rust #42451). It lets the TUI acknowledge the exact pending
+	// steer even when several submissions carry identical content. The value is
+	// in-process only: the exec/SDK item shape does not carry it.
+	ClientID string `json:"-"`
+	// ImageCount counts the image parts of a completed user message. Together
+	// with Text it forms the legacy compare key used for older app servers that
+	// do not echo submission IDs.
+	ImageCount int `json:"-"`
 }
 
 type TodoItem struct {
@@ -261,20 +314,32 @@ func ImageGenerationItem(id string, status string, revisedPrompt string, savedPa
 	if len(transparentBackground) > 0 {
 		transparent = transparentBackground[0]
 	}
+	return ImageGenerationItemWithID(id, status, revisedPrompt, savedPath, transparent, nil)
+}
+
+// ImageGenerationItemWithID builds an image-generation item that also carries
+// the backend-provided generation id (Rust #57552).
+func ImageGenerationItemWithID(id string, status string, revisedPrompt string, savedPath string, transparentBackground *bool, generationID *string) ThreadItem {
+	metadata := map[string]any{
+		"status":         status,
+		"revisedPrompt":  revisedPrompt,
+		"revised_prompt": revisedPrompt,
+		"savedPath":      savedPath,
+		"saved_path":     savedPath,
+	}
+	if generationID != nil && *generationID != "" {
+		metadata["generationId"] = *generationID
+		metadata["generation_id"] = *generationID
+	}
 	return ThreadItem{
 		ID:                    id,
 		Type:                  "imageGeneration",
 		Status:                status,
 		RevisedPrompt:         revisedPrompt,
 		SavedPath:             savedPath,
-		TransparentBackground: transparent,
-		Metadata: map[string]any{
-			"status":         status,
-			"revisedPrompt":  revisedPrompt,
-			"revised_prompt": revisedPrompt,
-			"savedPath":      savedPath,
-			"saved_path":     savedPath,
-		},
+		TransparentBackground: transparentBackground,
+		GenerationID:          generationID,
+		Metadata:              metadata,
 	}
 }
 
@@ -623,6 +688,14 @@ func TurnCompletedWithID(usage Usage, turnID string) ThreadEvent {
 	}
 }
 
+// TurnCompletedWithStatus carries the server's turn id and whether the turn
+// failed, so the TUI does not report a successful completion for a failed turn.
+func TurnCompletedWithStatus(usage Usage, turnID string, failed bool) ThreadEvent {
+	event := TurnCompletedWithID(usage, turnID)
+	event.TurnFailed = failed
+	return event
+}
+
 func TurnFailed(message string) ThreadEvent {
 	return ThreadEvent{
 		Type:  "turn.failed",
@@ -634,6 +707,34 @@ func ErrorEvent(message string) ThreadEvent {
 	return ThreadEvent{
 		Type:  "error",
 		Error: &ThreadError{Message: message},
+	}
+}
+
+// ErrorEventWithKind is ErrorEvent with the in-process classification the TUI
+// uses to route policy refusals (Rust's codex_error_info).
+func ErrorEventWithKind(message, kind string) ThreadEvent {
+	return ThreadEvent{
+		Type:  "error",
+		Error: &ThreadError{Message: message, Kind: kind},
+	}
+}
+
+// TurnFailedWithKind is TurnFailed with the in-process classification.
+func TurnFailedWithKind(message, kind string) ThreadEvent {
+	return ThreadEvent{
+		Type:  "turn.failed",
+		Error: &ThreadError{Message: message, Kind: kind},
+	}
+}
+
+// TurnModerationMetadata emits the internal-only turn moderation metadata that
+// feeds the TUI's safety recourse (Rust #57363).
+func TurnModerationMetadata(threadID, turnID string, metadata any) ThreadEvent {
+	return ThreadEvent{
+		Type:     "turn.moderation_metadata",
+		ThreadID: strings.TrimSpace(threadID),
+		TurnID:   strings.TrimSpace(turnID),
+		Metadata: metadata,
 	}
 }
 

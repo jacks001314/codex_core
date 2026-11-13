@@ -94,8 +94,8 @@ func ToolOutputParts(items []eventmap.ContentItem) []map[string]any {
 }
 
 // ToolOutputText mirrors Rust's `content_items_to_code_mode_result`: non-empty
-// text parts are joined with newlines, an image contributes its URL or file id,
-// and an audio part contributes its audio URL (Rust #54776 code-mode output).
+// text parts are joined with newlines, an image or audio part contributes its
+// URL or file id (Rust #54776, #60735 code-mode output).
 func ToolOutputText(parts []map[string]any) string {
 	texts := make([]string, 0, len(parts))
 	for _, part := range parts {
@@ -119,6 +119,10 @@ func ToolOutputText(parts []map[string]any) string {
 		case "input_audio":
 			if audioURL, _ := part["audio_url"].(string); strings.TrimSpace(audioURL) != "" {
 				texts = append(texts, audioURL)
+				continue
+			}
+			if fileID, _ := part["file_id"].(string); strings.TrimSpace(fileID) != "" {
+				texts = append(texts, fileID)
 			}
 		}
 	}
@@ -214,13 +218,27 @@ type PluginSummary struct {
 
 type AvailablePluginsInstructions struct {
 	Plugins []PluginSummary
+	// Intro and Usage carry model-catalog overrides (Rust #58894); empty uses
+	// the bundled wording.
+	Intro string
+	Usage string
 }
 
 func NewAvailablePluginsInstructions(plugins []PluginSummary) *AvailablePluginsInstructions {
+	return NewAvailablePluginsInstructionsWithGuidance(plugins, "", "")
+}
+
+// NewAvailablePluginsInstructionsWithGuidance renders the generic guidance with
+// caller-resolved catalog wording. Empty values keep the bundled text.
+func NewAvailablePluginsInstructionsWithGuidance(plugins []PluginSummary, intro string, usage string) *AvailablePluginsInstructions {
 	if len(plugins) == 0 {
 		return nil
 	}
-	return &AvailablePluginsInstructions{Plugins: append([]PluginSummary(nil), plugins...)}
+	return &AvailablePluginsInstructions{
+		Plugins: append([]PluginSummary(nil), plugins...),
+		Intro:   intro,
+		Usage:   usage,
+	}
 }
 
 func (p *AvailablePluginsInstructions) Role() string {
@@ -231,17 +249,35 @@ func (p *AvailablePluginsInstructions) Markers() (string, string) {
 	return "<plugins_instructions>", "</plugins_instructions>"
 }
 
+const (
+	// PluginGuidanceIntroDefault is Rust's GENERIC_INTRO.
+	PluginGuidanceIntroDefault = "A plugin is a local bundle of skills, MCP servers, and apps."
+	// PluginGuidanceUsageDefault is Rust's GENERIC_USAGE.
+	PluginGuidanceUsageDefault = "- Skill naming: If a plugin contributes skills, those skill entries are prefixed with `plugin_name:` in the Skills list.\n" +
+		"- MCP naming: Plugin-provided MCP tools keep standard MCP identifiers such as `mcp__server__tool`; use tool provenance to tell which plugin they come from.\n" +
+		"- Trigger rules: If the user explicitly names a plugin, prefer capabilities associated with that plugin for that turn.\n" +
+		"- Relationship to capabilities: Plugins are not invoked directly. Use their underlying skills, MCP tools, and app tools to help solve the task.\n" +
+		"- Relevance: Determine what a plugin can help with from explicit user mention or from the plugin-associated skills, MCP tools, and apps exposed elsewhere in this turn.\n" +
+		"- Missing/blocked: If the user requests a plugin that does not have relevant callable capabilities for the task, say so briefly and continue with the best fallback."
+	// PluginRecommendationsIntroDefault is Rust's RECOMMENDATIONS_INTRO plus the
+	// install guidance behind it.
+	PluginRecommendationsIntroDefault = "Here is a list of plugins that are available but not installed. If the user's query would benefit from one of these plugins, use the `request_plugin_install` tool to suggest that they install it. Pass the parenthesized ID as `plugin_id`. For example, suggest the Google Drive plugin if the query could possibly be better answered with access to Google Drive."
+)
+
 func (p *AvailablePluginsInstructions) Body() string {
+	intro := p.Intro
+	if strings.TrimSpace(intro) == "" {
+		intro = PluginGuidanceIntroDefault
+	}
+	usage := p.Usage
+	if strings.TrimSpace(usage) == "" {
+		usage = PluginGuidanceUsageDefault
+	}
 	lines := []string{
 		"## Plugins",
-		"A plugin is a local bundle of skills, MCP servers, and apps.",
+		intro,
 		"### How to use plugins",
-		"- Skill naming: If a plugin contributes skills, those skill entries are prefixed with `plugin_name:` in the Skills list.",
-		"- MCP naming: Plugin-provided MCP tools keep standard MCP identifiers such as `mcp__server__tool`; use tool provenance to tell which plugin they come from.",
-		"- Trigger rules: If the user explicitly names a plugin, prefer capabilities associated with that plugin for that turn.",
-		"- Relationship to capabilities: Plugins are not invoked directly. Use their underlying skills, MCP tools, and app tools to help solve the task.",
-		"- Relevance: Determine what a plugin can help with from explicit user mention or from the plugin-associated skills, MCP tools, and apps exposed elsewhere in this turn.",
-		"- Missing/blocked: If the user requests a plugin that does not have relevant callable capabilities for the task, say so briefly and continue with the best fallback.",
+		usage,
 	}
 	return strings.Join(lines, "\n")
 }
@@ -463,9 +499,18 @@ type RecommendedPlugin struct {
 
 type RecommendedPluginsInstructions struct {
 	Plugins []RecommendedPlugin
+	// Intro carries the model-catalog recommendation introduction (Rust
+	// #58894); empty uses the bundled text.
+	Intro string
 }
 
 func NewRecommendedPluginsInstructions(plugins []RecommendedPlugin) *RecommendedPluginsInstructions {
+	return NewRecommendedPluginsInstructionsWithIntro(plugins, "")
+}
+
+// NewRecommendedPluginsInstructionsWithIntro renders the recommendation list
+// with caller-resolved catalog wording. An empty intro keeps the bundled text.
+func NewRecommendedPluginsInstructionsWithIntro(plugins []RecommendedPlugin, intro string) *RecommendedPluginsInstructions {
 	if len(plugins) == 0 {
 		return nil
 	}
@@ -473,11 +518,11 @@ func NewRecommendedPluginsInstructions(plugins []RecommendedPlugin) *Recommended
 	if len(out) > maxRecommendedPlugins {
 		out = out[:maxRecommendedPlugins]
 	}
-	return &RecommendedPluginsInstructions{Plugins: out}
+	return &RecommendedPluginsInstructions{Plugins: out, Intro: intro}
 }
 
 func (p *RecommendedPluginsInstructions) Role() string {
-	return RoleUser
+	return RoleDeveloper
 }
 
 func (p *RecommendedPluginsInstructions) Markers() (string, string) {
@@ -485,8 +530,12 @@ func (p *RecommendedPluginsInstructions) Markers() (string, string) {
 }
 
 func (p *RecommendedPluginsInstructions) Body() string {
+	intro := p.Intro
+	if strings.TrimSpace(intro) == "" {
+		intro = PluginRecommendationsIntroDefault
+	}
 	lines := []string{
-		"Here is a list of plugins that are available but not installed. If the user's query would benefit from one of these plugins, use the `request_plugin_install` tool to suggest that they install it. Pass the parenthesized ID as `plugin_id`. For example, suggest the Google Drive plugin if the query could possibly be better answered with access to Google Drive.",
+		intro,
 		"",
 	}
 	for _, plugin := range p.Plugins {

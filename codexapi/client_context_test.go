@@ -87,6 +87,9 @@ func TestClientMetadataClientMetadataAndHeaders(t *testing.T) {
 	if client["parent_turn_id"] != "parent-turn" || !strings.Contains(client[ClientCodexTurnMetadataHeader], `"parent_turn_id":"parent-turn"`) {
 		t.Fatalf("ClientMetadata() missing parent turn: %v", client)
 	}
+	if client["root_turn_id"] != "root-turn" {
+		t.Fatalf("ClientMetadata() missing top-level root turn: %v", client)
+	}
 	if !strings.Contains(client[ClientCodexTurnMetadataHeader], `"root_turn_id":"root-turn"`) {
 		t.Fatalf("ClientMetadata() missing root turn: %v", client)
 	}
@@ -415,6 +418,8 @@ func TestClientSubagentHeaderValue(t *testing.T) {
 		"subagent_guardian":               "guardian",
 		"internal:memory_consolidation":   "memory_consolidation",
 		"internal_memory_consolidation":   "memory_consolidation",
+		"internal:guardian":               "guardian",
+		"internal_guardian":               "guardian",
 		"cli":                             "",
 	}
 	for input, want := range cases {
@@ -431,6 +436,7 @@ func TestClientSubagentMetadataKind(t *testing.T) {
 		"subagent_thread_spawn_parent_d2": "thread_spawn",
 		"subagent_guardian":               "guardian",
 		"internal_memory_consolidation":   "",
+		"internal_guardian":               "",
 		"cli":                             "",
 	}
 	for input, want := range cases {

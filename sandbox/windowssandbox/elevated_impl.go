@@ -2,13 +2,45 @@ package windowssandbox
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"codex_core/sandbox/windowssandbox/elevated"
 )
 
+func elevatedDesktopPolicyForCapture(capture *CaptureRequest, permissions *ResolvedWindowsSandboxPermissions, envMap map[string]string, capabilitySIDs []string) (DesktopPolicy, error) {
+	request := &SandboxSetupRequest{
+		CodexHome:     capture.CodexHome,
+		CommandCWD:    capture.CWD,
+		Env:           envMap,
+		ProxyEnforced: capture.ProxyEnforced,
+		Permissions:   permissions,
+	}
+	overrides := WindowsSandboxFilesystemOverrides{
+		ReadRoots:                        capture.ReadRootsOverride,
+		ReadRootsSet:                     capture.ReadRootsOverrideSet,
+		ReadRootsIncludePlatformDefaults: capture.ReadRootsIncludePlatformDefaults,
+		WriteRoots:                       capture.WriteRootsOverride,
+		WriteRootsSet:                    capture.WriteRootsOverrideSet,
+		AdditionalDenyReadPaths:          capture.DenyReadPaths,
+		AdditionalDenyWritePaths:         capture.DenyWritePaths,
+	}.SetupRootOverrides()
+	return NewElevatedDesktopPolicy(request, overrides, capabilitySIDs, "")
+}
+
 type ElevatedSandboxProfileCaptureRequest struct {
 	Capture CaptureRequest
+}
+
+// registeredRunnerAliasForSpawn resolves the service-written alias a registered
+// Core launch must run instead of the app-contained runner. Legacy runtimes
+// keep the materialized helper, and a missing receipt is an error rather than a
+// silent fallback (Rust spawn_runner_transport).
+func registeredRunnerAliasForSpawn(codexHome string, username string) (string, error) {
+	if !RegisteredCoreRequested() {
+		return "", nil
+	}
+	return RegisteredRunnerAlias(codexHome, username)
 }
 
 func SpawnWindowsSandboxElevatedRunnerTransport(capture *CaptureRequest) (*elevated.RunnerTransport, error) {
@@ -49,6 +81,10 @@ func SpawnWindowsSandboxElevatedRunnerTransport(capture *CaptureRequest) (*eleva
 	if err != nil {
 		return nil, err
 	}
+	desktopPolicy, err := elevatedDesktopPolicyForCapture(capture, permissions, envMap, context.CapSIDs)
+	if err != nil {
+		return nil, err
+	}
 	var timeout *uint64
 	if capture.TimeoutMS != nil {
 		value := uint64(*capture.TimeoutMS)
@@ -66,14 +102,28 @@ func SpawnWindowsSandboxElevatedRunnerTransport(capture *CaptureRequest) (*eleva
 		TimeoutMS:         timeout,
 		TTY:               capture.TTY,
 		StdinOpen:         capture.StdinOpen,
-		UsePrivateDesktop: capture.UsePrivateDesktop,
 	}
 	creds := toElevatedRunnerCreds(context.SandboxCreds)
 	return elevated.RetryRunnerSpawnOnce(
 		creds,
 		capture.Command,
 		func(creds elevated.SandboxCredentials) (*elevated.RunnerTransport, error) {
-			return elevated.SpawnRunnerTransport(capture.CodexHome, capture.CWD, &creds, "", spawnRequest)
+			request := spawnRequest
+			name := strings.TrimSpace(capture.PrivateDesktopName)
+			if name == "" {
+				selected, err := SharedPrivateDesktopForUser(creds.Username, desktopPolicy)
+				if err != nil {
+					return nil, err
+				}
+				name = selected
+			}
+			request.PrivateDesktopName = name
+			alias, err := registeredRunnerAliasForSpawn(capture.CodexHome, creds.Username)
+			if err != nil {
+				return nil, err
+			}
+			request.RegisteredAlias = alias
+			return elevated.SpawnRunnerTransport(capture.CodexHome, capture.CWD, &creds, "", request)
 		},
 		func() (elevated.SandboxCredentials, error) {
 			refreshed, err := refreshLogonSandboxCredsForPermissions(
@@ -139,6 +189,10 @@ func RunWindowsSandboxCaptureForPermissionProfileElevated(req *ElevatedSandboxPr
 	if err != nil {
 		return nil, err
 	}
+	desktopPolicy, err := elevatedDesktopPolicyForCapture(capture, permissions, envMap, context.CapSIDs)
+	if err != nil {
+		return nil, err
+	}
 	var timeout *uint64
 	if capture.TimeoutMS != nil {
 		value := uint64(*capture.TimeoutMS)
@@ -156,7 +210,6 @@ func RunWindowsSandboxCaptureForPermissionProfileElevated(req *ElevatedSandboxPr
 		TimeoutMS:         timeout,
 		TTY:               capture.TTY,
 		StdinOpen:         capture.StdinOpen,
-		UsePrivateDesktop: capture.UsePrivateDesktop,
 	}
 	creds := toElevatedRunnerCreds(context.SandboxCreds)
 	_ = LogNote(capture.CodexHome, fmt.Sprintf(
@@ -170,7 +223,23 @@ func RunWindowsSandboxCaptureForPermissionProfileElevated(req *ElevatedSandboxPr
 		capture.Command,
 		func(creds elevated.SandboxCredentials) (*elevated.RunnerTransport, error) {
 			_ = LogNote(capture.CodexHome, fmt.Sprintf("elevated runner transport attempt: user=%s cwd=%s", creds.Username, capture.CWD))
-			transport, err := elevated.SpawnRunnerTransport(capture.CodexHome, capture.CWD, &creds, "", spawnRequest)
+			request := spawnRequest
+			name := strings.TrimSpace(capture.PrivateDesktopName)
+			if name == "" {
+				selected, err := SharedPrivateDesktopForUser(creds.Username, desktopPolicy)
+				if err != nil {
+					return nil, err
+				}
+				name = selected
+			}
+			request.PrivateDesktopName = name
+			alias, err := registeredRunnerAliasForSpawn(capture.CodexHome, creds.Username)
+			if err != nil {
+				_ = LogNote(capture.CodexHome, "elevated runner alias unavailable: "+err.Error())
+				return nil, err
+			}
+			request.RegisteredAlias = alias
+			transport, err := elevated.SpawnRunnerTransport(capture.CodexHome, capture.CWD, &creds, "", request)
 			if err != nil {
 				_ = LogNote(capture.CodexHome, "elevated runner transport failed: "+err.Error())
 				return nil, err

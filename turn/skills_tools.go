@@ -22,6 +22,7 @@ const (
 	skillsToolNamespace                  = "skills"
 	skillsToolListName                   = "list"
 	skillsToolReadName                   = "read"
+	skillsToolInstallationsName          = "installations"
 	orchestratorSkillMimeType            = "mcp/skill"
 	maxSkillToolHandleBytes              = 2048
 	maxSkillToolWarnings                 = 4
@@ -33,6 +34,7 @@ const (
 	maxOrchestratorSkillResourceBytes    = 1024 * 1024
 	maxSkillToolListPageEntries          = 20
 	maxSkillToolResponseBytes            = 512 * 1024
+	maxSkillInstallationsResponseBytes   = 8 * 1024
 	maxCatalogSkillDescriptionChars      = 1024
 	skillDescriptionTruncatedSuffix      = "..."
 	skillOversizedEntryWarning           = "Some skills were omitted because their metadata is too large."
@@ -68,6 +70,9 @@ type skillsReadArgs struct {
 	Package   string              `json:"package"`
 	Resource  string              `json:"resource"`
 	Cursor    *string             `json:"cursor,omitempty"`
+	// Source is the discovery-V2 selector (`cloud` or one executor
+	// environment) that may replace the legacy authority selector.
+	Source *skillsInstallationSource `json:"source,omitempty"`
 }
 
 type skillsReadResponse struct {
@@ -77,16 +82,53 @@ type skillsReadResponse struct {
 	NextCursor *string `json:"next_cursor"`
 }
 
+type skillsInstallationSource struct {
+	Kind          string `json:"kind"`
+	EnvironmentID string `json:"environment_id,omitempty"`
+}
+
+type skillsInstallationsArgs struct {
+	Package string                    `json:"package"`
+	Source  *skillsInstallationSource `json:"source,omitempty"`
+	Cursor  *string                   `json:"cursor,omitempty"`
+}
+
+type skillsInstallationLocation struct {
+	Package       string `json:"package,omitempty"`
+	Resource      string `json:"resource,omitempty"`
+	EnvironmentID string `json:"environment_id,omitempty"`
+	SkillRoot     string `json:"skill_root,omitempty"`
+}
+
+type skillsInstallationsResponse struct {
+	Installations []skillsInstallationLocation `json:"installations"`
+	NextCursor    *string                      `json:"next_cursor"`
+}
+
+// SkillToolMetrics receives the skill tool outcome counters (Rust
+// SkillsExtension's ExtensionMetrics, #59295). Session telemetry satisfies it.
+type SkillToolMetrics interface {
+	Counter(name string, inc int, tags map[string]string)
+}
+
+const (
+	skillReadResultMetric          = "codex.skills.read.result"
+	skillInstallationsResultMetric = "codex.skills.installations.result"
+)
+
 type skillsToolExecutor struct {
-	spec       tool.Spec
-	mcpService *mcp.MCPService
-	threadID   string
-	name       string
-	catalog    *orchestratorSkillCatalogCache
-	providers  *skillprovider.Registry
-	executor   *executorSkillCatalogCache
-	readMu     sync.Mutex
-	read       *executorReadSnapshot
+	spec          tool.Spec
+	mcpService    *mcp.MCPService
+	cloudProvider skillprovider.Provider
+	threadID      string
+	name          string
+	catalog       *orchestratorSkillCatalogCache
+	providers     *skillprovider.Registry
+	executor      *executorSkillCatalogCache
+	readMu        sync.Mutex
+	read          *executorReadSnapshot
+	metrics       SkillToolMetrics
+	discoveryV2   bool
 }
 
 type executorReadSnapshot struct {
@@ -101,6 +143,12 @@ type OrchestratorSkillMetadata struct {
 	Description  string
 	MainResource string
 	PluginID     string
+	// AliasRoot is the provider-declared root for rendered aliases; empty
+	// derives it from the package URI.
+	AliasRoot string
+	// PromptVisible is false for cloud skills a snapshot hides from the model
+	// catalog while keeping them readable (Rust #55631).
+	PromptVisible bool
 }
 
 type OrchestratorSkillCatalog struct {
@@ -122,7 +170,8 @@ func registerSkillsTools(registry *tool.Registry, options *ToolRegistryOptions) 
 	if registry == nil || options == nil {
 		return nil
 	}
-	orchestratorAvailable := options.MCPService != nil && (options.OrchestratorSkillsEnabled == nil || *options.OrchestratorSkillsEnabled)
+	orchestratorAvailable := options.CloudSkillProvider != nil ||
+		(options.MCPService != nil && (options.OrchestratorSkillsEnabled == nil || *options.OrchestratorSkillsEnabled))
 	if !orchestratorAvailable && options.SkillProviders == nil {
 		return nil
 	}
@@ -133,7 +182,14 @@ func registerSkillsTools(registry *tool.Registry, options *ToolRegistryOptions) 
 		return err
 	}
 	read := newSkillsToolExecutor(options, skillsToolReadName, "Read one page from a skill. Pass its provided package directly; root aliases are resolved automatically. Omit resource to read SKILL.md; to read another file, use the same package and pass the file's complete skill:// identifier as resource. For executor-backed skills, skill_root is the skill's absolute directory in the executor filesystem and can be used to locate bundled scripts. If the package is not provided, use skills.list to find it. Pass next_cursor back as cursor to continue.", catalog, executor)
-	return registry.Register(read)
+	if err := registry.Register(read); err != nil {
+		return err
+	}
+	if options.DiscoveryV2Skills {
+		installations := newSkillsToolExecutor(options, skillsToolInstallationsName, "Find a skill's enabled Cloud and executor locations, including those omitted by skills.read. Pass its provided package directly; root aliases are resolved automatically. Use source {kind: cloud} for Cloud or {kind: executor, environment_id: ...} for one environment. Omit source for all locations. Cloud locations return package and resource: pass both directly to skills.read to read the main instruction file, usually SKILL.md. Executor locations return environment_id and skill_root, the absolute directory containing instructions and supporting files such as scripts. Pass next_cursor back as cursor with the same package and source to continue listing locations.", catalog, executor)
+		return registry.Register(installations)
+	}
+	return nil
 }
 
 func newSkillsToolExecutor(options *ToolRegistryOptions, name string, description string, catalog *orchestratorSkillCatalogCache, executor *executorSkillCatalogCache) *skillsToolExecutor {
@@ -146,12 +202,15 @@ func newSkillsToolExecutor(options *ToolRegistryOptions, name string, descriptio
 			Parallel:             true,
 			NamespaceDescription: fmt.Sprintf("Tools in the %s namespace.", skillsToolNamespace),
 		},
-		mcpService: options.MCPService,
-		threadID:   strings.TrimSpace(options.ThreadID),
-		name:       name,
-		catalog:    catalog,
-		providers:  options.SkillProviders,
-		executor:   executor,
+		mcpService:    options.MCPService,
+		cloudProvider: options.CloudSkillProvider,
+		threadID:      strings.TrimSpace(options.ThreadID),
+		name:          name,
+		catalog:       catalog,
+		providers:     options.SkillProviders,
+		executor:      executor,
+		metrics:       options.SkillMetrics,
+		discoveryV2:   options.DiscoveryV2Skills,
 	}
 }
 
@@ -174,6 +233,8 @@ func (e *skillsToolExecutor) Execute(ctx context.Context, invocation *tool.Invoc
 		return e.executeList(ctx, invocation)
 	case skillsToolReadName:
 		return e.executeRead(ctx, invocation)
+	case skillsToolInstallationsName:
+		return e.executeInstallations(ctx, invocation)
 	default:
 		return nil, tool.Fatal("unknown skills tool")
 	}
@@ -266,6 +327,188 @@ func (e *skillsToolExecutor) executeList(ctx context.Context, invocation *tool.I
 	}
 }
 
+func (e *skillsToolExecutor) executeInstallations(ctx context.Context, invocation *tool.Invocation) (*tool.Output, error) {
+	outcome, sourceFilter, output, err := e.installationsResult(ctx, invocation)
+	e.recordSkillToolResult(skillInstallationsResultMetric, outcome, map[string]string{
+		"source_filter":     sourceFilter,
+		"discovery_version": e.skillDiscoveryVersion(),
+	})
+	return output, err
+}
+
+// installationsResult reports the bounded outcome and source filter Rust
+// records for every skills.installations invocation (#59295).
+func (e *skillsToolExecutor) installationsResult(ctx context.Context, invocation *tool.Invocation) (string, string, *tool.Output, error) {
+	sourceFilter := "unparsed"
+	var args skillsInstallationsArgs
+	if err := decodeStrictToolArgs(invocation, &args); err != nil {
+		return "invalid_arguments", sourceFilter, nil, tool.RespondToModel(err.Error())
+	}
+	sourceFilter = "all"
+	if args.Source != nil {
+		sourceFilter = strings.TrimSpace(args.Source.Kind)
+	}
+	packageArg := strings.TrimSpace(args.Package)
+	if packageArg == "" || len(packageArg) > maxSkillToolHandleBytes || strings.ContainsFunc(packageArg, unicode.IsControl) {
+		return "invalid_package", sourceFilter, nil, tool.RespondToModel("package must be non-empty, contain no control characters, and be at most 2048 bytes")
+	}
+	if args.Source != nil {
+		switch strings.TrimSpace(args.Source.Kind) {
+		case "cloud":
+		case "executor":
+			environmentID := strings.TrimSpace(args.Source.EnvironmentID)
+			if environmentID == "" || len(environmentID) > maxSkillToolHandleBytes || strings.ContainsFunc(environmentID, unicode.IsControl) {
+				return "invalid_source", sourceFilter, nil, tool.RespondToModel("environment_id must be non-empty, contain no control characters, and be at most 2048 bytes")
+			}
+		default:
+			return "invalid_source", sourceFilter, nil, tool.RespondToModel("source.kind must be `cloud` or `executor`")
+		}
+	}
+	locations := e.skillInstallations(ctx, packageArg)
+	if args.Source != nil {
+		filtered := locations[:0]
+		for _, location := range locations {
+			switch strings.TrimSpace(args.Source.Kind) {
+			case "cloud":
+				if location.Package != "" {
+					filtered = append(filtered, location)
+				}
+			case "executor":
+				if location.EnvironmentID == strings.TrimSpace(args.Source.EnvironmentID) {
+					filtered = append(filtered, location)
+				}
+			}
+		}
+		locations = filtered
+	}
+	if len(locations) == 0 {
+		output, err := skillsToolJSONOutput(invocation, skillsInstallationsResponse{Installations: []skillsInstallationLocation{}})
+		if err != nil {
+			return "internal_error", sourceFilter, nil, err
+		}
+		return "empty", sourceFilter, output, nil
+	}
+	fingerprint := skillInstallationsFingerprint(packageArg, args.Source, locations)
+	start, err := parseSkillInstallationsCursor(args.Cursor, fingerprint)
+	if err != nil {
+		return "invalid_cursor", sourceFilter, nil, err
+	}
+	if start > len(locations) {
+		return "invalid_cursor", sourceFilter, nil, tool.RespondToModel("skills.installations cursor is invalid")
+	}
+	responseByteBudget := invocation.ResponseByteBudget(maxSkillInstallationsResponseBytes)
+	response := skillsInstallationsResponse{Installations: []skillsInstallationLocation{}}
+	for index := start; index < len(locations); index++ {
+		response.Installations = append(response.Installations, locations[index])
+		if index+1 < len(locations) {
+			cursor := fmt.Sprintf("%s:%d", fingerprint, index+1)
+			response.NextCursor = &cursor
+		} else {
+			response.NextCursor = nil
+		}
+		if skillToolSerializedLen(response) > responseByteBudget {
+			response.Installations = response.Installations[:len(response.Installations)-1]
+			if len(response.Installations) == 0 {
+				return "response_budget", sourceFilter, nil, tool.RespondToModel("skills.installations response budget leaves no room for an installation")
+			}
+			cursor := fmt.Sprintf("%s:%d", fingerprint, index)
+			response.NextCursor = &cursor
+			break
+		}
+	}
+	output, err := skillsToolJSONOutput(invocation, response)
+	if err != nil {
+		return "internal_error", sourceFilter, nil, err
+	}
+	return "success", sourceFilter, output, nil
+}
+
+func (e *skillsToolExecutor) skillInstallations(ctx context.Context, packageArg string) []skillsInstallationLocation {
+	locations := make([]skillsInstallationLocation, 0)
+	seen := map[skillsInstallationLocation]struct{}{}
+	appendLocation := func(location skillsInstallationLocation) {
+		if _, duplicate := seen[location]; duplicate {
+			return
+		}
+		seen[location] = struct{}{}
+		locations = append(locations, location)
+	}
+	cloud := e.orchestratorSkillCatalog()
+	cloudEntries := orchestratorCatalogAsSkillProviderEntries(cloud)
+	targetNames := map[string]struct{}{}
+	for _, entry := range cloud.Skills {
+		if skillPackageMatchesAlias(cloudEntries, entry.Package, packageArg) {
+			targetNames[strings.TrimSpace(entry.Name)] = struct{}{}
+		}
+	}
+	executor := e.executorSkillCatalog(ctx)
+	for _, entry := range executor.Entries {
+		if skillPackageMatchesAlias(executor.Entries, entry.PackageID, packageArg) {
+			targetNames[strings.TrimSpace(entry.Name)] = struct{}{}
+		}
+	}
+	for _, entry := range cloud.Skills {
+		_, byName := targetNames[strings.TrimSpace(entry.Name)]
+		if !byName && !skillPackageMatchesAlias(cloudEntries, entry.Package, packageArg) {
+			continue
+		}
+		appendLocation(skillsInstallationLocation{Package: entry.Package, Resource: entry.MainResource})
+	}
+	for _, entry := range executor.Entries {
+		_, byName := targetNames[strings.TrimSpace(entry.Name)]
+		if !entry.Enabled || entry.Authority.Kind != skillprovider.SourceExecutor || (!byName && !skillPackageMatchesAlias(executor.Entries, entry.PackageID, packageArg)) {
+			continue
+		}
+		environmentID := strings.TrimSpace(entry.EnvironmentID)
+		if environmentID == "" {
+			environmentID = strings.TrimPrefix(strings.TrimSpace(entry.Authority.ID), "discovery:")
+		}
+		skillRoot := strings.TrimSpace(entry.SkillRoot)
+		if skillRoot == "" {
+			skillRoot = pathDirectory(entry.MainResource)
+		}
+		if environmentID == "" || skillRoot == "" {
+			continue
+		}
+		appendLocation(skillsInstallationLocation{EnvironmentID: environmentID, SkillRoot: skillRoot})
+	}
+	return locations
+}
+
+func pathDirectory(value string) string {
+	value = strings.TrimSpace(strings.ReplaceAll(value, "\\", "/"))
+	if index := strings.LastIndex(value, "/"); index > 0 {
+		return value[:index]
+	}
+	return ""
+}
+
+func skillInstallationsFingerprint(packageArg string, source *skillsInstallationSource, locations []skillsInstallationLocation) string {
+	payload, _ := json.Marshal(struct {
+		Package       string                       `json:"package"`
+		Source        *skillsInstallationSource    `json:"source,omitempty"`
+		Installations []skillsInstallationLocation `json:"installations"`
+	}{Package: packageArg, Source: source, Installations: locations})
+	sum := sha256.Sum256(payload)
+	return fmt.Sprintf("%x", sum[:8])
+}
+
+func parseSkillInstallationsCursor(cursor *string, fingerprint string) (int, error) {
+	if cursor == nil || strings.TrimSpace(*cursor) == "" {
+		return 0, nil
+	}
+	value := strings.TrimSpace(*cursor)
+	separator := strings.LastIndex(value, ":")
+	if separator < 0 || value[:separator] != fingerprint {
+		return 0, tool.RespondToModel("skills.installations cursor is stale; restart from the first page")
+	}
+	offset, err := strconv.Atoi(value[separator+1:])
+	if err != nil || offset < 0 {
+		return 0, tool.RespondToModel("skills.installations cursor is invalid")
+	}
+	return offset, nil
+}
+
 type indexedListedSkill struct {
 	index int
 	skill listedSkill
@@ -328,21 +571,55 @@ func parseSkillListCursor(cursor *string, value any, toolName string) (int, *int
 }
 
 func (e *skillsToolExecutor) executeRead(ctx context.Context, invocation *tool.Invocation) (*tool.Output, error) {
+	outcome, output, err := e.readSkillResult(ctx, invocation)
+	e.recordSkillToolResult(skillReadResultMetric, outcome, map[string]string{
+		"discovery_version": e.skillDiscoveryVersion(),
+	})
+	return output, err
+}
+
+// readSkillResult reports the bounded outcome label Rust records for every
+// skills.read invocation (#59295) alongside the tool result.
+func (e *skillsToolExecutor) readSkillResult(ctx context.Context, invocation *tool.Invocation) (string, *tool.Output, error) {
+	outcome := "internal_error"
 	var args skillsReadArgs
 	if err := decodeStrictToolArgs(invocation, &args); err != nil {
-		return nil, tool.RespondToModel(err.Error())
+		return "invalid_arguments", nil, tool.RespondToModel(err.Error())
 	}
 	responseByteBudget := invocation.ResponseByteBudget(maxSkillToolResponseBytes)
 	authority := args.Authority
+	if args.Source != nil {
+		resolved, resolveErr := e.skillReadAuthorityForSource(ctx, args.Package, args.Source)
+		if resolveErr != nil {
+			return "invalid_arguments", nil, resolveErr
+		}
+		authority = resolved
+	}
+	if authority.Kind == "" {
+		// Rust's read handler has no authority argument: it derives the source
+		// from the matched catalog entry (`matching_packages`). Go accepts the
+		// legacy selector but must behave the same when it is omitted.
+		resolved, ok, resolveErr := e.skillReadAuthorityForPackage(ctx, args.Package)
+		if resolveErr != nil {
+			return "invalid_arguments", nil, tool.RespondToModel(resolveErr.Error())
+		}
+		if !ok {
+			return "source_unavailable", nil, tool.RespondToModel("skill package is not available")
+		}
+		authority = resolved
+	}
 	if err := validateSkillsToolReadAuthority(authority); err != nil {
-		return nil, err
+		return "invalid_arguments", nil, err
 	}
 	if err := validateSkillToolHandle("package", args.Package, maxSkillToolHandleBytes); err != nil {
-		return nil, err
+		return "invalid_arguments", nil, err
 	}
-	entry, ok := e.availableSkillPackage(ctx, authority, args.Package)
+	entry, ok, resolveErr := e.availableSkillPackage(ctx, authority, args.Package)
+	if resolveErr != nil {
+		return "invalid_arguments", nil, tool.RespondToModel(resolveErr.Error())
+	}
 	if !ok {
-		return nil, tool.RespondToModel("skill package is not available from the requested authority")
+		return "source_unavailable", nil, tool.RespondToModel("skill package is not available from the requested authority")
 	}
 	resource := args.Resource
 	if resource == "" {
@@ -351,10 +628,12 @@ func (e *skillsToolExecutor) executeRead(ctx context.Context, invocation *tool.I
 		resource = entry.MainResource
 	}
 	if err := validateSkillToolHandle("resource", resource, maxSkillToolHandleBytes); err != nil {
-		return nil, err
+		return "invalid_arguments", nil, err
 	}
-	if !skillResourceBelongsToPackage(authority, args.Package, resource) {
-		return nil, tool.RespondToModel("skill package is not available from the requested authority")
+	// The requested package may be a rendered alias; validate the resource
+	// against the canonical package the catalog selected (Rust #55631).
+	if !skillResourceBelongsToPackage(authority, entry.Package, resource) {
+		return "invalid_arguments", nil, tool.RespondToModel("skill package is not available from the requested authority")
 	}
 	var result skillprovider.ReadResult
 	var err error
@@ -372,8 +651,16 @@ func (e *skillsToolExecutor) executeRead(ctx context.Context, invocation *tool.I
 		// of rereading the whole resource for every page.
 		switch {
 		case authority.Kind == "orchestrator":
+			if e.cloudProvider != nil {
+				result, err = e.cloudProvider.Read(ctx, skillprovider.ReadRequest{
+					Authority: skillprovider.Authority{Kind: skillprovider.SourceCloud, ID: skillprovider.FrozenCloudServerName},
+					PackageID: entry.Package,
+					Resource:  resource,
+				})
+				break
+			}
 			var contents string
-			contents, err = ReadOrchestratorSkillResource(e.mcpService, e.threadID, args.Package, resource)
+			contents, err = ReadOrchestratorSkillResource(e.mcpService, e.threadID, entry.Package, resource)
 			result = skillprovider.ReadResult{Resource: resource, Contents: contents}
 		case e.providers != nil:
 			result, err = e.providers.Read(ctx, skillprovider.ReadRequest{
@@ -386,17 +673,17 @@ func (e *skillsToolExecutor) executeRead(ctx context.Context, invocation *tool.I
 		}
 	}
 	if err != nil {
-		return nil, tool.RespondToModel("failed to read skill resource")
+		return "read_failed", nil, tool.RespondToModel("failed to read skill resource")
 	}
 	if result.Resource != resource {
-		return nil, tool.Fatal("skill provider returned a different resource")
+		return outcome, nil, tool.Fatal("skill provider returned a different resource")
 	}
 	start, cursorErr := parseSkillToolCursor(args.Cursor, result.Contents, "skills.read")
 	if cursorErr != nil {
-		return nil, cursorErr
+		return "invalid_cursor", nil, cursorErr
 	}
 	if start > len(result.Contents) || !utf8.ValidString(result.Contents) || !isUTF8Boundary(result.Contents, start) {
-		return nil, tool.RespondToModel("skills.read cursor is invalid")
+		return "invalid_cursor", nil, tool.RespondToModel("skills.read cursor is invalid")
 	}
 	var skillRoot *string
 	if authority.Kind == "executor" {
@@ -406,7 +693,7 @@ func (e *skillsToolExecutor) executeRead(ctx context.Context, invocation *tool.I
 	}
 	response, pageErr := skillReadPage(result.Resource, result.Contents, skillRoot, start, responseByteBudget)
 	if pageErr != nil {
-		return nil, pageErr
+		return "response_budget", nil, pageErr
 	}
 	if authority.Kind == "executor" && response.NextCursor != nil {
 		e.readMu.Lock()
@@ -417,7 +704,127 @@ func (e *skillsToolExecutor) executeRead(ctx context.Context, invocation *tool.I
 		}
 		e.readMu.Unlock()
 	}
-	return skillsToolJSONOutput(invocation, response)
+	output, outputErr := skillsToolJSONOutput(invocation, response)
+	if outputErr != nil {
+		return outcome, nil, outputErr
+	}
+	return "success", output, nil
+}
+
+func (e *skillsToolExecutor) skillDiscoveryVersion() string {
+	if e != nil && e.discoveryV2 {
+		return "v2"
+	}
+	return "v1"
+}
+
+func (e *skillsToolExecutor) recordSkillToolResult(name string, outcome string, tags map[string]string) {
+	if e == nil || e.metrics == nil || outcome == "" {
+		return
+	}
+	tags["outcome"] = outcome
+	e.metrics.Counter(name, 1, tags)
+}
+
+func (e *skillsToolExecutor) skillReadAuthorityForSource(ctx context.Context, packageArg string, source *skillsInstallationSource) (skillsToolAuthority, error) {
+	if source == nil {
+		return skillsToolAuthority{}, nil
+	}
+	switch strings.TrimSpace(source.Kind) {
+	case "cloud":
+		return skillsToolAuthority{Kind: "orchestrator"}, nil
+	case "executor":
+		environmentID := strings.TrimSpace(source.EnvironmentID)
+		if environmentID == "" {
+			return skillsToolAuthority{}, tool.RespondToModel("environment_id is required for an executor source")
+		}
+		catalog := e.executorSkillCatalog(ctx)
+		for _, entry := range catalog.Entries {
+			if !entry.Enabled || entry.Authority.Kind != skillprovider.SourceExecutor || !skillPackageMatchesAlias(catalog.Entries, entry.PackageID, packageArg) {
+				continue
+			}
+			entryEnvironment := strings.TrimSpace(entry.EnvironmentID)
+			if entryEnvironment == "" {
+				entryEnvironment = strings.TrimPrefix(strings.TrimSpace(entry.Authority.ID), "discovery:")
+			}
+			if entryEnvironment == environmentID {
+				return skillsToolAuthority{Kind: "executor", ID: entry.Authority.ID}, nil
+			}
+		}
+		return skillsToolAuthority{}, tool.RespondToModel("skill package is not available from the requested environment")
+	default:
+		return skillsToolAuthority{}, tool.RespondToModel("source.kind must be `cloud` or `executor`")
+	}
+}
+
+// skillReadAuthorityForPackage resolves the authority Rust derives from the
+// matched catalog entry when skills.read omits an authority selector. Cloud
+// entries win over executor entries, and a generated `cN/`/`eN/` alias keeps
+// the search scoped to its own source.
+func (e *skillsToolExecutor) skillReadAuthorityForPackage(ctx context.Context, packageArg string) (skillsToolAuthority, bool, error) {
+	aliasSource := skillAliasSource(packageArg)
+	cloud := e.orchestratorSkillCatalog()
+	cloudEntries := orchestratorCatalogAsSkillProviderEntries(cloud)
+	if aliasSource != "executor" {
+		for _, skill := range cloud.Skills {
+			if skill.Package == packageArg || skillPackageMatchesLocator(cloudEntries, skill.Package, packageArg) {
+				return skillsToolAuthority{Kind: "orchestrator"}, true, nil
+			}
+		}
+	}
+	executorAllowed := aliasSource != "cloud" && aliasSource != "host"
+	executor := e.executorSkillCatalog(ctx)
+	if executorAllowed {
+		for _, entry := range executor.Entries {
+			if !entry.Enabled || entry.Authority.Kind != skillprovider.SourceExecutor || entry.Authority.ID == "" {
+				continue
+			}
+			if entry.PackageID == packageArg || skillPackageMatchesLocator(executor.Entries, entry.PackageID, packageArg) {
+				return skillsToolAuthority{Kind: "executor", ID: entry.Authority.ID}, true, nil
+			}
+		}
+	}
+	// Rust reaches the display-name tier only for locators without a generated
+	// `cN/`/`eN/` alias, and a name shared by several installations is an error:
+	// taking the first would read a different environment's copy of the skill.
+	if aliasSource != "" {
+		return skillsToolAuthority{}, false, nil
+	}
+	type namedInstallation struct {
+		authority skillsToolAuthority
+		pkg       string
+	}
+	named := make([]namedInstallation, 0, 1)
+	seen := map[namedInstallation]bool{}
+	addNamed := func(authority skillsToolAuthority, pkg string) {
+		installation := namedInstallation{authority: authority, pkg: pkg}
+		if seen[installation] {
+			return
+		}
+		seen[installation] = true
+		named = append(named, installation)
+	}
+	for _, skill := range cloud.Skills {
+		if skillListedNameMatches(skill.Name, packageArg) {
+			addNamed(skillsToolAuthority{Kind: "orchestrator"}, skill.Package)
+		}
+	}
+	for _, entry := range executor.Entries {
+		if !entry.Enabled || !entry.PromptVisible || entry.Authority.Kind != skillprovider.SourceExecutor || entry.Authority.ID == "" {
+			continue
+		}
+		if skillListedNameMatches(entry.Name, packageArg) {
+			addNamed(skillsToolAuthority{Kind: "executor", ID: entry.Authority.ID}, entry.PackageID)
+		}
+	}
+	switch len(named) {
+	case 0:
+		return skillsToolAuthority{}, false, nil
+	case 1:
+		return named[0].authority, true, nil
+	default:
+		return skillsToolAuthority{}, false, errors.New(skillNameAmbiguousMessage)
+	}
 }
 
 func (e *skillsToolExecutor) orchestratorSkillCatalog() OrchestratorSkillCatalog {
@@ -428,6 +835,18 @@ func (e *skillsToolExecutor) orchestratorSkillCatalog() OrchestratorSkillCatalog
 		e.catalog = &orchestratorSkillCatalogCache{}
 	}
 	e.catalog.once.Do(func() {
+		if e.cloudProvider != nil {
+			catalog, err := e.cloudProvider.List(context.Background(), skillprovider.ListQuery{})
+			if err != nil {
+				e.catalog.catalog = OrchestratorSkillCatalog{
+					Skills:   []OrchestratorSkillMetadata{},
+					Warnings: []string{"orchestrator skills unavailable: " + err.Error()},
+				}
+				return
+			}
+			e.catalog.catalog = OrchestratorSkillCatalogFromProviderCatalog(catalog)
+			return
+		}
 		catalog, err := LoadOrchestratorSkillCatalog(e.mcpService, e.threadID)
 		if err != nil {
 			catalog.Warnings = append(catalog.Warnings, "orchestrator skills unavailable: "+err.Error())
@@ -435,6 +854,31 @@ func (e *skillsToolExecutor) orchestratorSkillCatalog() OrchestratorSkillCatalog
 		e.catalog.catalog = catalog
 	})
 	return cloneOrchestratorSkillCatalog(e.catalog.catalog)
+}
+
+// OrchestratorSkillCatalogFromProviderCatalog adapts a native cloud provider
+// catalog to the orchestrator shape the skills tool and prompt renderer use.
+// Disabled entries are omitted; hidden entries stay listed for skills.read.
+func OrchestratorSkillCatalogFromProviderCatalog(catalog skillprovider.Catalog) OrchestratorSkillCatalog {
+	out := OrchestratorSkillCatalog{
+		Skills:   make([]OrchestratorSkillMetadata, 0, len(catalog.Entries)),
+		Warnings: append([]string(nil), catalog.Warnings...),
+	}
+	for _, entry := range catalog.Entries {
+		if !entry.Enabled {
+			continue
+		}
+		out.Skills = append(out.Skills, OrchestratorSkillMetadata{
+			Package:       entry.PackageID,
+			Name:          entry.Name,
+			Description:   entry.Description,
+			MainResource:  entry.MainResource,
+			PluginID:      entry.PluginID,
+			AliasRoot:     entry.AliasRoot,
+			PromptVisible: entry.PromptVisible,
+		})
+	}
+	return out
 }
 
 func LoadOrchestratorSkillCatalog(service *mcp.MCPService, threadID string) (OrchestratorSkillCatalog, error) {
@@ -554,23 +998,96 @@ func (e *skillsToolExecutor) listedSkills(ctx context.Context, kind string) ([]l
 	return listed, catalog.Warnings
 }
 
-func (e *skillsToolExecutor) availableSkillPackage(ctx context.Context, authority skillsToolAuthority, pkg string) (listedSkill, bool) {
+// skillNameAmbiguousMessage is Rust's ambiguity error: a display name that
+// resolves to more than one catalog entry must name the package instead of
+// silently picking the first match.
+const skillNameAmbiguousMessage = "skill name is ambiguous; use skills.list and pass the package for the intended skill"
+
+// availableSkillPackage resolves the package (or alias, or model-visible display
+// name) a `skills.read` call asked for, mirroring Rust #59954's
+// `matching_packages` order: the exact package locator wins, a `skill://`
+// locator never falls through to looser matching, and a display name that
+// matches several entries is reported as ambiguous.
+func (e *skillsToolExecutor) availableSkillPackage(ctx context.Context, authority skillsToolAuthority, pkg string) (listedSkill, bool, error) {
+	aliasSource := skillAliasSource(pkg)
+	if aliasSource == "cloud" || aliasSource == "host" {
+		if authority.Kind != "orchestrator" || aliasSource == "host" {
+			return listedSkill{}, false, nil
+		}
+	}
+	if aliasSource == "executor" && authority.Kind != "executor" {
+		return listedSkill{}, false, nil
+	}
 	listed, _ := e.listedSkills(ctx, authority.Kind)
+	candidates := make([]listedSkill, 0, len(listed))
+	var entries []skillprovider.CatalogEntry
 	if authority.Kind == "executor" {
 		catalog := e.executorSkillCatalog(ctx)
+		entries = catalog.Entries
 		for _, entry := range catalog.Entries {
-			if entry.Enabled && entry.Authority.Kind == skillprovider.SourceExecutor && entry.Authority.ID == authority.ID && skillPackageMatchesAlias(catalog.Entries, entry.PackageID, pkg) {
-				return listedSkill{Authority: authority, Package: entry.PackageID, Name: entry.Name, Description: entry.Description, MainResource: entry.MainResource}, true
+			if !entry.Enabled || entry.Authority.Kind != skillprovider.SourceExecutor || entry.Authority.ID != authority.ID {
+				continue
 			}
+			candidates = append(candidates, listedSkill{
+				Authority:    authority,
+				Package:      entry.PackageID,
+				Name:         truncateUTF8Bytes(entry.Name, maxOrchestratorQualifiedNameChars),
+				Description:  entry.Description,
+				MainResource: entry.MainResource,
+			})
 		}
-		return listedSkill{}, false
+	} else {
+		entries = orchestratorCatalogAsSkillProviderEntries(e.orchestratorSkillCatalog())
+		candidates = append(candidates, listed...)
 	}
-	for _, entry := range listed {
-		if skillPackageMatchesAlias(orchestratorCatalogAsSkillProviderEntries(e.orchestratorSkillCatalog()), entry.Package, pkg) {
-			return entry, true
+	return resolveListedSkill(candidates, entries, pkg)
+}
+
+// resolveListedSkill applies Rust #59954's three-level resolution to the
+// candidates one authority exposes: the exact package locator, then a
+// `skill://` short-circuit, then the short alias or model-visible display name.
+// Several distinct entries matching one name are reported as ambiguous instead
+// of silently resolving to the first.
+func resolveListedSkill(candidates []listedSkill, entries []skillprovider.CatalogEntry, pkg string) (listedSkill, bool, error) {
+	for _, candidate := range candidates {
+		if candidate.Package != "" && candidate.Package == pkg {
+			return candidate, true, nil
 		}
 	}
-	return listedSkill{}, false
+	if strings.HasPrefix(pkg, "skill://") {
+		return listedSkill{}, false, nil
+	}
+	// Locator aliases keep the catalog order: Rust only treats the display-name
+	// tier as ambiguous, and a generated `cN/`/`eN/` locator never reaches it.
+	for _, candidate := range candidates {
+		if skillPackageMatchesLocator(entries, candidate.Package, pkg) {
+			return candidate, true, nil
+		}
+	}
+	if skillAliasSource(pkg) != "" {
+		return listedSkill{}, false, nil
+	}
+	matches := make([]listedSkill, 0, 1)
+	seen := map[string]bool{}
+	for _, candidate := range candidates {
+		if !skillPackageMatchesListedName(entries, candidate.Package, pkg) {
+			continue
+		}
+		key := candidate.Authority.Kind + "\x00" + candidate.Authority.ID + "\x00" + candidate.Package
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		matches = append(matches, candidate)
+	}
+	switch len(matches) {
+	case 0:
+		return listedSkill{}, false, nil
+	case 1:
+		return matches[0], true, nil
+	default:
+		return listedSkill{}, false, errors.New(skillNameAmbiguousMessage)
+	}
 }
 
 // skillPackageMatchesAlias accepts the complete package locator or the short
@@ -578,6 +1095,15 @@ func (e *skillsToolExecutor) availableSkillPackage(ctx context.Context, authorit
 // (Rust #38261). Aliases are derived from the leading URI segments and are
 // stable for a single authority/kind list.
 func skillPackageMatchesAlias(entries []skillprovider.CatalogEntry, packageID string, candidate string) bool {
+	return skillPackageMatchesLocator(entries, packageID, candidate) ||
+		skillPackageMatchesListedName(entries, packageID, candidate)
+}
+
+// skillPackageMatchesLocator accepts the complete package locator or the short
+// alias rendered in the skills catalog under metadata pressure (Rust #38261).
+// It intentionally excludes the display name: Rust orders that as its own tier,
+// which is the only one where several installations are an error.
+func skillPackageMatchesLocator(entries []skillprovider.CatalogEntry, packageID string, candidate string) bool {
 	if packageID == "" || candidate == "" {
 		return false
 	}
@@ -591,15 +1117,84 @@ func skillPackageMatchesAlias(entries []skillprovider.CatalogEntry, packageID st
 		}
 	}
 	roots := skillAliasRoots(visible)
-	prefix := "e"
+	prefix := skillAliasPrefixExecutor
 	for _, entry := range visible {
 		if entry.Authority.Kind == skillprovider.SourceOrchestrator {
-			prefix = "o"
+			prefix = skillAliasPrefixCloud
 			break
 		}
 	}
-	short := skillShortPackageLocator(packageID, roots, prefix)
-	return short == candidate
+	return skillShortPackageLocator(packageID, roots, prefix) == candidate
+}
+
+// skillPackageMatchesListedName resolves the model-visible display name, which
+// is the exact name `skills.list` returned — possibly truncated to
+// MAX_SKILL_NAME_BYTES on a character boundary. Reusing the listing truncation
+// keeps "the name list showed" and "the name read accepts" the same string.
+func skillPackageMatchesListedName(entries []skillprovider.CatalogEntry, packageID string, candidate string) bool {
+	if packageID == "" || candidate == "" {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.Enabled && entry.PromptVisible && entry.PackageID == packageID &&
+			skillListedNameMatches(entry.Name, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+// skillListedNameMatches accepts the complete display name or its listed form.
+func skillListedNameMatches(name string, candidate string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" || candidate == "" {
+		return false
+	}
+	if name == candidate {
+		return true
+	}
+	return truncateUTF8Bytes(name, maxOrchestratorQualifiedNameChars) == candidate
+}
+
+const (
+	// Alias source prefixes are shared by generated locators and parser
+	// selection (Rust #55303).
+	skillAliasPrefixCloud    = "c"
+	skillAliasPrefixExecutor = "e"
+	skillAliasPrefixHost     = "r"
+)
+
+// skillAliasSource recognizes a generated package locator's source from its
+// `cN/`, `eN/`, or `rN/` root. Malformed roots (missing suffix, leading zeros,
+// overflow, non-ASCII digits) are not aliases and keep the legacy search order.
+func skillAliasSource(locator string) string {
+	root, suffix, ok := strings.Cut(strings.TrimSpace(locator), "/")
+	if !ok || suffix == "" || len(root) < 2 {
+		return ""
+	}
+	prefix := root[:1]
+	digits := root[1:]
+	if len(digits) > 1 && digits[0] == '0' {
+		return ""
+	}
+	for index := 0; index < len(digits); index++ {
+		if digits[index] < '0' || digits[index] > '9' {
+			return ""
+		}
+	}
+	if _, err := strconv.ParseUint(digits, 10, 64); err != nil {
+		return ""
+	}
+	switch prefix {
+	case skillAliasPrefixCloud:
+		return "cloud"
+	case skillAliasPrefixExecutor:
+		return "executor"
+	case skillAliasPrefixHost:
+		return "host"
+	default:
+		return ""
+	}
 }
 
 func skillAliasRoots(entries []skillprovider.CatalogEntry) []string {
@@ -609,7 +1204,10 @@ func skillAliasRoots(entries []skillprovider.CatalogEntry) []string {
 		if entry.PackageID == "" {
 			continue
 		}
-		root := extensionSkillAliasRoot(entry.PackageID)
+		root := strings.TrimSpace(entry.AliasRoot)
+		if root == "" {
+			root = extensionSkillAliasRoot(entry.PackageID)
+		}
 		if root == "" || seen[root] {
 			continue
 		}
@@ -660,6 +1258,7 @@ func orchestratorCatalogAsSkillProviderEntries(catalog OrchestratorSkillCatalog)
 		entries = append(entries, skillprovider.CatalogEntry{
 			PackageID:     skill.Package,
 			Authority:     skillprovider.Authority{Kind: skillprovider.SourceOrchestrator},
+			AliasRoot:     skill.AliasRoot,
 			Enabled:       true,
 			PromptVisible: true,
 			MainResource:  skill.MainResource,
@@ -710,11 +1309,12 @@ func orchestratorSkillMetadataFromResource(resource mcp.MCPResource) (Orchestrat
 		return OrchestratorSkillMetadata{}, false
 	}
 	return OrchestratorSkillMetadata{
-		Package:      entry.Package,
-		Name:         entry.Name,
-		Description:  entry.Description,
-		MainResource: entry.MainResource,
-		PluginID:     entry.PluginID,
+		Package:       entry.Package,
+		Name:          entry.Name,
+		Description:   entry.Description,
+		MainResource:  entry.MainResource,
+		PluginID:      entry.PluginID,
+		PromptVisible: true,
 	}, true
 }
 
@@ -1121,6 +1721,24 @@ func skillsToolInputSchema(name string) map[string]any {
 	}
 	properties := map[string]any{"authority": authoritySelector, "cursor": map[string]any{"type": "string"}}
 	required := []string{"authority"}
+	if name == skillsToolInstallationsName {
+		properties = map[string]any{
+			"package": map[string]any{"type": "string"},
+			"source": map[string]any{
+				"oneOf": []any{
+					map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{"kind": map[string]any{"const": "cloud"}}, "required": []string{"kind"}},
+					map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{"kind": map[string]any{"const": "executor"}, "environment_id": map[string]any{"type": "string"}}, "required": []string{"kind", "environment_id"}},
+				},
+			},
+			"cursor": map[string]any{"type": "string"},
+		}
+		return map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"properties":           properties,
+			"required":             []string{"package"},
+		}
+	}
 	if name == skillsToolReadName {
 		properties["authority"] = map[string]any{
 			"oneOf": []any{
@@ -1130,7 +1748,13 @@ func skillsToolInputSchema(name string) map[string]any {
 		}
 		properties["package"] = map[string]any{"type": "string"}
 		properties["resource"] = map[string]any{"type": "string"}
-		required = append(required, "package")
+		properties["source"] = map[string]any{
+			"oneOf": []any{
+				map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{"kind": map[string]any{"const": "cloud"}}, "required": []string{"kind"}},
+				map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{"kind": map[string]any{"const": "executor"}, "environment_id": map[string]any{"type": "string"}}, "required": []string{"kind", "environment_id"}},
+			},
+		}
+		required = []string{"package"}
 	}
 	return map[string]any{
 		"type":                 "object",

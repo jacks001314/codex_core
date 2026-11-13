@@ -18,14 +18,31 @@ type stdioHostServer struct {
 	read    func(*ClientToHost) (bool, error)
 	writeFn func(any) error
 
-	writeMu      sync.Mutex
-	mu           sync.Mutex
-	sessions     map[SessionID]*stdioHostSession
-	seen         map[SessionID]struct{}
-	requests     map[RequestID]*stdioHostRequest
-	pending      map[DelegateRequestID]chan delegateHostResult
-	nextDelegate atomic.Int64
-	wg           sync.WaitGroup
+	writeMu         sync.Mutex
+	mu              sync.Mutex
+	sessions        map[SessionID]*stdioHostSession
+	seen            map[SessionID]struct{}
+	requests        map[RequestID]*stdioHostRequest
+	pending         map[DelegateRequestID]chan delegateHostResult
+	pendingCount    int
+	pendingSession  map[SessionID]int
+	activeCells     map[activeCellKey]struct{}
+	delegateLimit   int
+	activeCellLimit int
+	enforceSessions bool
+	nextDelegate    atomic.Int64
+	wg              sync.WaitGroup
+}
+
+type codemodeHostOptions struct {
+	// enforceSessionDelegateLimits mirrors the structured gRPC service, where
+	// each session owns a callback budget in addition to the shared host budget.
+	enforceSessionDelegateLimits bool
+}
+
+type activeCellKey struct {
+	sessionID SessionID
+	cellID    CellID
 }
 
 // stdioHostRequest tracks one in-flight host request. The yield signal is the
@@ -50,13 +67,14 @@ func RunStdioHost(ctx context.Context, stdin io.Reader, stdout io.Writer) error 
 		ctx,
 		func(message *ClientToHost) (bool, error) { return reader.Read(message) },
 		func(message any) error { return writer.Write(message) },
+		codemodeHostOptions{},
 	)
 }
 
 // runCodemodeHost runs the code-mode host protocol over an arbitrary message
 // transport. Rust's gRPC stdio host serves the same logic over a framed gRPC
 // stream (#52723).
-func runCodemodeHost(ctx context.Context, read func(*ClientToHost) (bool, error), write func(any) error) error {
+func runCodemodeHost(ctx context.Context, read func(*ClientToHost) (bool, error), write func(any) error, options codemodeHostOptions) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -64,6 +82,9 @@ func runCodemodeHost(ctx context.Context, read func(*ClientToHost) (bool, error)
 		ctx: ctx, read: read, writeFn: write,
 		sessions: map[SessionID]*stdioHostSession{}, seen: map[SessionID]struct{}{},
 		requests: map[RequestID]*stdioHostRequest{}, pending: map[DelegateRequestID]chan delegateHostResult{},
+		pendingSession: map[SessionID]int{}, activeCells: map[activeCellKey]struct{}{},
+		delegateLimit: LegacyMaxPendingDelegateCalls, activeCellLimit: MaxActiveCells,
+		enforceSessions: options.enforceSessionDelegateLimits,
 	}
 	if err := host.negotiate(); err != nil {
 		return err
@@ -115,7 +136,7 @@ func (h *stdioHostServer) negotiate() error {
 	// Rust #48123: the host advertises the supported optional capabilities the
 	// client asked for, and rejects a required capability it cannot provide.
 	supported := CapabilitySet{}
-	for _, name := range []string{SessionCellExecutionResourceLimitsCapability, YieldObservationCapability} {
+	for _, name := range []string{SessionCellExecutionResourceLimitsCapability, YieldObservationCapability, LargeDelegateCapacityCapability} {
 		if capability, err := NewCapability(name); err == nil {
 			supported = append(supported, capability)
 		}
@@ -134,6 +155,11 @@ func (h *stdioHostServer) negotiate() error {
 			hostCapabilities = append(hostCapabilities, capability)
 		}
 	}
+	if (&hostCapabilities).Contains(Capability(LargeDelegateCapacityCapability)) {
+		h.delegateLimit = MaxPendingDelegateCalls
+	} else {
+		h.delegateLimit = LegacyMaxPendingDelegateCalls
+	}
 	return h.write(HostHelloMessage(HostHello{SelectedVersion: ProtocolV1, Capabilities: hostCapabilities}))
 }
 
@@ -145,6 +171,12 @@ func (h *stdioHostServer) startRequest(id RequestID, request *HostRequest) {
 	}
 	entry := &stdioHostRequest{kind: kind, cancel: cancel, yield: tool.NewYieldSignal()}
 	h.mu.Lock()
+	if len(h.requests) >= maxInFlightRequests {
+		h.mu.Unlock()
+		cancel()
+		_ = h.write(HostOperationResponse(id, ResultErr[HostResponse]("code-mode host has too many in-flight requests")))
+		return
+	}
 	if _, exists := h.requests[id]; exists {
 		h.mu.Unlock()
 		cancel()
@@ -177,7 +209,11 @@ func (h *stdioHostServer) handleRequest(ctx context.Context, id RequestID, reque
 		_, active := h.sessions[request.SessionID]
 		_, reused := h.seen[request.SessionID]
 		if !active && !reused {
-			h.sessions[request.SessionID] = newStdioHostSession(h, request.SessionID)
+			session := newStdioHostSession(h, request.SessionID)
+			if request.OutputTruncation != nil {
+				session.outputTruncation = *request.OutputTruncation
+			}
+			h.sessions[request.SessionID] = session
 			h.seen[request.SessionID] = struct{}{}
 		}
 		h.mu.Unlock()
@@ -201,12 +237,18 @@ func (h *stdioHostServer) handleRequest(ctx context.Context, id RequestID, reque
 			return
 		}
 		cellID := session.nextCellID()
+		if !h.reserveActiveCell(request.SessionID, cellID) {
+			_ = h.write(HostOperationResponse(id, ResultErr[HostResponse]("code-mode host has too many active cells")))
+			return
+		}
 		if err := h.write(HostOperationResponse(id, ResultOK(ExecutionStarted(cellID)))); err != nil {
+			h.releaseActiveCell(request.SessionID, cellID)
 			return
 		}
 		response := session.execute(ctx, cellID, request.Request, yield)
 		_ = h.write(InitialResponse(id, ResultOK(response)))
 		if response.Variant != "Yielded" {
+			h.releaseActiveCell(request.SessionID, cellID)
 			_ = h.write(CellClosed(request.SessionID, cellID))
 		}
 	case "session/wait":
@@ -218,6 +260,7 @@ func (h *stdioHostServer) handleRequest(ctx context.Context, id RequestID, reque
 		outcome := session.wait(ctx, request.Wait, false, yield)
 		_ = h.write(HostOperationResponse(id, ResultOK(WaitCompleted(outcome))))
 		if outcome.Response.Variant != "Yielded" {
+			h.releaseActiveCell(request.SessionID, outcome.Response.CellID)
 			_ = h.write(CellClosed(request.SessionID, outcome.Response.CellID))
 		}
 	case "session/terminate":
@@ -226,13 +269,17 @@ func (h *stdioHostServer) handleRequest(ctx context.Context, id RequestID, reque
 			_ = h.write(HostOperationResponse(id, ResultErr[HostResponse](fmt.Sprintf("unknown code-mode session %s", request.SessionID))))
 			return
 		}
-		outcome := session.wait(ctx, &WaitRequest{CellID: request.CellID}, true, yield)
+		// The terminating observation's maxOutputTokens budget is accepted for
+		// server-truncated sessions; client-mode sessions ignore it (Rust #57272).
+		outcome := session.wait(ctx, &WaitRequest{CellID: request.CellID, MaxOutputTokens: request.MaxOutputTokens}, true, yield)
 		_ = h.write(HostOperationResponse(id, ResultOK(WaitCompleted(outcome))))
+		h.releaseActiveCell(request.SessionID, request.CellID)
 		_ = h.write(CellClosed(request.SessionID, request.CellID))
 	case "session/shutdown":
 		h.mu.Lock()
 		session := h.sessions[request.SessionID]
 		delete(h.sessions, request.SessionID)
+		h.releaseSessionActiveCellsLocked(request.SessionID)
 		h.mu.Unlock()
 		if session == nil {
 			_ = h.write(HostOperationResponse(id, ResultErr[HostResponse](fmt.Sprintf("unknown code-mode session %s", request.SessionID))))
@@ -280,12 +327,13 @@ func (h *stdioHostServer) requestDelegate(ctx context.Context, sessionID Session
 	id := DelegateRequestID(h.nextDelegate.Add(1))
 	response := make(chan delegateHostResult, 1)
 	h.mu.Lock()
-	if len(h.pending) >= MaxPendingDelegateCalls {
+	if err := h.reserveDelegateBudgetLocked(sessionID); err != nil {
 		h.mu.Unlock()
-		return DelegateResponse{}, fmt.Errorf("code-mode host exceeded the limit of %d pending delegate calls", MaxPendingDelegateCalls)
+		return DelegateResponse{}, err
 	}
 	h.pending[id] = response
 	h.mu.Unlock()
+	defer h.releaseDelegateBudget(sessionID)
 	if err := h.write(DelegateRequestMessage(id, sessionID, request)); err != nil {
 		h.mu.Lock()
 		delete(h.pending, id)
@@ -301,6 +349,71 @@ func (h *stdioHostServer) requestDelegate(ctx context.Context, sessionID Session
 		h.mu.Unlock()
 		_ = h.write(CancelDelegateRequest(id))
 		return DelegateResponse{}, ctx.Err()
+	}
+}
+
+// reserveDelegateBudgetLocked enforces the negotiated shared-host budget and,
+// for the structured gRPC transport, the owning session's independent budget.
+func (h *stdioHostServer) reserveDelegateBudgetLocked(sessionID SessionID) error {
+	limit := h.delegateLimit
+	if limit <= 0 {
+		limit = LegacyMaxPendingDelegateCalls
+	}
+	if h.enforceSessions && h.pendingSession[sessionID] >= limit {
+		return errors.New("code-mode session has too many pending delegate calls")
+	}
+	if h.pendingCount >= limit {
+		return errors.New("code-mode host has too many pending delegate calls")
+	}
+	h.pendingCount++
+	h.pendingSession[sessionID]++
+	return nil
+}
+
+func (h *stdioHostServer) reserveDelegateBudget(sessionID SessionID) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.reserveDelegateBudgetLocked(sessionID)
+}
+
+func (h *stdioHostServer) releaseDelegateBudget(sessionID SessionID) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.pendingCount > 0 {
+		h.pendingCount--
+	}
+	if h.pendingSession[sessionID] <= 1 {
+		delete(h.pendingSession, sessionID)
+	} else {
+		h.pendingSession[sessionID]--
+	}
+}
+
+func (h *stdioHostServer) reserveActiveCell(sessionID SessionID, cellID CellID) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	limit := h.activeCellLimit
+	if limit <= 0 {
+		limit = MaxActiveCells
+	}
+	if len(h.activeCells) >= limit {
+		return false
+	}
+	h.activeCells[activeCellKey{sessionID: sessionID, cellID: cellID}] = struct{}{}
+	return true
+}
+
+func (h *stdioHostServer) releaseActiveCell(sessionID SessionID, cellID CellID) {
+	h.mu.Lock()
+	delete(h.activeCells, activeCellKey{sessionID: sessionID, cellID: cellID})
+	h.mu.Unlock()
+}
+
+func (h *stdioHostServer) releaseSessionActiveCellsLocked(sessionID SessionID) {
+	for key := range h.activeCells {
+		if key.sessionID == sessionID {
+			delete(h.activeCells, key)
+		}
 	}
 }
 
@@ -333,6 +446,7 @@ func (h *stdioHostServer) shutdown() {
 		sessions = append(sessions, session)
 	}
 	h.sessions = map[SessionID]*stdioHostSession{}
+	h.activeCells = map[activeCellKey]struct{}{}
 	h.mu.Unlock()
 	for _, entry := range requests {
 		entry.cancel()
@@ -351,12 +465,16 @@ type stdioHostSession struct {
 	waitExecutor tool.Executor
 	definitions  map[string]struct{}
 	nextCell     atomic.Uint64
+	// outputTruncation records the session-level setting requested at
+	// session/open. Server mode bounds every observation with its own budget;
+	// client mode returns raw output for the caller to truncate (Rust #57272).
+	outputTruncation OutputTruncation
 }
 
 func newStdioHostSession(host *stdioHostServer, id SessionID) *stdioHostSession {
 	registry := tool.NewRegistry()
 	execExecutor, waitExecutor := tool.NewCodeModeExecutors(registry)
-	return &stdioHostSession{host: host, id: id, registry: registry, exec: execExecutor, waitExecutor: waitExecutor, definitions: map[string]struct{}{}}
+	return &stdioHostSession{host: host, id: id, registry: registry, exec: execExecutor, waitExecutor: waitExecutor, definitions: map[string]struct{}{}, outputTruncation: OutputTruncationClient}
 }
 
 func (s *stdioHostSession) nextCellID() CellID {
@@ -378,14 +496,18 @@ func (s *stdioHostSession) execute(ctx context.Context, cellID CellID, request *
 			tool.CodeModeEnabledToolsContextKey: allowed,
 			// #48123: the request's preempt signal lets an `operation/yield`
 			// frame end this observation while the cell keeps running.
-			tool.CodeModePreemptContextKey: yield,
+			tool.CodeModePreemptContextKey:         yield,
+			tool.CodeModeHostObservationContextKey: true,
 		},
 	}
+	invocation.Context[tool.CodeModeCellClosedContextKey] = tool.CodeModeCellClosedFunc(func() {
+		s.host.releaseActiveCell(s.id, cellID)
+	})
 	invocation.Context["code_mode_notify"] = tool.CodeModeNotifyFunc(func(callID, text string) {
 		_, _ = s.host.requestDelegate(ctx, s.id, NotifyRequest(callID, cellID, text))
 	})
 	output, execErr := s.exec.Execute(ctx, invocation)
-	return hostRuntimeResponse(cellID, output, execErr)
+	return s.observeResponse(cellID, output, execErr, request.MaxOutputTokens)
 }
 
 func (s *stdioHostSession) wait(ctx context.Context, request *WaitRequest, terminate bool, yield *tool.YieldSignal) WaitOutcome {
@@ -403,13 +525,13 @@ func (s *stdioHostSession) wait(ctx context.Context, request *WaitRequest, termi
 	output, err := s.waitExecutor.Execute(ctx, &tool.Invocation{
 		CallID:  "wait-" + request.CellID.String(),
 		Payload: tool.Payload{Kind: tool.PayloadFunction, Arguments: string(arguments)},
-		Context: map[string]any{tool.CodeModePreemptContextKey: yield},
+		Context: map[string]any{tool.CodeModePreemptContextKey: yield, tool.CodeModeHostObservationContextKey: true},
 	})
 	if err != nil && strings.Contains(err.Error(), "not found") {
 		message := err.Error()
 		return MissingCell(Result(request.CellID, nil, &message))
 	}
-	response := hostRuntimeResponse(request.CellID, output, err)
+	response := s.observeResponse(request.CellID, output, err, request.MaxOutputTokens)
 	return LiveCell(response)
 }
 
@@ -525,6 +647,30 @@ func hostSourceWithOptions(source string, yieldTimeMS *uint64, maxOutputTokens *
 	return "// @exec: " + string(encoded) + "\n" + source
 }
 
+// observeResponse renders a host observation under the session's output policy.
+// Server truncation bounds the typed items with the observation's own budget and
+// sends an independently bounded diagnostic (Rust #57870).
+func (s *stdioHostSession) observeResponse(cellID CellID, output *tool.Output, err error, maxOutputTokens *int) RuntimeResponse {
+	response := hostRuntimeResponse(cellID, output, err)
+	if s == nil {
+		return response
+	}
+	// Server truncation bounds the typed items with the observation's own
+	// budget, labels a completed error inside those items, and sends an
+	// independently bounded diagnostic (Rust #57272/#57870).
+	response.ContentItems, response.ErrorText = renderSessionObservation(s.outputTruncation, response.ContentItems, maxOutputTokens, response.ErrorText)
+	return response
+}
+
+// withoutTrailingFailureItem removes the executor's own `Script error:` block so
+// the observation carries the diagnostic exactly once.
+func withoutTrailingFailureItem(items []ContentItem, diagnostic string) []ContentItem {
+	if n := len(items); n > 0 && items[n-1].Type == "input_text" && items[n-1].Text == scriptErrorLabel+diagnostic {
+		return items[:n-1]
+	}
+	return items
+}
+
 func hostRuntimeResponse(cellID CellID, output *tool.Output, err error) RuntimeResponse {
 	items := hostContentItems(output)
 	if err != nil {
@@ -538,8 +684,47 @@ func hostRuntimeResponse(cellID CellID, output *tool.Output, err error) RuntimeR
 		if terminated, _ := output.Data["terminated"].(bool); terminated {
 			return Terminated(cellID, items)
 		}
+		// A failed script is a completed Result that carries its diagnostic, not
+		// a successful observation with an unlabeled error block (Rust's
+		// RuntimeResponse::Result { error_text }). The in-process executor already
+		// appended the labeled block, so drop that copy and let the observation
+		// policy re-add it: client mode hands the error to the caller, server mode
+		// charges the labeled item against the observation budget.
+		if !output.Success {
+			if diagnostic, ok := output.Data["error_text"].(string); ok && diagnostic != "" {
+				return Result(cellID, withoutTrailingFailureItem(items, diagnostic), &diagnostic)
+			}
+		}
 	}
-	return Result(cellID, items, nil)
+	response := Result(cellID, items, nil)
+	// The in-process host measures buffering with the same cells its exec/wait
+	// handlers own (Rust #55653).
+	response.ResultBufferedForNS = uint64DataValue(output, "result_buffered_for_ns")
+	return response
+}
+
+// uint64DataValue reads a uint64-style tool output data field.
+func uint64DataValue(output *tool.Output, key string) uint64 {
+	if output == nil || output.Data == nil {
+		return 0
+	}
+	switch value := output.Data[key].(type) {
+	case uint64:
+		return value
+	case int:
+		if value > 0 {
+			return uint64(value)
+		}
+	case int64:
+		if value > 0 {
+			return uint64(value)
+		}
+	case float64:
+		if value > 0 {
+			return uint64(value)
+		}
+	}
+	return 0
 }
 
 func hostContentItems(output *tool.Output) []ContentItem {

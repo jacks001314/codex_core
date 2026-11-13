@@ -20,6 +20,7 @@ const (
 	PlanPlus                        PlanType = "plus"
 	PlanPro                         PlanType = "pro"
 	PlanProlite                     PlanType = "prolite"
+	PlanProMax                      PlanType = "promax"
 	PlanTeam                        PlanType = "team"
 	PlanSelfServeBusinessProlite    PlanType = "self_serve_business_prolite"
 	PlanSelfServeBusinessUsageBased PlanType = "self_serve_business_usage_based"
@@ -31,6 +32,8 @@ const (
 	PlanEdu                         PlanType = "edu"
 	PlanEduPlus                     PlanType = "edu_plus"
 	PlanEduPro                      PlanType = "edu_pro"
+	PlanSci                         PlanType = "sci"
+	PlanSciPlus                     PlanType = "sci_plus"
 )
 
 func (p PlanType) IsBusinessLike() bool {
@@ -63,7 +66,8 @@ func (p PlanType) IsTeamLike() bool {
 }
 
 func (p PlanType) IsWorkspaceAccount() bool {
-	return p.IsTeamLike() || p.IsBusinessLike() || p.IsEducationLike() || p == PlanEnterprise
+	return p.IsTeamLike() || p.IsBusinessLike() || p.IsEducationLike() ||
+		p == PlanEnterprise || p == PlanSci || p == PlanSciPlus
 }
 
 type AccountType string
@@ -72,6 +76,7 @@ const (
 	AccountAPIKey        AccountType = "apiKey"
 	AccountChatGPT       AccountType = "chatgpt"
 	AccountAmazonBedrock AccountType = "amazonBedrock"
+	AccountGcp           AccountType = "gcp"
 )
 
 type Account struct {
@@ -79,6 +84,11 @@ type Account struct {
 	Email                       *string     `json:"email,omitempty"`
 	PlanType                    PlanType    `json:"planType,omitempty"`
 	UsesCodexManagedCredentials bool        `json:"usesCodexManagedCredentials,omitempty"`
+	// WorkspaceName is the display name of the selected ChatGPT workspace when
+	// the backend reports one (Rust Account::Chatgpt.workspace_name, #57366).
+	// It is never inferred from the account id. Rust requires the field for
+	// ChatGPT accounts and serializes it as null when unknown.
+	WorkspaceName *string `json:"workspaceName"`
 }
 
 func (a *Account) MarshalJSON() ([]byte, error) {
@@ -93,15 +103,20 @@ func (a *Account) MarshalJSON() ([]byte, error) {
 			plan = PlanUnknown
 		}
 		return json.Marshal(struct {
-			Type     AccountType `json:"type"`
-			Email    *string     `json:"email"`
-			PlanType PlanType    `json:"planType"`
-		}{Type: AccountChatGPT, Email: a.Email, PlanType: plan})
+			Type          AccountType `json:"type"`
+			Email         *string     `json:"email"`
+			PlanType      PlanType    `json:"planType"`
+			WorkspaceName *string     `json:"workspaceName"`
+		}{Type: AccountChatGPT, Email: a.Email, PlanType: plan, WorkspaceName: a.WorkspaceName})
 	case AccountAmazonBedrock:
 		return json.Marshal(struct {
 			Type                        AccountType `json:"type"`
 			UsesCodexManagedCredentials bool        `json:"usesCodexManagedCredentials"`
 		}{Type: AccountAmazonBedrock, UsesCodexManagedCredentials: a.UsesCodexManagedCredentials})
+	case AccountGcp:
+		return json.Marshal(struct {
+			Type AccountType `json:"type"`
+		}{Type: AccountGcp})
 	default:
 		type accountAlias Account
 		return json.Marshal(accountAlias(*a))
@@ -170,6 +185,15 @@ func AccountIDFromAuthForRestrictions(snapshot *AuthDotJSON) string {
 		}
 	}
 	return ""
+}
+
+// ChatGPTAccessTokenFromAuth returns the stored OAuth access token. Callers
+// that need a ChatGPT login must check AuthDotJSON.Mode first.
+func ChatGPTAccessTokenFromAuth(snapshot *AuthDotJSON) string {
+	if snapshot == nil {
+		return ""
+	}
+	return strings.TrimSpace(stringFromAny(snapshot.Tokens, "access_token"))
 }
 
 func ChatGPTUserIDFromAuth(snapshot *AuthDotJSON) string {
@@ -410,6 +434,16 @@ func (p *LoginAccountParams) MarshalJSON() ([]byte, error) {
 			ChatGPTAccountID: p.ChatGPTAccountID,
 			ChatGPTPlanType:  cloneStringPtr(p.ChatGPTPlanType),
 		})
+	case AccountAmazonBedrock:
+		return json.Marshal(struct {
+			Type   AccountType `json:"type"`
+			APIKey string      `json:"apiKey"`
+			Region string      `json:"region"`
+		}{
+			Type:   AccountAmazonBedrock,
+			APIKey: p.APIKey,
+			Region: p.Region,
+		})
 	case "amazonBedrockAccessKeys":
 		return json.Marshal(struct {
 			Type            AccountType `json:"type"`
@@ -447,6 +481,13 @@ func (p *LoginAccountParams) Validate() error {
 		}
 		if strings.TrimSpace(p.ChatGPTAccountID) == "" {
 			return fmt.Errorf("%w: chatgptAccountId is required", ErrInvalidAccountRequest)
+		}
+	case AccountAmazonBedrock:
+		if strings.TrimSpace(p.APIKey) == "" {
+			return fmt.Errorf("%w: apiKey is required", ErrInvalidAccountRequest)
+		}
+		if strings.TrimSpace(p.Region) == "" {
+			return fmt.Errorf("%w: region is required", ErrInvalidAccountRequest)
 		}
 	case "amazonBedrockAccessKeys":
 		if strings.TrimSpace(p.AccessKeyID) == "" || strings.TrimSpace(p.SecretAccessKey) == "" {
@@ -533,6 +574,11 @@ type GetAccountParams struct {
 type GetAccountResponse struct {
 	Account            *Account `json:"account"`
 	RequiresOpenAIAuth bool     `json:"requiresOpenaiAuth"`
+	// UserID is the canonical ChatGPT user id taken from the same
+	// authenticated snapshot as Account (Rust GetAccountResponse.userId,
+	// #60004). It is null for API-only, Bedrock and signed-out sessions, and
+	// for snapshots that do not carry one.
+	UserID *string `json:"userId"`
 	// WorkspaceRouting is the discovered routing for the selected ChatGPT
 	// workspace (Rust GetAccountResponse.workspaceRouting); null when the
 	// account has no ChatGPT workspace or no routing was discovered.
@@ -558,6 +604,23 @@ type GetAccountRateLimitsResponse struct {
 	// keys); null leaves the client's existing UI unchanged.
 	RateLimitUpsell json.RawMessage `json:"rateLimitUpsell"`
 }
+
+// GetAccountRateLimitsParams carries the usage-read capabilities of the
+// requesting client (Rust v2 GetAccountRateLimitsParams, #42358). Capabilities
+// are never inferred from the caller's experiment arm.
+type GetAccountRateLimitsParams struct {
+	// SupportsLunaReserve lets an eligible ChatGPT session record automatic
+	// Luna Reserve fallback exposure after ordinary usage is blocked.
+	SupportsLunaReserve bool `json:"supportsLunaReserve,omitempty"`
+	// ExcludeResetCreditDetails skips the separate reset-credit detail lookup
+	// for background polls; the usage response still carries the available
+	// count.
+	ExcludeResetCreditDetails bool `json:"excludeResetCreditDetails,omitempty"`
+}
+
+// NullableGetAccountRateLimitsParams preserves omitted and null parameters,
+// mirroring Rust's Option<GetAccountRateLimitsParams>.
+type NullableGetAccountRateLimitsParams = *GetAccountRateLimitsParams
 
 func (r *GetAccountRateLimitsResponse) MarshalJSON() ([]byte, error) {
 	rateLimits := RateLimitSnapshot{}
@@ -680,6 +743,27 @@ type GetAccountTokenUsageParams struct {
 	ThreadID *string `json:"threadId,omitempty"`
 }
 
+// GetAccountSecuritySetupResponse mirrors Rust v2::GetAccountSecuritySetupResponse
+// (#60082): the optional account-security reminder plus the account identity the
+// client verifies before rendering it. An ineligible account reports no notice.
+type GetAccountSecuritySetupResponse struct {
+	Notice *AccountSecuritySetupNotice `json:"notice,omitempty"`
+}
+
+// AccountSecuritySetupNotice is the server-owned reminder copy and action.
+type AccountSecuritySetupNotice struct {
+	AccountID   string                     `json:"accountId"`
+	UserID      string                     `json:"userId"`
+	Title       string                     `json:"title"`
+	Description string                     `json:"description"`
+	Action      AccountSecuritySetupAction `json:"action"`
+}
+
+type AccountSecuritySetupAction struct {
+	Label string `json:"label"`
+	URL   string `json:"url"`
+}
+
 type GetAccountTokenUsageResponse struct {
 	Summary           AccountTokenUsageSummary       `json:"summary"`
 	DailyUsageBuckets []AccountTokenUsageDailyBucket `json:"dailyUsageBuckets"`
@@ -703,10 +787,13 @@ type AccountTokenUsageDailyBucket struct {
 
 // ThreadUsage is the estimated billing usage for a requested thread.
 type ThreadUsage struct {
-	ThreadID                    string                      `json:"threadId"`
-	EstimatedUsageCreditsMicros int64                       `json:"estimatedUsageCreditsMicros"`
-	EstimatedUsageUSDMicros     *int64                      `json:"estimatedUsageUsdMicros"`
-	Groups                      []ThreadUsageBreakdownGroup `json:"groups"`
+	ThreadID                    string `json:"threadId"`
+	EstimatedUsageCreditsMicros int64  `json:"estimatedUsageCreditsMicros"`
+	EstimatedUsageUSDMicros     *int64 `json:"estimatedUsageUsdMicros"`
+	// NativeUsageUSDMicros is the backend's native dollar amount, independent
+	// of credit estimates (Rust #57251). Missing means unknown, not zero.
+	NativeUsageUSDMicros *int64                      `json:"nativeUsageUsdMicros"`
+	Groups               []ThreadUsageBreakdownGroup `json:"groups"`
 }
 
 // ThreadUsageBreakdownGroup is one model/speed/reasoning bucket in a thread
@@ -890,6 +977,9 @@ func (p *AccountSessionsLogoutParams) Validate() error {
 type AccountSessionsSwitchParams struct {
 	SessionID string `json:"sessionId"`
 	AccountID string `json:"accountId"`
+	// AllowBrowserLogin lets Core start a browser sign-in when the selected
+	// workspace needs SSO for this login (Rust #57514).
+	AllowBrowserLogin bool `json:"allowBrowserLogin,omitempty"`
 }
 
 func (p *AccountSessionsSwitchParams) Validate() error {
@@ -909,6 +999,52 @@ type AccountSessionsResponse = SessionsResponse
 type AccountSession = Session
 type AccountSessionWorkspace = SessionWorkspace
 type AccountSessionWorkspaceKind = SessionWorkspaceKind
+
+// AccountBrowserLogin is the accountSession/switch response when the requested
+// workspace requires a fresh browser sign-in. Open AuthURL and wait for
+// account/login/completed for LoginID.
+type AccountBrowserLogin struct {
+	LoginID string `json:"loginId"`
+	AuthURL string `json:"authUrl"`
+}
+
+// AccountSessionsSwitchResponse mirrors Rust's untagged
+// AccountSessionsSwitchResponse: either a flattened session listing or a
+// browser sign-in request.
+type AccountSessionsSwitchResponse struct {
+	Sessions     *AccountSessionsResponse
+	BrowserLogin *AccountBrowserLogin
+}
+
+func (r AccountSessionsSwitchResponse) MarshalJSON() ([]byte, error) {
+	if r.BrowserLogin != nil {
+		return json.Marshal(r.BrowserLogin)
+	}
+	if r.Sessions != nil {
+		return json.Marshal(r.Sessions)
+	}
+	return json.Marshal(AccountSessionsResponse{})
+}
+
+func (r *AccountSessionsSwitchResponse) UnmarshalJSON(data []byte) error {
+	var probe struct {
+		ActiveSessionID *string   `json:"activeSessionId"`
+		Sessions        []Session `json:"sessions"`
+		LoginID         string    `json:"loginId"`
+		AuthURL         string    `json:"authUrl"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return err
+	}
+	if probe.LoginID != "" || probe.AuthURL != "" {
+		r.Sessions = nil
+		r.BrowserLogin = &AccountBrowserLogin{LoginID: probe.LoginID, AuthURL: probe.AuthURL}
+		return nil
+	}
+	r.BrowserLogin = nil
+	r.Sessions = &AccountSessionsResponse{ActiveSessionID: probe.ActiveSessionID, Sessions: probe.Sessions}
+	return nil
+}
 
 func (r *SessionsResponse) MarshalJSON() ([]byte, error) {
 	sessions := append([]Session(nil), r.Sessions...)
@@ -1014,7 +1150,13 @@ func (m *AccountManager) GetAccount(params *GetAccountParams) *GetAccountRespons
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.ensureLocked()
-	return &GetAccountResponse{Account: cloneAccount(m.account), RequiresOpenAIAuth: m.requiresOpenAIAuth}
+	response := &GetAccountResponse{Account: cloneAccount(m.account), RequiresOpenAIAuth: m.requiresOpenAIAuth}
+	// Rust #60004: the id comes from the snapshot the account was built from,
+	// so a provider switch can never pair one account with another's id.
+	if userID := ChatGPTUserIDFromAuth(m.authSnapshot); userID != "" {
+		response.UserID = &userID
+	}
+	return response
 }
 
 func (m *AccountManager) AccountUpdated() *AccountUpdatedNotification {
@@ -1089,6 +1231,14 @@ func (m *AccountManager) Login(params *LoginAccountParams) (*LoginAccountRespons
 		snapshot := FromBedrockAccessKeys(params.AccessKeyID, params.SecretAccessKey, params.SessionToken, params.Region)
 		m.account = &Account{Type: AccountAmazonBedrock, UsesCodexManagedCredentials: true}
 		mode := wireAuthModeFromMode("bedrock-access-keys")
+		m.authMode = &mode
+		m.requiresOpenAIAuth = false
+		m.authSnapshot = cloneAuthDotJSON(&snapshot)
+		return &LoginAccountResponse{Type: AccountAmazonBedrock}, nil
+	case AccountAmazonBedrock:
+		snapshot := FromBedrockAPIKey(params.APIKey, params.Region)
+		m.account = &Account{Type: AccountAmazonBedrock, UsesCodexManagedCredentials: true}
+		mode := wireAuthModeFromMode("bedrock-api-key")
 		m.authMode = &mode
 		m.requiresOpenAIAuth = false
 		m.authSnapshot = cloneAuthDotJSON(&snapshot)
@@ -1356,6 +1506,7 @@ func cloneAccount(account *Account) *Account {
 	}
 	clone := *account
 	clone.Email = cloneStringPtr(account.Email)
+	clone.WorkspaceName = cloneStringPtr(account.WorkspaceName)
 	return &clone
 }
 
@@ -1639,6 +1790,8 @@ func planFromString(value string) PlanType {
 		return PlanPro
 	case string(PlanProlite):
 		return PlanProlite
+	case string(PlanProMax):
+		return PlanProMax
 	case string(PlanTeam):
 		return PlanTeam
 	case string(PlanSelfServeBusinessProlite):
@@ -1661,6 +1814,10 @@ func planFromString(value string) PlanType {
 		return PlanEduPlus
 	case string(PlanEduPro):
 		return PlanEduPro
+	case string(PlanSci):
+		return PlanSci
+	case string(PlanSciPlus):
+		return PlanSciPlus
 	default:
 		return PlanUnknown
 	}

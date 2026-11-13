@@ -66,6 +66,9 @@ type Client struct {
 	// session. A registry lookup that returns a different executor must not
 	// resume this session against it.
 	executorPublicKey *RemotePublicKey
+	// missingWatches receives `fs/missingChanged` invalidation for the newest
+	// observation registered through WatchMissing (Rust #57598).
+	missingWatches map[uint64]chan struct{}
 }
 
 type inFlightMetadataRequest struct {
@@ -155,8 +158,12 @@ func startClientWebSocketKeepalive(conn *websocket.Conn) context.CancelFunc {
 }
 
 var (
-	clientRecoveryTimeout = 25 * time.Second
-	clientRecoveryRetry   = 100 * time.Millisecond
+	// sessionRecoveryTimeout is the whole recovery window. The attach phase stops
+	// five seconds earlier so process replay can still use the retained session
+	// (Rust #58983).
+	clientRecoveryTimeout       = 50 * time.Second
+	clientRecoveryReplayReserve = 5 * time.Second
+	clientRecoveryRetry         = 100 * time.Millisecond
 	// environmentInfoTimeout bounds the live metadata probe and covers sending
 	// as well as waiting: Rust #49407 notes a stuck transport can fill the
 	// outbound queue, so bounding only the response wait is not enough. It is a
@@ -233,11 +240,21 @@ type clientProcessSession struct {
 	policy        *networkPolicyDecisionController
 	policyDone    chan struct{}
 	policyOnce    sync.Once
+	auditMu       sync.Mutex
+	audit         *networkPolicyAuditContext
 }
 
 type networkPolicyDecisionController struct {
 	decider network.ProxyPolicyDecider
 	timeout time.Duration
+}
+
+// networkPolicyAuditContext mirrors Rust's controller-side audit context. It
+// is captured from the launch request and never replaced by later process
+// operations.
+type networkPolicyAuditContext struct {
+	metadata    RemoteNetworkProxyAuditMetadata
+	executionID string
 }
 
 type HTTPBodyStream struct {
@@ -454,6 +471,13 @@ func DialClientWithOptions(ctx context.Context, url string, options DialClientOp
 	if err != nil {
 		return nil, err
 	}
+	httpClient := options.HTTPClient
+	if len(headers) > 0 && isPlainWebSocketURL(url) {
+		httpClient, err = loopbackDirectWebSocketClient(ctx, url, options.HTTPClient)
+		if err != nil {
+			return nil, err
+		}
+	}
 	client := &Client{
 		url:          url,
 		clientName:   clientName,
@@ -467,7 +491,7 @@ func DialClientWithOptions(ctx context.Context, url string, options DialClientOp
 		done:         make(chan struct{}),
 	}
 	client.open = func(ctx context.Context, resumeSessionID string, handleNotification func(string, json.RawMessage) error) (clientConnection, *InitializeResponse, clientConnectMetadata, error) {
-		conn, initialized, err := dialInitializedClientConnection(ctx, url, clientName, resumeSessionID, handleNotification, options.HTTPClient, headers, options.InitializeTimeout)
+		conn, initialized, err := dialInitializedClientConnection(ctx, url, clientName, resumeSessionID, handleNotification, httpClient, headers, options.InitializeTimeout)
 		return conn, initialized, clientConnectMetadata{}, err
 	}
 	conn, initialized, _, err := client.open(ctx, options.ResumeSessionID, client.handleNotification)
@@ -1036,6 +1060,36 @@ func (s *clientProcessSession) cancelNetworkPolicy() {
 	})
 }
 
+func (s *clientProcessSession) setNetworkPolicyAudit(audit *networkPolicyAuditContext) {
+	if s == nil {
+		return
+	}
+	s.auditMu.Lock()
+	s.audit = audit
+	s.auditMu.Unlock()
+}
+
+func (s *clientProcessSession) networkPolicyAuditSnapshot() *networkPolicyAuditContext {
+	if s == nil {
+		return nil
+	}
+	s.auditMu.Lock()
+	defer s.auditMu.Unlock()
+	return s.audit
+}
+
+func (c *Client) setProcessNetworkPolicyAudit(processID string, audit *networkPolicyAuditContext) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	session := c.sessions[processID]
+	c.mu.Unlock()
+	if session != nil {
+		session.setNetworkPolicyAudit(audit)
+	}
+}
+
 func (s *ProcessEventSubscription) publish(event ProcessEvent) {
 	const eventCapacity = 256
 	s.mu.Lock()
@@ -1079,11 +1133,45 @@ func (c *Client) Start(ctx context.Context, params *ExecParams) (*ExecResponse, 
 		return nil, err
 	}
 	request.CWD = cwd
+	if err := c.ensureNetworkReviewCapability(ctx, &request); err != nil {
+		return nil, err
+	}
+	audit := networkPolicyAuditContextFromParams(&request)
+	c.setProcessNetworkPolicyAudit(request.ProcessID, audit)
 	var response ExecResponse
 	if err := c.call(ctx, MethodProcessStart, &request, &response); err != nil {
+		c.setProcessNetworkPolicyAudit(request.ProcessID, nil)
 		return nil, err
 	}
 	return &response, nil
+}
+
+func networkPolicyAuditContextFromParams(params *ExecParams) *networkPolicyAuditContext {
+	if params == nil || params.NetworkProxy == nil {
+		return nil
+	}
+	launch := params.NetworkProxy
+	return &networkPolicyAuditContext{
+		metadata:    launch.AuditMetadata,
+		executionID: stringValue(launch.ExecutionID),
+	}
+}
+
+// ensureNetworkReviewCapability rejects a launch whose proxy carries managed
+// review domains when the executor cannot enforce them, matching Rust
+// #56154's ExecServerClient::ensure_network_review_capability.
+func (c *Client) ensureNetworkReviewCapability(ctx context.Context, params *ExecParams) error {
+	if params == nil || params.NetworkProxy == nil || len(params.NetworkProxy.Proxy.ReviewDomains) == 0 {
+		return nil
+	}
+	info, err := c.cachedEnvironmentInfo(ctx)
+	if err != nil {
+		return err
+	}
+	if info == nil || !info.Capabilities.NetworkProxyReviewDomains {
+		return errors.New("selected exec-server does not support managed network review domains")
+	}
+	return nil
 }
 
 func (c *Client) Read(ctx context.Context, params *ReadParams) (*ReadResponse, error) {
@@ -1151,6 +1239,18 @@ func (c *Client) EnvironmentCapabilities(ctx context.Context) (*EnvironmentCapab
 	}
 	capabilities := info.Capabilities
 	return &capabilities, nil
+}
+
+// SupportsCapabilityDiscoveryV2 reports whether the initialized executor both
+// advertises V2 discovery and reports a compatible release version. The
+// compatibility check is shared with Environment::discover_capabilities_v2
+// (Rust #57192).
+func (c *Client) SupportsCapabilityDiscoveryV2(ctx context.Context) (bool, error) {
+	info, err := c.cachedEnvironmentInfo(ctx)
+	if err != nil {
+		return false, err
+	}
+	return SupportsCapabilityDiscoveryV2(info), nil
 }
 
 // rememberEnvironmentInfo caches the executor metadata returned by the
@@ -1297,6 +1397,13 @@ func (c *Client) discoverCapabilityRoots(ctx context.Context, params *Capability
 	if params == nil || len(params.Roots) == 0 {
 		return &response, nil
 	}
+	sandboxes := make([]*FileSystemSandboxContext, 0, len(params.Roots))
+	for i := range params.Roots {
+		sandboxes = append(sandboxes, params.Roots[i].Sandbox)
+	}
+	if err := c.validateDiscoveryMXC(ctx, sandboxes); err != nil {
+		return nil, err
+	}
 	normalizedRoots := make([]CapabilityRootDiscoverRequest, len(params.Roots))
 	for i := range params.Roots {
 		normalizedRoots[i] = params.Roots[i]
@@ -1337,6 +1444,16 @@ func (c *Client) DiscoverCapabilitiesV2(ctx context.Context, params *DiscoverV2C
 	}
 	if params == nil || strings.TrimSpace(params.CWD) == "" {
 		return nil, errors.New("capabilities/discoverV2 cwd is required")
+	}
+	supported, err := c.SupportsCapabilityDiscoveryV2(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !supported {
+		return nil, errors.New("capabilities/discoverV2 is unavailable in this environment session")
+	}
+	if err := c.validateDiscoveryMXC(ctx, []*FileSystemSandboxContext{params.Sandbox}); err != nil {
+		return nil, err
 	}
 	response, err := c.discoverCapabilitiesV2Once(ctx, params)
 	if err != nil && IsRetryableRecoveryError(err) {
@@ -1746,6 +1863,77 @@ func (c *Client) FSGetMetadata(ctx context.Context, params *FSGetMetadataParams)
 	return c.fsGetMetadataCoalesced(ctx, &normalized)
 }
 
+// WatchMissing registers an unsandboxed observation over the executor's own
+// filesystem (Rust #57598). When the executor acknowledges coverage, the
+// returned channel closes on the first relevant change, connection loss or
+// supersession. An unsupported executor returns a nil channel.
+func (c *Client) WatchMissing(ctx context.Context, params *FSWatchMissingParams) (*FSWatchMissingResponse, <-chan struct{}, error) {
+	if params == nil {
+		return nil, nil, errors.New("fs/watchMissing params are required")
+	}
+	normalized := FSWatchMissingParams{WatchID: params.WatchID, Missing: make([]string, 0, len(params.Missing))}
+	for _, raw := range params.Missing {
+		path, err := normalizeFSPathForWire(raw)
+		if err != nil {
+			return nil, nil, fmt.Errorf("fs/watchMissing missing path: %w", err)
+		}
+		normalized.Missing = append(normalized.Missing, path)
+	}
+	if params.Present != nil {
+		path, err := normalizeFSPathForWire(*params.Present)
+		if err != nil {
+			return nil, nil, fmt.Errorf("fs/watchMissing present path: %w", err)
+		}
+		normalized.Present = &path
+	}
+	changed := make(chan struct{})
+	c.mu.Lock()
+	if c.missingWatches == nil {
+		c.missingWatches = map[uint64]chan struct{}{}
+	}
+	previous := c.missingWatches[normalized.WatchID]
+	c.missingWatches[normalized.WatchID] = changed
+	c.mu.Unlock()
+	if previous != nil {
+		close(previous)
+	}
+	var response FSWatchMissingResponse
+	if err := c.call(ctx, MethodFSWatchMissing, &normalized, &response); err != nil {
+		c.forgetMissingWatch(normalized.WatchID, changed)
+		return nil, nil, fmt.Errorf("fs/watchMissing: %w", err)
+	}
+	if !response.Watching {
+		c.forgetMissingWatch(normalized.WatchID, changed)
+		return &response, nil, nil
+	}
+	return &response, changed, nil
+}
+
+func (c *Client) forgetMissingWatch(watchID uint64, changed chan struct{}) {
+	c.mu.Lock()
+	registered := c.missingWatches[watchID]
+	if registered == changed {
+		delete(c.missingWatches, watchID)
+	}
+	c.mu.Unlock()
+	if registered == changed {
+		close(changed)
+	}
+}
+
+// invalidateMissingWatches completes every registered observation. Connection
+// loss invalidates coverage because the executor connection that verified it is
+// gone (Rust #57598).
+func (c *Client) invalidateMissingWatches() {
+	c.mu.Lock()
+	watches := c.missingWatches
+	c.missingWatches = nil
+	c.mu.Unlock()
+	for _, changed := range watches {
+		close(changed)
+	}
+}
+
 func (c *Client) fsGetMetadataCoalesced(ctx context.Context, params *FSGetMetadataParams) (*FSGetMetadataResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1966,6 +2154,7 @@ func (c *Client) Close() error {
 		c.cleanup()
 		c.recoverMu.Unlock()
 	}
+	c.invalidateMissingWatches()
 	c.failTerminal(errors.New("exec-server client is closed"))
 	return err
 }
@@ -2165,6 +2354,9 @@ func (c *Client) recoverConnection(ctx context.Context) error {
 			c.conn = conn
 			c.executorRegistrationID = strings.TrimSpace(metadata.executorRegistrationID)
 			c.mu.Unlock()
+			// Observations verified on the lost connection are no longer covered
+			// until the client re-registers them (Rust #57598).
+			c.invalidateMissingWatches()
 			go c.readLoop(conn)
 			return nil
 		}
@@ -2467,12 +2659,34 @@ func (c *Client) handleNotification(method string, raw json.RawMessage) error {
 			return fmt.Errorf("invalid network policy decision notification")
 		}
 		c.mu.Lock()
-		active := c.sessions[params.ProcessID] != nil
+		session := c.sessions[params.ProcessID]
 		c.mu.Unlock()
-		if !active {
+		if session == nil {
 			return nil
 		}
-		emitNetworkPolicyDecisionAudit(params)
+		audit := session.networkPolicyAuditSnapshot()
+		if audit == nil {
+			return nil
+		}
+		emitNetworkPolicyDecisionAudit(params, audit)
+		return nil
+	case MethodFSMissingChanged:
+		if err := requireNotificationFields(raw, "watchId"); err != nil {
+			return err
+		}
+		var params FSMissingChangedNotification
+		if err := json.Unmarshal(raw, &params); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		changed := c.missingWatches[params.WatchID]
+		if changed != nil {
+			delete(c.missingWatches, params.WatchID)
+		}
+		c.mu.Unlock()
+		if changed != nil {
+			close(changed)
+		}
 		return nil
 	default:
 		return nil
@@ -2486,7 +2700,10 @@ func (c *Client) handleNotification(method string, raw json.RawMessage) error {
 	return nil
 }
 
-func emitNetworkPolicyDecisionAudit(decision NetworkPolicyDecisionNotification) {
+func emitNetworkPolicyDecisionAudit(decision NetworkPolicyDecisionNotification, audit *networkPolicyAuditContext) {
+	if audit == nil {
+		return
+	}
 	method := "none"
 	if decision.Method != nil {
 		method = *decision.Method
@@ -2495,6 +2712,7 @@ func emitNetworkPolicyDecisionAudit(decision NetworkPolicyDecisionNotification) 
 	if decision.Client != nil {
 		client = *decision.Client
 	}
+	metadata := audit.metadata
 	// Rust 899d1715c8 (#38800): forwarded network policy decisions are audit
 	// telemetry. The codex_otel.log_only target keeps them available to OTEL
 	// log export while the state log DB handler excludes them from persistent
@@ -2503,7 +2721,16 @@ func emitNetworkPolicyDecisionAudit(decision NetworkPolicyDecisionNotification) 
 		"target", "codex_otel.log_only",
 		"event.name", "codex.network_proxy.policy_decision",
 		"event.timestamp", decision.Timestamp,
-		"execution.id", decision.ProcessID,
+		"conversation.id", metadata.ConversationID,
+		"app.version", metadata.AppVersion,
+		"auth_mode", metadata.AuthMode,
+		"originator", metadata.Originator,
+		"user.account_id", metadata.UserAccountID,
+		"user.email", metadata.UserEmail,
+		"terminal.type", metadata.TerminalType,
+		"model", metadata.Model,
+		"slug", metadata.Slug,
+		"execution.id", audit.executionID,
 		"network.policy.scope", decision.Scope,
 		"network.policy.decision", decision.Decision,
 		"network.policy.source", decision.Source,
@@ -2579,11 +2806,23 @@ func (c *Client) failTransport(conn clientConnection, err error) error {
 	_ = conn.CloseNow()
 	failClientInFlight(pending, nil, httpStreams, transportErr)
 	go func() {
-		if recoveryErr := c.recoverConnection(context.Background()); recoveryErr != nil {
+		startedAt := time.Now()
+		attachCtx, cancelAttach := context.WithDeadline(
+			context.Background(),
+			startedAt.Add(clientRecoveryTimeout-clientRecoveryReplayReserve),
+		)
+		recoveryErr := c.recoverConnection(attachCtx)
+		cancelAttach()
+		if recoveryErr != nil {
 			c.failProcessSessions(recoveryErr)
 			return
 		}
-		c.recoverProcessSessions()
+		replayCtx, cancelReplay := context.WithDeadline(
+			context.Background(),
+			startedAt.Add(clientRecoveryTimeout),
+		)
+		defer cancelReplay()
+		c.recoverProcessSessions(replayCtx)
 	}()
 	return transportErr
 }
@@ -2633,7 +2872,7 @@ func failClientInFlight(
 	}
 }
 
-func (c *Client) recoverProcessSessions() {
+func (c *Client) recoverProcessSessions(ctx context.Context) {
 	c.mu.Lock()
 	sessions := make(map[string]*clientProcessSession, len(c.sessions))
 	for processID, session := range c.sessions {
@@ -2648,7 +2887,7 @@ func (c *Client) recoverProcessSessions() {
 		if closed {
 			continue
 		}
-		response, err := c.Read(context.Background(), &ReadParams{ProcessID: processID, AfterSeq: &after})
+		response, err := c.Read(ctx, &ReadParams{ProcessID: processID, AfterSeq: &after})
 		if err != nil {
 			c.failProcessSession(processID, session, err)
 			continue

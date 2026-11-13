@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"codex_core/audioutil"
+	"codex_core/protocol"
 )
 
 func TestEvaluatePolicy(t *testing.T) {
@@ -536,6 +537,14 @@ func TestShouldKeepCompactedHistoryItemDropsDescendantProgressLikeRust(t *testin
 	if ShouldKeepCompactedHistoryItem(descendantProgress) {
 		t.Fatal("descendant MESSAGE progress must not be retained")
 	}
+	descendantChannelPost := Item{
+		ID:   "desc-channel-post",
+		Type: "agent_message",
+		Raw:  mustAgentMessageRaw(t, "/root/child", "/root", "Message Type: CHANNEL_POST\nSender: /root/child\nChannel: progress\nMessage ID: aaaabbbbcccc\nThread ID: aaaabbbbcccc\nPayload:\nchild channel progress"),
+	}
+	if ShouldKeepCompactedHistoryItem(descendantChannelPost) {
+		t.Fatal("descendant CHANNEL_POST progress must not be retained (Rust #47249)")
+	}
 	rootProgress := Item{
 		ID:   "root-progress",
 		Type: "agent_message",
@@ -651,6 +660,32 @@ func TestEstimateToolItemTokensLikeRust(t *testing.T) {
 	}
 }
 
+// Rust estimates an encrypted reasoning item from its opaque payload rather
+// than from the visible summary. Without that charge, a bounded compaction
+// request can still replay hundreds of thousands of reasoning tokens.
+func TestEstimateReasoningItemTokensChargesEncryptedPayloadLikeRust(t *testing.T) {
+	encrypted := strings.Repeat("A", 10_000)
+	wantBytes := len(encrypted)*3/4 - 650
+	want := (wantBytes + 3) / 4
+	raw, err := json.Marshal(map[string]any{
+		"type":              "reasoning",
+		"summary":           []any{},
+		"encrypted_content": encrypted,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := EstimateItemTokens(&Item{Type: "reasoning", Raw: raw}); got != want {
+		t.Fatalf("raw reasoning estimate = %d, want %d", got, want)
+	}
+	if got := EstimateItemTokens(&Item{Type: "reasoning", Data: map[string]any{"encrypted_content": encrypted}}); got != want {
+		t.Fatalf("data reasoning estimate = %d, want %d", got, want)
+	}
+	if got := EstimateItemTokens(&Item{Type: "reasoning", Text: "short visible summary"}); got == 0 {
+		t.Fatal("reasoning without encrypted content should still charge its visible summary")
+	}
+}
+
 // TestEstimateAudioOutputTokensLikeRust pins Rust #45094's audio arm: an audio
 // content block contributes approx_bytes_for_tokens over its duration-derived
 // token count (20 tokens for 2 s at 10 tokens/s => 80 bytes).
@@ -746,5 +781,54 @@ func TestEstimateItemTokensChargesMessageImagesLikeRust(t *testing.T) {
 	}}
 	if got := EstimateItemTokens(&output); got < compactOriginalImageMaxPatches {
 		t.Fatalf("tool output tokens = %d, want at least the maximum patch count", got)
+	}
+}
+
+// Mirrors Rust #55991: Responses Lite reports retained reasoning in its usage
+// even without an X-Reasoning-Included header, so re-estimating reasoning
+// before the last user boundary would trigger compaction prematurely.
+func TestEstimateActiveContextTokensHonorsServerReasoningIncluded(t *testing.T) {
+	raw, err := json.Marshal(map[string]any{
+		"type": "reasoning", "summary": []any{}, "encrypted_content": strings.Repeat("A", 4_000),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := []Item{
+		{ID: "u1", Type: "message", Role: "user", Text: "first"},
+		{ID: "r1", Type: "reasoning", Raw: raw},
+		{ID: "u2", Type: "message", Role: "user", Text: "next"},
+		{ID: "a1", Type: "message", Role: "assistant", Text: "answer"},
+	}
+	reasoning := EstimateNonLastReasoningTokens(items)
+	if reasoning <= 0 {
+		t.Fatalf("non-last reasoning tokens = %d, want the encrypted payload charged", reasoning)
+	}
+	if got := EstimateActiveContextTokensWithServerReasoning(items, 80, true); got != 80 {
+		t.Fatalf("server-included active tokens = %d, want 80", got)
+	}
+	if got := EstimateActiveContextTokensWithServerReasoning(items, 80, false); got != 80+reasoning {
+		t.Fatalf("re-estimated active tokens = %d, want %d", got, 80+reasoning)
+	}
+	limit := Policy{Enabled: true, TokenLimit: 81}
+	if status := Evaluate(limit, EstimateActiveContextTokensWithServerReasoning(items, 80, true)); status.ShouldCompact {
+		t.Fatalf("server-included usage at 80 tokens must stay below an 81-token limit: %+v", status)
+	}
+	if status := Evaluate(limit, EstimateActiveContextTokensWithServerReasoning(items, 80, false)); !status.ShouldCompact {
+		t.Fatalf("re-estimated reasoning must trigger compaction at 81 tokens: %+v", status)
+	}
+}
+
+func TestNewWindowUsesUUIDv7AndSuppliedAdvanceIDsLikeRust(t *testing.T) {
+	window := NewWindow("thread-a")
+	ids := window.IDs()
+	if _, ok := protocol.ParseContextWindowID(ids.WindowID); !ok {
+		t.Fatalf("initial window id %q is not UUIDv7", ids.WindowID)
+	}
+	next := protocol.NewContextWindowID().String()
+	window.SetIDGenerator(func() string { return next })
+	_, advanced := window.Advance()
+	if advanced.PreviousWindowID != ids.WindowID || advanced.WindowID != next || advanced.FirstWindowID != ids.FirstWindowID {
+		t.Fatalf("advanced ids = %#v, want first=%q previous=%q current=%q", advanced, ids.FirstWindowID, ids.WindowID, next)
 	}
 }

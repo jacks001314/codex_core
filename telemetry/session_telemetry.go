@@ -51,6 +51,9 @@ type SessionTelemetryMetadata struct {
 	AppVersion string
 	// TerminalType is the client's terminal name.
 	TerminalType string
+	// ProductSKU is the bounded product attribution the session reports with
+	// metrics, when the host knows it (Rust metadata.product_sku).
+	ProductSKU string
 }
 
 // LogRecordSink receives the log-only records the session telemetry emits.
@@ -65,6 +68,10 @@ type LogRecordSink interface {
 // SessionTelemetry emits Rust's session telemetry records.
 type SessionTelemetry struct {
 	Metadata SessionTelemetryMetadata
+	// LogSSEDeltas suppresses the per-delta `codex.sse_event` log records when
+	// false, while errors and metrics keep reporting (Rust #58034
+	// `without_sse_delta_logs`). It defaults to true.
+	LogSSEDeltas bool
 	// Logs receives the log-only half; nil drops it, like a process without an
 	// OTEL log layer.
 	Logs LogRecordSink
@@ -78,7 +85,17 @@ type SessionTelemetry struct {
 
 // NewSessionTelemetry builds an emitter for one conversation's metadata.
 func NewSessionTelemetry(metadata SessionTelemetryMetadata) *SessionTelemetry {
-	return &SessionTelemetry{Metadata: metadata}
+	return &SessionTelemetry{Metadata: metadata, LogSSEDeltas: true}
+}
+
+// WithoutSSEDeltaLogs suppresses successful SSE delta log records while
+// retaining errors and every metric (Rust #58034).
+func (t *SessionTelemetry) WithoutSSEDeltaLogs() *SessionTelemetry {
+	if t == nil {
+		return nil
+	}
+	t.LogSSEDeltas = false
+	return t
 }
 
 // The session telemetry is the sink the model client reports its records and
